@@ -1,0 +1,566 @@
+/*
+ * chart.css - the one fixed look every perch chart renders in.
+ *
+ * Charts render in the app's own Oro Nero look (boss decision 2026-07-07,
+ * overriding the plan's beige-paper direction): warm near-black canvas, cream
+ * ink, hairline rules, serif display titles. Gold is the brand accent and it
+ * is rationed - the title rule, links, and nothing else; if a chart shows
+ * more than a few gold elements, something is wrong. Palette values match
+ * PerchTheme in apps/ios/Perch/ContentView.swift.
+ *
+ * Authors write plain semantic HTML against this vocabulary and nothing else
+ * (no <style> blocks, no style= attributes, no external design systems).
+ * See AUTHORING.md for the full reference. The vocabulary:
+ *
+ *   Elements    h1-h4, p, a, ul/ol, blockquote, hr, table, code, pre,
+ *               strong/em, figcaption - styled bare, no classes needed
+ *   .chart-header  title block: .eyebrow, h1, .subtitle, .meta
+ *   .cards / .card grid of bordered panels; tone modifiers on .card
+ *   .columns / .col side-by-side comparison columns
+ *   .table-wrap    horizontal-scroll wrapper for wide tables
+ *   .badge         small status label; takes tone modifiers
+ *   .figure        framed container for diagrams; holds <pre class="mermaid">
+ *   .mermaid       Mermaid source block (rendered in place)
+ *   .good .warn .risk .info  tone modifiers for .card, .col, .badge
+ */
+
+:root {
+  --canvas: #0a0908;
+  --panel: #141210;
+  --panel-deep: #191613;
+  --inline-code: #262019;
+  --hairline: #2a251f;
+  --hairline-strong: #3e372d;
+  --text: #e9e2d0;
+  --text-2: #a89f8c;
+  --text-3: #6f685a;
+  --gold: #c9a227;
+  --good: #5a7a4a;
+  --good-text: #9dbd8a;
+  --good-bg: #131a10;
+  --warn: #c98a27;
+  --warn-text: #e0ac55;
+  --warn-bg: #1e1709;
+  --risk: #8e2f22;
+  --risk-text: #da7a66;
+  --risk-bg: #1c0f0b;
+  --info: #7e93a3;
+  --info-text: #a7b8c4;
+  --info-bg: #11151a;
+  --serif: ui-serif, "New York", "Iowan Old Style", Georgia, "Times New Roman", serif;
+  --sans: -apple-system, BlinkMacSystemFont, "SF Pro Text", "Segoe UI", "Helvetica Neue", sans-serif;
+  --mono: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+}
+
+*,
+*::before,
+*::after {
+  box-sizing: border-box;
+}
+
+html {
+  background: var(--canvas);
+}
+
+body {
+  margin: 0 auto;
+  max-width: 46rem;
+  padding: clamp(1.5rem, 5vw, 3.5rem) clamp(1.1rem, 4vw, 2rem) 4rem;
+  background: var(--canvas);
+  color: var(--text);
+  font-family: var(--sans);
+  font-size: 1rem;
+  line-height: 1.65;
+  -webkit-font-smoothing: antialiased;
+  text-rendering: optimizeLegibility;
+}
+
+::selection {
+  background: rgba(201, 162, 39, 0.28);
+}
+
+/* ---------- Prose ---------- */
+
+h1,
+h2 {
+  font-family: var(--serif);
+  font-weight: 600;
+  line-height: 1.18;
+  letter-spacing: -0.01em;
+  /* ui-serif ink is ~1.375em tall, taller than the 1.18 line box; pad so
+     ascenders/descenders stay inside the element instead of tripping the
+     layout audit's clipped-text check (2px vertical spill). */
+  padding-block: 0.15em 0.1em;
+  margin: 0 0 0.5em;
+}
+
+h1 {
+  font-size: 2rem;
+}
+
+h2 {
+  font-size: 1.35rem;
+  margin-top: 2.6em;
+  padding-top: 1.1em;
+  border-top: 1px solid var(--hairline);
+}
+
+h3 {
+  font-family: var(--sans);
+  font-size: 1rem;
+  font-weight: 650;
+  line-height: 1.3;
+  margin: 2em 0 0.4em;
+}
+
+h4 {
+  font-family: var(--sans);
+  font-size: 0.72rem;
+  font-weight: 650;
+  text-transform: uppercase;
+  letter-spacing: 0.12em;
+  color: var(--text-2);
+  margin: 1.8em 0 0.4em;
+}
+
+p {
+  margin: 0 0 1em;
+}
+
+a {
+  color: var(--gold);
+  text-decoration: underline;
+  text-decoration-thickness: 1px;
+  text-underline-offset: 0.18em;
+}
+
+a:hover {
+  text-decoration-thickness: 2px;
+}
+
+ul,
+ol {
+  margin: 0 0 1em;
+  padding-left: 1.4em;
+}
+
+li {
+  margin-bottom: 0.35em;
+}
+
+li::marker {
+  color: var(--text-3);
+}
+
+strong {
+  font-weight: 650;
+  color: var(--text);
+}
+
+blockquote {
+  margin: 1.5em 0;
+  padding: 0.2em 0 0.2em 1.1em;
+  border-left: 3px solid var(--hairline-strong);
+  color: var(--text-2);
+  font-family: var(--serif);
+  font-style: italic;
+  font-size: 1.05em;
+}
+
+hr {
+  width: 5rem;
+  margin: 3rem auto;
+  border: 0;
+  border-top: 1px solid var(--hairline-strong);
+}
+
+/* ---------- Title block ---------- */
+
+.chart-header {
+  margin-bottom: 2.5rem;
+  padding-bottom: 1.4rem;
+  border-bottom: 6px double var(--gold);
+}
+
+.eyebrow {
+  display: block;
+  font-size: 0.7rem;
+  font-weight: 650;
+  text-transform: uppercase;
+  letter-spacing: 0.16em;
+  color: var(--text-3);
+  margin-bottom: 0.9em;
+}
+
+.chart-header h1 {
+  margin-bottom: 0.25em;
+}
+
+.subtitle {
+  font-family: var(--serif);
+  font-style: italic;
+  font-size: 1.1rem;
+  color: var(--text-2);
+  margin: 0 0 1em;
+}
+
+.meta {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.4em 0.9em;
+  font-size: 0.8rem;
+  color: var(--text-2);
+  margin: 0;
+}
+
+/* ---------- Cards ---------- */
+
+.cards {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(13rem, 1fr));
+  gap: 0.9rem;
+  margin: 1.5rem 0;
+}
+
+.card {
+  background: var(--panel);
+  border: 1px solid var(--hairline);
+  border-radius: 4px;
+  padding: 1rem 1.1rem;
+  min-width: 0;
+}
+
+.card > h3,
+.card > h4 {
+  margin-top: 0;
+}
+
+.card > :last-child {
+  margin-bottom: 0;
+}
+
+.card.good {
+  border-left: 3px solid var(--good);
+  background: var(--good-bg);
+}
+
+.card.warn {
+  border-left: 3px solid var(--warn);
+  background: var(--warn-bg);
+}
+
+.card.risk {
+  border-left: 3px solid var(--risk);
+  background: var(--risk-bg);
+}
+
+.card.info {
+  border-left: 3px solid var(--info);
+  background: var(--info-bg);
+}
+
+/* ---------- Comparison columns ---------- */
+
+.columns {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(15rem, 1fr));
+  gap: 1.4rem;
+  margin: 1.5rem 0;
+}
+
+.col {
+  border-top: 2px solid var(--text-2);
+  padding-top: 0.9rem;
+  min-width: 0;
+}
+
+.col > h3 {
+  margin-top: 0;
+}
+
+.col.good {
+  border-top-color: var(--good);
+}
+
+.col.warn {
+  border-top-color: var(--warn);
+}
+
+.col.risk {
+  border-top-color: var(--risk);
+}
+
+.col.info {
+  border-top-color: var(--info);
+}
+
+/* ---------- Tables ---------- */
+
+.table-wrap {
+  overflow-x: auto;
+  margin: 1.5rem 0;
+}
+
+.table-wrap > table {
+  margin: 0;
+}
+
+table {
+  width: 100%;
+  border-collapse: collapse;
+  margin: 1.5rem 0;
+  font-size: 0.92rem;
+}
+
+th {
+  font-size: 0.7rem;
+  font-weight: 650;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  color: var(--text-3);
+  text-align: left;
+  padding: 0.5em 0.8em;
+  border-bottom: 1px solid var(--hairline-strong);
+}
+
+td {
+  padding: 0.55em 0.8em;
+  border-bottom: 1px solid var(--hairline);
+  vertical-align: top;
+}
+
+th:first-child,
+td:first-child {
+  padding-left: 0;
+}
+
+th:last-child,
+td:last-child {
+  padding-right: 0;
+}
+
+/* ---------- Badges ---------- */
+
+.badge {
+  display: inline-block;
+  font-size: 0.68rem;
+  font-weight: 650;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  line-height: 1.5;
+  padding: 0.1em 0.55em;
+  border: 1px solid var(--hairline-strong);
+  border-radius: 3px;
+  background: var(--panel);
+  color: var(--text-2);
+  white-space: nowrap;
+}
+
+.badge.good {
+  color: var(--good-text);
+  border-color: var(--good);
+  background: var(--good-bg);
+}
+
+.badge.warn {
+  color: var(--warn-text);
+  border-color: var(--warn);
+  background: var(--warn-bg);
+}
+
+.badge.risk {
+  color: var(--risk-text);
+  border-color: var(--risk);
+  background: var(--risk-bg);
+}
+
+.badge.info {
+  color: var(--info-text);
+  border-color: var(--info);
+  background: var(--info-bg);
+}
+
+/* ---------- Code ---------- */
+
+code {
+  font-family: var(--mono);
+  font-size: 0.86em;
+  background: var(--inline-code);
+  padding: 0.1em 0.35em;
+  border-radius: 3px;
+}
+
+pre {
+  background: var(--panel-deep);
+  border: 1px solid var(--hairline);
+  border-radius: 4px;
+  padding: 0.9rem 1.1rem;
+  overflow-x: auto;
+  margin: 1.5rem 0;
+  line-height: 1.55;
+}
+
+pre code {
+  background: none;
+  padding: 0;
+  font-size: 0.82rem;
+}
+
+/* ---------- Figures and Mermaid ---------- */
+
+.figure {
+  margin: 2rem 0;
+  border: 1px solid var(--hairline);
+  border-radius: 4px;
+  background: var(--panel);
+  padding: 1.2rem 1rem 0.9rem;
+  text-align: center;
+  overflow-x: auto;
+}
+
+.figure figcaption {
+  font-size: 0.8rem;
+  color: var(--text-2);
+  text-align: center;
+  margin-top: 0.8rem;
+}
+
+.mermaid {
+  border: 0;
+  background: none;
+  padding: 0;
+  margin: 0;
+  display: block;
+}
+
+/* Mermaid source before render: quiet mono, not a wall of raw text. */
+.mermaid:not([data-processed]) {
+  display: block;
+  font-family: var(--mono);
+  font-size: 0.78rem;
+  color: var(--text-3);
+  text-align: left;
+  white-space: pre;
+  overflow-x: auto;
+}
+
+/* Center without clipping: auto margins collapse to 0 when the diagram is
+   wider than the frame, so the .figure scroll reaches the left edge. */
+.mermaid svg {
+  display: block;
+  margin: 0 auto;
+  max-width: none; /* .figure scrolls; shrinking the diagram makes it unreadable */
+  height: auto;
+}
+
+/* ---------- Overflow safety ---------- */
+
+img,
+svg,
+video,
+canvas {
+  max-width: 100%;
+  height: auto;
+}
+
+:where(.cards, .columns, .meta) > * {
+  min-width: 0;
+}
+
+:where(p, h1, h2, h3, h4, li, td, figcaption, blockquote) {
+  overflow-wrap: anywhere;
+}
+
+th {
+  white-space: nowrap; /* headers never break mid-word; wide tables scroll in .table-wrap */
+}
+
+/* ---------- Print ---------- */
+
+@media print {
+  body {
+    max-width: none;
+    padding: 0;
+  }
+
+  .figure,
+  pre {
+    break-inside: avoid;
+  }
+}
+
+/*
+ * ---------- Gallery (server-rendered /charts/gallery listing) ----------
+ *
+ * Layout-only classes for the desktop Charts gallery page (chartsGallery.ts):
+ * a vertical list of clickable rows under each project's <h2>. Charts render in
+ * the same Oro Nero look; these classes only arrange the listing. Gold stays
+ * rationed - .gallery-item resets the default gold link styling so rows read as
+ * quiet panels, not a wall of gold links.
+ */
+
+.gallery-count {
+  margin: -0.2rem 0 0.4rem;
+  font-size: 0.8rem;
+  color: var(--text-3);
+  overflow-wrap: anywhere;
+}
+
+.gallery-list {
+  list-style: none;
+  margin: 0.6rem 0 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+}
+
+.gallery-item {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 1rem;
+  padding: 0.7rem 0.9rem;
+  border: 1px solid var(--hairline);
+  border-radius: 0.5rem;
+  background: var(--panel);
+  color: var(--text);
+  text-decoration: none;
+}
+
+.gallery-item:hover {
+  border-color: var(--hairline-strong);
+  background: var(--panel-deep);
+  text-decoration: none;
+}
+
+.gallery-item-main {
+  min-width: 0;
+}
+
+.gallery-item-title {
+  display: block;
+  font-weight: 650;
+  color: var(--text);
+  overflow-wrap: anywhere;
+}
+
+.gallery-item-meta {
+  margin-top: 0.15rem;
+  font-size: 0.8rem;
+  color: var(--text-2);
+  overflow-wrap: anywhere;
+}
+
+.gallery-item-aside {
+  flex: none;
+  display: flex;
+  align-items: center;
+  gap: 0.4rem;
+}
+
+.gallery-empty {
+  color: var(--text-2);
+  font-style: italic;
+}

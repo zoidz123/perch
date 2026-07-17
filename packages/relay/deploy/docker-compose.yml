@@ -1,0 +1,46 @@
+# One-command TLS deployment of the perch WAN relay.
+#
+#   1. Point a domain's A/AAAA record at this VM.
+#   2. cp .env.example .env  and set RELAY_DOMAIN + LETSENCRYPT_EMAIL.
+#   3. docker compose up -d --build
+#
+# Caddy fetches and renews a Let's Encrypt cert for RELAY_DOMAIN automatically
+# and reverse-proxies wss:// -> the relay's plain ws:// on the internal network.
+# The relay is stateless and content-blind; only Caddy's ACME cert store is
+# persisted (in the caddy_data volume), never any relay traffic.
+
+services:
+  relay:
+    build:
+      # Context is the package root (one level up); the Dockerfile lives there.
+      context: ..
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    environment:
+      - PORT=8080
+      - HOST=0.0.0.0
+    # No published ports: the relay is reachable only via Caddy on the internal
+    # compose network. This keeps plain ws:// off the public internet.
+    expose:
+      - "8080"
+
+  caddy:
+    image: caddy:2-alpine
+    restart: unless-stopped
+    ports:
+      - "80:80"
+      - "443:443"
+      - "443:443/udp" # HTTP/3
+    environment:
+      - RELAY_DOMAIN=${RELAY_DOMAIN}
+      - LETSENCRYPT_EMAIL=${LETSENCRYPT_EMAIL}
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data     # ACME account + issued certs (survives restarts)
+      - caddy_config:/config
+    depends_on:
+      - relay
+
+volumes:
+  caddy_data:
+  caddy_config:

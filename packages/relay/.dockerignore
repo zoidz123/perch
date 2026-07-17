@@ -1,0 +1,7 @@
+# Keep the build context tiny: ship only source + manifests, never build output
+# or deps (the image rebuilds both from scratch).
+node_modules
+dist
+*.log
+.env
+.DS_Store

@@ -1,0 +1,40 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  validate:
+    name: Build, tests, package, and iOS
+    runs-on: macos-26
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 24
+          cache: npm
+      - run: npm ci
+      - run: npm run check:public-seed
+      - run: npm run build
+      - run: npm run typecheck
+      - run: npm test -w @perch/server
+      - run: npm test -w @perch/relay
+      - run: npm run test:package
+      - name: Build with Xcode 26
+        run: >-
+          xcodebuild
+          -project apps/ios/Perch.xcodeproj
+          -scheme Perch
+          -destination 'platform=iOS Simulator,name=iPhone 17 Pro'
+          -derivedDataPath "$RUNNER_TEMP/PerchDerivedData"
+          build

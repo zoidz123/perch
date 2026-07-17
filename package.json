@@ -1,0 +1,72 @@
+{
+  "name": "perchctl",
+  "private": false,
+  "version": "0.1.0",
+  "type": "module",
+  "description": "A durable local-first orchestrator for Claude Code and Codex agents on macOS.",
+  "license": "MIT",
+  "os": [
+    "darwin"
+  ],
+  "keywords": [
+    "ai-agents",
+    "claude-code",
+    "codex",
+    "multi-agent",
+    "orchestration",
+    "ios",
+    "terminal"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/zoidz123/perch.git"
+  },
+  "bugs": {
+    "url": "https://github.com/zoidz123/perch/issues"
+  },
+  "homepage": "https://github.com/zoidz123/perch#readme",
+  "publishConfig": {
+    "access": "public"
+  },
+  "files": [
+    "bin/perch.mjs",
+    "apps/server/dist/**/*.js",
+    "apps/server/assets/**",
+    "packages/shared/dist/**/*.js",
+    "packages/relay/dist/**/*.js",
+    "!packages/relay/README.md",
+    "README.md",
+    "LICENSE"
+  ],
+  "workspaces": [
+    "apps/server",
+    "packages/*"
+  ],
+  "scripts": {
+    "check:public-seed": "node scripts/check-public-seed.mjs --mode source-preflight",
+    "build": "npm run build -w @perch/shared && npm run build -w @perch/relay && npm run build -w @perch/server",
+    "build:package": "node scripts/prepare-npm-package.mjs",
+    "prepack": "npm run build:package",
+    "test:package": "node scripts/npm-package-smoke.mjs",
+    "typecheck": "npm run build -w @perch/shared && npm run build -w @perch/relay && npm run typecheck -w @perch/server && npm run typecheck -w @perch/relay",
+    "dev:server": "npm run dev -w @perch/server",
+    "ios:simulator": "scripts/run-ios-simulator.sh",
+    "open:ios": "open apps/ios/Perch.xcodeproj"
+  },
+  "bin": {
+    "perch": "./bin/perch.mjs"
+  },
+  "dependencies": {
+    "@xterm/addon-serialize": "^0.14.0",
+    "@xterm/headless": "^6.0.0",
+    "better-sqlite3": "^12.11.1",
+    "node-pty": "^1.1.0",
+    "qrcode-terminal": "^0.12.0",
+    "tweetnacl": "^1.0.3",
+    "ws": "^8.18.0"
+  },
+  "engines": {
+    "node": ">=20",
+    "npm": ">=10"
+  }
+}

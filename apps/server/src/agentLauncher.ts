@@ -1,0 +1,541 @@
+import { randomUUID } from "node:crypto";
+import type {
+  AgentKind,
+  AgentSession,
+  CodexReasoningEffort,
+  PendingServerRequest,
+  PendingApproval,
+  StartAgentRequest
+} from "@perch/shared";
+import type { AgentAdapter } from "./adapters/types.js";
+import type { AuditLog, AuditRecord } from "./audit.js";
+import type { CodexControlPlane } from "./codexControl.js";
+import type { FleetMonitor } from "./fleetMonitor.js";
+import { findCodexRollout, isAllowedTranscriptPath, type HookRegistry } from "./hooks.js";
+import { resolveSessionModel } from "./models.js";
+import { assertLocalRuntimeModelId } from "./modelSwitch.js";
+import type { ProjectRegistry } from "./projects.js";
+import type { TaskStore } from "./tasks.js";
+import type { TaskCompletionReconciler } from "./taskCompletion.js";
+import type { RuntimeManager } from "./runtimeManager.js";
+import type { RecoveryCoordinator } from "./recovery.js";
+import type { OwnerManager } from "./ownerManager.js";
+import type { MateRecoveryCoordinator } from "./mateRecovery.js";
+import type { TimelineStore } from "./timeline.js";
+import type { WorktreeLease, WorktreePool } from "./worktrees.js";
+
+type LaunchAuditMeta = Pick<AuditRecord, "deviceId" | "remoteAddress">;
+
+export type ManagedAgentLauncherOptions = {
+  adapter: AgentAdapter;
+  auditLog: AuditLog;
+  monitor: FleetMonitor;
+  projects: ProjectRegistry;
+  worktrees: WorktreePool;
+  hooks: HookRegistry;
+  timeline: TimelineStore;
+  tasks: TaskStore;
+  port: number;
+  codexControl?: CodexControlPlane;
+  taskCompletion?: TaskCompletionReconciler;
+  runtimeManager?: RuntimeManager;
+  recoveryCoordinator?: RecoveryCoordinator;
+  ownerManager?: OwnerManager;
+  mateRecoveryCoordinator?: MateRecoveryCoordinator;
+};
+
+export type StartManagedAgentInput = {
+  request: StartAgentRequest;
+  auditMeta?: LaunchAuditMeta;
+  taskId?: string;
+  // Task dispatch already leases to the task id before launch. The launcher
+  // still owns binding that lease to the session and releasing it on failure.
+  worktreeLease?: WorktreeLease;
+  // Project root to register after launch. Defaults to the lease repo root or
+  // request cwd; task dispatch passes the original project root.
+  projectRoot?: string;
+  // Mate home is infrastructure, not a project.
+  registerProject?: boolean;
+  // Task kickoffs are agent-authored and need provenance before queueing.
+  initialPromptSource?: "human" | "agent";
+  // Recovery already owns the authoritative `recovering` generation and
+  // binds g+1 only after provider identity verification.
+  trackRuntime?: boolean;
+  // Durable-owner recovery already holds the mate generation and binds its
+  // replacement only after provider identity verification.
+  trackOwner?: boolean;
+  intentionalNewMate?: boolean;
+  // A recovery failure must preserve the task-held worktree for another try.
+  retainWorktreeOnFailure?: boolean;
+  // Codex recovery uses the CLI's verified native `resume <id>` path. A fresh
+  // remote daemon does not reliably broadcast identity for a resumed thread.
+  disableCodexRemote?: boolean;
+};
+
+export type StartManagedAgentResult = {
+  session: AgentSession;
+  request: StartAgentRequest;
+  codexRemote: boolean;
+  worktreeId?: string;
+};
+
+// One codex rollout resolver loop per session: many hooks/control signals can
+// arrive before the first attach, and each would otherwise spawn overlapping
+// filesystem polls.
+const codexRolloutResolving = new Set<string>();
+
+export async function startManagedAgent(
+  options: ManagedAgentLauncherOptions,
+  input: StartManagedAgentInput
+): Promise<StartManagedAgentResult> {
+  if (!options.adapter.startAgent) {
+    throw new Error("PTY agents are not supported by this server");
+  }
+
+  const request = cloneStartRequest(input.request);
+  validateStartAgent(request);
+
+  if (request.worktree === true && input.worktreeLease) {
+    throw new Error("worktree launch cannot specify both worktree=true and an existing lease");
+  }
+
+  let lease = input.worktreeLease;
+  let releaseLeaseOnFailure = Boolean(input.worktreeLease);
+  if (request.worktree === true) {
+    const repoRoot = request.cwd ?? process.cwd();
+    lease = await options.worktrees.acquire(repoRoot, "pending");
+    releaseLeaseOnFailure = true;
+    request.cwd = lease.path;
+  } else if (lease) {
+    request.cwd = lease.path;
+  }
+
+  const cwd = request.cwd ?? process.cwd();
+  const launchModel = resolveSessionModel(launchAgentKind(request.command, request.agent), {
+    model: request.model,
+    effort: request.effort
+  });
+  if (launchModel.effort && !request.effort) request.effort = launchModel.effort;
+
+  const codexSocketPath = input.disableCodexRemote
+    ? null
+    : await prepareCodexRemote(options, request, cwd, launchModel.effort);
+  if (codexSocketPath && request.sessionId) {
+    await attachCodexControl(options, request.sessionId, codexSocketPath, cwd);
+  }
+
+  const task = input.taskId && input.trackRuntime !== false ? options.tasks.find(input.taskId) : undefined;
+  const runtime = task
+    ? options.runtimeManager?.beginLaunch(
+        task,
+        { ...request, ...(launchModel.model ? { model: launchModel.model } : {}) },
+        lease
+      )
+    : undefined;
+  const ownerRuntime = request.labels?.role === "mate" && input.trackOwner !== false
+    ? options.ownerManager?.beginMateLaunch(request, input.intentionalNewMate === true)
+    : undefined;
+  let session: AgentSession | undefined;
+  try {
+    session = await options.adapter.startAgent(request);
+
+    if (request.sessionId && session.id !== request.sessionId) {
+      // The adapter refused the pre-minted id. Drop the misaddressed control
+      // client so a stale id cannot receive model or turn commands - but the
+      // spawned TUI stays dialed into the daemon, so daemon ownership moves to
+      // the adapter's id (releasing it here would kill the live session's
+      // backend; the session's exit releases it instead).
+      options.codexControl?.transferDaemon(request.sessionId, session.id);
+      await options.codexControl?.detach(request.sessionId).catch(() => {});
+      options.hooks.unregister(request.sessionId);
+    }
+
+    if (lease) {
+      await options.worktrees.assign(lease.id, session.id);
+      session.worktreeId = lease.id;
+    }
+
+    if (runtime) {
+      options.runtimeManager?.markLive(runtime, session.id, options.adapter.runtimeProcess?.(session.id), {
+        ...(request.model ? { model: request.model } : {}),
+        ...(lease ? { worktreeId: lease.id, leaseId: lease.id, worktreePath: lease.path } : {})
+      });
+    }
+    if (ownerRuntime) {
+      options.ownerManager?.markLive(ownerRuntime, session.id, options.adapter.runtimeProcess?.(session.id));
+    }
+
+    options.monitor.setSessionModel(
+      session.id,
+      resolveSessionModel(session.agent, {
+        model: request.model,
+        effort: request.effort
+      })
+    );
+
+    const shouldRegisterProject = input.registerProject ?? request.labels?.role !== "mate";
+    if (shouldRegisterProject) {
+      options.projects.touch(input.projectRoot ?? lease?.repoRoot ?? cwd);
+    }
+
+    if (typeof request.initialPrompt === "string" && request.initialPrompt.trim().length > 0) {
+      if (input.initialPromptSource) {
+        options.timeline.recordSource(session.id, request.initialPrompt, input.initialPromptSource);
+      }
+      options.monitor.queueInitialPrompt(session.id, request.initialPrompt);
+    }
+
+    await audit(options.auditLog, {
+      action: "start_agent",
+      sessionId: session.id,
+      ...input.auditMeta,
+      command: request.command,
+      cwd: request.cwd,
+      ...(input.taskId ? { taskId: input.taskId } : {})
+    });
+
+    return {
+      session,
+      request,
+      codexRemote: Boolean(codexSocketPath),
+      ...(lease ? { worktreeId: lease.id } : {})
+    };
+  } catch (error) {
+    if (runtime) options.runtimeManager?.markLaunchFailed(runtime);
+    if (ownerRuntime) options.ownerManager?.markLaunchFailed(ownerRuntime);
+    if (session?.id && options.adapter.stopSession) {
+      await options.adapter.stopSession(session.id).catch(() => {});
+    }
+    if (request.sessionId) {
+      await options.codexControl?.detach(request.sessionId).catch(() => {});
+      options.hooks.unregister(request.sessionId);
+    }
+    if (lease && releaseLeaseOnFailure && !input.retainWorktreeOnFailure) {
+      await options.worktrees.release(lease.id, { force: true }).catch(() => {});
+    }
+    throw error;
+  }
+}
+
+function cloneStartRequest(request: StartAgentRequest): StartAgentRequest {
+  return {
+    ...request,
+    ...(request.args ? { args: [...request.args] } : {}),
+    ...(request.labels ? { labels: { ...request.labels } } : {}),
+    ...(request.desktop ? { desktop: { ...request.desktop } } : {})
+  };
+}
+
+// Is this launch a Codex session? The New Agent sheet sends agent: "codex";
+// otherwise infer from the command basename.
+function isCodexLaunch(command: string, agent?: AgentKind): boolean {
+  if (agent) return agent === "codex";
+  const base = command.trim().split(/[\\/]/).pop() ?? "";
+  return base.toLowerCase().includes("codex");
+}
+
+async function prepareCodexRemote(
+  options: ManagedAgentLauncherOptions,
+  request: StartAgentRequest,
+  cwd: string,
+  effort?: CodexReasoningEffort
+): Promise<string | null> {
+  if (!options.codexControl || !isCodexLaunch(request.command, request.agent)) return null;
+
+  // Pre-mint this session's id + hook token and set them on the request so the
+  // PTY adapter adopts the same id. The daemon is spawned before the session
+  // exists, so seed it with hook wiring now.
+  const sessionId = request.sessionId ?? `pty:${randomUUID()}`;
+  request.sessionId = sessionId;
+  const hookEnv: Record<string, string> = {
+    PERCH_SESSION_ID: sessionId,
+    PERCH_HOOK_URL: `http://127.0.0.1:${options.port}/hooks`,
+    PERCH_HOOK_TOKEN: options.hooks.register(sessionId).token
+  };
+  const handle = await options.codexControl.prepareRemote(cwd, { effort, env: hookEnv });
+  if (!handle) return null;
+
+  request.args = ["--remote", `unix://${handle.socketPath}`, ...(request.args ?? [])];
+  return handle.socketPath;
+}
+
+// A dispatched task stays `queued` until its worker shows life. Claude workers
+// reliably curl a `working` event themselves, but a codex worker can report
+// nothing (or inherit stale hook credentials), so any observed activity flips
+// queued -> working. A parked task is different: the verb may be a deliberate
+// worker report, so only an explicit new-turn start or successfully submitted
+// composer input (`newTurn`) may restore it to `working` - trailing activity
+// from the turn that reported the block (Stop hooks, residual assistant-stream
+// /turn-complete frames) must not.
+export function markTaskWorkingFromActivity(
+  options: { tasks: TaskStore },
+  sessionId: string,
+  opts: { newTurn?: boolean } = {}
+): void {
+  const task = options.tasks.list().find((candidate) => candidate.sessionId === sessionId);
+  if (!task) return;
+  const resumesParkedTask =
+    opts.newTurn === true && (task.state === "blocked" || task.state === "needs_you");
+  if (task.state !== "queued" && !resumesParkedTask) return;
+  try {
+    options.tasks.recordEvent(task.id, { kind: "working", source: "system", message: "worker session active" });
+  } catch {
+    // Never let the activity flip disturb the session.
+  }
+}
+
+function publishCodexStream(
+  options: ManagedAgentLauncherOptions,
+  sessionId: string,
+  ev: { itemId: string; text: string; done: boolean }
+): void {
+  options.monitor.publish({
+    type: "assistant_stream",
+    sessionId,
+    itemId: ev.itemId,
+    text: ev.text,
+    done: ev.done,
+    at: new Date().toISOString()
+  });
+}
+
+function taskForSession(options: ManagedAgentLauncherOptions, sessionId: string) {
+  return options.tasks.list().find((task) => task.sessionId === sessionId);
+}
+
+export function surfaceApprovalToTask(
+  tasks: TaskStore,
+  sessionId: string,
+  approval: PendingApproval
+): void {
+  const task = tasks.list().find((candidate) => candidate.sessionId === sessionId);
+  if (!task || !["queued", "working", "needs_you", "blocked"].includes(task.state)) return;
+  tasks.recordEvent(task.id, {
+    kind: "needs_decision",
+    source: "system",
+    message: approval.summary,
+    data: {
+      reason: "approval_request",
+      approvalId: approval.id,
+      source: approval.source ?? "hook",
+      decisions: approval.decisions,
+      context: approval.context
+    }
+  });
+}
+
+export function resolveApprovalForTask(
+  tasks: TaskStore,
+  sessionId: string,
+  approval: PendingApproval
+): void {
+  const task = tasks.list().find((candidate) => candidate.sessionId === sessionId);
+  if (!task || task.state !== "needs_you") return;
+  const last = tasks.events(task.id).at(-1);
+  if (last?.data?.reason !== "approval_request" || last.data.approvalId !== approval.id) return;
+  tasks.recordEvent(task.id, {
+    kind: "working",
+    source: "system",
+    message: "Permission request resolved",
+    data: {
+      reason: "approval_request_resolved",
+      approvalId: approval.id,
+      decision: approval.submittedDecision
+    }
+  });
+}
+
+function surfaceCodexServerRequest(
+  options: ManagedAgentLauncherOptions,
+  sessionId: string,
+  request: PendingServerRequest
+): void {
+  if (!options.monitor.setPendingServerRequest(sessionId, request)) return;
+  const task = taskForSession(options, sessionId);
+  if (!task || !["queued", "working", "needs_you", "blocked"].includes(task.state)) return;
+  options.tasks.recordEvent(task.id, {
+    kind: "needs_decision",
+    source: "system",
+    message: request.summary,
+    data: {
+      reason: "codex_server_request",
+      requestId: request.requestId,
+      threadId: request.threadId,
+      turnId: request.turnId,
+      itemId: request.itemId,
+      callId: request.callId,
+      family: request.family,
+      decisions: request.decisions,
+      persistence: request.persistence
+    }
+  });
+}
+
+function resolveCodexServerRequest(
+  options: ManagedAgentLauncherOptions,
+  sessionId: string,
+  request: PendingServerRequest
+): void {
+  if (!options.monitor.resolveServerRequest(sessionId, request.requestId)) return;
+  const task = taskForSession(options, sessionId);
+  if (!task || task.state !== "needs_you") return;
+  const last = options.tasks.events(task.id).at(-1);
+  if (last?.data?.reason !== "codex_server_request" || last.data.requestId !== request.requestId) return;
+  options.tasks.recordEvent(task.id, {
+    kind: "working",
+    source: "system",
+    message: "Codex approval resolved",
+    data: { reason: "codex_server_request_resolved", requestId: request.requestId }
+  });
+}
+
+async function attachCodexControl(
+  options: ManagedAgentLauncherOptions,
+  sessionId: string,
+  socketPath: string,
+  cwd: string
+): Promise<void> {
+  if (!options.codexControl) return;
+  let sharedThreadId: string | undefined;
+  const ensureRollout = () => {
+    if (sharedThreadId) attachCodexRollout(options, sessionId, sharedThreadId);
+  };
+  const attached = await options.codexControl.attach(sessionId, {
+    socketPath,
+    cwd,
+    onSharedThread: (threadId) => {
+      sharedThreadId = threadId;
+      options.runtimeManager?.recordProviderSession(sessionId, "codex", threadId);
+      options.ownerManager?.recordProviderSession(sessionId, "codex", threadId);
+      // Feed the recovery verifier for remote-topology sessions. Recovery
+      // currently launches codex PTY-only (disableCodexRemote), so no
+      // identity expectation matches here today; the codex driver's
+      // out-of-band verifier resolves it instead. This stays wired so a
+      // future remote-enabled recovery carries same-daemon evidence.
+      options.recoveryCoordinator?.observeSessionStart(sessionId, "codex", threadId);
+      options.mateRecoveryCoordinator?.observeSessionStart(sessionId, "codex", threadId);
+      ensureRollout();
+    },
+    onAssistantStream: (ev) => {
+      ensureRollout();
+      markTaskWorkingFromActivity(options, sessionId);
+      publishCodexStream(options, sessionId, ev);
+    },
+    onStatus: (status) => {
+      // Status alone never recovers a blocked task: approval resolution also
+      // transitions back to `running` mid-turn (see onTurnStarted below).
+      options.monitor.applyExternalStatus(sessionId, status, "codex", "adapter");
+    },
+    onServerRequest: (request) => surfaceCodexServerRequest(options, sessionId, request),
+    onServerRequestResolved: (request) => resolveCodexServerRequest(options, sessionId, request),
+    onTurnStarted: () => {
+      // An actual turn start (legacy task_started / raw v2 turn/started) is
+      // the one signal allowed to recover a blocked task back to working.
+      options.taskCompletion?.onTurnStarted(sessionId, "codex");
+      markTaskWorkingFromActivity(options, sessionId, { newTurn: true });
+    },
+    onTurnComplete: (ev) => {
+      ensureRollout();
+      markTaskWorkingFromActivity(options, sessionId);
+      options.taskCompletion?.onTurnCompleted(sessionId, "codex");
+    },
+    onUsageLimit: (limit) => {
+      options.monitor.reportUsageLimit(sessionId, "codex", limit);
+    }
+  });
+  if (!attached) {
+    console.warn(`codex: control attach failed session=${sessionId.slice(0, 12)}`);
+  }
+}
+
+export function attachCodexRollout(
+  options: {
+    hooks: HookRegistry;
+    timeline: TimelineStore;
+  },
+  sessionId: string,
+  agentSessionId: string
+): void {
+  if (codexRolloutResolving.has(sessionId)) return;
+  codexRolloutResolving.add(sessionId);
+  void (async () => {
+    try {
+      // 60s window: the rollout file only appears at the thread's first turn,
+      // and turn signals re-arm a fresh pass, so a later first turn still
+      // attaches.
+      for (let attempt = 0; attempt < 30; attempt += 1) {
+        if (options.hooks.correlation(sessionId)?.transcriptPath) {
+          return;
+        }
+        const rollout = findCodexRollout(agentSessionId);
+        if (rollout) {
+          if (isAllowedTranscriptPath(rollout)) {
+            options.hooks.correlate(sessionId, agentSessionId, rollout);
+            options.timeline.attach(sessionId, rollout, isAllowedTranscriptPath, "codex", agentSessionId);
+            console.log(`codex rollout attached session=${sessionId.slice(0, 12)}`);
+          }
+          return;
+        }
+        await new Promise((resolve) => setTimeout(resolve, 2000));
+      }
+    } finally {
+      codexRolloutResolving.delete(sessionId);
+    }
+  })();
+}
+
+// Resolve the agent kind for a launch, mirroring the PTY adapter's inference so
+// model/effort can be resolved before the session exists. Explicit agent wins.
+function launchAgentKind(command: string, agent?: AgentKind): AgentKind {
+  if (agent) return agent;
+  const base = command.trim().split(/[\\/]/).pop()?.toLowerCase() ?? "";
+  for (const kind of ["codex", "claude"] as const) {
+    if (base.includes(kind)) return kind;
+  }
+  return "unknown";
+}
+
+export function validateStartAgent(body: StartAgentRequest): void {
+  if (!body || typeof body.command !== "string" || body.command.trim().length === 0) {
+    throw new Error("command is required");
+  }
+
+  if (body.args !== undefined && !Array.isArray(body.args)) {
+    throw new Error("args must be an array");
+  }
+
+  if (body.args?.some((arg) => typeof arg !== "string")) {
+    throw new Error("args must be strings");
+  }
+
+  if (body.model !== undefined && typeof body.model !== "string") {
+    throw new Error("model must be a string");
+  }
+  if (typeof body.model === "string" && body.model.trim().length > 0) {
+    assertLocalRuntimeModelId(body.model.trim());
+  }
+
+  if (body.desktop !== undefined) {
+    if (!body.desktop || typeof body.desktop !== "object" || Array.isArray(body.desktop)) {
+      throw new Error("desktop must be an object");
+    }
+
+    for (const key of ["sessionId", "workspaceId", "paneId", "surfaceId", "terminal"] as const) {
+      if (body.desktop[key] !== undefined && typeof body.desktop[key] !== "string") {
+        throw new Error(`desktop.${key} must be a string`);
+      }
+    }
+
+    for (const key of ["cols", "rows"] as const) {
+      if (body.desktop[key] !== undefined && !Number.isInteger(body.desktop[key])) {
+        throw new Error(`desktop.${key} must be an integer`);
+      }
+    }
+  }
+}
+
+function audit(auditLog: AuditLog, record: Parameters<AuditLog["write"]>[0]): Promise<void> {
+  return auditLog.write(record).catch((error) => {
+    console.error("audit write failed:", error instanceof Error ? error.message : error);
+  });
+}

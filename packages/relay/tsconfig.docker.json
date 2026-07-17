@@ -1,0 +1,23 @@
+{
+  // Standalone build config for the container image only.
+  // The relay has zero workspace dependencies, so the Docker build copies just
+  // this package; it cannot reach the repo-root `tsconfig.base.json` that
+  // `tsconfig.json` extends. These options mirror that base so `tsc` behaves
+  // identically inside the image. Keep in sync with `../../tsconfig.base.json`.
+  "compilerOptions": {
+    "target": "ES2022",
+    "module": "NodeNext",
+    "moduleResolution": "NodeNext",
+    "strict": true,
+    "esModuleInterop": true,
+    "forceConsistentCasingInFileNames": true,
+    "skipLibCheck": true,
+    "resolveJsonModule": true,
+    "declaration": false,
+    "outDir": "dist",
+    "rootDir": "src",
+    "noEmitOnError": true
+  },
+  "include": ["src/**/*.ts"],
+  "exclude": ["src/**/*.test.ts"]
+}

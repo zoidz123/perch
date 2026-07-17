@@ -1,0 +1,42 @@
+{
+  "include": [
+    ".github/workflows/ci.yml",
+    ".gitignore",
+    "LICENSE",
+    "README.md",
+    "package.json",
+    "package-lock.json",
+    "public-seed.json",
+    "tsconfig.base.json",
+    "bin/**",
+    "apps/ios/**",
+    "apps/server/**",
+    "packages/**",
+    "design/app-icon/generate.sh",
+    "design/app-icon/icon-dark.svg",
+    "design/app-icon/icon-light.svg",
+    "design/app-icon/icon-tinted.svg",
+    "docs/architecture.md",
+    "docs/cli.md",
+    "docs/operations.md",
+    "docs/security.md",
+    "scripts/check-public-seed.mjs",
+    "scripts/npm-package-smoke.mjs",
+    "scripts/prepare-npm-package.mjs",
+    "scripts/relay-recovery-check.mjs",
+    "scripts/run-ios-simulator.sh"
+  ],
+  "publicMarkdown": [
+    "README.md",
+    "docs/architecture.md",
+    "docs/cli.md",
+    "docs/operations.md",
+    "docs/security.md",
+    "packages/relay/README.md",
+    "packages/relay/deploy/README.md"
+  ],
+  "runtimeMarkdown": [
+    "apps/server/assets/charts/AUTHORING.md",
+    "apps/server/assets/mate/AGENTS.md"
+  ]
+}

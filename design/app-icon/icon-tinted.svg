@@ -1,0 +1,7 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024" role="img" aria-labelledby="title desc">
+  <title id="title">Perch app icon - tinted</title>
+  <desc id="desc">Grayscale double attach mark on a transparent background; iOS supplies the tinted backdrop. Grays match the luminance of the cream mark and oro connector.</desc>
+  <rect x="250" y="344" width="174" height="336" rx="82" fill="none" stroke="#E2E2E2" stroke-width="78"/>
+  <rect x="600" y="344" width="174" height="336" rx="82" fill="none" stroke="#E2E2E2" stroke-width="78"/>
+  <path d="M450 512h124" fill="none" stroke="#A1A1A1" stroke-width="88" stroke-linecap="round"/>
+</svg>

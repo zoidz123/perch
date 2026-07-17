@@ -1,0 +1,31 @@
+{
+  "name": "@perch/server",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "main": "./dist/index.js",
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "dev": "tsx watch src/index.ts",
+    "start": "node dist/index.js",
+    "test": "node --import tsx --test 'src/**/*.test.ts'"
+  },
+  "dependencies": {
+    "@perch/shared": "file:../../packages/shared",
+    "@xterm/addon-serialize": "^0.14.0",
+    "@xterm/headless": "^6.0.0",
+    "better-sqlite3": "^12.11.1",
+    "node-pty": "^1.1.0",
+    "tweetnacl": "^1.0.3",
+    "ws": "^8.18.0"
+  },
+  "devDependencies": {
+    "@perch/relay": "file:../../packages/relay",
+    "@types/better-sqlite3": "^7.6.13",
+    "@types/node": "^20.14.10",
+    "@types/ws": "^8.5.12",
+    "tsx": "^4.16.2",
+    "typescript": "^5.5.4"
+  }
+}

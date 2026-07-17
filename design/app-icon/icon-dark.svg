@@ -1,0 +1,8 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024" role="img" aria-labelledby="title desc">
+  <title id="title">Perch app icon - dark</title>
+  <desc id="desc">Full-bleed nero square with the cream double attach mark and oro connector. iOS applies the squircle mask.</desc>
+  <rect width="1024" height="1024" fill="#0A0908"/>
+  <rect x="250" y="344" width="174" height="336" rx="82" fill="none" stroke="#E9E2D0" stroke-width="78"/>
+  <rect x="600" y="344" width="174" height="336" rx="82" fill="none" stroke="#E9E2D0" stroke-width="78"/>
+  <path d="M450 512h124" fill="none" stroke="#C9A227" stroke-width="88" stroke-linecap="round"/>
+</svg>

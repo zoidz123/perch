@@ -1,0 +1,16 @@
+# Caddy terminates TLS for the relay. Given a real domain + email it obtains and
+# renews a Let's Encrypt certificate automatically - no manual cert steps.
+#
+# reverse_proxy transparently upgrades WebSocket connections, so the phone's
+# wss://RELAY_DOMAIN/ws?... reaches the relay's ws://relay:8080/ws?... unchanged.
+# The relay only ever forwards opaque, end-to-end-encrypted frames; Caddy sees
+# ciphertext too.
+
+{
+	email {$LETSENCRYPT_EMAIL}
+}
+
+{$RELAY_DOMAIN} {
+	encode zstd gzip
+	reverse_proxy relay:8080
+}

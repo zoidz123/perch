@@ -1,0 +1,42 @@
+[
+  {
+    "label": "empty",
+    "serverPub": "IuNSoLtXG4z5/Vpc3D01jL8v6UnsHzF71ylJ+Fep5k4=",
+    "serverSec": "W5TOb924XbmOHtrIxczGiWvtDhwEE5WwrSqJzaWLQrw=",
+    "phonePub": "6awX3UYOl0K/vF8Ib3UFndq7a7LlfwMVOvv2Z3LVEnU=",
+    "phoneSec": "QwUxAi+xunHN1ulHpgoH8c+cjwTTGdp+KBUkPll6W6M=",
+    "nonce": "oWeUB4jA+amVhUYGyk+NyHbPVnftcErE",
+    "plaintext": "",
+    "frame": "AaFnlAeIwPmplYVGBspPjch2z1Z37XBKxCq28myGro4/w8rd51ZlvpQ="
+  },
+  {
+    "label": "ascii-json",
+    "serverPub": "4Ry6rS6fjstao5WiY3YkzSJn65iYO/LqSuLOBmnqqQs=",
+    "serverSec": "RBXDJ7Zn+82eRLzY1lj7B8Clbop/UVl5l8ucHQJC1nk=",
+    "phonePub": "T9QXxD8Uy8smsJ3DwFOOXnU8hrqlmxqBfVEndTn6zzw=",
+    "phoneSec": "qtqZi1f6sA+mFMo+mijh6M8rj5LhQem8zQNooDo+lvI=",
+    "nonce": "3v+d/Pa9/NQjxjCj3nsUvje98nDNO09W",
+    "plaintext": "{\"type\":\"e2ee_auth\",\"token\":\"deadbeef\"}",
+    "frame": "Ad7/nfz2vfzUI8Ywo957FL43vfJwzTtPVn20ac4KIaoqjNZLGEYqgRkonwVUr8Mu8trVBqh64tf7d3iv66V0Ot8QX6sTvyMvfQK0W4UYkNw="
+  },
+  {
+    "label": "unicode",
+    "serverPub": "wKWudfv06hZhL1LsW/pAmEFpJJGzvuhj9y3OciSoUQ0=",
+    "serverSec": "00eo/m2i0w0a/MPTgGobEbfJPrB9t1lFpYIM707X/e4=",
+    "phonePub": "61XfZumxHIQRpTNf2cqVPORMtl1e6wbTojFexuVnHXQ=",
+    "phoneSec": "7fr86PyETMmlfAobq0hZ9hhWmij1nfzkyNTHoaOVhe4=",
+    "nonce": "74c+Rp+b9ocfIVcmDMYIU1TE7NkfWESZ",
+    "plaintext": "héllo 🐦 perch — relay",
+    "frame": "Ae+HPkafm/aHHyFXJgzGCFNUxOzZH1hEmRF2KhOxpk8D17jhlZD0OR+lcGow0wqLepBke674cpCFCehOCpzJNf7PV0U="
+  },
+  {
+    "label": "fleet-event",
+    "serverPub": "oVlY1ZF90ih1liBbD5KYjlBsvCPXxjVnzvxqy70sy0g=",
+    "serverSec": "b1sVHthxQcYl9MbWGIFndn2/o6WlKFgD3PByoyLdmkw=",
+    "phonePub": "fUTo3+MKCQUdrrNI/WQiKX8PcGoOsZO01MHFWg61eSM=",
+    "phoneSec": "BN8OR358DRtXGB0NeLPFWSjv5o2cooauizzTwXEbAkY=",
+    "nonce": "eQjd7Lt2MpiFlTj1qNTqVPjIonElGpTz",
+    "plaintext": "{\"type\":\"fleet\",\"sessions\":[],\"at\":\"2026-07-04T00:00:00.000Z\"}",
+    "frame": "AXkI3ey7djKYhZU49ajU6lT4yKJxJRqU8zJWHN99C0etQ5h8v1Ly7dszUodCSjRw6C7TTkotcw/Idz1HuumZ9KrxGi+you649SE3Pu1ZT2Z1VMZeK1MJEsXAK85GX8QYaGq0U6vwzg=="
+  }
+]

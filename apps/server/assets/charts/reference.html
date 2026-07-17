@@ -1,0 +1,158 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Perch chart reference</title>
+<link rel="stylesheet" href="chart.css">
+</head>
+<body>
+
+<header class="chart-header">
+  <span class="eyebrow">Perch &middot; Chart reference</span>
+  <h1>Review concrete work without leaving the agent loop</h1>
+  <p class="subtitle">Use one focused HTML file to make a plan, comparison, architecture, or finding easy to inspect and annotate.</p>
+  <p class="meta">
+    <span class="badge good">Current</span>
+    <span>Server and iPhone review</span>
+    <span>Fixed Perch chart system</span>
+  </p>
+</header>
+
+<blockquote>
+  Lead with the decision or result, show concrete behavior, and end with the risks or next action.
+</blockquote>
+
+<h2>Review loop</h2>
+
+<figure class="figure">
+  <pre class="mermaid">
+flowchart LR
+  agent["Agent writes<br/>one HTML file"] --> register["POST /charts<br/>session auth"]
+  register --> server["Perch stores<br/>canonical review"]
+  server --> review["Phone or desktop<br/>reviews and annotates"]
+  review --> feedback["Feedback enters<br/>owning session queue"]
+  feedback --> agent
+  </pre>
+  <figcaption>Registration binds a chart to its owning session and task so feedback returns to the correct agent.</figcaption>
+</figure>
+
+<h2>What the chart should answer</h2>
+
+<div class="cards">
+  <div class="card good">
+    <h4>Decision</h4>
+    <p>Put the recommendation, finding, or requested approval first.</p>
+  </div>
+  <div class="card">
+    <h4>Evidence</h4>
+    <p>Use exact behaviors, files, commands, states, or measurements instead of generic advantages.</p>
+  </div>
+  <div class="card warn">
+    <h4>Boundary</h4>
+    <p>Name what is unverified, intentionally excluded, risky, or still open.</p>
+  </div>
+</div>
+
+<h2>Choose the smallest useful structure</h2>
+
+<div class="table-wrap">
+  <table>
+    <thead>
+      <tr>
+        <th>Content</th>
+        <th>Use</th>
+        <th>Avoid</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>Exact mappings</td>
+        <td>Table</td>
+        <td>Repeated prose</td>
+      </tr>
+      <tr>
+        <td>State or sequence</td>
+        <td>Flowchart</td>
+        <td>Disconnected cards</td>
+      </tr>
+      <tr>
+        <td>Option tradeoffs</td>
+        <td>Side-by-side columns</td>
+        <td>Unranked brainstorm</td>
+      </tr>
+      <tr>
+        <td>Plan or audit</td>
+        <td>Outcome, evidence, risks, next action</td>
+        <td>Investigation diary</td>
+      </tr>
+    </tbody>
+  </table>
+</div>
+
+<h2>Registration</h2>
+
+<p>Fetch the live authoring guide first because it defines the available classes and content constraints.</p>
+
+<pre><code>curl -sf "${PERCH_HOOK_URL%/hooks}/charts/authoring"
+
+curl -sf -X POST "${PERCH_HOOK_URL%/hooks}/charts" \
+  -H "x-perch-session: $PERCH_SESSION_ID" \
+  -H "x-perch-token: $PERCH_HOOK_TOKEN" \
+  -H "content-type: application/json" \
+  -d '{"file":"/absolute/path/to/.charts/example.html"}'</code></pre>
+
+<p>Register once.</p>
+<p>Edits to the source file refresh the open review, while Perch keeps a canonical copy for durable access.</p>
+
+<h2>Quality checks</h2>
+
+<div class="columns">
+  <div class="col good">
+    <h3>Required</h3>
+    <ul>
+      <li>One fixed Perch stylesheet</li>
+      <li>No inline style attributes or style blocks</li>
+      <li>No horizontal overflow at nested widths</li>
+      <li>Readable phone layout</li>
+      <li>Concrete final action or open question</li>
+    </ul>
+  </div>
+  <div class="col">
+    <h3>Useful restraint</h3>
+    <ul>
+      <li>Stay under roughly two screens</li>
+      <li>Use one diagram only when relationships need it</li>
+      <li>Keep status badges short</li>
+      <li>Do not expose tokens or private paths</li>
+      <li>Do not turn a simple answer into an artifact</li>
+    </ul>
+  </div>
+</div>
+
+<script type="module">
+  import mermaid from "https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.esm.min.mjs";
+  mermaid.initialize({
+    startOnLoad: true,
+    securityLevel: "strict",
+    flowchart: { useMaxWidth: false },
+    theme: "base",
+    themeVariables: {
+      darkMode: true,
+      background: "transparent",
+      fontFamily: "-apple-system, BlinkMacSystemFont, 'SF Pro Text', 'Segoe UI', sans-serif",
+      fontSize: "14px",
+      primaryColor: "#211d18",
+      primaryTextColor: "#e9e2d0",
+      primaryBorderColor: "#6f685a",
+      lineColor: "#a89f8c",
+      secondaryColor: "#191613",
+      tertiaryColor: "#141210",
+      clusterBkg: "#141210",
+      edgeLabelBackground: "#0a0908"
+    }
+  });
+</script>
+
+</body>
+</html>
