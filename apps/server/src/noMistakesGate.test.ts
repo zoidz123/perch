@@ -79,7 +79,7 @@ type Fixture = {
   projects: ProjectRegistry;
   hooks: HookRegistry;
   rpc: (
-    method: "GET" | "POST" | "DELETE",
+    method: "GET" | "POST" | "PATCH" | "DELETE",
     path: string,
     body?: unknown
   ) => ReturnType<typeof handleWebSocketRpcRequest>;
@@ -98,7 +98,7 @@ function writeInitShim(bin: string, initLog: string): void {
       '  echo "gate refreshed"',
       "  exit 0",
       "fi",
-      'echo "no-mistakes version v1.31.2"'
+      'echo "no-mistakes version v1.39.0-perch.1 authorization-protocol=1"'
     ].join("\n"),
     { mode: 0o755 }
   );
@@ -124,6 +124,7 @@ async function withServer(run: (ctx: Fixture) => Promise<void>): Promise<void> {
   execFileSync("git", ["-c", "user.email=t@t", "-c", "user.name=t", "commit", "-qm", "init"], {
     cwd: repo
   });
+  execFileSync("git", ["remote", "add", "origin", "https://github.com/acme/demo.git"], { cwd: repo });
 
   const env = { PERCH_HOME: home } as NodeJS.ProcessEnv;
   const adapter = new DispatchAdapter();
@@ -150,9 +151,7 @@ async function withServer(run: (ctx: Fixture) => Promise<void>): Promise<void> {
     prPoller: new PrPoller(tasks, async () => {
       throw new Error("gh disabled in tests");
     }),
-    // The gate's binary lookup rides the doctor's injected PATH, so tests
-    // control exactly which tools exist.
-    doctorDeps: { env: { PATH: bin } }
+    doctorDeps: { env: { PATH: bin }, noMistakesPath: join(bin, "no-mistakes") }
   };
   const server = createControlServer(options);
   await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
@@ -183,15 +182,31 @@ function post(port: number, path: string, body: unknown): Promise<Response> {
   });
 }
 
+function patch(port: number, path: string, body: unknown): Promise<Response> {
+  return fetch(`http://127.0.0.1:${port}${path}`, {
+    method: "PATCH",
+    headers: authed,
+    body: JSON.stringify(body)
+  });
+}
+
 function authorize(
   port: number,
   hooks: HookRegistry,
-  task: { id: string; project: string; branch?: string; sessionId?: string },
+  task: {
+    id: string;
+    project: string;
+    mode?: string;
+    branch?: string;
+    sessionId?: string;
+    runtime?: { generation?: number };
+  },
   worktreePath: string,
-  overrides: Record<string, unknown> = {}
+  overrides: Record<string, unknown> = {},
+  providedToken?: string
 ): Promise<Response> {
   assert.ok(task.sessionId);
-  const token = hooks.register(task.sessionId).token;
+  const token = providedToken ?? hooks.register(task.sessionId).token;
   return fetch(`http://127.0.0.1:${port}/hooks/no-mistakes/authorize`, {
     method: "POST",
     headers: {
@@ -200,11 +215,17 @@ function authorize(
       "content-type": "application/json"
     },
     body: JSON.stringify({
+      protocolVersion: "1",
+      requestId: randomUUID().replaceAll("-", ""),
+      operation: "run",
       taskId: task.id,
+      runtimeGeneration: task.runtime?.generation ?? 0,
+      sessionId: task.sessionId,
       projectPath: task.project,
+      repository: "github.com/acme/demo",
       worktreePath,
       branch: task.branch,
-      operation: "run",
+      durableMode: task.mode ?? "no-mistakes",
       ...overrides
     })
   });
@@ -245,19 +266,19 @@ test("POST /projects with mode no-mistakes runs init in the repo, idempotently, 
   });
 });
 
-test("POST /projects with mode no-mistakes but no binary saves the project with a doctor --fix warning", async () => {
+test("POST /projects with mode no-mistakes and no bundled runtime preserves the prior mode", async () => {
   await withServer(async ({ port, repo, initLog, projects }) => {
+    projects.touch(repo, { mode: "local-only" });
     const response = await post(port, "/projects", { rootPath: repo, mode: "no-mistakes" });
-    assert.equal(response.status, 200);
+    assert.equal(response.status, 422);
     const body = (await response.json()) as {
-      project: { mode?: string };
+      error: string;
       noMistakes?: NoMistakesInitResult;
     };
-    assert.equal(body.project.mode, "no-mistakes", "the project is saved either way");
-    assert.equal(projects.find(repo)?.mode, "no-mistakes");
+    assert.equal(projects.find(repo)?.mode, "local-only");
     assert.equal(body.noMistakes?.ran, false);
     assert.equal(body.noMistakes?.ready, false);
-    assert.match(body.noMistakes?.warning ?? "", /perch doctor --fix/);
+    assert.match(body.error, /bundled no-mistakes runtime/);
     assert.deepEqual(initRuns(initLog), [], "nothing to run without the binary");
   });
 });
@@ -266,16 +287,35 @@ test("upstream init failure surfaces its error text verbatim", async () => {
   await withServer(async ({ port, bin, repo, initLog }) => {
     writeFileSync(
       join(bin, "no-mistakes"),
-      '#!/bin/sh\nif [ "$1" = "init" ]; then echo "fatal: no origin remote configured" >&2; exit 1; fi\necho v1',
+      '#!/bin/sh\nif [ "$1" = "init" ]; then echo "fatal: no origin remote configured" >&2; exit 1; fi\necho "v1.39.0-perch.1 authorization-protocol=1"',
       { mode: 0o755 }
     );
     const response = await post(port, "/projects", { rootPath: repo, mode: "no-mistakes" });
-    assert.equal(response.status, 200);
+    assert.equal(response.status, 422);
     const body = (await response.json()) as { noMistakes?: NoMistakesInitResult };
     assert.equal(body.noMistakes?.ran, true);
     assert.equal(body.noMistakes?.ready, false);
     assert.match(body.noMistakes?.warning ?? "", /no origin remote configured/);
     assert.deepEqual(initRuns(initLog), []);
+  });
+});
+
+test("project config activation validates and initializes before persisting mode", async () => {
+  await withServer(async ({ port, bin, repo, initLog, projects }) => {
+    projects.touch(repo, { mode: "local-only" });
+    writeInitShim(bin, initLog);
+    const response = await patch(port, "/projects", { rootPath: repo, mode: "no-mistakes" });
+    assert.equal(response.status, 200);
+    assert.equal(projects.find(repo)?.mode, "no-mistakes");
+    assert.deepEqual(initRuns(initLog), [repo]);
+  });
+
+  await withServer(async ({ port, bin, repo, projects }) => {
+    projects.touch(repo, { mode: "direct-PR" });
+    writeFileSync(join(bin, "no-mistakes"), '#!/bin/sh\necho "init failed" >&2\nexit 1\n', { mode: 0o755 });
+    const response = await patch(port, "/projects", { rootPath: repo, mode: "no-mistakes" });
+    assert.equal(response.status, 422);
+    assert.equal(projects.find(repo)?.mode, "direct-PR");
   });
 });
 
@@ -301,9 +341,9 @@ test("dispatch with effective mode no-mistakes and no binary is refused with a s
     const response = await post(port, "/tasks", { title: "gated work", project: repo, dispatch: true });
     assert.equal(response.status, 422);
     const body = (await response.json()) as NoMistakesDispatchRefusal;
-    assert.match(body.error, /perch doctor --fix/);
+    assert.match(body.error, /bundled no-mistakes runtime/);
     assert.equal(body.noMistakes.binaryFound, false);
-    assert.ok(body.noMistakes.missing.some((item) => item.includes("perch doctor --fix")));
+    assert.ok(body.noMistakes.missing.some((item) => item.includes("bundled no-mistakes runtime")));
 
     assert.equal(tasks.list().length, 0, "refusal happens before the task record exists");
     assert.equal(adapter.sessions.length, 0, "no worker spawned");
@@ -335,7 +375,7 @@ test("the RPC surface mirrors the 422 refusal", async () => {
     projects.touch(repo, { mode: "no-mistakes" });
     const refused = await rpc("POST", "/tasks", { title: "gated work", project: repo, dispatch: true });
     assert.equal(refused.status, 422);
-    assert.match(refused.ok ? "" : (refused.error ?? ""), /perch doctor --fix/);
+    assert.match(refused.ok ? "" : (refused.error ?? ""), /bundled no-mistakes runtime/);
     assert.equal(tasks.list().length, 0);
   });
 });
@@ -432,7 +472,9 @@ test("direct-PR and local-only authorization is denied despite prompt words and 
       const worktreePath = adapter.sessions.at(-1)?.cwd;
       assert.ok(worktreePath);
 
-      const denied = await authorize(port, hooks, body.task, worktreePath);
+      assert.ok(body.task.sessionId);
+      const hookToken = hooks.register(body.task.sessionId).token;
+      const denied = await authorize(port, hooks, body.task, worktreePath, {}, hookToken);
       assert.equal(denied.status, 403);
       const decision = (await denied.json()) as {
         allowed: boolean;
@@ -457,6 +499,8 @@ test("direct-PR and local-only authorization is denied despite prompt words and 
         .map((line) => JSON.parse(line) as { action: string; decision?: string; durableMode?: string });
       assert.ok(auditRows.some((row) =>
         row.action === "no_mistakes_authorization" && row.decision === "deny" && row.durableMode === mode));
+      const durableEvidence = `${JSON.stringify(tasks.events(body.task.id))}\n${readFileSync(join(home, "audit.jsonl"), "utf8")}`;
+      assert.equal(durableEvidence.includes(hookToken), false, "hook token must never enter task evidence or audit");
     });
   }
 });
@@ -503,7 +547,7 @@ test("explicit per-task mode override controls authorization in both directions"
   });
 });
 
-test("authorization rejects task, project, worktree, branch, session, and generation replay scopes", async () => {
+test("authorization rejects protocol, replay, task, generation, session, repo, project, worktree, branch, and mode mismatch", async () => {
   await withServer(async ({ port, bin, repo, adapter, hooks }) => {
     writeInitShim(bin, join(repo, "scope-init.log"));
     assert.equal((await post(port, "/projects", { rootPath: repo, mode: "no-mistakes" })).status, 200);
@@ -514,15 +558,27 @@ test("authorization rejects task, project, worktree, branch, session, and genera
     const worktreePath = adapter.sessions.at(-1)!.cwd!;
 
     for (const [overrides, expectedReason] of [
+      [{ protocolVersion: "2" }, "invalid_request"],
       [{ taskId: "another-task" }, "task_mismatch"],
+      [{ runtimeGeneration: 99 }, "runtime_generation_mismatch"],
+      [{ sessionId: "pty:another-session" }, "session_mismatch"],
       [{ projectPath: join(repo, "other") }, "project_mismatch"],
+      [{ repository: "github.com/acme/other" }, "repository_mismatch"],
       [{ worktreePath: join(worktreePath, "other") }, "worktree_mismatch"],
-      [{ branch: "perch/another-task" }, "branch_mismatch"]
+      [{ branch: "perch/another-task" }, "branch_mismatch"],
+      [{ durableMode: "direct-PR" }, "durable_mode_mismatch"]
     ] as const) {
       const denied = await authorize(port, hooks, task, worktreePath, overrides);
       assert.equal(denied.status, 403);
       assert.equal(((await denied.json()) as { reason: string }).reason, expectedReason);
     }
+
+    const requestId = randomUUID().replaceAll("-", "");
+    const first = await authorize(port, hooks, task, worktreePath, { requestId });
+    assert.equal(first.status, 200);
+    const replayed = await authorize(port, hooks, task, worktreePath, { requestId });
+    assert.equal(replayed.status, 403);
+    assert.equal(((await replayed.json()) as { reason: string }).reason, "request_replayed");
 
     assert.ok(task.sessionId);
     const staleToken = hooks.register(task.sessionId).token;

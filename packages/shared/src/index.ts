@@ -619,18 +619,32 @@ export type NoMistakesDispatchRefusal = {
 // mode and runtime generation from the durable ledger behind its per-session
 // hook credential.
 export type NoMistakesAuthorizationRequest = {
+  protocolVersion: "1";
+  requestId: string;
+  operation: "run" | "gate-push" | "agent-launch";
   taskId: string;
+  runtimeGeneration: number;
+  sessionId: string;
   projectPath: string;
+  repository: string;
   worktreePath: string;
   branch: string;
-  operation?: "run" | "gate-push" | "agent-launch";
+  durableMode: TaskMode;
 };
 
 export type NoMistakesAuthorizationResponse = {
-  allowed: boolean;
+  protocolVersion: "1";
+  requestId: string;
+  operation: "run" | "gate-push" | "agent-launch";
   taskId: string;
   runtimeGeneration: number;
+  sessionId: string;
+  projectPath: string;
+  repository: string;
+  worktreePath: string;
+  branch: string;
   durableMode: TaskMode;
+  allowed: boolean;
   reason: string;
 };
 
@@ -1330,6 +1344,18 @@ export type MateLaunchResolution = {
   modelSource: "pinned" | "auto" | "fallback";
 };
 
+export type ConfigValue = string | boolean | number | null;
+
+export type ConfigEntry = {
+  effectiveValue: ConfigValue;
+  source: "environment" | "global" | "project" | "built-in" | "automatic" | "bundled";
+  scope: "global" | "project" | "runtime";
+  storedValue: ConfigValue;
+  defaultValue: ConfigValue;
+  overriddenBy: string | null;
+  readOnly?: boolean;
+};
+
 // GET /config and PATCH /config both return the EFFECTIVE defaults
 // (PERCH_DEFAULT_*/PERCH_MATE_* env overrides win over the persisted settings
 // file).
@@ -1340,4 +1366,5 @@ export type ConfigResponse = {
   dispatchResolved?: DispatchDefaults;
   mateDefaults: MateDefaults;
   mateResolved?: MateLaunchResolution;
+  entries?: Record<string, ConfigEntry>;
 };

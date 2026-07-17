@@ -1,0 +1,46 @@
+{
+  "schemaVersion": 1,
+  "source": "bundled",
+  "releaseRepository": "zoidz123/no-mistakes",
+  "releaseUrl": "https://github.com/zoidz123/no-mistakes/releases/tag/v1.39.0-perch.1",
+  "releaseTag": "v1.39.0-perch.1",
+  "releaseImmutable": true,
+  "releaseAttestation": "github",
+  "version": "1.39.0-perch.1",
+  "authorizationProtocol": "1",
+  "forkCommit": "2d35e552b4cbc191b06abcadc3b05fd3da510d26",
+  "upstreamRepository": "kunchenguid/no-mistakes",
+  "upstreamBaseCommit": "0a2c82f993b9467c5ab84992313dfd13b66830af",
+  "build": {
+    "goVersion": "go1.25.12",
+    "buildDate": "2026-07-17T19:30:00Z"
+  },
+  "signing": {
+    "authority": "Developer ID Application: Ellipsoid Labs, Inc. (JU7RZ24773)",
+    "teamId": "JU7RZ24773",
+    "identifier": "com.ellipsoidlabs.no-mistakes",
+    "hardenedRuntime": true,
+    "secureTimestamp": "2026-07-17T19:29:56Z",
+    "notarized": false
+  },
+  "platforms": {
+    "darwin-arm64": {
+      "path": "darwin-arm64/no-mistakes",
+      "architecture": "arm64",
+      "binaryBytes": 20871424,
+      "binarySha256": "a6dcf49b9e7b630bc3637ebaf83c738ecb105d10f656845ad686bfb96372bd1d",
+      "releaseAsset": "no-mistakes-v1.39.0-perch.1-darwin-arm64.tar.gz",
+      "releaseAssetSha256": "884e5c74e59e77f76b8ea0726580c0cd4bedc094ea4a1cb6b285e79a597352bf",
+      "cdHashSha256": "224b7b4005357d110e1deeccdc2b792b7a1aaf65"
+    },
+    "darwin-x64": {
+      "path": "darwin-x64/no-mistakes",
+      "architecture": "x86_64",
+      "binaryBytes": 22241088,
+      "binarySha256": "0525ac68813764e68362b547fdb271c1a2efbb8f4223498bcf6e229280256a91",
+      "releaseAsset": "no-mistakes-v1.39.0-perch.1-darwin-amd64.tar.gz",
+      "releaseAssetSha256": "36845033334beef180ffeff902ce270351f3257501cac8dc93dc3141506d58c0",
+      "cdHashSha256": "b2e6fea9951ddb66f163b4988a0adfef272db911"
+    }
+  }
+}

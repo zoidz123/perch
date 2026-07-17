@@ -9,7 +9,7 @@ Perch requires macOS, Node.js 20 or newer, and npm 10 or newer.
 Install the pinned release:
 
 ```sh
-npm install --global perchctl@0.1.0
+npm install --global perchctl@0.1.2
 ```
 
 Install at least one supported provider CLI, then complete its own sign-in flow:
@@ -31,6 +31,7 @@ perch doctor
 
 `doctor` checks whether provider binaries are installed, but it does not verify Claude Code or Codex sign-in.
 It also reports GitHub CLI authentication because direct-PR task delivery and PR polling use `gh`.
+The compatible no-mistakes runtime is already inside the npm package and needs no separate install, PATH entry, or lifecycle download.
 
 ## Projects and task defaults
 
@@ -46,13 +47,13 @@ Optional project modes control how managed code tasks are delivered:
 
 - `direct-PR` expects a pushed branch and pull request.
 - `local-only` keeps delivery on the local task branch.
-- `no-mistakes` uses the opt-in local no-mistakes gate.
+- `no-mistakes` uses the signed no-mistakes runtime bundled with Perch.
 
 Task mode is also the authorization boundary for the expensive no-mistakes pipeline.
 Only a durably persisted `no-mistakes` task may receive authorization.
 `direct-PR` and `local-only` tasks remain denied regardless of prompt language, diff size, repository initialization, or an existing gate remote.
 Perch cannot filter a globally installed Codex or Claude skill catalog per task, so mode-specific dispatch text is defense in depth rather than the security boundary.
-The launch boundary must use the server verifier documented in [No-mistakes authorization](no-mistakes-authorization.md).
+The packaged runtime consumes the fail-closed verifier documented in [No-mistakes authorization](no-mistakes-authorization.md).
 
 Set a mode when registering a project:
 
@@ -71,13 +72,14 @@ It does not delete the repository or its worktrees.
 Fleet defaults are split between workers and Mate:
 
 ```sh
-perch config get
-perch config set default-agent codex
-perch config set default-model <model-id>
-perch config set default-effort high
-perch config set mate-agent claude
-perch config set mate-model <model-id>
-perch config unset default-model
+perch config show --effective
+perch config set --global dispatch.agent codex
+perch config set --global dispatch.model <model-id>
+perch config set --global dispatch.effort high
+perch config set --global mate.agent claude
+perch config set --global mate.model <model-id>
+perch config unset --global dispatch.model
+perch config set --project /path/to/project task.mode no-mistakes
 ```
 
 The server validates model and effort combinations against its current provider catalog.
@@ -196,7 +198,7 @@ Do not attach tokens, pairing offers, device records, keypairs, or provider conf
 
 ## Updating
 
-The pinned public package is `perchctl@0.1.0` and installs the `perch` executable.
+The pinned package for this source is `perchctl@0.1.2` and installs the `perch` executable plus both Darwin no-mistakes architectures.
 Update to another explicit published version with npm, then restart the local server so it runs the new build:
 
 ```sh

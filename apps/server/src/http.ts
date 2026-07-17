@@ -19,6 +19,7 @@ import type {
   RegisterChartRequest,
   RegisterChartResponse,
   CodexReasoningEffort,
+  ConfigEntry,
   ConfigResponse,
   CompletionDecisionRequest,
   CompletionDecisionResponse,
@@ -84,6 +85,7 @@ import { EncryptedServerChannel } from "./e2ee/channel.js";
 import {
   collectDoctor,
   noMistakesBinary,
+  noMistakesRuntimeFacts,
   repoGateState,
   runNoMistakesInit,
   type DoctorDeps
@@ -132,6 +134,8 @@ import type {
 import type { CodexControlPlane } from "./codexControl.js";
 import {
   attachCodexRollout,
+  canonicalRepository,
+  canonicalRepositoryForPath,
   markTaskWorkingFromActivity,
   startManagedAgent
 } from "./agentLauncher.js";
@@ -142,6 +146,7 @@ import { RecoveryCoordinator } from "./recovery.js";
 import { RecoveryContinuationCoordinator } from "./recoveryContinuation.js";
 import type { OwnerManager } from "./ownerManager.js";
 import { MateRecoveryCoordinator } from "./mateRecovery.js";
+import { PERCH_VERSION } from "./version.js";
 
 export { markTaskWorkingFromActivity } from "./agentLauncher.js";
 
@@ -172,9 +177,9 @@ export type HttpServerOptions = {
   charts?: ChartRegistry;
   // State-machine measurements (G6), served at GET /doctor/state-metrics.
   metrics?: StateMetrics;
-  // Environment-doctor injection (tests point PATH at a shim dir so the real
-  // no-mistakes binary is never invoked); absent in production.
-  doctorDeps?: Pick<DoctorDeps, "env">;
+  // Environment-doctor and fake-runtime injection. Production always uses
+  // the signed bundled runtime and never resolves no-mistakes from PATH.
+  doctorDeps?: Pick<DoctorDeps, "env" | "noMistakesPath">;
   // Fleet-level user settings (dispatch defaults, `perch config`). Optional so
   // existing tests keep working; absent means no defaults are ever applied.
   settings?: FleetSettings;
@@ -342,7 +347,9 @@ async function resolveAutomaticDispatchDefaults(options: HttpServerOptions): Pro
 
 async function buildConfigResponse(
   options: HttpServerOptions,
-  layers: { dispatchDefaults: DispatchDefaults; mateDefaults: MateDefaults }
+  layers: { dispatchDefaults: DispatchDefaults; mateDefaults: MateDefaults },
+  projectPath?: string,
+  includeEntries = false
 ): Promise<ConfigResponse> {
   const agent = layers.mateDefaults.agent ?? "claude";
   const mateResolved = await resolveMateLaunchNow(
@@ -352,7 +359,100 @@ async function buildConfigResponse(
   const dispatchResolved = !layers.dispatchDefaults.agent && (options.codexOnPath ?? codexResolvableOnPath)()
     ? await resolveAutomaticDispatchDefaults(options)
     : undefined;
-  return { ...layers, ...(dispatchResolved ? { dispatchResolved } : {}), mateResolved };
+  const response: ConfigResponse = { ...layers, ...(dispatchResolved ? { dispatchResolved } : {}), mateResolved };
+  if (!includeEntries) return response;
+  const stored = options.settings?.stored() ?? {};
+  const environment = options.settings?.environmentOverrides() ?? {};
+  const entries: Record<string, ConfigEntry> = {};
+  const globalLayers = [
+    ["dispatch", "dispatchDefaults", response.dispatchDefaults, dispatchResolved, stored.dispatchDefaults, environment.dispatchDefaults],
+    ["mate", "mateDefaults", response.mateDefaults, mateResolved, stored.mateDefaults, environment.mateDefaults]
+  ] as const;
+  for (const [prefix, _layer, effective, fallback, persisted, env] of globalLayers) {
+    for (const field of ["agent", "model", "effort"] as const) {
+      const envValue = env?.[field] ?? null;
+      const storedValue = persisted?.[field] ?? null;
+      const effectiveValue = effective?.[field] ?? fallback?.[field] ?? null;
+      entries[`${prefix}.${field}`] = {
+        effectiveValue,
+        source: envValue !== null
+          ? "environment"
+          : storedValue !== null
+            ? "global"
+            : prefix === "dispatch" && fallback?.[field] !== undefined
+              ? "automatic"
+              : "built-in",
+        scope: "global",
+        storedValue,
+        defaultValue: field === "agent" ? (prefix === "dispatch" ? "auto" : "claude") : null,
+        overriddenBy: envValue !== null && storedValue !== null
+          ? `PERCH_${prefix === "dispatch" ? "DEFAULT" : "MATE"}_${field.toUpperCase()}`
+          : null
+      };
+    }
+  }
+  const project = projectPath ? options.projects.find(projectPath) : undefined;
+  entries["task.mode"] = {
+    effectiveValue: project?.mode ?? "direct-PR",
+    source: project?.mode ? "project" : "built-in",
+    scope: "project",
+    storedValue: project?.mode ?? null,
+    defaultValue: "direct-PR",
+    overriddenBy: null
+  };
+  entries["task.yolo"] = {
+    effectiveValue: project?.yolo ?? false,
+    source: project?.yolo !== undefined ? "project" : "built-in",
+    scope: "project",
+    storedValue: project?.yolo ?? null,
+    defaultValue: false,
+    overriddenBy: null
+  };
+  const runtime = noMistakesRuntimeFacts();
+  for (const [suffix, value] of Object.entries({
+    version: runtime?.version ?? null,
+    path: runtime?.path ?? null,
+    "SHA-256": runtime?.sha256 ?? null,
+    source: runtime?.source ?? "bundled",
+    architecture: runtime?.architecture ?? null,
+    protocol: runtime?.protocol ?? null
+  })) {
+    entries[`runtime.no-mistakes.${suffix}`] = {
+      effectiveValue: value,
+      source: "bundled",
+      scope: "runtime",
+      storedValue: null,
+      defaultValue: null,
+      overriddenBy: null,
+      readOnly: true
+    };
+  }
+  response.entries = entries;
+  return response;
+}
+
+function strictConfigPatch(body: Record<string, unknown>): {
+  dispatchDefaults?: DispatchDefaultsUpdate;
+  mateDefaults?: MateDefaultsUpdate;
+} {
+  const layers = new Set(["dispatchDefaults", "mateDefaults"]);
+  const unknownLayer = Object.keys(body).find((key) => !layers.has(key));
+  if (unknownLayer) throw new Error(`unknown config layer: ${unknownLayer}`);
+  if (!Object.keys(body).length) throw new Error("dispatchDefaults or mateDefaults required");
+  const result: { dispatchDefaults?: DispatchDefaultsUpdate; mateDefaults?: MateDefaultsUpdate } = {};
+  for (const layer of layers) {
+    const value = body[layer];
+    if (value === undefined) continue;
+    if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error(`${layer} must be an object`);
+    const record = value as Record<string, unknown>;
+    const unknownKey = Object.keys(record).find((key) => !new Set(["agent", "model", "effort"]).has(key));
+    if (unknownKey) throw new Error(`unknown ${layer} key: ${unknownKey}`);
+    for (const [key, field] of Object.entries(record)) {
+      if (field !== null && typeof field !== "string") throw new Error(`${layer}.${key} must be a string or null`);
+    }
+    result[layer as "dispatchDefaults" | "mateDefaults"] = record as DispatchDefaultsUpdate;
+  }
+  return result;
 }
 
 type RpcResult = { status: number; body: unknown };
@@ -392,38 +492,85 @@ async function registerProject(
   if (!isDirectory) {
     return rpcError(400, `Not a directory on this Mac: ${root}`);
   }
-  const project = options.projects.touch(root, {
+  const fields = {
     ...(typeof body.name === "string" && body.name ? { name: body.name } : {}),
-    ...(body.mode === "direct-PR" || body.mode === "no-mistakes" || body.mode === "local-only" ? { mode: body.mode } : {}),
+    ...(body.mode === "direct-PR" || body.mode === "no-mistakes" || body.mode === "local-only"
+      ? { mode: body.mode as Project["mode"] }
+      : {}),
     ...(typeof body.yolo === "boolean" ? { yolo: body.yolo } : {})
-  });
-  if (body.mode !== "no-mistakes") {
-    return rpcOk(200, { project });
+  };
+  if (body.mode === "no-mistakes") {
+    const noMistakes = await initNoMistakesGate(root, options, auditMeta);
+    if (!noMistakes.ready) {
+      return {
+        status: 422,
+        body: { error: noMistakes.warning ?? "no-mistakes activation failed", noMistakes }
+      };
+    }
+    const project = options.projects.touch(root, fields);
+    return rpcOk(200, { project, noMistakes });
   }
-  const noMistakes = await initNoMistakesGate(root, options, auditMeta);
-  return rpcOk(200, { project, noMistakes });
+  const project = options.projects.touch(root, fields);
+  return rpcOk(200, { project });
+}
+
+async function configureProject(
+  body: Record<string, unknown>,
+  options: HttpServerOptions,
+  auditMeta: Pick<Parameters<AuditLog["write"]>[0], "deviceId" | "remoteAddress">
+): Promise<RpcResult> {
+  const allowedKeys = new Set(["rootPath", "mode", "yolo"]);
+  const unknown = Object.keys(body).find((key) => !allowedKeys.has(key));
+  if (unknown) return rpcError(400, `unknown project config key: ${unknown}`);
+  if (typeof body.rootPath !== "string" || body.rootPath.trim().length === 0) {
+    return rpcError(400, "rootPath required");
+  }
+  const root = resolvePath(body.rootPath);
+  try {
+    if (!statSync(root).isDirectory()) return rpcError(400, `Not a directory on this Mac: ${root}`);
+  } catch {
+    return rpcError(400, `Not a directory on this Mac: ${root}`);
+  }
+  const modes = new Set(["direct-PR", "no-mistakes", "local-only"]);
+  if (body.mode !== undefined && body.mode !== null && (typeof body.mode !== "string" || !modes.has(body.mode))) {
+    return rpcError(400, "mode must be direct-PR, no-mistakes, local-only, or null");
+  }
+  if (body.yolo !== undefined && body.yolo !== null && typeof body.yolo !== "boolean") {
+    return rpcError(400, "yolo must be a boolean or null");
+  }
+  if (body.mode === undefined && body.yolo === undefined) return rpcError(400, "mode or yolo required");
+  let noMistakes: NoMistakesInitResult | undefined;
+  if (body.mode === "no-mistakes") {
+    noMistakes = await initNoMistakesGate(root, options, auditMeta);
+    if (!noMistakes.ready) {
+      return { status: 422, body: { error: noMistakes.warning ?? "no-mistakes activation failed", noMistakes } };
+    }
+  }
+  const project = options.projects.configure(root, {
+    ...(body.mode !== undefined ? { mode: body.mode as Project["mode"] | null } : {}),
+    ...(body.yolo !== undefined ? { yolo: body.yolo as boolean | null } : {})
+  });
+  return rpcOk(200, { project, ...(noMistakes ? { noMistakes } : {}) });
 }
 
 // The consent-driven init run behind a mode: "no-mistakes" set. The project is
-// saved either way; what this returns is the gate's resulting state plus, when
-// something is missing or upstream failed, the exact fix - never a silent
-// downgrade.
+// validated and initialized before the registry mutation. Any failure leaves
+// the prior project mode untouched.
 async function initNoMistakesGate(
   root: string,
   options: HttpServerOptions,
   auditMeta: Pick<Parameters<AuditLog["write"]>[0], "deviceId" | "remoteAddress">
 ): Promise<NoMistakesInitResult> {
-  const env = options.doctorDeps?.env ?? process.env;
-  if (!noMistakesBinary(env)) {
+  if (!noMistakesBinary(options.doctorDeps)) {
     const { initialized } = await repoGateState(root);
     return {
       ran: false,
       initialized,
       ready: false,
-      warning: "no-mistakes binary not installed - run `perch doctor --fix`"
+      warning: "bundled no-mistakes runtime is unavailable or corrupt - reinstall this exact perchctl version"
     };
   }
-  const result = await runNoMistakesInit(root, env);
+  const result = await runNoMistakesInit(root, options.doctorDeps);
   await audit(options.auditLog, { action: "no_mistakes_init", ...auditMeta, cwd: root });
   const { initialized } = await repoGateState(root);
   if (!result.ok) {
@@ -453,11 +600,11 @@ async function refuseUnreadyNoMistakesDispatch(
   const mode = body.mode ?? options.projects.find(body.project)?.mode ?? "direct-PR";
   if (mode !== "no-mistakes") return undefined;
   const root = resolvePath(body.project);
-  const binaryFound = noMistakesBinary(options.doctorDeps?.env ?? process.env) !== undefined;
+  const binaryFound = noMistakesBinary(options.doctorDeps) !== undefined;
   const { initialized } = await repoGateState(root);
   const missing: string[] = [];
   if (!binaryFound) {
-    missing.push("no-mistakes binary not installed: run `perch doctor --fix`");
+    missing.push("bundled no-mistakes runtime unavailable or corrupt: reinstall this exact perchctl version");
   }
   if (!initialized) {
     missing.push(
@@ -584,6 +731,12 @@ async function dispatchWebSocketRpc(
     return result;
   }
 
+  if (method === "PATCH" && pathname === "/projects") {
+    const result = await configureProject(body, options, auditPeer);
+    if (result.status === 200) await audit(options.auditLog, { action: "set_config", ...auditPeer });
+    return result;
+  }
+
   if (method === "DELETE" && pathname === "/projects") {
     const rootPath = body.rootPath ?? url.searchParams.get("rootPath") ?? undefined;
     const result = unregisterProject(rootPath, options);
@@ -609,7 +762,7 @@ async function dispatchWebSocketRpc(
     const responseBody = await buildConfigResponse(options, {
       dispatchDefaults: options.settings?.dispatchDefaults() ?? {},
       mateDefaults: options.settings?.mateDefaults() ?? {}
-    });
+    }, url.searchParams.get("project") ?? undefined, url.searchParams.get("effective") === "1");
     return rpcOk(200, responseBody);
   }
 
@@ -618,10 +771,11 @@ async function dispatchWebSocketRpc(
       return rpcError(501, "settings are not supported by this server");
     }
     try {
+      const update = strictConfigPatch(body);
       const resolveEfforts = await codexEffortResolver(options);
       const responseBody = await buildConfigResponse(options, {
-        dispatchDefaults: options.settings.updateDispatchDefaults((body.dispatchDefaults ?? {}) as DispatchDefaultsUpdate, resolveEfforts),
-        mateDefaults: options.settings.updateMateDefaults((body.mateDefaults ?? {}) as MateDefaultsUpdate, resolveEfforts)
+        dispatchDefaults: options.settings.updateDispatchDefaults(update.dispatchDefaults ?? {}, resolveEfforts),
+        mateDefaults: options.settings.updateMateDefaults(update.mateDefaults ?? {}, resolveEfforts)
       });
       await audit(options.auditLog, { action: "set_config", ...auditPeer });
       return rpcOk(200, responseBody);
@@ -1057,7 +1211,7 @@ async function route(
     const body: HealthResponse = {
       ok: true,
       adapter: options.adapter.name,
-      version: "0.1.0",
+      version: PERCH_VERSION,
       at: new Date().toISOString()
     };
     writeJson(response, 200, body);
@@ -1243,6 +1397,22 @@ async function route(
       return;
     }
 
+    if (request.method === "PATCH" && pathname === "/projects") {
+      const body = await readJson<Record<string, unknown>>(request);
+      const result = await configureProject(body, options, {
+        remoteAddress: request.socket.remoteAddress
+      });
+      if (result.status === 200) {
+        await audit(options.auditLog, {
+          action: "set_config",
+          cwd: resolvePath(String(body.rootPath)),
+          remoteAddress: request.socket.remoteAddress
+        });
+      }
+      writeJson(response, result.status, result.body);
+      return;
+    }
+
     // Unregister a project (registry-only; the repo on disk is untouched).
     if (request.method === "DELETE" && pathname === "/projects") {
       const body = await readJsonOrEmpty<{ rootPath?: string }>(request);
@@ -1305,7 +1475,7 @@ async function route(
       const body = await buildConfigResponse(options, {
         dispatchDefaults: options.settings?.dispatchDefaults() ?? {},
         mateDefaults: options.settings?.mateDefaults() ?? {}
-      });
+      }, url.searchParams.get("project") ?? undefined, url.searchParams.get("effective") === "1");
       writeJson(response, 200, body);
       return;
     }
@@ -1318,16 +1488,14 @@ async function route(
         writeJson(response, 501, { error: "settings are not supported by this server" });
         return;
       }
-      const body = await readJson<{
-        dispatchDefaults?: DispatchDefaultsUpdate;
-        mateDefaults?: MateDefaultsUpdate;
-      }>(request);
+      const body = await readJson<Record<string, unknown>>(request);
       let dispatchDefaults: ConfigResponse["dispatchDefaults"];
       let mateDefaults: ConfigResponse["mateDefaults"];
       try {
+        const update = strictConfigPatch(body);
         const resolveEfforts = await codexEffortResolver(options);
-        dispatchDefaults = options.settings.updateDispatchDefaults(body.dispatchDefaults ?? {}, resolveEfforts);
-        mateDefaults = options.settings.updateMateDefaults(body.mateDefaults ?? {}, resolveEfforts);
+        dispatchDefaults = options.settings.updateDispatchDefaults(update.dispatchDefaults ?? {}, resolveEfforts);
+        mateDefaults = options.settings.updateMateDefaults(update.mateDefaults ?? {}, resolveEfforts);
       } catch (error) {
         writeJson(response, 400, { error: error instanceof Error ? error.message : String(error) });
         return;
@@ -3502,25 +3670,62 @@ async function handleNoMistakesAuthorization(
   }
 
   const body = await readJson<NoMistakesAuthorizationRequest>(request);
+  const protocolVersion = boundedPolicyString(body.protocolVersion, 16);
+  const requestId = boundedPolicyString(body.requestId, 128);
   const taskId = boundedPolicyString(body.taskId, 256);
+  const requestSessionId = boundedPolicyString(body.sessionId, 256);
   const projectPath = boundedPolicyString(body.projectPath, 4_096);
+  const repository = boundedPolicyString(body.repository, 4_096);
   const worktreePath = boundedPolicyString(body.worktreePath, 4_096);
   const branch = boundedPolicyString(body.branch, 512);
-  const operation = boundedPolicyString(body.operation ?? "run", 32);
-  const runtime = options.tasks.stateDb.runtimes.latestForTask(task.id);
+  const operation = boundedPolicyString(body.operation, 32);
+  const durableMode = boundedPolicyString(body.durableMode, 32);
+  const requestGeneration = Number.isSafeInteger(body.runtimeGeneration) ? body.runtimeGeneration : -1;
+  const runtime = sessionRuntime ?? options.tasks.stateDb.runtimes.latestForTask(task.id);
   const expectedWorktree = runtime?.worktreePath ??
     (task.worktreeId ? options.worktrees.find(task.worktreeId)?.path : undefined);
   const expectedBranch = task.branch ?? `perch/${task.id}`;
+  const expectedRepository = canonicalRepositoryForPath(expectedWorktree ?? task.project) ??
+    canonicalRepositoryForPath(task.project);
+  const replayed = requestId.length > 0 && options.tasks.events(task.id).some((event) => {
+    const evidence = event.data?.noMistakesAuthorization;
+    return Boolean(
+      evidence &&
+      typeof evidence === "object" &&
+      "requestId" in evidence &&
+      (evidence as { requestId?: unknown }).requestId === requestId
+    );
+  });
 
-  let reason = "durable_task_mode_no_mistakes";
-  if (!taskId || !projectPath || !worktreePath || !branch || !operation) {
+  let reason = "authorized";
+  if (
+    protocolVersion !== "1" ||
+    !/^[a-f0-9]{32}$/.test(requestId) ||
+    !taskId ||
+    !requestSessionId ||
+    !projectPath ||
+    !repository ||
+    !worktreePath ||
+    !branch ||
+    !operation ||
+    !durableMode ||
+    requestGeneration < 0
+  ) {
     reason = "invalid_request";
+  } else if (replayed) {
+    reason = "request_replayed";
   } else if (taskId !== task.id) {
     reason = "task_mismatch";
+  } else if (requestSessionId !== sessionId) {
+    reason = "session_mismatch";
   } else if (canonicalPolicyPath(projectPath) !== canonicalPolicyPath(task.project)) {
     reason = "project_mismatch";
+  } else if (!expectedRepository || canonicalRepository(repository) !== expectedRepository) {
+    reason = "repository_mismatch";
   } else if (!runtime) {
     reason = "runtime_missing";
+  } else if (requestGeneration !== runtime.generation) {
+    reason = "runtime_generation_mismatch";
   } else if (runtime.ptySessionId !== sessionId) {
     reason = "runtime_session_mismatch";
   } else if (runtime.state !== "live") {
@@ -3531,16 +3736,26 @@ async function handleNoMistakesAuthorization(
     reason = "branch_mismatch";
   } else if (!new Set(["run", "gate-push", "agent-launch"]).has(operation)) {
     reason = "unsupported_operation";
+  } else if (durableMode !== task.mode) {
+    reason = "durable_mode_mismatch";
   } else if (task.mode !== "no-mistakes") {
     reason = "durable_task_mode_denied";
   }
 
-  let allowed = reason === "durable_task_mode_no_mistakes";
+  let allowed = reason === "authorized";
   const decision = (): NoMistakesAuthorizationResponse => ({
+    protocolVersion: "1",
+    requestId,
+    operation: operation as NoMistakesAuthorizationResponse["operation"],
+    taskId,
+    runtimeGeneration: requestGeneration,
+    sessionId: requestSessionId,
+    projectPath,
+    repository: canonicalRepository(repository),
+    worktreePath,
+    branch,
+    durableMode: durableMode as NoMistakesAuthorizationResponse["durableMode"],
     allowed,
-    taskId: task.id,
-    runtimeGeneration: runtime?.generation ?? -1,
-    durableMode: task.mode,
     reason
   });
   try {
@@ -3551,10 +3766,7 @@ async function handleNoMistakesAuthorization(
       data: {
         noMistakesAuthorization: {
           ...decision(),
-          operation,
-          projectPath,
-          worktreePath,
-          branch
+          evidenceVersion: 1
         }
       }
     });
@@ -3572,6 +3784,10 @@ async function handleNoMistakesAuthorization(
     worktreeId: runtime?.worktreeId,
     runtimeGeneration: runtime?.generation ?? -1,
     durableMode: task.mode,
+    requestId,
+    protocolVersion,
+    operation,
+    repository: canonicalRepository(repository),
     decision: allowed ? "allow" : "deny",
     reason
   });
@@ -4235,7 +4451,7 @@ function getRequestUrl(request: IncomingMessage): URL {
 
 function setCorsHeaders(response: ServerResponse): void {
   response.setHeader("Access-Control-Allow-Origin", "*");
-  response.setHeader("Access-Control-Allow-Methods", "GET,POST,DELETE,OPTIONS");
+  response.setHeader("Access-Control-Allow-Methods", "GET,POST,PATCH,DELETE,OPTIONS");
   response.setHeader("Access-Control-Allow-Headers", "authorization,content-type");
 }
 

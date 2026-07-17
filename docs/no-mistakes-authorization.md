@@ -1,62 +1,64 @@
 # No-mistakes authorization
 
-Perch treats task mode as negative capability policy for the expensive no-mistakes pipeline.
-Only a worker linked to a durable task whose mode is exactly `no-mistakes` may start that pipeline.
-An explicit per-task mode persisted before dispatch takes precedence over the project default in either direction.
-Prompt words, size heuristics, repository initialization, an existing gate remote, and global skill visibility never grant authorization.
+Perch task mode is a negative capability policy for the expensive no-mistakes pipeline.
+Only a live worker linked to a durable task whose effective mode is exactly `no-mistakes` may use the managed pipeline.
+An explicit persisted task mode wins over the project mode in either direction, and the built-in fallback is `direct-PR`.
 
-## Perch-owned verifier
+The signed runtime bundled with `perchctl` consumes this verifier contract.
+Perch therefore provides end-to-end managed enforcement when the packaged runtime passes its byte, version, architecture, and protocol checks.
+Standalone no-mistakes execution with no managed context remains unchanged.
 
-Perch workers receive non-secret `PERCH_TASK_ID`, `PERCH_TASK_MODE`, `PERCH_TASK_PROJECT`, `PERCH_TASK_WORKTREE`, and `PERCH_TASK_BRANCH` context.
-These values are claims, not authority.
-The existing `PERCH_SESSION_ID`, `PERCH_HOOK_URL`, and `PERCH_HOOK_TOKEN` values provide a short-lived, per-session credential that the server verifies against the durable task and current runtime.
+## Protocol version 1
 
-The pipeline must send this request immediately before each protected operation:
+Immediately before each protected operation the runtime sends:
 
-```http
-POST ${PERCH_HOOK_URL%/hooks}/hooks/no-mistakes/authorize
-x-perch-session: $PERCH_SESSION_ID
-x-perch-token: $PERCH_HOOK_TOKEN
-content-type: application/json
-
+```json
 {
-  "taskId": "$PERCH_TASK_ID",
-  "projectPath": "$PERCH_TASK_PROJECT",
-  "worktreePath": "$PERCH_TASK_WORKTREE",
-  "branch": "$PERCH_TASK_BRANCH",
-  "operation": "run"
+  "protocolVersion": "1",
+  "requestId": "32-lowercase-hex-characters",
+  "operation": "run",
+  "taskId": "durable-task-id",
+  "runtimeGeneration": 1,
+  "sessionId": "live-session-id",
+  "projectPath": "/canonical/project",
+  "repository": "github.com/owner/repository",
+  "worktreePath": "/canonical/worktree",
+  "branch": "perch/task-id",
+  "durableMode": "no-mistakes"
 }
 ```
 
-`operation` is one of `run`, `gate-push`, or `agent-launch`.
-The server derives durable mode and runtime generation from its ledger.
-It verifies task, project, worktree, branch, session, current runtime, and live generation before checking mode.
-The response includes `allowed`, `taskId`, `runtimeGeneration`, `durableMode`, and `reason`.
-Every validly authenticated attempt appends the same decision data to the immutable task event ledger and writes a secret-free operational audit record.
-If durable evidence cannot be appended, the verifier fails closed.
+`operation` is `run`, `gate-push`, or `agent-launch`.
+Every verifier call receives a fresh one-use request ID.
+The hook token travels only in `x-perch-token`, with the live session in `x-perch-session`.
 
-## CLI and daemon contract
+The response echoes every request field exactly and adds `allowed` and `reason`.
+The runtime proceeds only after HTTP 200, protocol `1`, `allowed: true`, durable mode `no-mistakes`, and an exact scope echo.
 
-The no-mistakes CLI and daemon are a separate component and are not implemented in this repository.
-Their integration must satisfy all of these rules before end-to-end enforcement is complete:
+Perch independently resolves the durable task, current live runtime generation and session, canonical project, credential-free canonical repository, worktree, branch, operation, and durable mode.
+It rejects a protocol mismatch, malformed or incomplete scope, a reused request ID, a stale generation, and every cross-task, repository, worktree, branch, or session replay.
+Request claims are never authority.
 
-1. Treat the presence of any `PERCH_` task or hook variable as Perch-managed execution.
-2. Reject incomplete Perch context instead of falling back to standalone behavior.
-3. Call the verifier before creating a run record.
-4. Call it again immediately before pushing to the gate remote.
-5. Call it again immediately before launching any Claude or other review, test, document, or lint agent.
-6. Continue only after an HTTP 200 response whose JSON has `allowed: true` and exactly matches the requested task scope.
-7. Treat network errors, timeouts, malformed responses, non-200 responses, `allowed: false`, and scope mismatches as terminal policy denials.
-8. Never cache an authorization across operations, sessions, tasks, repositories, worktrees, branches, or runtime generations.
-9. Never accept prompt text, repository state, a gate remote, file counts, line counts, budgets, skill metadata, PATH selection, or an absolute executable path as authorization.
-10. Preserve standalone no-mistakes behavior only when execution is genuinely outside a Perch worker context.
+## Protected boundaries
 
-The gate must live inside the CLI, daemon, gate receiver, or credential broker required for all protected operations.
-A PATH wrapper is insufficient because an absolute executable path bypasses it.
-Perch recovery creates a fresh worker session and runtime generation, so credentials from the interrupted generation must be rejected and the replacement must authorize again.
+The bundled fork authorizes before managed AXI run creation, before the gate receiver creates a run from a push, and immediately before every external-agent subprocess.
+Each agent attempt reauthorizes.
+An absolute executable path, another binary on PATH, a globally visible skill, an initialized repository, an existing gate remote, prompt language, and diff size cannot bypass these checks.
 
-## Current boundary
+The fork carries the minimum authorization capability through local hook and daemon IPC in memory.
+It does not write the hook token or provider authorization context to SQLite, prompts, telemetry, git configuration, push options, snapshots, or child-agent environments.
+Missing verifier, timeout, connection failure, daemon recovery without live context, malformed response, non-200 response, denial, protocol mismatch, or scope mismatch fails closed.
 
-This repository owns mode persistence, dispatch policy text, scoped worker context, live server verification, and durable authorization evidence.
-It does not own the installed no-mistakes CLI, daemon, run database, gate receiver, or Claude launch code.
-Until that separate component implements the fail-closed calls above, Perch can issue and audit correct decisions but cannot prevent the external binary from ignoring them.
+## Durable evidence
+
+Every authenticated allow or deny appends a secret-free task event containing protocol, request ID, operation, task, generation, session, canonical scope, durable mode, decision, and reason.
+The operational audit receives the same decision metadata without credentials.
+If task evidence cannot be appended, authorization fails closed.
+
+## Packaged runtime
+
+`perchctl@0.1.2` contains signed Darwin arm64 and x64 binaries from fork release `v1.39.0-perch.1` at commit `2d35e552b4cbc191b06abcadc3b05fd3da510d26`.
+The runtime resolver selects only the matching packaged architecture and verifies exact bytes before use.
+It never downloads during installation, works with `npm --ignore-scripts`, and never falls back to a PATH binary for Perch-managed execution.
+
+See `vendor/no-mistakes/manifest.json`, [Third-party notices](../THIRD_PARTY_NOTICES.md), and [No-mistakes upstream sync](no-mistakes-upstream-sync.md) for provenance and maintenance details.

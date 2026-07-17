@@ -84,6 +84,20 @@ The replacement conversation identity and live PTY are verified before the next 
 
 Solo provider sessions and arbitrary `perch run` commands do not receive managed task recovery.
 
+## Managed no-mistakes boundary
+
+Perch-managed no-mistakes uses only the signed runtime inside the installed package.
+The runtime is selected by host architecture and verified against the pinned SHA-256 manifest before use.
+PATH binaries, absolute alternate paths, repository setup, skill visibility, and prompts are not authorization.
+
+The runtime requests one-use authorization before run creation, gate push acceptance, and every external-agent launch.
+The verifier binds each decision to protocol, operation, durable task, live runtime generation and session, canonical project, credential-free repository identity, worktree, branch, and durable mode.
+Protocol mismatch, replay, stale context, missing verifier, timeout, malformed response, and any scope mismatch fail closed.
+
+Authorization evidence is append-only and secret-free.
+Hook tokens remain in request headers and transient local IPC only, and are removed from external-agent child environments.
+See [No-mistakes authorization](no-mistakes-authorization.md) for the exact contract.
+
 ## Local secrets and records
 
 Sensitive `$PERCH_HOME` files include:

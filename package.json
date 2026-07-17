@@ -1,7 +1,7 @@
 {
   "name": "perchctl",
   "private": false,
-  "version": "0.1.0",
+  "version": "0.1.2",
   "type": "module",
   "description": "A durable local-first orchestrator for Claude Code and Codex agents on macOS.",
   "license": "MIT",
@@ -34,6 +34,8 @@
     "apps/server/assets/**",
     "packages/shared/dist/**/*.js",
     "packages/relay/dist/**/*.js",
+    "vendor/no-mistakes/**",
+    "THIRD_PARTY_NOTICES.md",
     "!packages/relay/README.md",
     "README.md",
     "LICENSE"
@@ -44,6 +46,7 @@
   ],
   "scripts": {
     "check:public-seed": "node scripts/check-public-seed.mjs --mode source-preflight",
+    "check:version": "node --test scripts/version-sync.test.mjs",
     "build": "npm run build -w @perch/shared && npm run build -w @perch/relay && npm run build -w @perch/server",
     "build:package": "node scripts/prepare-npm-package.mjs",
     "prepack": "npm run build:package",

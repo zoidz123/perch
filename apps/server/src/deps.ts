@@ -1,10 +1,14 @@
 import { execFile } from "node:child_process";
 import { accessSync, constants, statSync } from "node:fs";
-import { homedir } from "node:os";
 import { delimiter, join } from "node:path";
 import { promisify } from "node:util";
 import type { DoctorFixAction, DoctorProjectGate, DoctorResponse, DoctorToolStatus } from "@perch/shared";
 import type { Project } from "./projects.js";
+import {
+  resolveBundledNoMistakes,
+  validateBundledNoMistakes,
+  type NoMistakesRuntimeFacts
+} from "./noMistakesRuntime.js";
 
 const execFileAsync = promisify(execFile);
 
@@ -89,24 +93,11 @@ export const DEPENDENCY_TOOLS: ToolSpec[] = [
     required: false,
     versionArgs: ["--version"],
     probe: noMistakesDaemonProbe,
-    installHint:
-      "curl -fsSL https://raw.githubusercontent.com/kunchenguid/no-mistakes/main/docs/install.sh | sh",
-    installer: true,
-    // Upstream's own documented variables (reference/environment): the
-    // telemetry opt-out per perch's no-cloud posture, and the link dir
-    // pinned inside $HOME so the installer's fallback branch (which reaches
-    // for sudo when no user-writable link dir is on PATH) can never trigger
-    // - --fix must never run sudo.
-    installEnv: () => ({
-      [NO_MISTAKES_TELEMETRY_ENV]: "0",
-      NO_MISTAKES_LINK_DIR: join(homedir(), ".local", "bin")
-    }),
+    installHint: "bundled with perchctl; update perchctl to repair this runtime",
     installNote:
-      "no-mistakes sends usage telemetry to its collector; perch disables it by default via " +
-      "upstream's documented opt-out (NO_MISTAKES_TELEMETRY=0), here and in every agent session " +
-      "perch spawns. To re-enable it, export NO_MISTAKES_TELEMETRY=1 before starting the perch " +
-      "server. Docs: https://kunchenguid.github.io/no-mistakes/reference/environment/",
-    docsUrl: "https://kunchenguid.github.io/no-mistakes"
+      "Perch-managed no-mistakes is an immutable signed runtime bundled with perchctl. " +
+      "Perch never downloads or repairs it from a consumer install and never falls back to PATH.",
+    docsUrl: "https://github.com/zoidz123/no-mistakes/releases/tag/v1.39.0-perch.1"
   }
 ];
 
@@ -129,6 +120,7 @@ export function planFix(tools: DoctorToolStatus[]): DoctorFixAction[] {
     const status = tools.find((tool) => tool.name === spec.name);
     if (!status) continue;
     if (!status.found) {
+      if (spec.name === "no-mistakes") continue;
       if (spec.installer) {
         actions.push({
           name: spec.name,
@@ -161,11 +153,18 @@ export type DoctorDeps = {
   // PATH source for binary lookup; injected in tests as a shim dir.
   env?: NodeJS.ProcessEnv;
   projects?: Project[];
+  // Test-only fake runtime injection. Production always resolves the bundled
+  // signed binary and never consults PATH.
+  noMistakesPath?: string | null;
 };
 
 export async function collectDoctor(deps: DoctorDeps = {}): Promise<DoctorResponse> {
   const env = deps.env ?? process.env;
-  const tools = await Promise.all(DEPENDENCY_TOOLS.map((spec) => checkTool(spec, env)));
+  const tools = await Promise.all(
+    DEPENDENCY_TOOLS.map((spec) =>
+      spec.name === "no-mistakes" ? checkBundledNoMistakes(spec, deps, env) : checkTool(spec, env)
+    )
+  );
   const binaryFound = tools.find((tool) => tool.name === "no-mistakes")?.found ?? false;
   const projects = await Promise.all(
     (deps.projects ?? []).map((project) => projectGate(project, binaryFound))
@@ -176,6 +175,50 @@ export async function collectDoctor(deps: DoctorDeps = {}): Promise<DoctorRespon
     tools,
     noMistakes: { binaryFound, projects },
     fix: planFix(tools)
+  };
+}
+
+async function checkBundledNoMistakes(
+  spec: ToolSpec,
+  deps: DoctorDeps,
+  env: NodeJS.ProcessEnv
+): Promise<DoctorToolStatus> {
+  const resolved = noMistakesRuntime(deps);
+  if (!resolved.path) {
+    return {
+      name: spec.name,
+      required: spec.required,
+      found: false,
+      installHint: spec.installHint,
+      ...(resolved.error ? { note: resolved.error } : {})
+    };
+  }
+  const execOptions = {
+    timeout: EXEC_TIMEOUT_MS,
+    env: {
+      ...env,
+      [NO_MISTAKES_TELEMETRY_ENV]:
+        env[NO_MISTAKES_TELEMETRY_ENV] ?? process.env[NO_MISTAKES_TELEMETRY_ENV] ?? "0"
+    }
+  };
+  let version: string | undefined;
+  let note: string | undefined;
+  try {
+    const { stdout } = await execFileAsync(resolved.path, spec.versionArgs, execOptions);
+    version = parseVersion(stdout);
+    if (!stdout.includes("authorization-protocol=1")) note = "incompatible authorization protocol";
+  } catch {
+    note = "bundled runtime failed `--version`";
+  }
+  if (spec.probe && note === undefined) note = await spec.probe(resolved.path, execOptions);
+  return {
+    name: spec.name,
+    required: spec.required,
+    found: note !== "incompatible authorization protocol" && note !== "bundled runtime failed `--version`",
+    path: resolved.path,
+    ...(version ? { version } : {}),
+    ...(note ? { note } : {}),
+    installHint: spec.installHint
   };
 }
 
@@ -265,8 +308,33 @@ async function noMistakesDaemonProbe(binPath: string, execOptions: ProbeExecOpti
 // The no-mistakes binary as the environment doctor would resolve it. The init
 // wiring and the dispatch readiness gate (T3) share this lookup so "binary
 // present" means the same thing everywhere.
-export function noMistakesBinary(env: NodeJS.ProcessEnv = process.env): string | undefined {
-  return findOnPath("no-mistakes", env);
+function noMistakesRuntime(deps: Pick<DoctorDeps, "noMistakesPath"> = {}): {
+  path?: string;
+  facts?: NoMistakesRuntimeFacts;
+  error?: string;
+} {
+  if (Object.hasOwn(deps, "noMistakesPath")) {
+    if (!deps.noMistakesPath) return { error: "bundled no-mistakes runtime unavailable" };
+    try {
+      accessSync(deps.noMistakesPath, constants.X_OK);
+      if (!statSync(deps.noMistakesPath).isFile()) throw new Error("runtime is not a regular file");
+      return { path: deps.noMistakesPath };
+    } catch {
+      return { error: "bundled no-mistakes runtime unavailable" };
+    }
+  }
+  const resolution = resolveBundledNoMistakes();
+  return resolution.ok && resolution.facts
+    ? { path: resolution.facts.path, facts: resolution.facts }
+    : { error: resolution.error ?? "bundled no-mistakes runtime unavailable" };
+}
+
+export function noMistakesBinary(deps: Pick<DoctorDeps, "noMistakesPath"> = {}): string | undefined {
+  return noMistakesRuntime(deps).path;
+}
+
+export function noMistakesRuntimeFacts(): NoMistakesRuntimeFacts | undefined {
+  return noMistakesRuntime().facts;
 }
 
 // A repo is initialized when `no-mistakes init` added its `no-mistakes` git
@@ -296,11 +364,28 @@ export async function repoGateState(
 // verbatim so upstream errors surface unparaphrased.
 export async function runNoMistakesInit(
   repoRoot: string,
-  env: NodeJS.ProcessEnv = process.env
+  deps: Pick<DoctorDeps, "env" | "noMistakesPath"> = {}
 ): Promise<{ ok: boolean; output: string }> {
-  const binPath = noMistakesBinary(env);
+  const env = deps.env ?? process.env;
+  const binPath = noMistakesBinary(deps);
   if (!binPath) {
-    return { ok: false, output: "no-mistakes binary not found on PATH" };
+    return { ok: false, output: "bundled no-mistakes runtime unavailable" };
+  }
+  if (Object.hasOwn(deps, "noMistakesPath")) {
+    try {
+      const { stdout } = await execFileAsync(binPath, ["--version"], {
+        timeout: EXEC_TIMEOUT_MS,
+        env: { ...env, [NO_MISTAKES_TELEMETRY_ENV]: env[NO_MISTAKES_TELEMETRY_ENV] ?? "0" }
+      });
+      if (!stdout.includes("v1.39.0-perch.1") || !stdout.includes("authorization-protocol=1")) {
+        return { ok: false, output: "bundled runtime version or authorization protocol mismatch" };
+      }
+    } catch {
+      return { ok: false, output: "bundled runtime version validation failed" };
+    }
+  } else {
+    const validation = await validateBundledNoMistakes({ env });
+    if (!validation.ok) return { ok: false, output: validation.error ?? "bundled runtime validation failed" };
   }
   try {
     // Same telemetry opt-out default as every other no-mistakes invocation

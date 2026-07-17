@@ -47,11 +47,11 @@ test("collectDoctor detects tools on PATH, parses versions, and hints missing on
   writeShim(
     bin,
     "no-mistakes",
-    'if [ "$1" = "--version" ]; then echo "no-mistakes version v1.31.2 (3c09496) 2026-06-27T00:02:18Z"; exit 0; fi\nif [ "$1" = "daemon" ]; then exit 0; fi\nexit 1'
+    'if [ "$1" = "--version" ]; then echo "no-mistakes version v1.39.0-perch.1 authorization-protocol=1"; exit 0; fi\nif [ "$1" = "daemon" ]; then exit 0; fi\nexit 1'
   );
   // No codex shim: optional tool missing.
   try {
-    const report = await collectDoctor({ env: { PATH: bin } });
+    const report = await collectDoctor({ env: { PATH: bin }, noMistakesPath: join(bin, "no-mistakes") });
     assert.equal(report.ok, true, "claude present, so required deps are satisfied");
 
     const claude = report.tools.find((tool) => tool.name === "claude");
@@ -72,10 +72,10 @@ test("collectDoctor detects tools on PATH, parses versions, and hints missing on
 
     const noMistakes = report.tools.find((tool) => tool.name === "no-mistakes");
     assert.equal(noMistakes?.found, true);
-    assert.equal(noMistakes?.version, "v1.31.2");
+    assert.equal(noMistakes?.version, "v1.39.0-perch.1");
     assert.equal(noMistakes?.note, "daemon running");
-    assert.match(noMistakes?.installHint ?? "", /install\.sh \| sh$/);
-    assert.equal(noMistakes?.installer, true, "no-mistakes has an official unattended installer");
+    assert.match(noMistakes?.installHint ?? "", /bundled with perchctl/);
+    assert.equal(noMistakes?.installer, undefined);
     assert.equal(claude?.installer, undefined, "claude needs its own sign-in; --fix never installs it");
     assert.equal(report.noMistakes.binaryFound, true);
   } finally {
@@ -86,7 +86,7 @@ test("collectDoctor detects tools on PATH, parses versions, and hints missing on
 test("collectDoctor reports ok=false when a required tool is missing", async () => {
   const bin = makeShimDir();
   try {
-    const report = await collectDoctor({ env: { PATH: bin } });
+    const report = await collectDoctor({ env: { PATH: bin }, noMistakesPath: null });
     assert.equal(report.ok, false);
     const claude = report.tools.find((tool) => tool.name === "claude");
     assert.equal(claude?.found, false);
@@ -104,10 +104,10 @@ test("collectDoctor probes gh auth and no-mistakes daemon states", async () => {
   writeShim(
     bin,
     "no-mistakes",
-    'if [ "$1" = "daemon" ]; then exit 1; fi\necho "no-mistakes version v1.31.2"'
+    'if [ "$1" = "daemon" ]; then exit 1; fi\necho "no-mistakes version v1.39.0-perch.1 authorization-protocol=1"'
   );
   try {
-    const report = await collectDoctor({ env: { PATH: bin } });
+    const report = await collectDoctor({ env: { PATH: bin }, noMistakesPath: join(bin, "no-mistakes") });
     assert.equal(report.tools.find((tool) => tool.name === "gh")?.note, "authenticated");
     assert.equal(
       report.tools.find((tool) => tool.name === "no-mistakes")?.note,
@@ -121,7 +121,7 @@ test("collectDoctor probes gh auth and no-mistakes daemon states", async () => {
 test("gate readiness reads the no-mistakes remote from repo config", async () => {
   const bin = makeShimDir();
   writeShim(bin, "claude", 'echo "2.1.19"');
-  writeShim(bin, "no-mistakes", 'echo "no-mistakes version v1.31.2"');
+  writeShim(bin, "no-mistakes", 'echo "no-mistakes version v1.39.0-perch.1 authorization-protocol=1"');
   const inited = mkdtempSync(join(tmpdir(), "perch-doctor-inited-"));
   const bare = mkdtempSync(join(tmpdir(), "perch-doctor-uninited-"));
   try {
@@ -134,6 +134,7 @@ test("gate readiness reads the no-mistakes remote from repo config", async () =>
 
     const report = await collectDoctor({
       env: { PATH: bin },
+      noMistakesPath: join(bin, "no-mistakes"),
       projects: [
         project(inited, "gated", "no-mistakes"),
         project(bare, "plain"),
@@ -171,7 +172,7 @@ test("gate readiness is never ready without the binary", async () => {
     execFileSync("git", ["-C", repo, "remote", "add", "no-mistakes", join(repo, ".fake-gate.git")], {
       stdio: "pipe"
     });
-    const report = await collectDoctor({ env: { PATH: bin }, projects: [project(repo, "gated")] });
+    const report = await collectDoctor({ env: { PATH: bin }, noMistakesPath: null, projects: [project(repo, "gated")] });
     const gate = report.noMistakes.projects[0];
     assert.equal(gate?.initialized, true);
     assert.equal(gate?.ready, false);
@@ -183,31 +184,16 @@ test("gate readiness is never ready without the binary", async () => {
 
 // --- `perch doctor --fix` planner (no network, no real installer) -----------
 
-test("planFix installs no-mistakes via the official installer with the telemetry opt-out", async () => {
+test("planFix never downloads or repairs the bundled no-mistakes runtime", async () => {
   const bin = makeShimDir();
   try {
     // Empty PATH: everything is missing.
-    const report = await collectDoctor({ env: { PATH: bin } });
+    const report = await collectDoctor({ env: { PATH: bin }, noMistakesPath: null });
     assert.deepEqual(
       report.fix.map((action) => `${action.name}:${action.kind}`),
-      ["claude:manual", "codex:manual", "gh:manual", "no-mistakes:install"]
+      ["claude:manual", "codex:manual", "gh:manual"]
     );
-
-    const install = report.fix.find((action) => action.kind === "install");
-    assert.equal(install?.name, "no-mistakes");
-    assert.equal(
-      install?.command,
-      "curl -fsSL https://raw.githubusercontent.com/kunchenguid/no-mistakes/main/docs/install.sh | sh",
-      "--fix runs the vendor's official installer verbatim - perch redistributes nothing"
-    );
-    assert.equal(install?.env?.NO_MISTAKES_TELEMETRY, "0", "upstream's documented telemetry opt-out is the default");
-    assert.match(
-      install?.env?.NO_MISTAKES_LINK_DIR ?? "",
-      /\.local\/bin$/,
-      "link dir pinned inside $HOME so the installer's sudo branch is unreachable"
-    );
-    assert.match(install?.note ?? "", /NO_MISTAKES_TELEMETRY=1/, "the note says how to re-enable telemetry");
-    assert.match(install?.note ?? "", /reference\/environment/, "the note attributes upstream's documented mechanism");
+    assert.equal(report.fix.some((action) => action.name === "no-mistakes"), false);
 
     const claude = report.fix.find((action) => action.name === "claude");
     assert.deepEqual(claude?.commands, [
@@ -225,16 +211,16 @@ test("planFix flags an installed-but-unauthenticated gh and is empty when all is
   const bin = makeShimDir();
   writeShim(bin, "claude", 'echo "2.1.19 (Claude Code)"');
   writeShim(bin, "codex", 'echo "codex-cli 0.9.0"');
-  writeShim(bin, "no-mistakes", 'if [ "$1" = "daemon" ]; then exit 0; fi\necho "no-mistakes version v1.31.2"');
+  writeShim(bin, "no-mistakes", 'if [ "$1" = "daemon" ]; then exit 0; fi\necho "no-mistakes version v1.39.0-perch.1 authorization-protocol=1"');
   writeShim(bin, "gh", 'if [ "$1" = "--version" ]; then echo "gh version 2.49.0"; exit 0; fi\nexit 1');
   try {
-    const unauthed = await collectDoctor({ env: { PATH: bin } });
+    const unauthed = await collectDoctor({ env: { PATH: bin }, noMistakesPath: join(bin, "no-mistakes") });
     assert.deepEqual(unauthed.fix, [
       { name: "gh", kind: "manual", commands: ["gh auth login"], reason: "installed but not signed in" }
     ]);
 
     writeShim(bin, "gh", 'echo "gh version 2.49.0"; exit 0');
-    const healthy = await collectDoctor({ env: { PATH: bin } });
+    const healthy = await collectDoctor({ env: { PATH: bin }, noMistakesPath: join(bin, "no-mistakes") });
     assert.deepEqual(healthy.fix, [], "idempotent re-run: nothing to fix once everything is present");
   } finally {
     rmSync(bin, { recursive: true, force: true });
@@ -246,11 +232,11 @@ test("no-mistakes probes run with the telemetry opt-out unless the user exported
   // The shim's reported patch version echoes the effective telemetry
   // setting, so the assertion reads it back out of the parsed version.
   writeShim(bin, "claude", 'echo "2.1.19"');
-  writeShim(bin, "no-mistakes", 'echo "no-mistakes version v9.9.$NO_MISTAKES_TELEMETRY"');
+  writeShim(bin, "no-mistakes", 'echo "no-mistakes version v9.9.$NO_MISTAKES_TELEMETRY authorization-protocol=1"');
   const saved = process.env.NO_MISTAKES_TELEMETRY;
   try {
     delete process.env.NO_MISTAKES_TELEMETRY;
-    const defaulted = await collectDoctor({ env: { PATH: bin } });
+    const defaulted = await collectDoctor({ env: { PATH: bin }, noMistakesPath: join(bin, "no-mistakes") });
     assert.equal(
       defaulted.tools.find((tool) => tool.name === "no-mistakes")?.version,
       "v9.9.0",
@@ -258,7 +244,7 @@ test("no-mistakes probes run with the telemetry opt-out unless the user exported
     );
 
     process.env.NO_MISTAKES_TELEMETRY = "1";
-    const reEnabled = await collectDoctor({ env: { PATH: bin } });
+    const reEnabled = await collectDoctor({ env: { PATH: bin }, noMistakesPath: join(bin, "no-mistakes") });
     assert.equal(
       reEnabled.tools.find((tool) => tool.name === "no-mistakes")?.version,
       "v9.9.1",
@@ -318,7 +304,7 @@ test("GET /doctor is authed and returns the report for registered projects", asy
     prPoller: new PrPoller(tasks, async () => {
       throw new Error("gh disabled in tests");
     }),
-    doctorDeps: { env: { PATH: bin } }
+    doctorDeps: { env: { PATH: bin }, noMistakesPath: null }
   });
   await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
   const port = (server.address() as AddressInfo).port;

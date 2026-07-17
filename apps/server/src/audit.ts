@@ -52,6 +52,10 @@ export type AuditRecord = {
   decision?: string;
   runtimeGeneration?: number;
   durableMode?: string;
+  requestId?: string;
+  protocolVersion?: string;
+  operation?: string;
+  repository?: string;
   reason?: string;
 };
 

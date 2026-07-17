@@ -1,4 +1,4 @@
-import { existsSync, readFileSync, renameSync, statSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, readFileSync, renameSync, statSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { basename, join, resolve } from "node:path";
 
@@ -80,6 +80,25 @@ export class ProjectRegistry {
     return project ? { ...project } : undefined;
   }
 
+  configure(
+    rootPath: string,
+    fields: { mode?: Project["mode"] | null; yolo?: boolean | null }
+  ): Project {
+    const root = resolve(rootPath);
+    const existing = this.find(root);
+    const project = existing ?? this.touch(root);
+    const projects = this.load();
+    const target = projects.find((candidate) => candidate.rootPath === project.rootPath);
+    if (!target) throw new Error(`Unknown project: ${root}`);
+    if (fields.mode === null) delete target.mode;
+    else if (fields.mode !== undefined) target.mode = fields.mode;
+    if (fields.yolo === null) delete target.yolo;
+    else if (fields.yolo !== undefined) target.yolo = fields.yolo;
+    target.lastUsedAt = new Date().toISOString();
+    this.persist(projects);
+    return { ...target };
+  }
+
   // Unregister a project. Registry-only: the directory on disk is untouched.
   remove(rootPath: string): boolean {
     const root = resolve(rootPath);
@@ -112,7 +131,9 @@ export class ProjectRegistry {
     writeFileSync(tmp, `${JSON.stringify({ projects } satisfies ProjectsFile, null, 2)}\n`, {
       mode: 0o600
     });
+    chmodSync(tmp, 0o600);
     renameSync(tmp, this.path);
+    chmodSync(this.path, 0o600);
     if (existsSync(this.path)) {
       this.cache = { projects, mtimeMs: statSync(this.path).mtimeMs };
     }
