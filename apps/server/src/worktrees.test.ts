@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
-import { existsSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
@@ -127,6 +127,53 @@ test("worktree release refuses dirty trees unless forced, then resets", async ()
 
   rmSync(root, { recursive: true, force: true });
   rmSync(repo, { recursive: true, force: true });
+});
+
+test("forced release removes read-only untracked cache trees", async () => {
+  const repo = makeRepo();
+  const { pool, root } = makePool();
+
+  const lease = await pool.acquire(repo, "pty:a");
+  const cache = join(lease.path, ".scratch", "go-path", "pkg", "mod", "example.com", "module");
+  mkdirSync(cache, { recursive: true });
+  writeFileSync(join(cache, "header.h"), "generated\n");
+  chmodSync(join(cache, "header.h"), 0o444);
+  chmodSync(cache, 0o555);
+
+  try {
+    await pool.release(lease.id, { force: true });
+    assert.ok(!existsSync(join(lease.path, ".scratch")), "forced release cleans the cache tree");
+  } finally {
+    if (existsSync(cache)) {
+      chmodSync(cache, 0o755);
+    }
+    rmSync(root, { recursive: true, force: true });
+    rmSync(repo, { recursive: true, force: true });
+  }
+});
+
+test("an unrecoverable cleanup failure quarantines the slot instead of retrying it", async () => {
+  const repo = makeRepo();
+  const { pool, root } = makePool();
+
+  const lease = await pool.acquire(repo, "pty:a");
+  writeFileSync(join(lease.path, "scratch.txt"), "uncommitted\n");
+  chmodSync(lease.path, 0o555);
+
+  try {
+    await assert.rejects(pool.release(lease.id, { force: true }), /cleanup failed and was quarantined/);
+    const quarantined = pool.find(lease.id);
+    assert.equal(quarantined?.leasedBy, undefined);
+    assert.ok(quarantined?.quarantinedAt);
+    assert.match(quarantined?.quarantineReason ?? "", /git clean failed/);
+
+    const replacement = await pool.acquire(repo, "pty:b");
+    assert.notEqual(replacement.id, lease.id, "dispatch skips the quarantined slot");
+  } finally {
+    chmodSync(lease.path, 0o755);
+    rmSync(root, { recursive: true, force: true });
+    rmSync(repo, { recursive: true, force: true });
+  }
 });
 
 test("release refuses committed-but-unlanded detached-HEAD work unless forced", async () => {

@@ -1,7 +1,16 @@
 import { execFile } from "node:child_process";
-import { existsSync, mkdirSync, readdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
+import {
+  chmodSync,
+  existsSync,
+  lstatSync,
+  mkdirSync,
+  readdirSync,
+  readFileSync,
+  renameSync,
+  writeFileSync
+} from "node:fs";
 import { homedir } from "node:os";
-import { basename, join, resolve } from "node:path";
+import { basename, join, resolve, sep } from "node:path";
 import { createHash } from "node:crypto";
 import { promisify } from "node:util";
 
@@ -31,6 +40,8 @@ export type WorktreeLease = {
   createdAt: string;
   leasedBy?: string;
   leasedAt?: string;
+  quarantinedAt?: string;
+  quarantineReason?: string;
 };
 
 // A lease enriched with best-effort live git state (GET /worktrees): absent
@@ -98,20 +109,36 @@ export class WorktreePool {
       const poolDir = this.poolDir(repo);
       const state = this.load(poolDir);
 
-      let lease = state.slots.find((slot) => !slot.leasedBy);
+      let lease: WorktreeLease | undefined;
+      for (const candidate of state.slots.filter((slot) => !slot.leasedBy && !slot.quarantinedAt)) {
+        if (!existsSync(candidate.path)) {
+          lease = candidate;
+          break;
+        }
+        try {
+          // A freed slot sits at whatever the default tip was when it was
+          // released; re-detach it on the freshly fetched tip so a lease never
+          // starts on a stale base.
+          await fetchDefaultBranch(repo);
+          await resetToDefault(repo, candidate.path);
+          lease = candidate;
+          break;
+        } catch (error) {
+          candidate.quarantinedAt = new Date().toISOString();
+          candidate.quarantineReason = conciseError(error);
+          this.persist(poolDir, state);
+        }
+      }
       if (!lease) {
         if (state.slots.length >= this.maxSlots) {
+          const quarantined = state.slots.filter((slot) => slot.quarantinedAt).length;
           throw new Error(
-            `worktree pool for ${basename(repo)} is full (${this.maxSlots} slots, all leased)`
+            quarantined === 0
+              ? `worktree pool for ${basename(repo)} is full (${this.maxSlots} slots, all leased)`
+              : `worktree pool for ${basename(repo)} is unavailable (${this.maxSlots} slots: ${state.slots.length - quarantined} leased, ${quarantined} quarantined)`
           );
         }
         lease = await this.createSlot(repo, poolDir, state);
-      } else if (existsSync(lease.path)) {
-        // A freed slot sits at whatever the default tip was when it was
-        // released; re-detach it on the freshly fetched tip so a lease never
-        // starts on a stale base.
-        await fetchDefaultBranch(repo);
-        await resetToDefault(repo, lease.path);
       }
 
       lease.leasedBy = holder;
@@ -151,11 +178,24 @@ export class WorktreePool {
             );
           }
         }
-        await resetToDefault(lease.repoRoot, lease.path);
+        try {
+          await resetToDefault(lease.repoRoot, lease.path);
+        } catch (error) {
+          lease.leasedBy = undefined;
+          lease.leasedAt = undefined;
+          lease.quarantinedAt = new Date().toISOString();
+          lease.quarantineReason = conciseError(error);
+          this.persist(poolDir, state);
+          throw new Error(
+            `Worktree ${id} cleanup failed and was quarantined: ${lease.quarantineReason}`
+          );
+        }
       }
 
       lease.leasedBy = undefined;
       lease.leasedAt = undefined;
+      lease.quarantinedAt = undefined;
+      lease.quarantineReason = undefined;
       this.persist(poolDir, state);
     });
   }
@@ -359,9 +399,54 @@ async function currentBranch(worktree: string): Promise<string | undefined> {
 // remote's real tip fetch first (fetchDefaultBranch); this only reads refs.
 async function resetToDefault(repo: string, worktree: string): Promise<void> {
   await git(worktree, ["reset", "--hard"]);
+  await makeUntrackedPathsOwnerWritable(worktree);
   await git(worktree, ["clean", "-fd"]);
   const base = await defaultBranchCommit(repo);
   await git(worktree, ["checkout", "--detach", base]);
+}
+
+// Go's module cache intentionally removes owner write permission. Worktree
+// cleanup still owns generated, untracked paths, so restore only the minimum
+// permissions needed to traverse and delete those paths. Never follow symlinks.
+async function makeUntrackedPathsOwnerWritable(worktree: string): Promise<void> {
+  const { stdout } = await git(worktree, [
+    "ls-files",
+    "--others",
+    "--directory",
+    "--exclude-standard",
+    "-z"
+  ]);
+  const root = resolve(worktree);
+  const prefix = `${root}${sep}`;
+  for (const relativePath of stdout.split("\0")) {
+    if (!relativePath) {
+      continue;
+    }
+    const path = resolve(root, relativePath);
+    if (!path.startsWith(prefix)) {
+      continue;
+    }
+    makePathOwnerWritable(path);
+  }
+}
+
+function makePathOwnerWritable(path: string): void {
+  let stat;
+  try {
+    stat = lstatSync(path);
+  } catch {
+    return;
+  }
+  if (stat.isSymbolicLink()) {
+    return;
+  }
+  chmodSync(path, stat.mode | (stat.isDirectory() ? 0o700 : 0o200));
+  if (!stat.isDirectory()) {
+    return;
+  }
+  for (const name of readDirNames(path)) {
+    makePathOwnerWritable(join(path, name));
+  }
 }
 
 // origin/HEAD when a remote exists, the local HEAD otherwise (plain local
@@ -428,6 +513,25 @@ function readDirNames(dir: string): string[] {
   }
 }
 
-function git(cwd: string, args: string[]): Promise<{ stdout: string; stderr: string }> {
-  return execFileAsync("git", ["-C", cwd, ...args], { timeout: 15_000 });
+async function git(cwd: string, args: string[]): Promise<{ stdout: string; stderr: string }> {
+  try {
+    return await execFileAsync("git", ["-C", cwd, ...args], {
+      timeout: 15_000,
+      maxBuffer: 4 * 1024 * 1024
+    });
+  } catch (error) {
+    throw new Error(`git ${args[0] ?? "command"} failed in ${basename(cwd)}: ${conciseError(error)}`);
+  }
+}
+
+function conciseError(error: unknown): string {
+  const structured = error as { stderr?: string | Buffer; stdout?: string | Buffer };
+  const stderr = structured?.stderr?.toString().trim();
+  const stdout = structured?.stdout?.toString().trim();
+  const fallback = error instanceof Error ? error.message : String(error);
+  const detail = stderr || stdout || fallback;
+  const lines = detail.split("\n").filter(Boolean);
+  const shown = lines.slice(0, 6).join("\n");
+  const omitted = lines.length > 6 ? `\n... ${lines.length - 6} additional lines omitted` : "";
+  return `${shown.slice(0, 1_500)}${omitted}`;
 }
