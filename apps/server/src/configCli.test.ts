@@ -23,11 +23,12 @@ const PERCH_BIN = fileURLToPath(new URL("../../../bin/perch.mjs", import.meta.ur
 type StubState = {
   defaults: Record<string, string>;
   mateDefaults: Record<string, string>;
+  project: { mode?: string; yolo?: boolean };
   patches: unknown[];
 };
 
 async function withStubServer(run: (serverUrl: string, state: StubState) => Promise<void>): Promise<void> {
-  const state: StubState = { defaults: {}, mateDefaults: {}, patches: [] };
+  const state: StubState = { defaults: {}, mateDefaults: {}, project: {}, patches: [] };
   const server = createServer((request, response) => {
     response.setHeader("content-type", "application/json");
     if (request.url?.startsWith("/health")) {
@@ -35,7 +36,7 @@ async function withStubServer(run: (serverUrl: string, state: StubState) => Prom
       return;
     }
     if (request.url?.startsWith("/config") && request.method === "GET") {
-      response.end(JSON.stringify({ dispatchDefaults: state.defaults, mateDefaults: state.mateDefaults }));
+      response.end(JSON.stringify(stubConfig(state)));
       return;
     }
     if (request.url?.startsWith("/config") && request.method === "PATCH") {
@@ -55,7 +56,21 @@ async function withStubServer(run: (serverUrl: string, state: StubState) => Prom
           if (value === null) delete state.mateDefaults[key];
           else state.mateDefaults[key] = value;
         }
-        response.end(JSON.stringify({ dispatchDefaults: state.defaults, mateDefaults: state.mateDefaults }));
+        response.end(JSON.stringify(stubConfig(state)));
+      });
+      return;
+    }
+    if (request.url?.startsWith("/projects") && request.method === "PATCH") {
+      let raw = "";
+      request.on("data", (chunk) => (raw += chunk));
+      request.on("end", () => {
+        const body = JSON.parse(raw) as { mode?: string | null; yolo?: boolean | null };
+        state.patches.push(body);
+        if (body.mode === null) delete state.project.mode;
+        else if (body.mode !== undefined) state.project.mode = body.mode;
+        if (body.yolo === null) delete state.project.yolo;
+        else if (body.yolo !== undefined) state.project.yolo = body.yolo;
+        response.end(JSON.stringify({ project: state.project }));
       });
       return;
     }
@@ -70,6 +85,66 @@ async function withStubServer(run: (serverUrl: string, state: StubState) => Prom
     server.closeAllConnections?.();
     await new Promise<void>((resolve) => server.close(() => resolve()));
   }
+}
+
+function stubConfig(state: StubState) {
+  const entries: Record<string, object> = {};
+  for (const [prefix, values] of [["dispatch", state.defaults], ["mate", state.mateDefaults]] as const) {
+    for (const field of ["agent", "model", "effort"] as const) {
+      const value = values[field] ?? null;
+      entries[`${prefix}.${field}`] = {
+        effectiveValue: value,
+        source: value === null ? "built-in" : "global",
+        scope: "global",
+        storedValue: value,
+        defaultValue: null,
+        overriddenBy: null
+      };
+    }
+  }
+  for (const [key, effectiveValue] of Object.entries({
+    version: "1.39.0-perch.1",
+    protocol: "1",
+    source: "bundled",
+    path: "/package/vendor/no-mistakes/darwin-arm64/no-mistakes",
+    "SHA-256": "abc123",
+    architecture: "arm64"
+  })) {
+    entries[`runtime.no-mistakes.${key}`] = {
+      effectiveValue,
+      source: "bundled",
+      scope: "runtime",
+      storedValue: null,
+      defaultValue: null,
+      overriddenBy: null,
+      readOnly: true
+    };
+  }
+  entries["task.mode"] = {
+    effectiveValue: state.project.mode ?? "direct-PR",
+    source: state.project.mode ? "project" : "built-in",
+    scope: "project",
+    storedValue: state.project.mode ?? null,
+    defaultValue: "direct-PR",
+    overriddenBy: null
+  };
+  entries["task.yolo"] = {
+    effectiveValue: state.project.yolo ?? false,
+    source: state.project.yolo === undefined ? "built-in" : "project",
+    scope: "project",
+    storedValue: state.project.yolo ?? null,
+    defaultValue: false,
+    overriddenBy: null
+  };
+  entries["provider.token"] = {
+    effectiveValue: "server-secret",
+    source: "environment",
+    scope: "global",
+    storedValue: "stored-secret",
+    defaultValue: null,
+    overriddenBy: "PERCH_PROVIDER_TOKEN"
+  };
+  return { dispatchDefaults: state.defaults, mateDefaults: state.mateDefaults, entries };
 }
 
 type CliResult = { code: number; stdout: string; stderr: string };
@@ -91,22 +166,22 @@ test("config set PATCHes the mapped field and get reads it back", async () => {
   const home = mkdtempSync(join(tmpdir(), "perch-config-home-"));
   try {
     await withStubServer(async (serverUrl, state) => {
-      const set = await runConfig(serverUrl, home, ["set", "default-agent", "codex"]);
+      const set = await runConfig(serverUrl, home, ["set", "--global", "dispatch.agent", "codex"]);
       assert.equal(set.code, 0, set.stderr);
-      assert.match(set.stdout, /default-agent = codex/);
+      assert.match(set.stdout, /dispatch\.agent = codex/);
       assert.deepEqual(state.patches, [{ dispatchDefaults: { agent: "codex" } }]);
 
-      const getOne = await runConfig(serverUrl, home, ["get", "default-agent"]);
+      const getOne = await runConfig(serverUrl, home, ["get", "--global", "dispatch.agent"]);
       assert.equal(getOne.stdout.trim(), "codex");
 
-      const getAll = await runConfig(serverUrl, home, ["get"]);
-      assert.match(getAll.stdout, /default-agent\s+codex/);
-      assert.match(getAll.stdout, /default-model\s+\(unset\)/);
-      assert.match(getAll.stdout, /default-effort\s+\(unset\)/);
+      const getAll = await runConfig(serverUrl, home, ["show", "--global"]);
+      assert.match(getAll.stdout, /dispatch\.agent\s+codex/);
+      assert.match(getAll.stdout, /dispatch\.model\s+\(unset\)/);
+      assert.match(getAll.stdout, /dispatch\.effort\s+\(unset\)/);
 
-      const unset = await runConfig(serverUrl, home, ["unset", "default-agent"]);
+      const unset = await runConfig(serverUrl, home, ["unset", "--global", "dispatch.agent"]);
       assert.equal(unset.code, 0, unset.stderr);
-      assert.match(unset.stdout, /default-agent = \(unset\)/);
+      assert.match(unset.stdout, /dispatch\.agent = \(unset\)/);
       assert.deepEqual(state.patches.at(-1), { dispatchDefaults: { agent: null } });
     });
   } finally {
@@ -118,33 +193,33 @@ test("config set/get/unset works the same for the mate-* keys, independent of de
   const home = mkdtempSync(join(tmpdir(), "perch-config-home-"));
   try {
     await withStubServer(async (serverUrl, state) => {
-      const set = await runConfig(serverUrl, home, ["set", "mate-agent", "codex"]);
+      const set = await runConfig(serverUrl, home, ["set", "--global", "mate.agent", "codex"]);
       assert.equal(set.code, 0, set.stderr);
-      assert.match(set.stdout, /mate-agent = codex/);
+      assert.match(set.stdout, /mate\.agent = codex/);
       assert.deepEqual(state.patches, [{ mateDefaults: { agent: "codex" } }]);
 
-      const setModel = await runConfig(serverUrl, home, ["set", "mate-model", "opus"]);
+      const setModel = await runConfig(serverUrl, home, ["set", "--global", "mate.model", "opus"]);
       assert.equal(setModel.code, 0, setModel.stderr);
-      assert.match(setModel.stdout, /mate-model = opus/);
+      assert.match(setModel.stdout, /mate\.model = opus/);
 
-      const getOne = await runConfig(serverUrl, home, ["get", "mate-agent"]);
+      const getOne = await runConfig(serverUrl, home, ["get", "--global", "mate.agent"]);
       assert.equal(getOne.stdout.trim(), "codex");
 
-      const getAll = await runConfig(serverUrl, home, ["get"]);
-      assert.match(getAll.stdout, /mate-agent\s+codex/);
-      assert.match(getAll.stdout, /mate-model\s+opus/);
-      assert.match(getAll.stdout, /mate-effort\s+\(unset\)/);
+      const getAll = await runConfig(serverUrl, home, ["show", "--global"]);
+      assert.match(getAll.stdout, /mate\.agent\s+codex/);
+      assert.match(getAll.stdout, /mate\.model\s+opus/);
+      assert.match(getAll.stdout, /mate\.effort\s+\(unset\)/);
       // The worker defaults are untouched by mate-* sets.
-      assert.match(getAll.stdout, /default-agent\s+\(unset\)/);
+      assert.match(getAll.stdout, /dispatch\.agent\s+\(unset\)/);
 
-      const unset = await runConfig(serverUrl, home, ["unset", "mate-agent"]);
+      const unset = await runConfig(serverUrl, home, ["unset", "--global", "mate.agent"]);
       assert.equal(unset.code, 0, unset.stderr);
-      assert.match(unset.stdout, /mate-agent = \(unset\)/);
+      assert.match(unset.stdout, /mate\.agent = \(unset\)/);
       assert.deepEqual(state.patches.at(-1), { mateDefaults: { agent: null } });
 
-      const badAgent = await runConfig(serverUrl, home, ["set", "mate-agent", "gemini"]);
+      const badAgent = await runConfig(serverUrl, home, ["set", "--global", "mate.agent", "gemini"]);
       assert.equal(badAgent.code, 1);
-      assert.match(badAgent.stderr, /invalid mate-agent: gemini \(expected claude\|codex\)/);
+      assert.match(badAgent.stderr, /invalid mate\.agent: gemini \(expected claude\|codex\)/);
     });
   } finally {
     rmSync(home, { recursive: true, force: true });
@@ -155,32 +230,84 @@ test("config set validates client-side: bad agent and unknown key never reach th
   const home = mkdtempSync(join(tmpdir(), "perch-config-home-"));
   try {
     await withStubServer(async (serverUrl, state) => {
-      const badAgent = await runConfig(serverUrl, home, ["set", "default-agent", "gemini"]);
+      const badAgent = await runConfig(serverUrl, home, ["set", "--global", "dispatch.agent", "gemini"]);
       assert.equal(badAgent.code, 1);
-      assert.match(badAgent.stderr, /invalid default-agent: gemini \(expected claude\|codex\)/);
+      assert.match(badAgent.stderr, /invalid dispatch\.agent: gemini \(expected claude\|codex\)/);
 
-      const badKey = await runConfig(serverUrl, home, ["set", "default-provider", "codex"]);
+      const badKey = await runConfig(serverUrl, home, ["set", "--global", "dispatch.provider", "codex"]);
       assert.equal(badKey.code, 1);
-      assert.match(badKey.stderr, /unknown config key: default-provider/);
+      assert.match(badKey.stderr, /unknown config key: dispatch\.provider/);
 
-      const noValue = await runConfig(serverUrl, home, ["set", "default-model"]);
+      const noValue = await runConfig(serverUrl, home, ["set", "--global", "dispatch.model"]);
       assert.equal(noValue.code, 1);
       assert.match(noValue.stderr, /requires a value/);
 
       // A free-string model is fine - only the agent is whitelisted client-side.
-      const model = await runConfig(serverUrl, home, ["set", "default-model", "some-future-model"]);
+      const model = await runConfig(serverUrl, home, ["set", "--global", "dispatch.model", "some-future-model"]);
       assert.equal(model.code, 0, model.stderr);
 
       // Efforts are per-model, so the CLI forwards ANY effort (including the
       // high tiers a stale local enum used to reject) to the server, which
       // validates it against the selected model.
-      const ultra = await runConfig(serverUrl, home, ["set", "default-effort", "ultra"]);
+      const ultra = await runConfig(serverUrl, home, ["set", "--global", "dispatch.effort", "ultra"]);
       assert.equal(ultra.code, 0, ultra.stderr);
 
       assert.deepEqual(state.patches, [
         { dispatchDefaults: { model: "some-future-model" } },
         { dispatchDefaults: { effort: "ultra" } }
       ]);
+    });
+  } finally {
+    rmSync(home, { recursive: true, force: true });
+  }
+});
+
+test("project config requires explicit scope, supports transactional activation flags, and reports provenance", async () => {
+  const home = mkdtempSync(join(tmpdir(), "perch-config-home-"));
+  try {
+    await withStubServer(async (serverUrl, state) => {
+      const missingScope = await runConfig(serverUrl, home, ["set", "task.mode", "direct-PR"]);
+      assert.equal(missingScope.code, 1);
+      assert.match(missingScope.stderr, /require explicit --global or --project PATH/);
+
+      const setMode = await runConfig(serverUrl, home, [
+        "set", "--project", "/repo", "--yes", "task.mode", "no-mistakes"
+      ]);
+      assert.equal(setMode.code, 0, setMode.stderr);
+      assert.equal(state.project.mode, "no-mistakes");
+      assert.deepEqual(state.patches.at(-1), { rootPath: "/repo", mode: "no-mistakes" });
+
+      const setYolo = await runConfig(serverUrl, home, ["set", "--project", "/repo", "task.yolo", "false"]);
+      assert.equal(setYolo.code, 0, setYolo.stderr);
+      assert.equal(state.project.yolo, false);
+
+      const effective = await runConfig(serverUrl, home, [
+        "get", "--project", "/repo", "--effective", "--json", "task.mode"
+      ]);
+      assert.equal(effective.code, 0, effective.stderr);
+      const parsed = JSON.parse(effective.stdout) as { effectiveValue: string; source: string; scope: string };
+      assert.deepEqual(
+        { value: parsed.effectiveValue, source: parsed.source, scope: parsed.scope },
+        { value: "no-mistakes", source: "project", scope: "project" }
+      );
+    });
+  } finally {
+    rmSync(home, { recursive: true, force: true });
+  }
+});
+
+test("text and JSON config views redact secret-shaped keys identically", async () => {
+  const home = mkdtempSync(join(tmpdir(), "perch-config-home-"));
+  try {
+    await withStubServer(async (serverUrl) => {
+      const text = await runConfig(serverUrl, home, ["show", "--effective"]);
+      const json = await runConfig(serverUrl, home, ["show", "--effective", "--json"]);
+      assert.equal(text.code, 0, text.stderr);
+      assert.equal(json.code, 0, json.stderr);
+      assert.match(text.stdout, /provider\.token\s+<redacted>/);
+      assert.doesNotMatch(text.stdout, /server-secret|stored-secret/);
+      assert.match(json.stdout, /<redacted>/);
+      assert.doesNotMatch(json.stdout, /server-secret|stored-secret/);
     });
   } finally {
     rmSync(home, { recursive: true, force: true });

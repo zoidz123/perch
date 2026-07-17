@@ -1,4 +1,4 @@
-import { existsSync, readFileSync, renameSync, statSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, readFileSync, renameSync, statSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import type { DispatchDefaults, MateDefaults } from "@perch/shared";
@@ -52,7 +52,7 @@ export type MateDefaultsUpdate = {
   effort?: string | null;
 };
 
-type SettingsFile = {
+export type SettingsFile = {
   dispatchDefaults?: DispatchDefaults;
   mateDefaults?: MateDefaults;
 };
@@ -65,6 +65,25 @@ export class FleetSettings {
   constructor(env: NodeJS.ProcessEnv = process.env) {
     this.env = env;
     this.path = join(env.PERCH_HOME ?? join(homedir(), ".perch"), "settings.json");
+  }
+
+  stored(): SettingsFile {
+    return structuredClone(this.load());
+  }
+
+  environmentOverrides(): SettingsFile {
+    return {
+      dispatchDefaults: compactDefaults({
+        agent: this.env.PERCH_DEFAULT_AGENT,
+        model: this.env.PERCH_DEFAULT_MODEL,
+        effort: this.env.PERCH_DEFAULT_EFFORT
+      }) as DispatchDefaults,
+      mateDefaults: compactDefaults({
+        agent: this.env.PERCH_MATE_AGENT,
+        model: this.env.PERCH_MATE_MODEL,
+        effort: this.env.PERCH_MATE_EFFORT
+      }) as MateDefaults
+    };
   }
 
   // The effective dispatch defaults: PERCH_DEFAULT_* env > persisted setting.
@@ -211,11 +230,17 @@ export class FleetSettings {
   private persist(file: SettingsFile): void {
     const tmp = `${this.path}.tmp`;
     writeFileSync(tmp, `${JSON.stringify(file, null, 2)}\n`, { mode: 0o600 });
+    chmodSync(tmp, 0o600);
     renameSync(tmp, this.path);
+    chmodSync(this.path, 0o600);
     if (existsSync(this.path)) {
       this.cache = { file, mtimeMs: statSync(this.path).mtimeMs };
     }
   }
+}
+
+function compactDefaults(values: Record<string, string | undefined>): Record<string, string> {
+  return Object.fromEntries(Object.entries(values).filter((entry): entry is [string, string] => Boolean(entry[1])));
 }
 
 // Reject an effort the SELECTED codex model does not support. Only applies to

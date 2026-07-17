@@ -42,6 +42,12 @@ const required = [
   "apps/server/assets/charts/AUTHORING.md",
   "packages/shared/dist/index.js",
   "packages/relay/dist/cli.js",
+  "vendor/no-mistakes/manifest.json",
+  "vendor/no-mistakes/LICENSE.upstream",
+  "vendor/no-mistakes/LICENSE.fork",
+  "vendor/no-mistakes/darwin-arm64/no-mistakes",
+  "vendor/no-mistakes/darwin-x64/no-mistakes",
+  "THIRD_PARTY_NOTICES.md",
   "LICENSE"
 ];
 

@@ -14,7 +14,8 @@ Perch keeps this delegation durable with explicit task lifecycles, immutable evi
 npm install --global perchctl
 ```
 
-The `perchctl` package installs the `perch` command.
+The `perchctl` package installs the `perch` command and its compatible signed no-mistakes runtime for Darwin arm64 and x64.
+Installation performs no lifecycle download and works with `npm --ignore-scripts`.
 
 ## Getting started
 
@@ -70,5 +71,7 @@ See the [complete CLI guide](docs/cli.md) for verified arguments, options, defau
 - [Operations](docs/operations.md)
 - [Architecture](docs/architecture.md)
 - [Security](docs/security.md)
+- [No-mistakes authorization](docs/no-mistakes-authorization.md)
+- [Release and version synchronization](docs/releasing.md)
 
 Perch is available under the [MIT License](LICENSE).

@@ -79,6 +79,23 @@ export function dispatchBrief(task: Task, worktreePath: string | undefined, plan
         ]
       : [];
 
+  const noMistakesProhibition =
+    task.kind !== "scout" && task.mode === "direct-PR"
+      ? [
+          "",
+          "No-mistakes is prohibited for this direct-PR task.",
+          "Do not invoke the no-mistakes skill, CLI, daemon, gate remote, or review agents, regardless of prompt wording, repository setup, existing gate remote, diff size, or global skill visibility.",
+          "Run ordinary task-specific tests, builds, and lint, then push the branch and open the PR directly."
+        ]
+      : task.kind !== "scout" && task.mode === "local-only"
+        ? [
+            "",
+            "No-mistakes is prohibited for this local-only task.",
+            "Do not invoke the no-mistakes skill, CLI, daemon, gate remote, review agents, push, or any remote delivery workflow, regardless of prompt wording, repository setup, existing gate remote, diff size, or global skill visibility.",
+            "Run ordinary task-specific tests, builds, and lint locally and keep the work on the local task branch."
+          ]
+        : [];
+
   return [
     "",
     "---",
@@ -87,6 +104,7 @@ export function dispatchBrief(task: Task, worktreePath: string | undefined, plan
     `Create and work on branch perch/${task.id}.`,
     definitionOfDone,
     ...noMistakesDriving,
+    ...noMistakesProhibition,
     ...planSection,
     "",
     "Report status by POSTing task events (run these exact curl commands from your shell):",

@@ -22,6 +22,7 @@ const root = dirname(dirname(fileURLToPath(import.meta.url)));
 const temporaryRoot = mkdtempSync(join(tmpdir(), "perch-package-smoke-"));
 const packs = join(temporaryRoot, "packs");
 const localPrefix = join(temporaryRoot, "local");
+const functionalPrefix = join(temporaryRoot, "functional");
 const globalPrefix = join(temporaryRoot, "global");
 const fakeHome = join(temporaryRoot, "home");
 const perchHome = join(fakeHome, ".perch");
@@ -35,7 +36,7 @@ const serverUrl = `http://127.0.0.1:${port}`;
 const npmPath = process.env.npm_execpath;
 
 assert(npmPath, "npm_execpath is required; run this through `npm run test:package`");
-for (const directory of [packs, localPrefix, globalPrefix, fakeHome, npmCache, temporaryFiles, xdgConfig, xdgCache, xdgData]) {
+for (const directory of [packs, localPrefix, functionalPrefix, globalPrefix, fakeHome, npmCache, temporaryFiles, xdgConfig, xdgCache, xdgData]) {
   mkdirSync(directory, { recursive: true });
 }
 
@@ -81,36 +82,43 @@ try {
     writeFileSync(join(outputDirectory, "sha256.txt"), `${checksum}  ${pack.filename}\n`);
   }
 
-  npm(["install", "--prefix", localPrefix, tarball]);
+  npm(["install", "--ignore-scripts", "--prefix", localPrefix, tarball]);
   const localBin = join(localPrefix, "node_modules/.bin/perch");
   chmodSync(localBin, 0o755);
   command(localBin, ["--help"]);
+  assert.equal(command(localBin, ["--version"]).trim(), pack.version);
   npm(["exec", "--prefix", localPrefix, "--", "perch", "--help"]);
   command(process.execPath, ["-e", `import(${JSON.stringify(pathToFileURL(join(localPrefix, "node_modules/perchctl/packages/shared/dist/index.js")).href)})`]);
   command(process.execPath, ["-e", `import(${JSON.stringify(pathToFileURL(join(localPrefix, "node_modules/perchctl/packages/relay/dist/index.js")).href)})`]);
+  assertBundledRuntime(join(localPrefix, "node_modules/perchctl"));
 
-  command(localBin, ["server", "start"]);
+  // better-sqlite3 is an existing native dependency with its own install
+  // script. The ignore-scripts lanes above and below prove the bundled
+  // no-mistakes runtime itself needs no lifecycle hook or network download.
+  // Use an ordinary isolated install for the full server smoke.
+  npm(["install", "--prefix", functionalPrefix, tarball]);
+  const functionalBin = join(functionalPrefix, "node_modules/.bin/perch");
+  command(functionalBin, ["server", "start"]);
   waitForHealth();
-  assertDoctorJson(localBin);
-  command(localBin, ["config", "set", "default-agent", "codex"]);
-  const config = command(localBin, ["config", "get", "default-agent"]);
+  assertDoctorJson(functionalBin);
+  command(functionalBin, ["config", "set", "--global", "dispatch.agent", "codex"]);
+  const config = command(functionalBin, ["config", "get", "dispatch.agent", "--effective"]);
   assert.match(config, /codex/);
   const authoring = fetchText(`${serverUrl}/charts/authoring`);
   assert.match(authoring, /chart\.css/);
-  command(localBin, ["pair"]);
-  command(localBin, ["server", "stop"]);
+  command(functionalBin, ["pair"]);
+  command(functionalBin, ["server", "stop"]);
   waitForStop();
 
   mkdirSync(perchHome, { recursive: true });
   const stateSentinel = join(perchHome, "release-smoke-state");
   writeFileSync(stateSentinel, "preserve me\n", { mode: 0o600 });
 
-  npm(["install", "--global", "--prefix", globalPrefix, tarball]);
+  npm(["install", "--ignore-scripts", "--global", "--prefix", globalPrefix, tarball]);
   const globalBin = join(globalPrefix, "bin/perch");
   command(globalBin, ["--help"]);
-  assertDoctorJson(globalBin);
-  waitForHealth();
-  command(globalBin, ["server", "stop"]);
+  assert.equal(command(globalBin, ["--version"]).trim(), pack.version);
+  assertBundledRuntime(join(globalPrefix, "lib/node_modules/perchctl"));
   waitForStop();
   npm(["uninstall", "--global", "--prefix", globalPrefix, pack.name]);
   assert(existsSync(stateSentinel), "global uninstall removed PERCH_HOME state");
@@ -143,7 +151,13 @@ function auditPack(pack) {
     "apps/server/assets/mate/AGENTS.md",
     "apps/server/assets/charts/chart.css",
     "packages/shared/dist/index.js",
-    "packages/relay/dist/cli.js"
+    "packages/relay/dist/cli.js",
+    "vendor/no-mistakes/manifest.json",
+    "vendor/no-mistakes/LICENSE.upstream",
+    "vendor/no-mistakes/LICENSE.fork",
+    "vendor/no-mistakes/darwin-arm64/no-mistakes",
+    "vendor/no-mistakes/darwin-x64/no-mistakes",
+    "THIRD_PARTY_NOTICES.md"
   ];
   for (const path of required) {
     assert(paths.includes(path), `tarball is missing ${path}`);
@@ -157,7 +171,9 @@ function auditPack(pack) {
     /^apps\/server\/dist\/.*\.js$/,
     /^apps\/server\/dist\/charts\/vendor\/LICENSE$/,
     /^apps\/server\/assets\//,
-    /^packages\/(shared|relay)\/dist\/.*\.js$/
+    /^packages\/(shared|relay)\/dist\/.*\.js$/,
+    /^vendor\/no-mistakes\/(manifest\.json|LICENSE\.(upstream|fork)|darwin-(arm64|x64)\/no-mistakes)$/,
+    /^THIRD_PARTY_NOTICES\.md$/
   ];
   for (const path of paths) {
     assert(allowed.some((pattern) => pattern.test(path)), `unexpected tarball entry: ${path}`);
@@ -167,6 +183,22 @@ function auditPack(pack) {
 
   const bin = pack.files.find((file) => file.path === "bin/perch.mjs");
   assert(bin && (bin.mode & 0o111) !== 0, "perch bin is not executable");
+  for (const path of ["vendor/no-mistakes/darwin-arm64/no-mistakes", "vendor/no-mistakes/darwin-x64/no-mistakes"]) {
+    const runtime = pack.files.find((file) => file.path === path);
+    assert(runtime && (runtime.mode & 0o111) !== 0, `${path} is not executable`);
+  }
+}
+
+function assertBundledRuntime(packageRoot) {
+  const manifest = JSON.parse(readFileSync(join(packageRoot, "vendor/no-mistakes/manifest.json"), "utf8"));
+  assert.equal(manifest.releaseTag, "v1.39.0-perch.1");
+  assert.equal(manifest.authorizationProtocol, "1");
+  assert.equal(manifest.forkCommit, "2d35e552b4cbc191b06abcadc3b05fd3da510d26");
+  for (const key of ["darwin-arm64", "darwin-x64"]) {
+    const entry = manifest.platforms[key];
+    const bytes = readFileSync(join(packageRoot, "vendor/no-mistakes", entry.path));
+    assert.equal(createHash("sha256").update(bytes).digest("hex"), entry.binarySha256);
+  }
 }
 
 function npm(args, options = {}) {

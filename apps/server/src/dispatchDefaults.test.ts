@@ -335,6 +335,20 @@ test("PATCH /config refuses values outside the whitelist with a 400", async () =
   });
   assert.equal(badMateAgent.status, 400);
   assert.match(((await badMateAgent.json()) as { error: string }).error, /invalid mate agent/);
+
+  for (const body of [
+    { unknownLayer: {} },
+    { dispatchDefaults: { unknownKey: "value" } },
+    { dispatchDefaults: { agent: true } },
+    {}
+  ]) {
+    const invalidShape = await fetch(`${baseUrl}/config`, {
+      ...authed,
+      method: "PATCH",
+      body: JSON.stringify(body)
+    });
+    assert.equal(invalidShape.status, 400, JSON.stringify(body));
+  }
 });
 
 test("default worktree capacity supports more than eight dispatched tasks", () => {

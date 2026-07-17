@@ -1,4 +1,7 @@
 import { randomUUID } from "node:crypto";
+import { execFileSync } from "node:child_process";
+import { realpathSync } from "node:fs";
+import { resolve } from "node:path";
 import type {
   AgentKind,
   AgentSession,
@@ -79,6 +82,74 @@ export type StartManagedAgentResult = {
   worktreeId?: string;
 };
 
+// Non-secret launch context for pipeline clients. These values are useful for
+// forming an authorization request but are never authority by themselves;
+// /hooks/no-mistakes/authorize verifies them against the hook credential and
+// durable task/runtime records.
+export function taskCapabilityEnvironment(
+  tasks: TaskStore,
+  request: StartAgentRequest,
+  cwd = request.cwd ?? process.cwd()
+): Record<string, string> {
+  const taskId = request.labels?.task;
+  if (!taskId) return {};
+  const task = tasks.find(taskId);
+  if (!task) return {};
+  const runtime = (request.sessionId
+    ? tasks.stateDb.runtimes.findBySession(request.sessionId)
+    : undefined) ?? tasks.stateDb.runtimes.latestForTask(task.id);
+  const repository = canonicalRepositoryForPath(task.project);
+  if (!runtime || !repository) return {};
+  return {
+    PERCH_TASK_ID: task.id,
+    PERCH_TASK_MODE: task.mode,
+    PERCH_TASK_PROJECT: canonicalLaunchPath(task.project),
+    PERCH_TASK_REPOSITORY: repository,
+    PERCH_TASK_WORKTREE: canonicalLaunchPath(cwd),
+    PERCH_TASK_BRANCH: task.branch ?? `perch/${task.id}`,
+    PERCH_RUNTIME_GENERATION: String(runtime.generation)
+  };
+}
+
+export function canonicalRepository(value: string): string {
+  const trimmed = value.trim().replace(/\.git$/, "");
+  try {
+    const parsed = new URL(trimmed);
+    const authority = trimmed.match(/^[a-z][a-z0-9+.-]*:\/\/([^/]+)/i)?.[1];
+    if (authority && parsed.host) {
+      const credentialFreeHost = authority.slice(authority.lastIndexOf("@") + 1).toLowerCase();
+      return `${credentialFreeHost}/${parsed.pathname.replace(/^\/+/, "")}`;
+    }
+  } catch {
+    // SCP-style and local remote forms are handled below.
+  }
+  const withoutUser = trimmed.includes("@") ? trimmed.slice(trimmed.lastIndexOf("@") + 1) : trimmed;
+  return withoutUser.replace(":", "/").replace(/^\/+/, "").toLowerCase();
+}
+
+export function canonicalRepositoryForPath(path: string): string | undefined {
+  try {
+    const remote = execFileSync("git", ["-C", path, "remote", "get-url", "origin"], {
+      encoding: "utf8",
+      timeout: 5_000,
+      stdio: ["ignore", "pipe", "ignore"]
+    }).trim();
+    const canonical = canonicalRepository(remote);
+    return canonical || undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+function canonicalLaunchPath(path: string): string {
+  const absolute = resolve(path);
+  try {
+    return realpathSync(absolute);
+  } catch {
+    return absolute;
+  }
+}
+
 // One codex rollout resolver loop per session: many hooks/control signals can
 // arrive before the first attach, and each would otherwise spawn overlapping
 // filesystem polls.
@@ -117,13 +188,6 @@ export async function startManagedAgent(
   });
   if (launchModel.effort && !request.effort) request.effort = launchModel.effort;
 
-  const codexSocketPath = input.disableCodexRemote
-    ? null
-    : await prepareCodexRemote(options, request, cwd, launchModel.effort);
-  if (codexSocketPath && request.sessionId) {
-    await attachCodexControl(options, request.sessionId, codexSocketPath, cwd);
-  }
-
   const task = input.taskId && input.trackRuntime !== false ? options.tasks.find(input.taskId) : undefined;
   const runtime = task
     ? options.runtimeManager?.beginLaunch(
@@ -135,8 +199,15 @@ export async function startManagedAgent(
   const ownerRuntime = request.labels?.role === "mate" && input.trackOwner !== false
     ? options.ownerManager?.beginMateLaunch(request, input.intentionalNewMate === true)
     : undefined;
+  let codexSocketPath: string | null = null;
   let session: AgentSession | undefined;
   try {
+    codexSocketPath = input.disableCodexRemote
+      ? null
+      : await prepareCodexRemote(options, request, cwd, launchModel.effort);
+    if (codexSocketPath && request.sessionId) {
+      await attachCodexControl(options, request.sessionId, codexSocketPath, cwd);
+    }
     session = await options.adapter.startAgent(request);
 
     if (request.sessionId && session.id !== request.sessionId) {
@@ -250,7 +321,8 @@ async function prepareCodexRemote(
   const hookEnv: Record<string, string> = {
     PERCH_SESSION_ID: sessionId,
     PERCH_HOOK_URL: `http://127.0.0.1:${options.port}/hooks`,
-    PERCH_HOOK_TOKEN: options.hooks.register(sessionId).token
+    PERCH_HOOK_TOKEN: options.hooks.register(sessionId).token,
+    ...taskCapabilityEnvironment(options.tasks, request, cwd)
   };
   const handle = await options.codexControl.prepareRemote(cwd, { effort, env: hookEnv });
   if (!handle) return null;
