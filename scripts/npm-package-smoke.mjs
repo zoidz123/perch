@@ -33,6 +33,8 @@ const xdgData = join(temporaryRoot, "xdg-data");
 const port = randomInt(20000, 50000);
 const serverUrl = `http://127.0.0.1:${port}`;
 const npmPath = process.env.npm_execpath;
+const canonicalReadme = readFileSync(join(root, "README.md"), "utf8");
+const packageReadme = readFileSync(join(root, "npm/README.md"), "utf8");
 
 assert(npmPath, "npm_execpath is required; run this through `npm run test:package`");
 for (const directory of [packs, localPrefix, globalPrefix, fakeHome, npmCache, temporaryFiles, xdgConfig, xdgCache, xdgData]) {
@@ -63,6 +65,10 @@ try {
   const pack = JSON.parse(packOutput)[0];
   const tarball = join(packs, pack.filename);
   auditPack(pack);
+  assert.equal(readFileSync(join(root, "README.md"), "utf8"), canonicalReadme, "npm pack did not restore the canonical README");
+  const packedReadme = execFileSync("tar", ["-xOf", tarball, "package/README.md"], { encoding: "utf8" });
+  assert.equal(packedReadme, packageReadme, "tarball README does not match npm/README.md");
+  assert.notEqual(packedReadme, canonicalReadme, "tarball README unexpectedly matches the canonical README");
 
   const checksum = createHash("sha256").update(readFileSync(tarball)).digest("hex");
   console.log(`package=${pack.name}@${pack.version}`);
@@ -72,6 +78,8 @@ try {
   console.log(`files=${pack.entryCount}`);
   console.log(`packedSize=${pack.size}`);
   console.log(`unpackedSize=${pack.unpackedSize}`);
+  console.log(`packedReadmeBytes=${Buffer.byteLength(packedReadme)}`);
+  console.log(`canonicalReadmeBytes=${Buffer.byteLength(canonicalReadme)}`);
 
   const outputDirectory = process.env.PACKAGE_SMOKE_OUTPUT;
   if (outputDirectory) {
@@ -121,6 +129,10 @@ try {
   console.log("package smoke passed");
 } finally {
   try {
+    execFileSync(process.execPath, [join(root, "scripts/npm-readme.mjs"), "restore"], {
+      cwd: root,
+      stdio: "inherit"
+    });
     const localBin = join(localPrefix, "node_modules/.bin/perch");
     if (existsSync(localBin)) {
       command(localBin, ["server", "stop"], { allowFailure: true });

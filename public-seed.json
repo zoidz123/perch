@@ -4,6 +4,7 @@
     ".gitignore",
     "LICENSE",
     "README.md",
+    "npm/README.md",
     "package.json",
     "package-lock.json",
     "public-seed.json",
@@ -22,12 +23,14 @@
     "docs/security.md",
     "scripts/check-public-seed.mjs",
     "scripts/npm-package-smoke.mjs",
+    "scripts/npm-readme.mjs",
     "scripts/prepare-npm-package.mjs",
     "scripts/relay-recovery-check.mjs",
     "scripts/run-ios-simulator.sh"
   ],
   "publicMarkdown": [
     "README.md",
+    "npm/README.md",
     "docs/architecture.md",
     "docs/cli.md",
     "docs/operations.md",
