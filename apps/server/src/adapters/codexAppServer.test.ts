@@ -177,12 +177,14 @@ test("submitTurnAndWait resolves on legacy task_complete", async () => {
 });
 
 test("submitTurnAndWait reports aborted on turn_aborted", async () => {
-  const { client, server } = await connectedClient();
+  const done: Array<{ message: string }> = [];
+  const { client, server } = await connectedClient({ onTurnComplete: (ev) => done.push(ev) });
   await client.startThread();
   const waiting = client.submitTurnAndWait("go");
   await tick();
   server.push("codex/event/turn_aborted", { msg: { type: "turn_aborted", turn_id: "turn_1" } });
   assert.equal((await waiting).aborted, true);
+  assert.deepEqual(done, []);
 });
 
 test("submitTurnAndWait resolves via raw v2 turn/completed", async () => {
@@ -196,7 +198,12 @@ test("submitTurnAndWait resolves via raw v2 turn/completed", async () => {
 });
 
 test("a stale completion for a different turn does not resolve the current wait", async () => {
-  const { client, server } = await connectedClient();
+  const done: Array<{ message: string }> = [];
+  const statuses: AgentSessionStatus[] = [];
+  const { client, server } = await connectedClient({
+    onTurnComplete: (ev) => done.push(ev),
+    onStatus: (status) => statuses.push(status)
+  });
   await client.startThread();
   const waiting = client.submitTurnAndWait("go", { turnTimeoutMs: 200 });
   await tick();
@@ -205,6 +212,8 @@ test("a stale completion for a different turn does not resolve the current wait"
   server.push("codex/event/task_complete", { msg: { type: "task_complete", turn_id: "turn_OTHER" } });
   const result = await waiting; // resolves via the 200ms timeout as aborted
   assert.equal(result.aborted, true);
+  assert.deepEqual(done, []);
+  assert.equal(statuses.at(-1), "running");
 });
 
 test("legacy notifications normalize to timeline items", async () => {
@@ -455,15 +464,21 @@ test("a daemon-owned thread idle notification clears the fleet status without a 
 
 test("protocol auto-detect: once legacy is seen, raw notifications are ignored", async () => {
   const items: TimelineItem[] = [];
-  const { client, server } = await connectedClient({ onTimelineItem: (i) => items.push(i) });
+  const done: Array<{ message: string }> = [];
+  const { client, server } = await connectedClient({
+    onTimelineItem: (i) => items.push(i),
+    onTurnComplete: (ev) => done.push(ev)
+  });
   await client.startThread();
   server.push("codex/event/agent_message", { msg: { type: "agent_message", message: "legacy" } });
   await tick();
   // A raw item after legacy was locked in must be dropped.
   server.push("item/completed", { item: { type: "agentMessage", id: "x", text: "raw" } });
+  server.push("turn/completed", { turn: { id: "raw-turn", status: "completed" } });
   await tick();
   assert.ok(items.some((i) => i.text === "legacy"));
   assert.ok(!items.some((i) => i.text === "raw"), "raw notifications ignored once legacy is detected");
+  assert.deepEqual(done, [], "non-authoritative raw completion is ignored once legacy is detected");
 });
 
 test("interrupt with no active turn is a no-op", async () => {
@@ -563,6 +578,20 @@ test("onTurnComplete fires once with the final assistant message when a raw turn
   assert.deepEqual(done, [{ message: "shipped the fix in PR #99" }]);
 });
 
+test("onTurnComplete fires once for a raw tool-result-ending turn with no assistant message", async () => {
+  const done: Array<{ message: string }> = [];
+  const { client, server } = await connectedClient({ onTurnComplete: (ev) => done.push(ev) });
+  await client.startThread();
+  server.push("turn/started", { turn: { id: "turn_1" } });
+  server.push("item/completed", {
+    item: { type: "commandExecution", id: "tool_1", aggregatedOutput: "tests passed" }
+  });
+  server.push("turn/completed", { turn: { id: "turn_1", status: "completed" } });
+  server.push("turn/completed", { turn: { id: "turn_1", status: "completed" } });
+  await tick();
+  assert.deepEqual(done, [{ message: "" }]);
+});
+
 test("onTurnComplete stays silent on an aborted turn", async () => {
   const done: Array<{ message: string }> = [];
   const { client, server } = await connectedClient({ onTurnComplete: (ev) => done.push(ev) });
@@ -585,7 +614,21 @@ test("onTurnComplete fires on legacy task_complete with the agent_message", asyn
   assert.deepEqual(done, [{ message: "all green" }]);
 });
 
-test("onTurnComplete does not reuse a prior turn's message for a later empty turn", async () => {
+test("onTurnComplete fires once on legacy task_complete with no agent_message", async () => {
+  const done: Array<{ message: string }> = [];
+  const { client, server } = await connectedClient({ onTurnComplete: (ev) => done.push(ev) });
+  await client.startThread();
+  server.push("codex/event/task_started", { msg: { type: "task_started", turn_id: "turn_1" } });
+  server.push("codex/event/exec_command_end", {
+    msg: { type: "exec_command_end", turn_id: "turn_1", output: "tests passed" }
+  });
+  server.push("codex/event/task_complete", { msg: { type: "task_complete", turn_id: "turn_1" } });
+  server.push("codex/event/task_complete", { msg: { type: "task_complete", turn_id: "turn_1" } });
+  await tick();
+  assert.deepEqual(done, [{ message: "" }]);
+});
+
+test("onTurnComplete clears a prior turn's message before a later empty turn", async () => {
   const done: Array<{ message: string }> = [];
   const { client, server } = await connectedClient({ onTurnComplete: (ev) => done.push(ev) });
   await client.startThread();
@@ -596,7 +639,7 @@ test("onTurnComplete does not reuse a prior turn's message for a later empty tur
   server.push("turn/started", { turn: { id: "turn_2" } });
   server.push("turn/completed", { turn: { id: "turn_2", status: "completed" } });
   await tick();
-  assert.deepEqual(done, [{ message: "first result" }]);
+  assert.deepEqual(done, [{ message: "first result" }, { message: "" }]);
 });
 
 test("a completed turn with no deltas emits no streaming frames", async () => {

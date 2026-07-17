@@ -113,10 +113,10 @@ export type CodexAppServerOptions = {
   // them the phone sees the message only when the finished row tails back.
   onAssistantStream?: (ev: { itemId: string; text: string; done: boolean }) => void;
   // Fired once when a turn settles successfully (not aborted), carrying the
-  // turn's final assistant message. Daemon-driven codex turns never fire the
-  // PERCH_SESSION_ID Stop hook Claude uses to auto-report, so this is the
-  // server's reliable signal to report a crew worker's result back to the
-  // orchestrator without depending on any call inside the codex process.
+  // turn's final assistant message when present. Daemon-driven codex turns
+  // never fire the PERCH_SESSION_ID Stop hook Claude uses to auto-report, so
+  // this is the server's reliable signal to report a crew worker's result back
+  // to the orchestrator without depending on a call inside the codex process.
   onTurnComplete?: (ev: { message: string }) => void;
   // Fired once per actual turn start (legacy `task_started` / raw v2
   // `turn/started`) - never from approval resolution or other status churn,
@@ -997,11 +997,7 @@ export class CodexAppServerClient {
     if (type === "task_complete" || type === "turn_aborted") {
       this.finishAssistantStream();
       const aborted = type === "turn_aborted";
-      if (turnId) this.completedTurnIds.add(turnId);
-      this.fireTurnComplete(aborted);
-      this.tryResolvePendingTurn(aborted, turnId);
-      this._turnId = null;
-      this.setStatus("idle");
+      this.emitRawTurnCompletion(turnId, aborted ? "aborted" : "completed");
     }
   }
 
@@ -1128,6 +1124,8 @@ export class CodexAppServerClient {
   }
 
   private emitRawTurnCompletion(turnId: string | null, status: string | null): void {
+    const activeTurnId = this._turnId ?? this.pendingTurnCompletion?.turnId;
+    if (turnId && activeTurnId && turnId !== activeTurnId) return;
     const aborted = status === "cancelled" || status === "canceled" || status === "aborted" || status === "interrupted";
     // A turn can settle via more than one raw notification (turn/completed,
     // thread/status idle, a final_answer item); report it exactly once.
@@ -1142,11 +1140,12 @@ export class CodexAppServerClient {
 
   // Hand the turn's final assistant message to onTurnComplete once, then clear
   // it so a later completion (same turn, or the next) can never reuse it.
-  // Aborted turns and empty replies report nothing.
+  // Successful turns still report when the message is empty because provider
+  // completion, not assistant prose, is the authoritative lifecycle boundary.
   private fireTurnComplete(aborted: boolean): void {
     const message = this.lastAssistantMessage;
     this.lastAssistantMessage = "";
-    if (aborted || !message) return;
+    if (aborted) return;
     this.onTurnComplete?.({ message });
   }
 

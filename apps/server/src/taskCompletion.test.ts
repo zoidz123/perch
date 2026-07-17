@@ -56,27 +56,50 @@ for (const provider of ["codex", "claude"] as const) {
   });
 }
 
-for (const kind of ["needs_decision", "blocked", "completion_requested", "failed"] as const) {
-  test(`${kind} accepted after turn start satisfies the outcome boundary`, () => {
+for (const outcome of [
+  { label: "done", kind: "completion_requested" },
+  { label: "needs_decision", kind: "needs_decision" },
+  { label: "blocked", kind: "blocked" },
+  { label: "failed", kind: "failed" }
+] as const) {
+  test(`${outcome.label} accepted after turn start satisfies the outcome boundary`, () => {
     const fx = fixture();
     try {
       fx.reconciler.onTurnStarted("pty:worker", "codex");
-      fx.tasks.recordEvent(fx.task.id, { kind, source: "worker", message: "accurate outcome" });
-      const outcome = fx.tasks.events(fx.task.id).at(-1);
+      fx.tasks.recordEvent(fx.task.id, { kind: outcome.kind, source: "worker", message: "accurate outcome" });
+      const outcomeEvent = fx.tasks.events(fx.task.id).at(-1);
       const result = fx.reconciler.onTurnCompleted("pty:worker", "codex");
 
       assert.equal(result.retryNeeded, false);
-      assert.equal(result.outcomeEvent?.seq, outcome?.seq);
+      assert.equal(result.outcomeEvent?.seq, outcomeEvent?.seq);
       assert.equal(fx.tasks.events(fx.task.id).filter((event) => event.kind === "stalled").length, 0);
       const completed = fx.tasks.events(fx.task.id).at(-1);
       assert.equal(completed?.kind, "turn_completed");
-      assert.equal(completed?.data?.outcomeKind, kind);
-      assert.equal(completed?.data?.outcomeEventSeq, outcome?.seq);
+      assert.equal(completed?.data?.outcomeKind, outcome.kind);
+      assert.equal(completed?.data?.outcomeEventSeq, outcomeEvent?.seq);
     } finally {
       fx.close();
     }
   });
 }
+
+test("duplicate Codex completion does not append another completion or stalled wake", () => {
+  const fx = fixture();
+  try {
+    fx.reconciler.onTurnStarted("pty:worker", "codex");
+    const first = fx.reconciler.onTurnCompleted("pty:worker", "codex");
+    const count = fx.tasks.events(fx.task.id).length;
+    const duplicate = fx.reconciler.onTurnCompleted("pty:worker", "codex");
+
+    assert.equal(first.retryNeeded, true);
+    assert.equal(duplicate.duplicate, true);
+    assert.equal(fx.tasks.events(fx.task.id).length, count);
+    assert.equal(fx.tasks.events(fx.task.id).filter((event) => event.kind === "turn_completed").length, 1);
+    assert.equal(fx.tasks.events(fx.task.id).filter((event) => event.kind === "stalled").length, 1);
+  } finally {
+    fx.close();
+  }
+});
 
 test("an outcome from before turn start cannot satisfy a later turn", () => {
   const fx = fixture();

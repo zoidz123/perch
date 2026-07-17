@@ -244,18 +244,18 @@ test("a phone-composer turn routes over the real transport as a turn/start RPC o
   await plane.detach("cx-1");
 });
 
-test("a dispatched codex worker's finished turn reports completion without inventing task done", async () => {
+test("an empty-message Codex turn records completion and immediate stalled once", async () => {
   // End-to-end over the real control transport: a daemon-driven codex worker
   // (as the orchestrator dispatches it - no PERCH_SESSION_ID Stop hook fires)
-  // finishes a turn. The final message is observable, but task completion still
-  // requires the worker's explicit reporting contract or the watchdog's
-  // blocked escalation. Nothing silently treats an idle prompt as done.
+  // finishes on a tool result without a final assistant message. Provider
+  // completion must still reach the task reconciler exactly once.
   const home = mkdtempSync(join(tmpdir(), "perch-cc-e2e-"));
   const tasks = new TaskStore({ PERCH_HOME: home } as NodeJS.ProcessEnv);
   const task = tasks.update(tasks.create({ title: "port the fix", project: "/repo" }).id, {
     sessionId: "pty:worker-1"
   });
   tasks.recordEvent(task.id, { kind: "working", source: "worker", message: "starting" });
+  const reconciler = new TaskCompletionReconciler({ tasks });
 
   const daemon = new ScriptedDaemon();
   const plane = new CodexControlPlane({
@@ -265,8 +265,15 @@ test("a dispatched codex worker's finished turn reports completion without inven
       spawn: () => ({ pid: 1, onExit() {}, kill() {} }),
       waitHealthy: async () => {}
     }),
-    createClient: ({ sessionId, onThreadStarted, onTurnComplete, onStatus }) =>
-      new CodexAppServerClient({ sessionId, spawn: () => daemon.transport(), onThreadStarted, onTurnComplete, onStatus })
+    createClient: ({ sessionId, onThreadStarted, onTurnComplete, onTurnStarted, onStatus }) =>
+      new CodexAppServerClient({
+        sessionId,
+        spawn: () => daemon.transport(),
+        onThreadStarted,
+        onTurnComplete,
+        onTurnStarted,
+        onStatus
+      })
   });
 
   const completed: string[] = [];
@@ -275,24 +282,38 @@ test("a dispatched codex worker's finished turn reports completion without inven
   await plane.attach("pty:worker-1", {
     socketPath: "/tmp/s",
     cwd: "/repo",
-    onTurnComplete: (ev) => completed.push(ev.message),
+    onTurnStarted: () => {
+      reconciler.onTurnStarted("pty:worker-1", "codex");
+    },
+    onTurnComplete: (ev) => {
+      completed.push(ev.message);
+      reconciler.onTurnCompleted("pty:worker-1", "codex");
+    },
     onStatus: (status) => statuses.push(status)
   });
 
-  // The daemon drives a full turn: it opens the thread, produces the final
-  // answer, and completes - exactly the v2 notifications a real turn emits.
+  // The daemon drives the incident shape: the last item is a tool result, then
+  // authoritative completion arrives twice through provider notifications.
   daemon.push("thread/started", { thread: { id: "thr_shared" } });
   daemon.push("turn/started", { turn: { id: "turn_1" } });
   daemon.push("item/completed", {
-    item: { type: "agentMessage", id: "a1", text: "Implemented the fix; opened PR https://github.com/o/r/pull/9" }
+    item: { type: "commandExecution", id: "tool_1", aggregatedOutput: "tests passed" }
   });
+  daemon.push("turn/completed", { turn: { id: "turn_1", status: "completed" } });
   daemon.push("turn/completed", { turn: { id: "turn_1", status: "completed" } });
   await tick();
 
   const after = tasks.find(task.id)!;
   assert.equal(after.state, "working");
-  assert.deepEqual(completed, ["Implemented the fix; opened PR https://github.com/o/r/pull/9"]);
+  assert.deepEqual(completed, [""]);
   assert.equal(statuses.at(-1), "idle");
+  const lifecycle = tasks.events(task.id).filter((event) =>
+    event.kind === "turn_started" || event.kind === "turn_completed" || event.kind === "stalled"
+  );
+  assert.deepEqual(lifecycle.map((event) => event.kind), ["turn_started", "turn_completed", "stalled"]);
+  assert.equal(lifecycle[1]?.data?.retryNeeded, true);
+  assert.equal(lifecycle[1]?.data?.outcomeEventSeq, undefined);
+  assert.equal(lifecycle[2]?.data?.reason, "turn_outcome_missing");
 
   await plane.detach("pty:worker-1");
   rmSync(home, { recursive: true, force: true });
