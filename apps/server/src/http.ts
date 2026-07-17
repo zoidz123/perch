@@ -1,6 +1,6 @@
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
 import { randomUUID } from "node:crypto";
-import { accessSync, constants as fsConstants, readFileSync, statSync } from "node:fs";
+import { accessSync, constants as fsConstants, readFileSync, realpathSync, statSync } from "node:fs";
 import { delimiter, extname, join as joinPath, resolve as resolvePath } from "node:path";
 import { WebSocketServer } from "ws";
 import type {
@@ -35,6 +35,8 @@ import type {
   ModelSwitchRequest,
   ModelSwitchResponse,
   NoMistakesDispatchRefusal,
+  NoMistakesAuthorizationRequest,
+  NoMistakesAuthorizationResponse,
   NoMistakesInitResult,
   PlanDocResponse,
   StartAgentRequest,
@@ -1067,6 +1069,16 @@ async function route(
   // the agent's shell and never sees server or device tokens.
   if (request.method === "POST" && pathname === "/hooks") {
     await handleHookReport(request, response, options);
+    return;
+  }
+
+  // The external no-mistakes CLI/daemon calls this immediately before run
+  // creation, gate push, and review-agent launch. A per-session hook token is
+  // non-forgeable and short-lived; every supplied scope field is checked
+  // against the durable task and current runtime generation before mode can
+  // authorize the expensive capability.
+  if (request.method === "POST" && pathname === "/hooks/no-mistakes/authorize") {
+    await handleNoMistakesAuthorization(request, response, options);
     return;
   }
 
@@ -3463,6 +3475,121 @@ async function handleTaskEvent(
   }
 
   writeJson(response, 200, { task: updated });
+}
+
+async function handleNoMistakesAuthorization(
+  request: IncomingMessage,
+  response: ServerResponse,
+  options: HttpServerOptions
+): Promise<void> {
+  const sessionId = String(request.headers["x-perch-session"] ?? "");
+  const token = String(request.headers["x-perch-token"] ?? "");
+  if (!sessionId || !token || !options.hooks.verify(sessionId, token)) {
+    writeJson(response, 401, { error: "Unauthorized" });
+    return;
+  }
+
+  // Runtime ownership is authoritative and is bound before the kickoff prompt
+  // can run. Task projection linkage follows immediately after launch, so
+  // deriving through the runtime also closes that small initial dispatch race.
+  const sessionRuntime = options.tasks.stateDb.runtimes.findBySession(sessionId);
+  const task = sessionRuntime
+    ? options.tasks.find(sessionRuntime.taskId)
+    : options.tasks.list().find((candidate) => candidate.sessionId === sessionId);
+  if (!task) {
+    writeJson(response, 403, { error: "No durable task is linked to this worker session" });
+    return;
+  }
+
+  const body = await readJson<NoMistakesAuthorizationRequest>(request);
+  const taskId = boundedPolicyString(body.taskId, 256);
+  const projectPath = boundedPolicyString(body.projectPath, 4_096);
+  const worktreePath = boundedPolicyString(body.worktreePath, 4_096);
+  const branch = boundedPolicyString(body.branch, 512);
+  const operation = boundedPolicyString(body.operation ?? "run", 32);
+  const runtime = options.tasks.stateDb.runtimes.latestForTask(task.id);
+  const expectedWorktree = runtime?.worktreePath ??
+    (task.worktreeId ? options.worktrees.find(task.worktreeId)?.path : undefined);
+  const expectedBranch = task.branch ?? `perch/${task.id}`;
+
+  let reason = "durable_task_mode_no_mistakes";
+  if (!taskId || !projectPath || !worktreePath || !branch || !operation) {
+    reason = "invalid_request";
+  } else if (taskId !== task.id) {
+    reason = "task_mismatch";
+  } else if (canonicalPolicyPath(projectPath) !== canonicalPolicyPath(task.project)) {
+    reason = "project_mismatch";
+  } else if (!runtime) {
+    reason = "runtime_missing";
+  } else if (runtime.ptySessionId !== sessionId) {
+    reason = "runtime_session_mismatch";
+  } else if (runtime.state !== "live") {
+    reason = "runtime_not_live";
+  } else if (!expectedWorktree || canonicalPolicyPath(worktreePath) !== canonicalPolicyPath(expectedWorktree)) {
+    reason = "worktree_mismatch";
+  } else if (branch !== expectedBranch) {
+    reason = "branch_mismatch";
+  } else if (!new Set(["run", "gate-push", "agent-launch"]).has(operation)) {
+    reason = "unsupported_operation";
+  } else if (task.mode !== "no-mistakes") {
+    reason = "durable_task_mode_denied";
+  }
+
+  let allowed = reason === "durable_task_mode_no_mistakes";
+  const decision = (): NoMistakesAuthorizationResponse => ({
+    allowed,
+    taskId: task.id,
+    runtimeGeneration: runtime?.generation ?? -1,
+    durableMode: task.mode,
+    reason
+  });
+  try {
+    options.tasks.recordEvent(task.id, {
+      kind: "note",
+      source: "system",
+      message: `no-mistakes authorization ${allowed ? "allowed" : "denied"}: ${reason}`,
+      data: {
+        noMistakesAuthorization: {
+          ...decision(),
+          operation,
+          projectPath,
+          worktreePath,
+          branch
+        }
+      }
+    });
+  } catch {
+    allowed = false;
+    reason = "durable_audit_failed";
+    writeJson(response, 503, decision());
+    return;
+  }
+
+  await audit(options.auditLog, {
+    action: "no_mistakes_authorization",
+    sessionId,
+    taskId: task.id,
+    worktreeId: runtime?.worktreeId,
+    runtimeGeneration: runtime?.generation ?? -1,
+    durableMode: task.mode,
+    decision: allowed ? "allow" : "deny",
+    reason
+  });
+  writeJson(response, allowed ? 200 : 403, decision());
+}
+
+function canonicalPolicyPath(path: unknown): string {
+  if (typeof path !== "string" || path.trim().length === 0) return "";
+  const resolved = resolvePath(path);
+  try {
+    return realpathSync(resolved);
+  } catch {
+    return resolved;
+  }
+}
+
+function boundedPolicyString(value: unknown, maxLength: number): string {
+  return typeof value === "string" && value.length <= maxLength ? value.trim() : "";
 }
 
 // Chart registration (the `chart` verb): hook-token callers are pinned to

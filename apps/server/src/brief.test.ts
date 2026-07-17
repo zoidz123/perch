@@ -61,12 +61,26 @@ test("a plan-edit brief points the worker at the staged file and the commit-as-r
   assert.ok(!brief.includes("builds from the finalized plan"));
 });
 
-test("direct-PR and scout briefs never mention the gate driving section", () => {
+test("direct-PR and local-only briefs prohibit no-mistakes while scouts omit gate policy", () => {
   for (const t of [task(), task({ kind: "scout", mode: "no-mistakes" }), task({ mode: "local-only" })]) {
     const brief = dispatchBrief(t, undefined);
     assert.ok(!brief.includes("Ship through the no-mistakes gate"), `unexpected gate section for ${t.kind}/${t.mode}`);
     assert.ok(!brief.includes("data.noMistakes"));
   }
+  const direct = dispatchBrief(task(), undefined);
+  assert.match(direct, /No-mistakes is prohibited for this direct-PR task/);
+  assert.match(direct, /ordinary task-specific tests, builds, and lint/);
+  assert.match(direct, /existing gate remote/);
+
+  const local = dispatchBrief(task({ mode: "local-only" }), undefined);
+  assert.match(local, /No-mistakes is prohibited for this local-only task/);
+  assert.match(local, /keep the work on the local task branch/);
+
+  const gated = dispatchBrief(task({ mode: "no-mistakes" }), undefined);
+  assert.ok(!gated.includes("No-mistakes is prohibited"));
+
+  const scout = dispatchBrief(task({ kind: "scout", mode: "direct-PR" }), undefined);
+  assert.ok(!scout.includes("No-mistakes is prohibited"));
 });
 
 test("the brief points chart authoring at the served guide, never a repo path", () => {

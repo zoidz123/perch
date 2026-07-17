@@ -21,6 +21,7 @@ export type AuditAction =
   | "remove_project"
   | "set_config"
   | "no_mistakes_init"
+  | "no_mistakes_authorization"
   | "release_worktree"
   | "register_chart"
   | "finalize_chart"
@@ -49,6 +50,9 @@ export type AuditRecord = {
   chartId?: string;
   approvalId?: string;
   decision?: string;
+  runtimeGeneration?: number;
+  durableMode?: string;
+  reason?: string;
 };
 
 export class AuditLog {

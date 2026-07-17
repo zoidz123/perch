@@ -25,6 +25,7 @@ import { ProjectRegistry } from "./projects.js";
 import { TaskStore } from "./tasks.js";
 import { TimelineStore } from "./timeline.js";
 import { WorktreePool } from "./worktrees.js";
+import { RuntimeManager } from "./runtimeManager.js";
 
 // T3: setting a project's mode to no-mistakes over HTTP is consent to run
 // `no-mistakes init` right away (O2), and dispatching a task whose effective
@@ -76,6 +77,7 @@ type Fixture = {
   adapter: DispatchAdapter;
   tasks: TaskStore;
   projects: ProjectRegistry;
+  hooks: HookRegistry;
   rpc: (
     method: "GET" | "POST" | "DELETE",
     path: string,
@@ -128,6 +130,8 @@ async function withServer(run: (ctx: Fixture) => Promise<void>): Promise<void> {
   const monitor = new FleetMonitor(adapter, { broadcastMs: 5 });
   const tasks = new TaskStore(env);
   const projects = new ProjectRegistry(env);
+  const hooks = new HookRegistry();
+  const runtimeManager = new RuntimeManager(tasks);
   const timeline = new TimelineStore();
   const options = {
     adapter,
@@ -137,11 +141,12 @@ async function withServer(run: (ctx: Fixture) => Promise<void>): Promise<void> {
     monitor,
     devices: new DeviceRegistry(env),
     port: 0,
-    hooks: new HookRegistry(),
+    hooks,
     timeline,
     projects,
     worktrees: new WorktreePool({ env }),
     tasks,
+    runtimeManager,
     prPoller: new PrPoller(tasks, async () => {
       throw new Error("gh disabled in tests");
     }),
@@ -159,7 +164,7 @@ async function withServer(run: (ctx: Fixture) => Promise<void>): Promise<void> {
       options
     );
   try {
-    await run({ port, home, bin, repo, initLog, adapter, tasks, projects, rpc });
+    await run({ port, home, bin, repo, initLog, adapter, tasks, projects, hooks, rpc });
   } finally {
     timeline.stop();
     server.closeAllConnections?.();
@@ -175,6 +180,33 @@ function post(port: number, path: string, body: unknown): Promise<Response> {
     method: "POST",
     headers: authed,
     body: JSON.stringify(body)
+  });
+}
+
+function authorize(
+  port: number,
+  hooks: HookRegistry,
+  task: { id: string; project: string; branch?: string; sessionId?: string },
+  worktreePath: string,
+  overrides: Record<string, unknown> = {}
+): Promise<Response> {
+  assert.ok(task.sessionId);
+  const token = hooks.register(task.sessionId).token;
+  return fetch(`http://127.0.0.1:${port}/hooks/no-mistakes/authorize`, {
+    method: "POST",
+    headers: {
+      "x-perch-session": task.sessionId,
+      "x-perch-token": token,
+      "content-type": "application/json"
+    },
+    body: JSON.stringify({
+      taskId: task.id,
+      projectPath: task.project,
+      worktreePath,
+      branch: task.branch,
+      operation: "run",
+      ...overrides
+    })
   });
 }
 
@@ -379,5 +411,137 @@ test("a ready gate dispatches normally with mode no-mistakes", async () => {
     assert.equal(created.task.mode, "no-mistakes");
     assert.ok(created.task.sessionId, "worker spawned into the ready gate");
     assert.equal(adapter.sessions.length, 1);
+  });
+});
+
+test("direct-PR and local-only authorization is denied despite prompt words and an existing gate remote", async () => {
+  for (const mode of ["direct-PR", "local-only"] as const) {
+    await withServer(async ({ port, home, repo, adapter, tasks, hooks }) => {
+      execFileSync("git", ["remote", "add", "no-mistakes", join(home, "existing-gate.git")], { cwd: repo });
+      const response = await post(port, "/tasks", {
+        title: `${mode} audit safe hardening public ship validate ready-for-review`,
+        project: repo,
+        mode,
+        prompt: "audit safe hardening public ship validate ready-for-review",
+        dispatch: true
+      });
+      assert.equal(response.status, 201);
+      const body = (await response.json()) as {
+        task: { id: string; project: string; mode: string; branch?: string; sessionId?: string };
+      };
+      const worktreePath = adapter.sessions.at(-1)?.cwd;
+      assert.ok(worktreePath);
+
+      const denied = await authorize(port, hooks, body.task, worktreePath);
+      assert.equal(denied.status, 403);
+      const decision = (await denied.json()) as {
+        allowed: boolean;
+        durableMode: string;
+        reason: string;
+        runtimeGeneration: number;
+      };
+      assert.equal(decision.allowed, false);
+      assert.equal(decision.durableMode, mode);
+      assert.equal(decision.reason, "durable_task_mode_denied");
+      assert.equal(decision.runtimeGeneration, 0);
+
+      const evidence = tasks.events(body.task.id).at(-1);
+      assert.equal(evidence?.kind, "note");
+      assert.equal(evidence?.data?.noMistakesAuthorization &&
+        (evidence.data.noMistakesAuthorization as { reason?: string }).reason, "durable_task_mode_denied");
+      assert.equal(adapter.sessions.length, 1, "authorization did not launch another agent");
+
+      const auditRows = readFileSync(join(home, "audit.jsonl"), "utf8")
+        .trim()
+        .split("\n")
+        .map((line) => JSON.parse(line) as { action: string; decision?: string; durableMode?: string });
+      assert.ok(auditRows.some((row) =>
+        row.action === "no_mistakes_authorization" && row.decision === "deny" && row.durableMode === mode));
+    });
+  }
+});
+
+test("explicit per-task mode override controls authorization in both directions", async () => {
+  await withServer(async ({ port, bin, home, repo, adapter, hooks, projects }) => {
+    writeInitShim(bin, join(home, "override-init.log"));
+    execFileSync("git", ["remote", "add", "no-mistakes", join(home, "ready-gate.git")], { cwd: repo });
+    projects.touch(repo, { mode: "direct-PR" });
+
+    const allowedResponse = await post(port, "/tasks", {
+      title: "explicitly gated",
+      project: repo,
+      mode: "no-mistakes",
+      dispatch: true
+    });
+    assert.equal(allowedResponse.status, 201);
+    const allowedTask = (await allowedResponse.json() as {
+      task: { id: string; project: string; branch?: string; sessionId?: string };
+    }).task;
+    for (const operation of ["run", "gate-push", "agent-launch"] as const) {
+      const allowed = await authorize(port, hooks, allowedTask, adapter.sessions.at(-1)!.cwd!, { operation });
+      assert.equal(allowed.status, 200);
+      assert.equal(((await allowed.json()) as { allowed: boolean }).allowed, true);
+    }
+  });
+
+  await withServer(async ({ port, bin, repo, adapter, hooks }) => {
+    writeInitShim(bin, join(repo, "override-init.log"));
+    assert.equal((await post(port, "/projects", { rootPath: repo, mode: "no-mistakes" })).status, 200);
+    const deniedResponse = await post(port, "/tasks", {
+      title: "explicitly direct",
+      project: repo,
+      mode: "direct-PR",
+      dispatch: true
+    });
+    assert.equal(deniedResponse.status, 201);
+    const deniedTask = (await deniedResponse.json() as {
+      task: { id: string; project: string; branch?: string; sessionId?: string };
+    }).task;
+    const denied = await authorize(port, hooks, deniedTask, adapter.sessions.at(-1)!.cwd!);
+    assert.equal(denied.status, 403);
+    assert.equal(((await denied.json()) as { durableMode: string }).durableMode, "direct-PR");
+  });
+});
+
+test("authorization rejects task, project, worktree, branch, session, and generation replay scopes", async () => {
+  await withServer(async ({ port, bin, repo, adapter, hooks }) => {
+    writeInitShim(bin, join(repo, "scope-init.log"));
+    assert.equal((await post(port, "/projects", { rootPath: repo, mode: "no-mistakes" })).status, 200);
+    const dispatched = await post(port, "/tasks", { title: "scoped gate", project: repo, dispatch: true });
+    const task = (await dispatched.json() as {
+      task: { id: string; project: string; branch?: string; sessionId?: string };
+    }).task;
+    const worktreePath = adapter.sessions.at(-1)!.cwd!;
+
+    for (const [overrides, expectedReason] of [
+      [{ taskId: "another-task" }, "task_mismatch"],
+      [{ projectPath: join(repo, "other") }, "project_mismatch"],
+      [{ worktreePath: join(worktreePath, "other") }, "worktree_mismatch"],
+      [{ branch: "perch/another-task" }, "branch_mismatch"]
+    ] as const) {
+      const denied = await authorize(port, hooks, task, worktreePath, overrides);
+      assert.equal(denied.status, 403);
+      assert.equal(((await denied.json()) as { reason: string }).reason, expectedReason);
+    }
+
+    assert.ok(task.sessionId);
+    const staleToken = hooks.register(task.sessionId).token;
+    hooks.unregister(task.sessionId);
+    const replay = await fetch(`http://127.0.0.1:${port}/hooks/no-mistakes/authorize`, {
+      method: "POST",
+      headers: {
+        "x-perch-session": task.sessionId,
+        "x-perch-token": staleToken,
+        "content-type": "application/json"
+      },
+      body: JSON.stringify({
+        taskId: task.id,
+        projectPath: task.project,
+        worktreePath,
+        branch: task.branch,
+        operation: "run"
+      })
+    });
+    assert.equal(replay.status, 401, "a revoked prior-session credential cannot authorize a recovered generation");
   });
 });

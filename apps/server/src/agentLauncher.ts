@@ -79,6 +79,28 @@ export type StartManagedAgentResult = {
   worktreeId?: string;
 };
 
+// Non-secret launch context for pipeline clients. These values are useful for
+// forming an authorization request but are never authority by themselves;
+// /hooks/no-mistakes/authorize verifies them against the hook credential and
+// durable task/runtime records.
+export function taskCapabilityEnvironment(
+  tasks: TaskStore,
+  request: StartAgentRequest,
+  cwd = request.cwd ?? process.cwd()
+): Record<string, string> {
+  const taskId = request.labels?.task;
+  if (!taskId) return {};
+  const task = tasks.find(taskId);
+  if (!task) return {};
+  return {
+    PERCH_TASK_ID: task.id,
+    PERCH_TASK_MODE: task.mode,
+    PERCH_TASK_PROJECT: task.project,
+    PERCH_TASK_WORKTREE: cwd,
+    PERCH_TASK_BRANCH: task.branch ?? `perch/${task.id}`
+  };
+}
+
 // One codex rollout resolver loop per session: many hooks/control signals can
 // arrive before the first attach, and each would otherwise spawn overlapping
 // filesystem polls.
@@ -250,7 +272,8 @@ async function prepareCodexRemote(
   const hookEnv: Record<string, string> = {
     PERCH_SESSION_ID: sessionId,
     PERCH_HOOK_URL: `http://127.0.0.1:${options.port}/hooks`,
-    PERCH_HOOK_TOKEN: options.hooks.register(sessionId).token
+    PERCH_HOOK_TOKEN: options.hooks.register(sessionId).token,
+    ...taskCapabilityEnvironment(options.tasks, request, cwd)
   };
   const handle = await options.codexControl.prepareRemote(cwd, { effort, env: hookEnv });
   if (!handle) return null;

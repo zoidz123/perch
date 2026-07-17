@@ -48,6 +48,12 @@ Optional project modes control how managed code tasks are delivered:
 - `local-only` keeps delivery on the local task branch.
 - `no-mistakes` uses the opt-in local no-mistakes gate.
 
+Task mode is also the authorization boundary for the expensive no-mistakes pipeline.
+Only a durably persisted `no-mistakes` task may receive authorization.
+`direct-PR` and `local-only` tasks remain denied regardless of prompt language, diff size, repository initialization, or an existing gate remote.
+Perch cannot filter a globally installed Codex or Claude skill catalog per task, so mode-specific dispatch text is defense in depth rather than the security boundary.
+The launch boundary must use the server verifier documented in [No-mistakes authorization](no-mistakes-authorization.md).
+
 Set a mode when registering a project:
 
 ```sh

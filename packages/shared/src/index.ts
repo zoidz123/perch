@@ -614,6 +614,26 @@ export type NoMistakesDispatchRefusal = {
   };
 };
 
+// Server-verified authorization contract consumed by the no-mistakes launch
+// boundary. The worker supplies its non-secret task scope; the server derives
+// mode and runtime generation from the durable ledger behind its per-session
+// hook credential.
+export type NoMistakesAuthorizationRequest = {
+  taskId: string;
+  projectPath: string;
+  worktreePath: string;
+  branch: string;
+  operation?: "run" | "gate-push" | "agent-launch";
+};
+
+export type NoMistakesAuthorizationResponse = {
+  allowed: boolean;
+  taskId: string;
+  runtimeGeneration: number;
+  durableMode: TaskMode;
+  reason: string;
+};
+
 // The boss's answer to a parked no-mistakes gate (POST /tasks/:id/decision,
 // device/server token; also a relay RPC). One action per gate, mirroring
 // upstream's `axi respond` verbs; findingIds and instructions ride only with

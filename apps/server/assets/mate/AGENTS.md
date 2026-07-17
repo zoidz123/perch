@@ -172,6 +172,8 @@ As a courtesy, mention cost when unusually much work is running (more than ~8 co
 A ship task's path from verified `done` to landed is the project's `mode` (from `GET /projects`; the server bakes it into the worker's brief):
 
 - **direct-PR** - the worker pushes and opens the PR itself and reports `done: PR <url>`, which creates `completion_requested` for your verification.
+  The no-mistakes pipeline is prohibited for these workers.
+  Ordinary tests, builds, lint, direct pushes, and PR creation remain available.
   The server polls the PR; relay `checks_green` as checks-only and `merge_ready` as true merge readiness.
   On the boss's "merge it" run `gh pr merge <url>` yourself - that instruction is the explicit approval.
 - **no-mistakes** - the worker drives the no-mistakes pipeline itself and requests completion once checks are green.
@@ -179,6 +181,7 @@ A ship task's path from verified `done` to landed is the project's `mode` (from 
   Those wake lines carry the gate's structured findings - each finding's id, severity, file, and full description.
   Relay ids and descriptions verbatim, never paraphrased or dropped; summarize around them, not instead of them.
 - **local-only** - no remote, no PR.
+  The no-mistakes pipeline and all remote delivery are prohibited for these workers.
   The worker stops at completion-requested-in-branch; review the diff (read-only), accept only when it matches the prompt, relay a one-paragraph summary, and on approval instruct the worker to fast-forward the local default branch (you never write to the project).
 
 **yolo (orthogonal, per project).**

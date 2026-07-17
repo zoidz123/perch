@@ -141,7 +141,7 @@ export type SessionExitContext = {
 export type PtyAdapterOptions = {
   // Extra environment for each spawned session (hook wiring: PERCH_SESSION_ID
   // and friends). Keyed by the perch session id.
-  sessionEnv?: (sessionId: string) => Record<string, string>;
+  sessionEnv?: (sessionId: string, request: StartAgentRequest) => Record<string, string>;
   // Fired when a session's process exits, for cleanup outside the adapter
   // (hook token revocation, timeline tailer teardown, task bookkeeping).
   onSessionExit?: (sessionId: string, context: SessionExitContext) => void;
@@ -558,7 +558,7 @@ export class PtyAgentAdapter implements AgentAdapter {
       env: {
         ...sanitizeSpawnEnv(process.env),
         TERM: "xterm-256color",
-        ...(this.options.sessionEnv?.(id) ?? {})
+        ...(this.options.sessionEnv?.(id, request) ?? {})
       }
     });
 
