@@ -12,6 +12,7 @@ import type {
 } from "@perch/shared";
 import type { AgentAdapter } from "./adapters/types.js";
 import type { AuditLog, AuditRecord } from "./audit.js";
+import { seedClaudeWorktreeTrust } from "./claudeTrust.js";
 import type { CodexControlPlane } from "./codexControl.js";
 import type { FleetMonitor } from "./fleetMonitor.js";
 import { findCodexRollout, isAllowedTranscriptPath, type HookRegistry } from "./hooks.js";
@@ -39,6 +40,9 @@ export type ManagedAgentLauncherOptions = {
   timeline: TimelineStore;
   tasks: TaskStore;
   port: number;
+  // Claude's state file (.claude.json) for pre-launch worktree trust seeding.
+  // The server entrypoint wires the real path; absent means no seeding.
+  claudeStateFile?: string;
   codexControl?: CodexControlPlane;
   taskCompletion?: TaskCompletionReconciler;
   runtimeManager?: RuntimeManager;
@@ -182,6 +186,20 @@ export async function startManagedAgent(
   }
 
   const cwd = request.cwd ?? process.cwd();
+
+  // Claude's folder-trust dialog renders before any hook loads, so no device
+  // can answer it: seed trust ahead of launch for a pool worktree created
+  // from a registered project (registration is the human trust decision this
+  // inherits). Never for paths perch does not manage; codex is untouched.
+  if (
+    options.claudeStateFile &&
+    lease &&
+    launchAgentKind(request.command, request.agent) === "claude" &&
+    options.projects.find(lease.repoRoot)
+  ) {
+    seedClaudeWorktreeTrust(options.claudeStateFile, lease.path);
+  }
+
   const launchModel = resolveSessionModel(launchAgentKind(request.command, request.agent), {
     model: request.model,
     effort: request.effort
