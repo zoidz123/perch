@@ -42,7 +42,7 @@ import { RuntimeManager } from "./runtimeManager.js";
 import { OwnerManager } from "./ownerManager.js";
 
 const config = readConfig();
-const hooks = new HookRegistry();
+const hooks = new HookRegistry(process.env);
 const timeline = new TimelineStore();
 // G6: every task transition and session status change is stamped with its
 // source and counted; GET /doctor/state-metrics serves the snapshot.
@@ -183,6 +183,7 @@ void adapter
   .listSessions()
   .then((sessions) => {
     const live = new Set(sessions.map((session) => session.id));
+    hooks.prune(live);
     runtimeManager.reconcile(live, (sessionId) => Boolean(adapter.runtimeProcess?.(sessionId)));
     ownerManager.reconcile(live, (sessionId) => Boolean(adapter.runtimeProcess?.(sessionId)));
   })

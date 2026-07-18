@@ -24,7 +24,7 @@ private let questionAccent = Style.accent
 // The pending chip: question title + "Answer…", a couple of lines max.
 struct QuestionChip: View {
     let question: PendingQuestion
-    let onSubmit: (_ selections: [[Int]]) async -> Void
+    let onSubmit: (_ selections: [[Int]], _ customAnswers: [String: String]) async -> Void
 
     @State private var showSheet = false
 
@@ -47,6 +47,15 @@ struct QuestionChip: View {
                             .font(.system(size: 12))
                             .foregroundStyle(Style.textSecondary)
                     }
+                    if question.remoteResolutionUnavailable == true {
+                        Text("Answer in Claude on the desktop")
+                            .font(.system(size: 11, weight: .medium))
+                            .foregroundStyle(Style.warningText)
+                    } else if question.submittedAnswers != nil {
+                        Text("Sent - waiting for Claude to continue")
+                            .font(.system(size: 11))
+                            .foregroundStyle(Style.textSecondary)
+                    }
                 }
                 Spacer(minLength: 8)
                 HStack(spacing: 3) {
@@ -67,6 +76,7 @@ struct QuestionChip: View {
             }
         }
         .buttonStyle(.plain)
+        .disabled(question.remoteResolutionUnavailable == true || question.submittedAnswers != nil)
         .sheet(isPresented: $showSheet) {
             QuestionSheet(question: question, onSubmit: onSubmit)
                 .preferredColorScheme(.dark)
@@ -106,10 +116,11 @@ struct AnsweredQuestionChip: View {
 struct QuestionSheet: View {
     @Environment(\.dismiss) private var dismiss
     let question: PendingQuestion
-    let onSubmit: (_ selections: [[Int]]) async -> Void
+    let onSubmit: (_ selections: [[Int]], _ customAnswers: [String: String]) async -> Void
 
     // selections[qi] = chosen option indices for question qi.
     @State private var selections: [Set<Int>] = []
+    @State private var customAnswers: [String: String] = [:]
     @State private var submitting = false
 
     // A lone single-select question submits on the tap itself; anything with a
@@ -119,9 +130,10 @@ struct QuestionSheet: View {
     }
 
     private var canSubmit: Bool {
-        // Every single-select question needs a pick; multi-select may be empty.
-        for (index, item) in question.questions.enumerated() where !(item.multiSelect ?? false) {
-            if (selections[safe: index]?.isEmpty ?? true) {
+        for (index, item) in question.questions.enumerated() {
+            let hasSelection = !(selections[safe: index]?.isEmpty ?? true)
+            let hasOther = !(customAnswers[item.question]?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ?? true)
+            if !hasSelection && !hasOther {
                 return false
             }
         }
@@ -192,6 +204,8 @@ struct QuestionSheet: View {
                 ForEach(Array(item.options.enumerated()), id: \.offset) { oi, option in
                     optionRow(qi: qi, oi: oi, option: option, multiSelect: item.multiSelect ?? false)
                 }
+                TextField("Other…", text: customBinding(for: item.question))
+                    .textFieldStyle(.roundedBorder)
             }
         }
     }
@@ -248,6 +262,13 @@ struct QuestionSheet: View {
         }
     }
 
+    private func customBinding(for question: String) -> Binding<String> {
+        Binding(
+            get: { customAnswers[question] ?? "" },
+            set: { customAnswers[question] = $0 }
+        )
+    }
+
     private func tap(qi: Int, oi: Int, multiSelect: Bool) {
         guard !submitting else { return }
         resetIfNeeded()
@@ -271,7 +292,10 @@ struct QuestionSheet: View {
         guard !submitting else { return }
         submitting = true
         Task {
-            await onSubmit(chosen)
+            await onSubmit(
+                chosen,
+                customAnswers.filter { !$0.value.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
+            )
             submitting = false
             // The chip outside reflects the outcome: it collapses on success
             // and stays pending (for a retry) if the submit did not land.

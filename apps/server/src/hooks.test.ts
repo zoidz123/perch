@@ -94,13 +94,31 @@ test("SessionStart and Stop echo structured responses while other hooks stay sil
   assert.ok(!stopCommand.includes(">/dev/null 2>&1"));
   assert.match(stopCommand, /@- 2>\/dev\/null; exit 0$/);
 
-  // Hooks without structured response semantics keep discarding output.
-  for (const event of ["UserPromptSubmit", "PreToolUse", "SessionEnd"]) {
+  // Telemetry hooks keep discarding output.
+  for (const event of ["UserPromptSubmit", "SessionEnd"]) {
     const perch = settings.hooks[event].filter((entry: { hooks: Array<{ command: string }> }) =>
       entry.hooks.some((hook) => hook.command.includes("$PERCH_HOOK_URL"))
     );
     assert.equal(perch.length, 1, event);
     assert.ok(perch[0].hooks[0].command.includes(">/dev/null 2>&1"), event);
+  }
+
+  const preTool = settings.hooks.PreToolUse.filter((entry: { hooks: Array<{ command: string }> }) =>
+    entry.hooks.some((hook) => hook.command.includes("$PERCH_HOOK_URL"))
+  );
+  assert.equal(preTool.length, 3);
+  assert.deepEqual(preTool.map((entry: { matcher?: string }) => entry.matcher), [undefined, "AskUserQuestion", "ExitPlanMode"]);
+  assert.match(preTool[0].hooks[0].command, /x-perch-observe-only/);
+  for (const entry of preTool.slice(1)) {
+    assert.equal(entry.hooks[0].timeout, 600);
+    assert.match(entry.hooks[0].command, /printf "%s" "\$response"/);
+  }
+  for (const event of ["PermissionRequest", "Elicitation", "ElicitationResult"]) {
+    const entry = settings.hooks[event].find((candidate: { hooks: Array<{ command: string }> }) =>
+      candidate.hooks.some((hook) => hook.command.includes("$PERCH_HOOK_URL"))
+    );
+    assert.equal(entry.hooks[0].timeout, 600);
+    assert.match(entry.hooks[0].command, /--max-time 570/);
   }
 
   // Second run changes nothing.
@@ -172,6 +190,19 @@ test("hook registry verifies per-session tokens and correlates transcripts", () 
   assert.equal(registry.verify("pty:1", token), false);
 });
 
+test("hook auth survives restart with 0600 storage and prunes stale sessions", () => {
+  const home = mkdtempSync(join(tmpdir(), "perch-hook-auth-"));
+  const env = { PERCH_HOME: home } as NodeJS.ProcessEnv;
+  const first = new HookRegistry(env);
+  const { token } = first.register("pty:live");
+  assert.equal(statSync(join(home, "hook-auth.json")).mode & 0o777, 0o600);
+  const restarted = new HookRegistry(env);
+  assert.equal(restarted.verify("pty:live", token), true);
+  restarted.prune(new Set());
+  assert.equal(new HookRegistry(env).verify("pty:live", token), false);
+  rmSync(home, { recursive: true, force: true });
+});
+
 test("normalizes hook events into status transitions and approvals", () => {
   assert.equal(normalizeHookEvent({ hook_event_name: "UserPromptSubmit" }).status, "running");
   assert.equal(normalizeHookEvent({ hook_event_name: "PreToolUse" }).status, "running");
@@ -209,8 +240,8 @@ test("normalizes hook events into status transitions and approvals", () => {
     hook_event_name: "Notification",
     message: "Claude needs your permission to use Bash"
   });
-  assert.equal(permissionNote.status, "needs_approval");
-  assert.ok(permissionNote.approval);
+  assert.equal(permissionNote.status, undefined);
+  assert.equal(permissionNote.approval, undefined);
 
   assert.deepEqual(normalizeHookEvent({ hook_event_name: "SomethingNew" }).status, undefined);
 });

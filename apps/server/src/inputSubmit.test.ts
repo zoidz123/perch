@@ -400,6 +400,46 @@ test("generic Claude approvals wait for a provider status barrier and reject dup
   });
 });
 
+test("Claude PermissionRequest hook blocks on durable CAS and returns exact structured JSON without PTY input", async () => {
+  await withServer(async ({ port, adapter, monitor, hooks }) => {
+    const { token } = hooks.register(SESSION_ID);
+    const hookResponse = fetch(`http://127.0.0.1:${port}/hooks`, {
+      method: "POST",
+      headers: {
+        "x-perch-session": SESSION_ID,
+        "x-perch-token": token,
+        "content-type": "application/json"
+      },
+      body: JSON.stringify({
+        hook_event_name: "PermissionRequest",
+        session_id: "claude-session-1",
+        cwd: "/tmp",
+        tool_name: "Bash",
+        tool_input: { command: "git status --short" }
+      })
+    });
+    let pending = monitor.pendingApproval(SESSION_ID);
+    for (let index = 0; !pending && index < 100; index += 1) {
+      await new Promise((resolve) => setTimeout(resolve, 5));
+      pending = monitor.pendingApproval(SESSION_ID);
+    }
+    assert.equal(pending?.requestVersion, 1);
+    const decision = await fetch(`http://127.0.0.1:${port}/sessions/${encodeURIComponent(SESSION_ID)}/approve`, {
+      method: "POST",
+      headers: { authorization: "Bearer test-token", "content-type": "application/json" },
+      body: JSON.stringify({ id: pending!.id, decision: "allow", requestVersion: 1, runtimeGeneration: pending!.runtimeGeneration ?? null })
+    });
+    assert.equal(decision.status, 202);
+    const response = await hookResponse;
+    assert.equal(response.status, 200);
+    assert.deepEqual(await response.json(), {
+      hookSpecificOutput: { hookEventName: "PermissionRequest", decision: { behavior: "allow" } }
+    });
+    assert.deepEqual(adapter.writes, []);
+    assert.equal(monitor.pendingApproval(SESSION_ID)?.state, "decision_sent");
+  });
+});
+
 test("a verified hook report flips the session's queued task to working", async () => {
   await withServer(async ({ port, tasks, hooks }) => {
     const task = tasks.update(tasks.create({ title: "compute 6x7", project: "/repo" }).id, {

@@ -244,6 +244,7 @@ struct AgentSession: Identifiable, Codable, Equatable {
     let pendingServerRequest: PendingServerRequest?
     // Set while the agent is blocked on an interactive AskUserQuestion prompt.
     let pendingQuestion: PendingQuestion?
+    let pendingClaudeInteraction: PendingClaudeInteraction?
     // Composer messages held server-side until the session can accept input.
     let queuedCount: Int?
     // Durable logical-worker identity. This remains meaningful when its PTY
@@ -261,6 +262,17 @@ struct PendingApproval: Codable, Equatable {
     let context: PendingApprovalContext?
     let source: String?
     let submittedDecision: String?
+    let requestVersion: Int?
+    let state: String?
+    let decisionPolicy: String?
+    let expiresAt: String?
+    let claudeSessionId: String?
+    let runtimeGeneration: Int?
+    let taskId: String?
+    let workerSessionId: String?
+    let toolInputHash: String?
+    let cwd: String?
+    let interactionKind: String?
 }
 
 struct PendingApprovalDecision: Codable, Equatable, Identifiable {
@@ -382,6 +394,41 @@ struct PendingQuestion: Codable, Equatable {
     let id: String
     let questions: [QuestionItem]
     let at: String
+    let requestVersion: Int?
+    let state: String?
+    let answerPolicy: String?
+    let remoteResolutionUnavailable: Bool?
+    let submittedAnswers: [String: String]?
+    let expiresAt: String?
+    let claudeSessionId: String?
+    let toolUseId: String?
+    let runtimeGeneration: Int?
+    let taskId: String?
+    let workerSessionId: String?
+    let questionsHash: String?
+    let cwd: String?
+}
+
+struct PendingClaudeInteraction: Codable, Equatable {
+    let id: String
+    let requestVersion: Int
+    let kind: String
+    let state: String
+    let summary: String
+    let at: String
+    let providerRequestId: String
+    let mode: String?
+    let message: String?
+    let url: String?
+    let requestedSchema: [String: JSONValue]?
+    let proposedAction: String?
+    let proposedContent: [String: JSONValue]?
+    let responseAction: String?
+    let allowedActions: [String]
+    let remoteResolutionUnavailable: Bool?
+    let runtimeGeneration: Int?
+    let taskId: String?
+    let failureReason: String?
 }
 
 struct DesktopContext: Codable, Equatable {

@@ -71,9 +71,8 @@ export function extractQuestions(toolInput: unknown): QuestionItem[] | undefined
   return questions.length > 0 ? questions : undefined;
 }
 
-// A stable id for a set of questions so the two hooks that fire for one prompt
-// (PreToolUse and PermissionRequest) map to the same pending question instead
-// of churning the card. Content-hashed, not time-based.
+// A stable legacy id for degraded question detection. The structured path uses
+// Claude's exact PreToolUse tool_use_id as its authority.
 export function questionId(questions: QuestionItem[]): string {
   const canonical = JSON.stringify(
     questions.map((q) => ({ h: q.header ?? "", q: q.question, m: !!q.multiSelect, o: q.options.map((o) => o.label) }))
