@@ -1527,8 +1527,8 @@ struct SessionDetailView: View {
             }
 
             if let question = session?.pendingQuestion {
-                QuestionChip(question: question) { selections in
-                    await store.answer(sessionId, questionId: question.id, selections: selections)
+                QuestionChip(question: question) { selections, customAnswers in
+                    await store.answer(sessionId, questionId: question.id, selections: selections, customAnswers: customAnswers)
                 }
                 .padding(.horizontal, 12)
             } else if let answered = store.answeredQuestions[sessionId],
@@ -1537,6 +1537,13 @@ struct SessionDetailView: View {
                 // retires once the agent moves the conversation on.
                 AnsweredQuestionChip(answered: answered)
                     .padding(.horizontal, 12)
+            }
+
+            if let interaction = session?.pendingClaudeInteraction {
+                ClaudeInteractionCard(interaction: interaction) { action, content in
+                    await store.respondToClaudeInteraction(sessionId, interactionId: interaction.id, action: action, content: content)
+                }
+                .padding(.horizontal, 12)
             }
 
             if store.lastSubmitQueued || (session?.queuedCount ?? 0) > 0 {

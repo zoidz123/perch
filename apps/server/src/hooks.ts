@@ -44,6 +44,36 @@ const HOOK_COMMAND_SESSION_START =
 // agentic loop once. The server uses that only when the correlated turn has no
 // accepted task outcome. The command still fails open if the server is down.
 const HOOK_COMMAND_STOP = HOOK_COMMAND_SESSION_START;
+const CLAUDE_PRETOOL_OBSERVER_COMMAND =
+  '[ -z "$PERCH_SESSION_ID" ] || curl -sf --max-time 3 -X POST "$PERCH_HOOK_URL" ' +
+  '-H "content-type: application/json" -H "x-perch-observe-only: 1" -H "x-perch-session: $PERCH_SESSION_ID" ' +
+  '-H "x-perch-token: $PERCH_HOOK_TOKEN" --data-binary @- >/dev/null 2>&1; exit 0';
+
+// Claude blocking interactions use synchronous command hooks. Claude's documented
+// command-hook window is ten minutes; the server owns a shorter internal
+// deadline and returns either the exact allow/deny JSON or an empty body. An
+// empty/error response exits 0 so Claude visibly opens its native dialog.
+// Other Claude events and every Codex hook keep their existing behavior.
+const CLAUDE_PERMISSION_HOOK_COMMAND =
+  'if [ -z "$PERCH_SESSION_ID" ]; then exit 0; fi; ' +
+  'response="$(curl -sf --max-time 570 -X POST "$PERCH_HOOK_URL" ' +
+  '-H "content-type: application/json" -H "x-perch-session: $PERCH_SESSION_ID" ' +
+  '-H "x-perch-token: $PERCH_HOOK_TOKEN" --data-binary @- 2>/dev/null)" || { ' +
+  'printf "%s\\n" "Perch remote approval unavailable; use Claude native dialog." >&2; exit 0; }; ' +
+  'if [ -z "$response" ]; then printf "%s\\n" "Perch remote approval expired; use Claude native dialog." >&2; exit 0; fi; ' +
+  'printf "%s" "$response"; exit 0';
+
+const CLAUDE_QUESTION_HOOK_COMMAND =
+  'if [ -z "$PERCH_SESSION_ID" ]; then exit 0; fi; ' +
+  'response="$(curl -sf --max-time 570 -X POST "$PERCH_HOOK_URL" ' +
+  '-H "content-type: application/json" -H "x-perch-session: $PERCH_SESSION_ID" ' +
+  '-H "x-perch-token: $PERCH_HOOK_TOKEN" --data-binary @- 2>/dev/null)" || { ' +
+  'printf "%s\\n" "Perch remote question unavailable; use Claude native question UI." >&2; exit 0; }; ' +
+  'if [ -z "$response" ]; then printf "%s\\n" "Perch remote question expired; use Claude native question UI." >&2; exit 0; fi; ' +
+  'printf "%s" "$response"; exit 0';
+
+const CLAUDE_PLAN_HOOK_COMMAND = CLAUDE_QUESTION_HOOK_COMMAND.replaceAll("question", "plan decision");
+const CLAUDE_ELICITATION_HOOK_COMMAND = CLAUDE_QUESTION_HOOK_COMMAND.replaceAll("question", "MCP interaction");
 
 // The capability note delivered to every solo perch session (mate and crew get
 // richer chart briefings elsewhere): Claude receives it as SessionStart
@@ -71,7 +101,12 @@ const CLAUDE_HOOK_EVENTS = [
   "SessionStart",
   "UserPromptSubmit",
   "PreToolUse",
+  "PostToolUse",
+  "PostToolUseFailure",
   "PermissionRequest",
+  "PermissionDenied",
+  "Elicitation",
+  "ElicitationResult",
   "Notification",
   "Stop",
   "SessionEnd"
@@ -196,13 +231,26 @@ export function installClaudeHooks(env: NodeJS.ProcessEnv = process.env): boolea
     // Replacing marker-matched entries also UPGRADES an older installed perch
     // command in place (e.g. SessionStart gaining the echo variant).
     const command =
-      event === "SessionStart"
+      event === "PermissionRequest"
+        ? CLAUDE_PERMISSION_HOOK_COMMAND
+        : event === "Elicitation" || event === "ElicitationResult"
+          ? CLAUDE_ELICITATION_HOOK_COMMAND
+        : event === "PreToolUse"
+          ? CLAUDE_QUESTION_HOOK_COMMAND
+        : event === "SessionStart"
         ? HOOK_COMMAND_SESSION_START
         : event === "Stop"
           ? HOOK_COMMAND_STOP
           : HOOK_COMMAND;
-    const perchEntry: HookEntry = { hooks: [{ type: "command", command, timeout: 10 }] };
-    const next = [...withoutPerch, perchEntry];
+    const synchronous = event === "PermissionRequest" || event === "PreToolUse" || event === "Elicitation" || event === "ElicitationResult";
+    const perchEntries: HookEntry[] = event === "PreToolUse"
+      ? [
+          { hooks: [{ type: "command", command: CLAUDE_PRETOOL_OBSERVER_COMMAND, timeout: 10 }] },
+          { matcher: ASK_USER_QUESTION_TOOL, hooks: [{ type: "command", command, timeout: 600 }] },
+          { matcher: "ExitPlanMode", hooks: [{ type: "command", command: CLAUDE_PLAN_HOOK_COMMAND, timeout: 600 }] }
+        ]
+      : [{ hooks: [{ type: "command", command, timeout: synchronous ? 600 : 10 }] }];
+    const next = [...withoutPerch, ...perchEntries];
     if (JSON.stringify(next) !== JSON.stringify(entries)) {
       changed = true;
     }
@@ -486,11 +534,32 @@ export type HookCorrelation = {
 export class HookRegistry {
   private readonly tokens = new Map<string, string>(); // token -> perch session id
   private readonly correlations = new Map<string, HookCorrelation>();
+  private readonly durablePath?: string;
+
+  constructor(env?: NodeJS.ProcessEnv) {
+    if (!env) return;
+    const root = env.PERCH_HOME ?? join(homedir(), ".perch");
+    this.durablePath = join(root, "hook-auth.json");
+    try {
+      const stored = JSON.parse(readFileSync(this.durablePath, "utf8")) as { version?: number; sessions?: Record<string, string> };
+      if (stored.version === 1 && stored.sessions) {
+        for (const [sessionId, token] of Object.entries(stored.sessions)) {
+          if (sessionId && /^[a-f0-9]{32}$/.test(token)) this.tokens.set(token, sessionId);
+        }
+      }
+    } catch {
+      // First startup or corrupt legacy state. Fresh registrations replace it.
+    }
+  }
 
   register(sessionId: string): { token: string } {
+    for (const [token, registered] of this.tokens) {
+      if (registered === sessionId) this.tokens.delete(token);
+    }
     const token = randomBytes(16).toString("hex");
     this.tokens.set(token, sessionId);
     this.correlations.set(sessionId, { sessionId });
+    this.persist();
     return { token };
   }
 
@@ -501,6 +570,19 @@ export class HookRegistry {
       }
     }
     this.correlations.delete(sessionId);
+    this.persist();
+  }
+
+  prune(activeSessionIds: Set<string>): void {
+    let changed = false;
+    for (const [token, sessionId] of this.tokens) {
+      if (!activeSessionIds.has(sessionId)) {
+        this.tokens.delete(token);
+        this.correlations.delete(sessionId);
+        changed = true;
+      }
+    }
+    if (changed) this.persist();
   }
 
   verify(sessionId: string, token: string): boolean {
@@ -520,6 +602,16 @@ export class HookRegistry {
 
   correlation(sessionId: string): HookCorrelation | undefined {
     return this.correlations.get(sessionId);
+  }
+
+  private persist(): void {
+    if (!this.durablePath) return;
+    mkdirSync(dirname(this.durablePath), { recursive: true });
+    const sessions = Object.fromEntries([...this.tokens].map(([token, sessionId]) => [sessionId, token]));
+    const tmp = `${this.durablePath}.tmp`;
+    writeFileSync(tmp, `${JSON.stringify({ version: 1, sessions }, null, 2)}\n`, { mode: 0o600 });
+    chmodSync(tmp, 0o600);
+    renameSync(tmp, this.durablePath);
   }
 }
 
@@ -584,12 +676,12 @@ export function normalizeHookEvent(payload: HookEventPayload): NormalizedHookEve
     transcriptPath: typeof payload.transcript_path === "string" ? payload.transcript_path : undefined
   };
 
-  // AskUserQuestion is an interactive selection, not a permission. Both its
-  // hooks (PreToolUse and PermissionRequest) carry the questions in tool_input;
-  // route either to a question payload so the phone gets an actionable card
+  // AskUserQuestion is an interactive selection, not a permission.
+  // The official AskUserQuestion path is its narrow PreToolUse matcher.
+  // PermissionRequest remains a separate allow/deny interaction.
   // instead of a bare "running" line or a misleading allow/deny approval.
   if (
-    (event === "PreToolUse" || event === "PermissionRequest") &&
+    event === "PreToolUse" &&
     payload.tool_name === ASK_USER_QUESTION_TOOL
   ) {
     const questions = extractQuestions(payload.tool_input);
@@ -625,17 +717,7 @@ export function normalizeHookEvent(payload: HookEventPayload): NormalizedHookEve
     }
     case "Notification": {
       const message = typeof payload.message === "string" ? payload.message : "";
-      // Permission-shaped notifications gate the composer like a real prompt.
-      if (/permission|approv/i.test(message)) {
-        return {
-          status: "needs_approval",
-          approval: {
-            id: `${event}-${Date.now().toString(36)}-${randomBytes(3).toString("hex")}`,
-            summary: message
-          },
-          correlation
-        };
-      }
+      // Notifications are reference-only. They never create decision authority.
       // "Waiting for your input" is the opposite of blocked: the composer is
       // exactly what the agent wants. Treating it as an approval would queue
       // every subsequent message forever (found the hard way in E2E).

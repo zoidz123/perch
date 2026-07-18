@@ -5,7 +5,7 @@ import { join } from "node:path";
 import type { Task, TaskEvent, TaskEventKind, TaskEventSource } from "@perch/shared";
 import Database from "better-sqlite3";
 
-const LATEST_SCHEMA_VERSION = 4;
+const LATEST_SCHEMA_VERSION = 9;
 const LEGACY_TASK_IMPORT = "tasks-json-v1";
 
 const MIGRATIONS = [
@@ -189,6 +189,181 @@ const MIGRATIONS = [
       ALTER TABLE runtimes ADD COLUMN parent_owner_id TEXT REFERENCES durable_owners(id) ON DELETE RESTRICT;
       CREATE INDEX runtimes_parent_owner_idx ON runtimes(parent_owner_id, state);
     `
+  },
+  {
+    version: 5,
+    name: "durable-claude-approvals",
+    sql: `
+      CREATE TABLE claude_approvals (
+        id TEXT PRIMARY KEY,
+        version INTEGER NOT NULL CHECK (version = 1),
+        state TEXT NOT NULL CHECK (state IN ('pending', 'decided', 'decision_sent', 'continued', 'denied', 'expired', 'canceled', 'local_fallback')),
+        perch_session_id TEXT NOT NULL,
+        claude_session_id TEXT NOT NULL,
+        prompt_identity TEXT NOT NULL,
+        tool_name TEXT NOT NULL,
+        tool_input_json TEXT NOT NULL,
+        tool_input_hash TEXT NOT NULL,
+        summary TEXT NOT NULL,
+        command TEXT,
+        cwd TEXT,
+        transcript_path TEXT,
+        runtime_generation INTEGER,
+        task_id TEXT REFERENCES tasks(id) ON DELETE RESTRICT,
+        worker_session_id TEXT NOT NULL,
+        parent_session_id TEXT,
+        decision_policy TEXT NOT NULL CHECK (decision_policy = 'boss_only'),
+        decision TEXT CHECK (decision IN ('allow', 'deny', 'allow_always')),
+        selected_permission_json TEXT,
+        decided_by TEXT,
+        decided_at TEXT,
+        decision_sent_at TEXT,
+        confirmed_at TEXT,
+        expires_at TEXT NOT NULL,
+        failure_reason TEXT,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+      ) STRICT;
+      CREATE INDEX claude_approvals_session_idx
+        ON claude_approvals(perch_session_id, created_at DESC);
+      CREATE INDEX claude_approvals_open_idx
+        ON claude_approvals(state, expires_at, created_at);
+      CREATE INDEX claude_approvals_identity_idx
+        ON claude_approvals(perch_session_id, prompt_identity, created_at DESC);
+    `
+  },
+  {
+    version: 6,
+    name: "durable-claude-questions",
+    sql: `
+      CREATE TABLE claude_questions (
+        id TEXT PRIMARY KEY,
+        version INTEGER NOT NULL CHECK (version = 1),
+        state TEXT NOT NULL CHECK (state IN ('waiting', 'answer_sent', 'continued', 'expired', 'local_fallback', 'simultaneous_fallback')),
+        perch_session_id TEXT NOT NULL,
+        claude_session_id TEXT NOT NULL,
+        tool_use_id TEXT NOT NULL,
+        questions_json TEXT NOT NULL,
+        questions_hash TEXT NOT NULL,
+        answers_json TEXT,
+        cwd TEXT,
+        transcript_path TEXT,
+        runtime_generation INTEGER,
+        task_id TEXT REFERENCES tasks(id) ON DELETE RESTRICT,
+        worker_session_id TEXT NOT NULL,
+        parent_session_id TEXT,
+        answer_policy TEXT NOT NULL CHECK (answer_policy = 'boss_only'),
+        answered_by TEXT,
+        answered_at TEXT,
+        answer_sent_at TEXT,
+        confirmed_at TEXT,
+        expires_at TEXT NOT NULL,
+        failure_reason TEXT,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+      ) STRICT;
+      CREATE INDEX claude_questions_session_idx
+        ON claude_questions(perch_session_id, created_at DESC);
+      CREATE INDEX claude_questions_open_idx
+        ON claude_questions(state, expires_at, created_at);
+      CREATE UNIQUE INDEX claude_questions_tool_use_idx
+        ON claude_questions(perch_session_id, tool_use_id);
+    `
+  },
+  {
+    version: 7,
+    name: "typed-claude-approval-kinds",
+    sql: `
+      ALTER TABLE claude_approvals ADD COLUMN interaction_kind TEXT NOT NULL DEFAULT 'permission_request'
+        CHECK (interaction_kind IN ('permission_request', 'exit_plan_mode'));
+      ALTER TABLE claude_approvals ADD COLUMN hook_event_name TEXT NOT NULL DEFAULT 'PermissionRequest'
+        CHECK (hook_event_name IN ('PermissionRequest', 'PreToolUse'));
+    `
+  },
+  {
+    version: 8,
+    name: "durable-claude-blocking-interactions",
+    sql: `
+      CREATE TABLE claude_interactions (
+        id TEXT PRIMARY KEY,
+        version INTEGER NOT NULL CHECK (version = 1),
+        kind TEXT NOT NULL CHECK (kind IN ('elicitation', 'elicitation_result', 'permission_denied', 'pty_manual_gate')),
+        state TEXT NOT NULL CHECK (state IN ('waiting', 'response_sent', 'confirmed', 'expired', 'local_fallback', 'observed')),
+        perch_session_id TEXT NOT NULL,
+        claude_session_id TEXT,
+        provider_request_id TEXT NOT NULL,
+        payload_json TEXT NOT NULL,
+        payload_hash TEXT NOT NULL,
+        summary TEXT NOT NULL,
+        runtime_generation INTEGER,
+        task_id TEXT REFERENCES tasks(id) ON DELETE RESTRICT,
+        response_action TEXT CHECK (response_action IN ('accept', 'decline', 'cancel')),
+        response_content_json TEXT,
+        responded_by TEXT,
+        responded_at TEXT,
+        confirmed_at TEXT,
+        expires_at TEXT,
+        failure_reason TEXT,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        UNIQUE(perch_session_id, kind, provider_request_id)
+      ) STRICT;
+      CREATE INDEX claude_interactions_session_idx ON claude_interactions(perch_session_id, created_at DESC);
+      CREATE INDEX claude_interactions_open_idx ON claude_interactions(state, created_at);
+    `
+  },
+  {
+    version: 9,
+    name: "claude-inbox-correlation-and-deltas",
+    sql: `
+      CREATE TABLE claude_tool_occurrences (
+        id TEXT PRIMARY KEY,
+        perch_session_id TEXT NOT NULL,
+        claude_session_id TEXT NOT NULL,
+        tool_use_id TEXT NOT NULL,
+        tool_name TEXT NOT NULL,
+        tool_input_hash TEXT NOT NULL,
+        runtime_generation INTEGER,
+        occurrence INTEGER NOT NULL,
+        consumed_at TEXT,
+        created_at TEXT NOT NULL,
+        UNIQUE(perch_session_id, tool_use_id)
+      ) STRICT;
+      CREATE INDEX claude_tool_occurrences_match_idx
+        ON claude_tool_occurrences(perch_session_id, claude_session_id, tool_name, tool_input_hash, consumed_at, created_at DESC);
+      CREATE TABLE claude_inbox_deltas (
+        seq INTEGER PRIMARY KEY AUTOINCREMENT,
+        request_type TEXT NOT NULL CHECK (request_type IN ('permission', 'question', 'interaction')),
+        request_id TEXT NOT NULL,
+        state TEXT NOT NULL,
+        snapshot_json TEXT NOT NULL,
+        at TEXT NOT NULL
+      ) STRICT;
+      CREATE TRIGGER claude_approval_insert_delta AFTER INSERT ON claude_approvals BEGIN
+        INSERT INTO claude_inbox_deltas(request_type, request_id, state, snapshot_json, at)
+        VALUES ('permission', NEW.id, NEW.state, json_object('id', NEW.id, 'version', NEW.version, 'state', NEW.state, 'kind', NEW.interaction_kind, 'sessionId', NEW.perch_session_id, 'runtimeGeneration', NEW.runtime_generation, 'taskId', NEW.task_id), NEW.updated_at);
+      END;
+      CREATE TRIGGER claude_approval_update_delta AFTER UPDATE ON claude_approvals BEGIN
+        INSERT INTO claude_inbox_deltas(request_type, request_id, state, snapshot_json, at)
+        VALUES ('permission', NEW.id, NEW.state, json_object('id', NEW.id, 'version', NEW.version, 'state', NEW.state, 'kind', NEW.interaction_kind, 'sessionId', NEW.perch_session_id, 'runtimeGeneration', NEW.runtime_generation, 'taskId', NEW.task_id), NEW.updated_at);
+      END;
+      CREATE TRIGGER claude_question_insert_delta AFTER INSERT ON claude_questions BEGIN
+        INSERT INTO claude_inbox_deltas(request_type, request_id, state, snapshot_json, at)
+        VALUES ('question', NEW.id, NEW.state, json_object('id', NEW.id, 'version', NEW.version, 'state', NEW.state, 'sessionId', NEW.perch_session_id, 'runtimeGeneration', NEW.runtime_generation, 'taskId', NEW.task_id), NEW.updated_at);
+      END;
+      CREATE TRIGGER claude_question_update_delta AFTER UPDATE ON claude_questions BEGIN
+        INSERT INTO claude_inbox_deltas(request_type, request_id, state, snapshot_json, at)
+        VALUES ('question', NEW.id, NEW.state, json_object('id', NEW.id, 'version', NEW.version, 'state', NEW.state, 'sessionId', NEW.perch_session_id, 'runtimeGeneration', NEW.runtime_generation, 'taskId', NEW.task_id), NEW.updated_at);
+      END;
+      CREATE TRIGGER claude_interaction_insert_delta AFTER INSERT ON claude_interactions BEGIN
+        INSERT INTO claude_inbox_deltas(request_type, request_id, state, snapshot_json, at)
+        VALUES ('interaction', NEW.id, NEW.state, json_object('id', NEW.id, 'version', NEW.version, 'state', NEW.state, 'kind', NEW.kind, 'sessionId', NEW.perch_session_id, 'runtimeGeneration', NEW.runtime_generation, 'taskId', NEW.task_id), NEW.updated_at);
+      END;
+      CREATE TRIGGER claude_interaction_update_delta AFTER UPDATE ON claude_interactions BEGIN
+        INSERT INTO claude_inbox_deltas(request_type, request_id, state, snapshot_json, at)
+        VALUES ('interaction', NEW.id, NEW.state, json_object('id', NEW.id, 'version', NEW.version, 'state', NEW.state, 'kind', NEW.kind, 'sessionId', NEW.perch_session_id, 'runtimeGeneration', NEW.runtime_generation, 'taskId', NEW.task_id), NEW.updated_at);
+      END;
+    `
   }
 ] as const;
 
@@ -301,6 +476,130 @@ export type NotificationOutboxRecord = {
   createdAt: string;
 };
 
+export type ClaudeApprovalState =
+  | "pending"
+  | "decided"
+  | "decision_sent"
+  | "continued"
+  | "denied"
+  | "expired"
+  | "canceled"
+  | "local_fallback";
+
+export type ClaudeApprovalRecord = {
+  id: string;
+  version: 1;
+  state: ClaudeApprovalState;
+  interactionKind: "permission_request" | "exit_plan_mode";
+  hookEventName: "PermissionRequest" | "PreToolUse";
+  perchSessionId: string;
+  claudeSessionId: string;
+  promptIdentity: string;
+  toolName: string;
+  toolInput: Record<string, unknown>;
+  toolInputHash: string;
+  summary: string;
+  command?: string;
+  cwd?: string;
+  transcriptPath?: string;
+  runtimeGeneration?: number;
+  taskId?: string;
+  workerSessionId: string;
+  parentSessionId?: string;
+  decisionPolicy: "boss_only";
+  decision?: "allow" | "deny" | "allow_always";
+  selectedPermission?: Record<string, unknown>;
+  decidedBy?: string;
+  decidedAt?: string;
+  decisionSentAt?: string;
+  confirmedAt?: string;
+  expiresAt: string;
+  failureReason?: string;
+  createdAt: string;
+  updatedAt: string;
+};
+
+export type ClaudeQuestionState =
+  | "waiting"
+  | "answer_sent"
+  | "continued"
+  | "expired"
+  | "local_fallback"
+  | "simultaneous_fallback";
+
+export type ClaudeQuestionRecord = {
+  id: string;
+  version: 1;
+  state: ClaudeQuestionState;
+  perchSessionId: string;
+  claudeSessionId: string;
+  toolUseId: string;
+  questions: unknown[];
+  questionsHash: string;
+  answers?: Record<string, string>;
+  cwd?: string;
+  transcriptPath?: string;
+  runtimeGeneration?: number;
+  taskId?: string;
+  workerSessionId: string;
+  parentSessionId?: string;
+  answerPolicy: "boss_only";
+  answeredBy?: string;
+  answeredAt?: string;
+  answerSentAt?: string;
+  confirmedAt?: string;
+  expiresAt: string;
+  failureReason?: string;
+  createdAt: string;
+  updatedAt: string;
+};
+
+export type ClaudeInteractionRecord = {
+  id: string;
+  version: 1;
+  kind: "elicitation" | "elicitation_result" | "permission_denied" | "pty_manual_gate";
+  state: "waiting" | "response_sent" | "confirmed" | "expired" | "local_fallback" | "observed";
+  perchSessionId: string;
+  claudeSessionId?: string;
+  providerRequestId: string;
+  payload: Record<string, unknown>;
+  payloadHash: string;
+  summary: string;
+  runtimeGeneration?: number;
+  taskId?: string;
+  responseAction?: "accept" | "decline" | "cancel";
+  responseContent?: Record<string, unknown>;
+  respondedBy?: string;
+  respondedAt?: string;
+  confirmedAt?: string;
+  expiresAt?: string;
+  failureReason?: string;
+  createdAt: string;
+  updatedAt: string;
+};
+
+export type ClaudeToolOccurrence = {
+  id: string;
+  perchSessionId: string;
+  claudeSessionId: string;
+  toolUseId: string;
+  toolName: string;
+  toolInputHash: string;
+  runtimeGeneration?: number;
+  occurrence: number;
+  consumedAt?: string;
+  createdAt: string;
+};
+
+export type ClaudeInboxDelta = {
+  seq: number;
+  requestType: "permission" | "question" | "interaction";
+  requestId: string;
+  state: string;
+  snapshot: Record<string, unknown>;
+  at: string;
+};
+
 type TaskEventInput = {
   kind: TaskEventKind;
   message?: string;
@@ -328,6 +627,11 @@ export class StateDb {
   readonly ownerRuntimes: OwnerRuntimeRepository;
   readonly ownerOperations: OwnerOperationRepository;
   readonly outbox: NotificationOutboxRepository;
+  readonly claudeApprovals: ClaudeApprovalRepository;
+  readonly claudeQuestions: ClaudeQuestionRepository;
+  readonly claudeInteractions: ClaudeInteractionRepository;
+  readonly claudeToolOccurrences: ClaudeToolOccurrenceRepository;
+  readonly claudeInbox: ClaudeInboxRepository;
   private readonly db: Database.Database;
 
   constructor(env: NodeJS.ProcessEnv = process.env) {
@@ -345,6 +649,11 @@ export class StateDb {
     this.ownerRuntimes = new OwnerRuntimeRepository(this.db);
     this.ownerOperations = new OwnerOperationRepository(this.db);
     this.outbox = new NotificationOutboxRepository(this.db);
+    this.claudeApprovals = new ClaudeApprovalRepository(this.db);
+    this.claudeQuestions = new ClaudeQuestionRepository(this.db);
+    this.claudeInteractions = new ClaudeInteractionRepository(this.db);
+    this.claudeToolOccurrences = new ClaudeToolOccurrenceRepository(this.db);
+    this.claudeInbox = new ClaudeInboxRepository(this.db);
     this.importLegacyTasks(join(home, "tasks"));
   }
 
@@ -1121,6 +1430,371 @@ export class NotificationOutboxRepository {
   }
 }
 
+export class ClaudeApprovalRepository {
+  constructor(private readonly db: Database.Database) {}
+
+  create(input: Omit<ClaudeApprovalRecord, "id" | "version" | "state" | "createdAt" | "updatedAt">): ClaudeApprovalRecord {
+    const now = new Date().toISOString();
+    const record: ClaudeApprovalRecord = {
+      ...input,
+      id: randomUUID(),
+      version: 1,
+      state: "pending",
+      createdAt: now,
+      updatedAt: now
+    };
+    this.db.prepare(
+      `INSERT INTO claude_approvals(
+         id, version, state, interaction_kind, hook_event_name, perch_session_id, claude_session_id, prompt_identity,
+         tool_name, tool_input_json, tool_input_hash, summary, command, cwd,
+         transcript_path, runtime_generation, task_id, worker_session_id,
+         parent_session_id, decision_policy, expires_at, created_at, updated_at
+       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+    ).run(
+      record.id,
+      record.version,
+      record.state,
+      record.interactionKind,
+      record.hookEventName,
+      record.perchSessionId,
+      record.claudeSessionId,
+      record.promptIdentity,
+      record.toolName,
+      JSON.stringify(record.toolInput),
+      record.toolInputHash,
+      record.summary,
+      record.command ?? null,
+      record.cwd ?? null,
+      record.transcriptPath ?? null,
+      record.runtimeGeneration ?? null,
+      record.taskId ?? null,
+      record.workerSessionId,
+      record.parentSessionId ?? null,
+      record.decisionPolicy,
+      record.expiresAt,
+      record.createdAt,
+      record.updatedAt
+    );
+    return record;
+  }
+
+  find(id: string): ClaudeApprovalRecord | undefined {
+    const row = this.db.prepare("SELECT * FROM claude_approvals WHERE id = ?").get(id) as
+      | ClaudeApprovalRow
+      | undefined;
+    return row ? claudeApprovalFromRow(row) : undefined;
+  }
+
+  latestForIdentity(perchSessionId: string, promptIdentity: string): ClaudeApprovalRecord | undefined {
+    const row = this.db.prepare(
+      `SELECT * FROM claude_approvals
+       WHERE perch_session_id = ? AND prompt_identity = ?
+       ORDER BY created_at DESC LIMIT 1`
+    ).get(perchSessionId, promptIdentity) as ClaudeApprovalRow | undefined;
+    return row ? claudeApprovalFromRow(row) : undefined;
+  }
+
+  latestForSession(perchSessionId: string): ClaudeApprovalRecord | undefined {
+    const row = this.db.prepare(
+      `SELECT * FROM claude_approvals WHERE perch_session_id = ? ORDER BY created_at DESC LIMIT 1`
+    ).get(perchSessionId) as ClaudeApprovalRow | undefined;
+    return row ? claudeApprovalFromRow(row) : undefined;
+  }
+
+  effective(): ClaudeApprovalRecord[] {
+    return (this.db.prepare(
+      `SELECT current.* FROM claude_approvals current
+       JOIN (
+         SELECT perch_session_id, max(created_at) AS created_at
+         FROM claude_approvals GROUP BY perch_session_id
+       ) latest
+       ON latest.perch_session_id = current.perch_session_id
+         AND latest.created_at = current.created_at
+       ORDER BY current.created_at`
+    ).all() as ClaudeApprovalRow[]).map(claudeApprovalFromRow);
+  }
+
+  decide(
+    id: string,
+    decision: "allow" | "deny" | "allow_always",
+    decidedBy: string,
+    selectedPermission?: Record<string, unknown>,
+    now = new Date().toISOString()
+  ): { record?: ClaudeApprovalRecord; outcome: "accepted" | "idempotent" | "conflict" | "missing" } {
+    const run = this.db.transaction(() => {
+      const current = this.find(id);
+      if (!current) return { outcome: "missing" as const };
+      if (["decided", "decision_sent"].includes(current.state) && current.decision === decision &&
+          (decision !== "allow_always" || JSON.stringify(current.selectedPermission) === JSON.stringify(selectedPermission))) {
+        return { record: current, outcome: "idempotent" as const };
+      }
+      if (current.state !== "pending") return { record: current, outcome: "conflict" as const };
+      const result = this.db.prepare(
+        `UPDATE claude_approvals
+         SET state = 'decided', decision = ?, selected_permission_json = ?, decided_by = ?, decided_at = ?, updated_at = ?
+         WHERE id = ? AND state = 'pending'`
+      ).run(decision, selectedPermission ? JSON.stringify(selectedPermission) : null, decidedBy, now, now, id);
+      if (result.changes !== 1) return { record: this.find(id), outcome: "conflict" as const };
+      return { record: this.find(id), outcome: "accepted" as const };
+    });
+    return run.immediate();
+  }
+
+  transition(
+    id: string,
+    expected: ClaudeApprovalState | readonly ClaudeApprovalState[],
+    state: ClaudeApprovalState,
+    patch: { failureReason?: string; confirmedAt?: string } = {},
+    now = new Date().toISOString()
+  ): ClaudeApprovalRecord | undefined {
+    const expectedStates = Array.isArray(expected) ? expected : [expected];
+    const result = this.db.prepare(
+      `UPDATE claude_approvals
+       SET state = ?, failure_reason = ?, confirmed_at = ?,
+           decision_sent_at = CASE WHEN ? = 'decision_sent' THEN ? ELSE decision_sent_at END,
+           updated_at = ?
+       WHERE id = ? AND state IN (${expectedStates.map(() => "?").join(",")})`
+    ).run(
+      state,
+      patch.failureReason ?? null,
+      patch.confirmedAt ?? null,
+      state,
+      now,
+      now,
+      id,
+      ...expectedStates
+    );
+    return result.changes === 1 ? this.find(id) : undefined;
+  }
+}
+
+export class ClaudeQuestionRepository {
+  constructor(private readonly db: Database.Database) {}
+
+  create(input: Omit<ClaudeQuestionRecord, "id" | "version" | "state" | "createdAt" | "updatedAt">): ClaudeQuestionRecord {
+    const now = new Date().toISOString();
+    const record: ClaudeQuestionRecord = {
+      ...input,
+      id: randomUUID(),
+      version: 1,
+      state: "waiting",
+      createdAt: now,
+      updatedAt: now
+    };
+    this.db.prepare(
+      `INSERT INTO claude_questions(
+         id, version, state, perch_session_id, claude_session_id, tool_use_id,
+         questions_json, questions_hash, cwd, transcript_path, runtime_generation,
+         task_id, worker_session_id, parent_session_id, answer_policy, expires_at,
+         created_at, updated_at
+       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+    ).run(
+      record.id, record.version, record.state, record.perchSessionId, record.claudeSessionId,
+      record.toolUseId, JSON.stringify(record.questions), record.questionsHash, record.cwd ?? null,
+      record.transcriptPath ?? null, record.runtimeGeneration ?? null, record.taskId ?? null,
+      record.workerSessionId, record.parentSessionId ?? null, record.answerPolicy,
+      record.expiresAt, record.createdAt, record.updatedAt
+    );
+    return record;
+  }
+
+  find(id: string): ClaudeQuestionRecord | undefined {
+    const row = this.db.prepare("SELECT * FROM claude_questions WHERE id = ?").get(id) as ClaudeQuestionRow | undefined;
+    return row ? claudeQuestionFromRow(row) : undefined;
+  }
+
+  findByToolUse(perchSessionId: string, toolUseId: string): ClaudeQuestionRecord | undefined {
+    const row = this.db.prepare(
+      "SELECT * FROM claude_questions WHERE perch_session_id = ? AND tool_use_id = ?"
+    ).get(perchSessionId, toolUseId) as ClaudeQuestionRow | undefined;
+    return row ? claudeQuestionFromRow(row) : undefined;
+  }
+
+  latestForSession(perchSessionId: string): ClaudeQuestionRecord | undefined {
+    const row = this.db.prepare(
+      "SELECT * FROM claude_questions WHERE perch_session_id = ? ORDER BY created_at DESC LIMIT 1"
+    ).get(perchSessionId) as ClaudeQuestionRow | undefined;
+    return row ? claudeQuestionFromRow(row) : undefined;
+  }
+
+  activeForSession(perchSessionId: string): ClaudeQuestionRecord | undefined {
+    const row = this.db.prepare(
+      `SELECT * FROM claude_questions
+       WHERE perch_session_id = ? AND state IN ('waiting', 'answer_sent')
+       ORDER BY created_at DESC LIMIT 1`
+    ).get(perchSessionId) as ClaudeQuestionRow | undefined;
+    return row ? claudeQuestionFromRow(row) : undefined;
+  }
+
+  effective(): ClaudeQuestionRecord[] {
+    return (this.db.prepare(
+      `SELECT current.* FROM claude_questions current
+       JOIN (SELECT perch_session_id, max(created_at) AS created_at FROM claude_questions GROUP BY perch_session_id) latest
+       ON latest.perch_session_id = current.perch_session_id AND latest.created_at = current.created_at
+       ORDER BY current.created_at`
+    ).all() as ClaudeQuestionRow[]).map(claudeQuestionFromRow);
+  }
+
+  answer(
+    id: string,
+    answers: Record<string, string>,
+    answeredBy: string,
+    now = new Date().toISOString()
+  ): { record?: ClaudeQuestionRecord; outcome: "accepted" | "idempotent" | "conflict" | "missing" } {
+    const run = this.db.transaction(() => {
+      const current = this.find(id);
+      if (!current) return { outcome: "missing" as const };
+      if (current.state === "answer_sent" && JSON.stringify(current.answers) === JSON.stringify(answers)) {
+        return { record: current, outcome: "idempotent" as const };
+      }
+      if (current.state !== "waiting") return { record: current, outcome: "conflict" as const };
+      const result = this.db.prepare(
+        `UPDATE claude_questions SET state = 'answer_sent', answers_json = ?, answered_by = ?,
+           answered_at = ?, answer_sent_at = ?, updated_at = ? WHERE id = ? AND state = 'waiting'`
+      ).run(JSON.stringify(answers), answeredBy, now, now, now, id);
+      return result.changes === 1
+        ? { record: this.find(id), outcome: "accepted" as const }
+        : { record: this.find(id), outcome: "conflict" as const };
+    });
+    return run.immediate();
+  }
+
+  transition(
+    id: string,
+    expected: ClaudeQuestionState | readonly ClaudeQuestionState[],
+    state: ClaudeQuestionState,
+    patch: { failureReason?: string; confirmedAt?: string } = {},
+    now = new Date().toISOString()
+  ): ClaudeQuestionRecord | undefined {
+    const expectedStates = Array.isArray(expected) ? expected : [expected];
+    const result = this.db.prepare(
+      `UPDATE claude_questions SET state = ?, failure_reason = ?, confirmed_at = ?, updated_at = ?
+       WHERE id = ? AND state IN (${expectedStates.map(() => "?").join(",")})`
+    ).run(state, patch.failureReason ?? null, patch.confirmedAt ?? null, now, id, ...expectedStates);
+    return result.changes === 1 ? this.find(id) : undefined;
+  }
+}
+
+export class ClaudeInteractionRepository {
+  constructor(private readonly db: Database.Database) {}
+
+  create(input: Omit<ClaudeInteractionRecord, "id" | "version" | "createdAt" | "updatedAt">): ClaudeInteractionRecord {
+    const now = new Date().toISOString();
+    const record: ClaudeInteractionRecord = { ...input, id: randomUUID(), version: 1, createdAt: now, updatedAt: now };
+    this.db.prepare(
+      `INSERT INTO claude_interactions(
+        id, version, kind, state, perch_session_id, claude_session_id, provider_request_id,
+        payload_json, payload_hash, summary, runtime_generation, task_id, expires_at,
+        failure_reason, created_at, updated_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+    ).run(
+      record.id, record.version, record.kind, record.state, record.perchSessionId,
+      record.claudeSessionId ?? null, record.providerRequestId, JSON.stringify(record.payload),
+      record.payloadHash, record.summary, record.runtimeGeneration ?? null, record.taskId ?? null,
+      record.expiresAt ?? null, record.failureReason ?? null, record.createdAt, record.updatedAt
+    );
+    return record;
+  }
+
+  find(id: string): ClaudeInteractionRecord | undefined {
+    const row = this.db.prepare("SELECT * FROM claude_interactions WHERE id = ?").get(id) as ClaudeInteractionRow | undefined;
+    return row ? claudeInteractionFromRow(row) : undefined;
+  }
+
+  findProvider(sessionId: string, kind: ClaudeInteractionRecord["kind"], providerId: string): ClaudeInteractionRecord | undefined {
+    const row = this.db.prepare(
+      "SELECT * FROM claude_interactions WHERE perch_session_id = ? AND kind = ? AND provider_request_id = ?"
+    ).get(sessionId, kind, providerId) as ClaudeInteractionRow | undefined;
+    return row ? claudeInteractionFromRow(row) : undefined;
+  }
+
+  effective(): ClaudeInteractionRecord[] {
+    return (this.db.prepare(
+      `SELECT current.* FROM claude_interactions current
+       JOIN (SELECT perch_session_id, max(created_at) AS created_at FROM claude_interactions GROUP BY perch_session_id) latest
+       ON latest.perch_session_id = current.perch_session_id AND latest.created_at = current.created_at
+       ORDER BY current.created_at`
+    ).all() as ClaudeInteractionRow[]).map(claudeInteractionFromRow);
+  }
+
+  respond(id: string, action: "accept" | "decline" | "cancel", content: Record<string, unknown> | undefined, actor: string, now = new Date().toISOString()) {
+    const current = this.find(id);
+    if (!current) return { outcome: "missing" as const };
+    if (current.state === "response_sent" && current.responseAction === action && JSON.stringify(current.responseContent ?? {}) === JSON.stringify(content ?? {})) {
+      return { outcome: "idempotent" as const, record: current };
+    }
+    if (current.state !== "waiting") return { outcome: "conflict" as const, record: current };
+    const result = this.db.prepare(
+      `UPDATE claude_interactions SET state = 'response_sent', response_action = ?, response_content_json = ?,
+       responded_by = ?, responded_at = ?, updated_at = ? WHERE id = ? AND state = 'waiting'`
+    ).run(action, content ? JSON.stringify(content) : null, actor, now, now, id);
+    return result.changes === 1
+      ? { outcome: "accepted" as const, record: this.find(id)! }
+      : { outcome: "conflict" as const, record: this.find(id) };
+  }
+
+  transition(id: string, expected: ClaudeInteractionRecord["state"], state: ClaudeInteractionRecord["state"], reason?: string) {
+    const now = new Date().toISOString();
+    const result = this.db.prepare(
+      "UPDATE claude_interactions SET state = ?, failure_reason = ?, confirmed_at = ?, updated_at = ? WHERE id = ? AND state = ?"
+    ).run(state, reason ?? null, state === "confirmed" ? now : null, now, id, expected);
+    return result.changes === 1 ? this.find(id) : undefined;
+  }
+}
+
+export class ClaudeToolOccurrenceRepository {
+  constructor(private readonly db: Database.Database) {}
+
+  record(input: Omit<ClaudeToolOccurrence, "id" | "occurrence" | "createdAt">): ClaudeToolOccurrence {
+    const prior = this.db.prepare("SELECT * FROM claude_tool_occurrences WHERE perch_session_id = ? AND tool_use_id = ?")
+      .get(input.perchSessionId, input.toolUseId) as ClaudeToolOccurrenceRow | undefined;
+    if (prior) return claudeToolOccurrenceFromRow(prior);
+    const occurrence = Number(this.db.prepare("SELECT count(*) FROM claude_tool_occurrences WHERE perch_session_id = ? AND claude_session_id = ?")
+      .pluck().get(input.perchSessionId, input.claudeSessionId)) + 1;
+    const record: ClaudeToolOccurrence = { ...input, id: randomUUID(), occurrence, createdAt: new Date().toISOString() };
+    this.db.prepare(`INSERT INTO claude_tool_occurrences(
+      id, perch_session_id, claude_session_id, tool_use_id, tool_name, tool_input_hash,
+      runtime_generation, occurrence, consumed_at, created_at
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
+      .run(record.id, record.perchSessionId, record.claudeSessionId, record.toolUseId, record.toolName,
+        record.toolInputHash, record.runtimeGeneration ?? null, record.occurrence, record.consumedAt ?? null, record.createdAt);
+    return record;
+  }
+
+  consumeMatch(input: { perchSessionId: string; claudeSessionId: string; toolName: string; toolInputHash: string; runtimeGeneration?: number }): ClaudeToolOccurrence | undefined {
+    const row = this.db.prepare(`SELECT * FROM claude_tool_occurrences
+      WHERE perch_session_id = ? AND claude_session_id = ? AND tool_name = ? AND tool_input_hash = ?
+        AND consumed_at IS NULL AND (runtime_generation IS ? OR runtime_generation = ?)
+      ORDER BY created_at DESC LIMIT 1`)
+      .get(input.perchSessionId, input.claudeSessionId, input.toolName, input.toolInputHash,
+        input.runtimeGeneration ?? null, input.runtimeGeneration ?? null) as ClaudeToolOccurrenceRow | undefined;
+    if (!row) return undefined;
+    const now = new Date().toISOString();
+    const result = this.db.prepare("UPDATE claude_tool_occurrences SET consumed_at = ? WHERE id = ? AND consumed_at IS NULL").run(now, row.id);
+    return result.changes === 1 ? { ...claudeToolOccurrenceFromRow(row), consumedAt: now } : undefined;
+  }
+
+  nextOccurrence(perchSessionId: string, claudeSessionId: string): number {
+    return Number(this.db.prepare("SELECT count(*) FROM claude_approvals WHERE perch_session_id = ? AND claude_session_id = ?").pluck().get(perchSessionId, claudeSessionId)) + 1;
+  }
+
+  prune(cutoff: string): number {
+    return this.db.prepare("DELETE FROM claude_tool_occurrences WHERE created_at < ? AND consumed_at IS NOT NULL").run(cutoff).changes;
+  }
+}
+
+export class ClaudeInboxRepository {
+  constructor(private readonly db: Database.Database) {}
+  sequence(): number { return Number(this.db.prepare("SELECT coalesce(max(seq), 0) FROM claude_inbox_deltas").pluck().get()); }
+  deltas(after = 0): ClaudeInboxDelta[] {
+    return (this.db.prepare("SELECT * FROM claude_inbox_deltas WHERE seq > ? ORDER BY seq").all(after) as ClaudeInboxDeltaRow[])
+      .map((row) => ({ seq: row.seq, requestType: row.request_type, requestId: row.request_id, state: row.state, snapshot: JSON.parse(row.snapshot_json), at: row.at }));
+  }
+  prune(beforeSequence: number): number {
+    return this.db.prepare("DELETE FROM claude_inbox_deltas WHERE seq < ?").run(beforeSequence).changes;
+  }
+}
+
 type RuntimeRow = {
   id: string;
   task_id: string;
@@ -1216,6 +1890,100 @@ type NotificationOutboxRow = {
   delivered_at: string | null;
   last_error: string | null;
   created_at: string;
+};
+
+type ClaudeApprovalRow = {
+  id: string;
+  version: 1;
+  state: ClaudeApprovalState;
+  interaction_kind: "permission_request" | "exit_plan_mode";
+  hook_event_name: "PermissionRequest" | "PreToolUse";
+  perch_session_id: string;
+  claude_session_id: string;
+  prompt_identity: string;
+  tool_name: string;
+  tool_input_json: string;
+  tool_input_hash: string;
+  summary: string;
+  command: string | null;
+  cwd: string | null;
+  transcript_path: string | null;
+  runtime_generation: number | null;
+  task_id: string | null;
+  worker_session_id: string;
+  parent_session_id: string | null;
+  decision_policy: "boss_only";
+  decision: "allow" | "deny" | "allow_always" | null;
+  selected_permission_json: string | null;
+  decided_by: string | null;
+  decided_at: string | null;
+  decision_sent_at: string | null;
+  confirmed_at: string | null;
+  expires_at: string;
+  failure_reason: string | null;
+  created_at: string;
+  updated_at: string;
+};
+
+type ClaudeQuestionRow = {
+  id: string;
+  version: 1;
+  state: ClaudeQuestionState;
+  perch_session_id: string;
+  claude_session_id: string;
+  tool_use_id: string;
+  questions_json: string;
+  questions_hash: string;
+  answers_json: string | null;
+  cwd: string | null;
+  transcript_path: string | null;
+  runtime_generation: number | null;
+  task_id: string | null;
+  worker_session_id: string;
+  parent_session_id: string | null;
+  answer_policy: "boss_only";
+  answered_by: string | null;
+  answered_at: string | null;
+  answer_sent_at: string | null;
+  confirmed_at: string | null;
+  expires_at: string;
+  failure_reason: string | null;
+  created_at: string;
+  updated_at: string;
+};
+
+type ClaudeInteractionRow = {
+  id: string;
+  version: 1;
+  kind: ClaudeInteractionRecord["kind"];
+  state: ClaudeInteractionRecord["state"];
+  perch_session_id: string;
+  claude_session_id: string | null;
+  provider_request_id: string;
+  payload_json: string;
+  payload_hash: string;
+  summary: string;
+  runtime_generation: number | null;
+  task_id: string | null;
+  response_action: "accept" | "decline" | "cancel" | null;
+  response_content_json: string | null;
+  responded_by: string | null;
+  responded_at: string | null;
+  confirmed_at: string | null;
+  expires_at: string | null;
+  failure_reason: string | null;
+  created_at: string;
+  updated_at: string;
+};
+
+type ClaudeToolOccurrenceRow = {
+  id: string; perch_session_id: string; claude_session_id: string; tool_use_id: string;
+  tool_name: string; tool_input_hash: string; runtime_generation: number | null;
+  occurrence: number; consumed_at: string | null; created_at: string;
+};
+type ClaudeInboxDeltaRow = {
+  seq: number; request_type: ClaudeInboxDelta["requestType"]; request_id: string;
+  state: string; snapshot_json: string; at: string;
 };
 
 function taskEventFromRow(row: TaskEventRow): TaskEvent {
@@ -1330,6 +2098,105 @@ function notificationOutboxFromRow(row: NotificationOutboxRow): NotificationOutb
     ...(row.delivered_at ? { deliveredAt: row.delivered_at } : {}),
     ...(row.last_error ? { lastError: row.last_error } : {}),
     createdAt: row.created_at
+  };
+}
+
+function claudeApprovalFromRow(row: ClaudeApprovalRow): ClaudeApprovalRecord {
+  return {
+    id: row.id,
+    version: row.version,
+    state: row.state,
+    interactionKind: row.interaction_kind,
+    hookEventName: row.hook_event_name,
+    perchSessionId: row.perch_session_id,
+    claudeSessionId: row.claude_session_id,
+    promptIdentity: row.prompt_identity,
+    toolName: row.tool_name,
+    toolInput: JSON.parse(row.tool_input_json) as Record<string, unknown>,
+    toolInputHash: row.tool_input_hash,
+    summary: row.summary,
+    ...(row.command ? { command: row.command } : {}),
+    ...(row.cwd ? { cwd: row.cwd } : {}),
+    ...(row.transcript_path ? { transcriptPath: row.transcript_path } : {}),
+    ...(row.runtime_generation !== null ? { runtimeGeneration: row.runtime_generation } : {}),
+    ...(row.task_id ? { taskId: row.task_id } : {}),
+    workerSessionId: row.worker_session_id,
+    ...(row.parent_session_id ? { parentSessionId: row.parent_session_id } : {}),
+    decisionPolicy: row.decision_policy,
+    ...(row.decision ? { decision: row.decision } : {}),
+    ...(row.selected_permission_json ? { selectedPermission: JSON.parse(row.selected_permission_json) as Record<string, unknown> } : {}),
+    ...(row.decided_by ? { decidedBy: row.decided_by } : {}),
+    ...(row.decided_at ? { decidedAt: row.decided_at } : {}),
+    ...(row.decision_sent_at ? { decisionSentAt: row.decision_sent_at } : {}),
+    ...(row.confirmed_at ? { confirmedAt: row.confirmed_at } : {}),
+    expiresAt: row.expires_at,
+    ...(row.failure_reason ? { failureReason: row.failure_reason } : {}),
+    createdAt: row.created_at,
+    updatedAt: row.updated_at
+  };
+}
+
+function claudeQuestionFromRow(row: ClaudeQuestionRow): ClaudeQuestionRecord {
+  return {
+    id: row.id,
+    version: row.version,
+    state: row.state,
+    perchSessionId: row.perch_session_id,
+    claudeSessionId: row.claude_session_id,
+    toolUseId: row.tool_use_id,
+    questions: JSON.parse(row.questions_json) as unknown[],
+    questionsHash: row.questions_hash,
+    ...(row.answers_json ? { answers: JSON.parse(row.answers_json) as Record<string, string> } : {}),
+    ...(row.cwd ? { cwd: row.cwd } : {}),
+    ...(row.transcript_path ? { transcriptPath: row.transcript_path } : {}),
+    ...(row.runtime_generation !== null ? { runtimeGeneration: row.runtime_generation } : {}),
+    ...(row.task_id ? { taskId: row.task_id } : {}),
+    workerSessionId: row.worker_session_id,
+    ...(row.parent_session_id ? { parentSessionId: row.parent_session_id } : {}),
+    answerPolicy: row.answer_policy,
+    ...(row.answered_by ? { answeredBy: row.answered_by } : {}),
+    ...(row.answered_at ? { answeredAt: row.answered_at } : {}),
+    ...(row.answer_sent_at ? { answerSentAt: row.answer_sent_at } : {}),
+    ...(row.confirmed_at ? { confirmedAt: row.confirmed_at } : {}),
+    expiresAt: row.expires_at,
+    ...(row.failure_reason ? { failureReason: row.failure_reason } : {}),
+    createdAt: row.created_at,
+    updatedAt: row.updated_at
+  };
+}
+
+function claudeInteractionFromRow(row: ClaudeInteractionRow): ClaudeInteractionRecord {
+  return {
+    id: row.id,
+    version: row.version,
+    kind: row.kind,
+    state: row.state,
+    perchSessionId: row.perch_session_id,
+    ...(row.claude_session_id ? { claudeSessionId: row.claude_session_id } : {}),
+    providerRequestId: row.provider_request_id,
+    payload: JSON.parse(row.payload_json) as Record<string, unknown>,
+    payloadHash: row.payload_hash,
+    summary: row.summary,
+    ...(row.runtime_generation !== null ? { runtimeGeneration: row.runtime_generation } : {}),
+    ...(row.task_id ? { taskId: row.task_id } : {}),
+    ...(row.response_action ? { responseAction: row.response_action } : {}),
+    ...(row.response_content_json ? { responseContent: JSON.parse(row.response_content_json) as Record<string, unknown> } : {}),
+    ...(row.responded_by ? { respondedBy: row.responded_by } : {}),
+    ...(row.responded_at ? { respondedAt: row.responded_at } : {}),
+    ...(row.confirmed_at ? { confirmedAt: row.confirmed_at } : {}),
+    ...(row.expires_at ? { expiresAt: row.expires_at } : {}),
+    ...(row.failure_reason ? { failureReason: row.failure_reason } : {}),
+    createdAt: row.created_at,
+    updatedAt: row.updated_at
+  };
+}
+
+function claudeToolOccurrenceFromRow(row: ClaudeToolOccurrenceRow): ClaudeToolOccurrence {
+  return {
+    id: row.id, perchSessionId: row.perch_session_id, claudeSessionId: row.claude_session_id,
+    toolUseId: row.tool_use_id, toolName: row.tool_name, toolInputHash: row.tool_input_hash,
+    ...(row.runtime_generation !== null ? { runtimeGeneration: row.runtime_generation } : {}),
+    occurrence: row.occurrence, ...(row.consumed_at ? { consumedAt: row.consumed_at } : {}), createdAt: row.created_at
   };
 }
 

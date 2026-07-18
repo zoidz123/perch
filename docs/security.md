@@ -65,7 +65,15 @@ An audit append failure is reported to server logs but does not reverse or fail 
 
 Remote approval is state-bound:
 
-- Claude approval and question cards drive the currently open TUI widget.
+- Claude PermissionRequest, AskUserQuestion, ExitPlanMode, and MCP elicitation use versioned structured requests with exact request identity and compare-and-set responses.
+- PermissionRequest is the sole permission authority.
+  Perch correlates it to a matching PreToolUse tool-use ID when available, otherwise it records a nonce, runtime generation, and durable occurrence number.
+- Hook credentials survive a server restart in a mode-0600 local file and stale session credentials are pruned.
+- The Claude inbox API returns a redacted full snapshot plus ordered durable deltas.
+- Always-allow suggestions stay ephemeral unless the boss selects the exact validated suggestion, at which point only that selected rule is persisted and returned to Claude.
+- Claude PermissionDenied is visible failure evidence, not an approval request.
+- Claude startup, authentication, and directory-trust prompts happen before hooks are available.
+  Perch surfaces those detected PTY gates as desktop-only manual actions and never treats a keystroke or notification as proof of remote approval.
 - Codex approvals use the structured app-server request only while its request ID is still current.
 - Codex attention without an authoritative structured request remains desktop-only.
 - Stale, missing, changed, or ambiguous prompts return a conflict instead of sending guessed input.

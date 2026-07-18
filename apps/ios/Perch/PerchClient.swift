@@ -947,12 +947,16 @@ final class PerchStore: ObservableObject {
     }
 
     func approve(_ sessionId: String, decision: String, approvalId: String? = nil) async {
-        var body = ["decision": decision]
+        var body: [String: Any] = ["decision": decision]
         if let approvalId {
             body["id"] = approvalId
         }
+        if let approval = session(for: sessionId)?.pendingApproval, approval.requestVersion == 1 {
+            body["requestVersion"] = 1
+            body["runtimeGeneration"] = approval.runtimeGeneration ?? NSNull()
+        }
         do {
-            try await post(path: "/sessions/\(escapePath(sessionId))/approve", body: body)
+            try await postAny(path: "/sessions/\(escapePath(sessionId))/approve", body: body)
             errorMessage = nil
         } catch {
             errorMessage = error.localizedDescription
@@ -981,9 +985,13 @@ final class PerchStore: ObservableObject {
     // injects them, so the desktop TUI resolves too. `selections` is
     // per-question: chosen option indices (one for single-select). The question
     // id pins the answer to this exact prompt (rejected if already resolved).
-    func answer(_ sessionId: String, questionId: String, selections: [[Int]]) async {
+    func answer(_ sessionId: String, questionId: String, selections: [[Int]], customAnswers: [String: String] = [:]) async {
         let question = session(for: sessionId)?.pendingQuestion
-        let body: [String: Any] = ["id": questionId, "selections": selections]
+        var body: [String: Any] = ["id": questionId, "selections": selections, "customAnswers": customAnswers]
+        if question?.requestVersion == 1 {
+            body["requestVersion"] = 1
+            body["runtimeGeneration"] = question?.runtimeGeneration ?? NSNull()
+        }
         do {
             try await postAny(path: "/sessions/\(escapePath(sessionId))/answer", body: body)
             errorMessage = nil
@@ -992,7 +1000,8 @@ final class PerchStore: ObservableObject {
             // this only bridges the moments until the conversation moves on.
             if let question, question.id == questionId {
                 let answers = zip(question.questions, selections).flatMap { item, picks in
-                    picks.compactMap { item.options[safe: $0]?.label }
+                    let selected = picks.compactMap { item.options[safe: $0]?.label }
+                    return selected + (customAnswers[item.question].map { [$0] } ?? [])
                 }
                 answeredQuestions[sessionId] = AnsweredQuestion(
                     questionId: questionId,
@@ -1000,6 +1009,21 @@ final class PerchStore: ObservableObject {
                     anchorSeq: chatItems(sessionId).last(where: { $0.seq > 0 })?.seq ?? 0
                 )
             }
+        } catch {
+            errorMessage = error.localizedDescription
+        }
+    }
+
+    func respondToClaudeInteraction(_ sessionId: String, interactionId: String, action: String, content: [String: Any]?) async {
+        var body: [String: Any] = ["id": interactionId, "action": action]
+        if let interaction = session(for: sessionId)?.pendingClaudeInteraction {
+            body["requestVersion"] = interaction.requestVersion
+            body["runtimeGeneration"] = interaction.runtimeGeneration ?? NSNull()
+        }
+        if let content { body["content"] = content }
+        do {
+            try await postAny(path: "/sessions/\(escapePath(sessionId))/claude-interaction", body: body)
+            errorMessage = nil
         } catch {
             errorMessage = error.localizedDescription
         }

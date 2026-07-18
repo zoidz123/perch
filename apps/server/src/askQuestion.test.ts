@@ -96,20 +96,14 @@ test("questionId is stable across identical question sets", () => {
   assert.equal(questionId(single), questionId(structuredClone(single)));
 });
 
-test("normalizeHookEvent routes AskUserQuestion (both hooks) to a question", () => {
+test("normalizeHookEvent routes only the official AskUserQuestion PreToolUse path to a question", () => {
   const toolInput = { questions: [{ header: "Fruit", question: "Which fruit?", options: [{ label: "Apple" }] }] };
-  for (const hook of ["PreToolUse", "PermissionRequest"]) {
-    const normalized = normalizeHookEvent({
-      hook_event_name: hook,
-      tool_name: "AskUserQuestion",
-      tool_input: toolInput
-    });
-    assert.equal(normalized.status, "needs_approval");
-    assert.ok(normalized.question, `${hook} should carry a question`);
-    assert.equal(normalized.question!.questions[0].question, "Which fruit?");
-    // Both hooks for one prompt must produce the same id (idempotent card).
-    assert.equal(normalized.approval, undefined);
-  }
+  const normalized = normalizeHookEvent({ hook_event_name: "PreToolUse", tool_name: "AskUserQuestion", tool_input: toolInput });
+  assert.equal(normalized.status, "needs_approval");
+  assert.equal(normalized.question?.questions[0].question, "Which fruit?");
+  const permission = normalizeHookEvent({ hook_event_name: "PermissionRequest", tool_name: "AskUserQuestion", tool_input: toolInput });
+  assert.equal(permission.question, undefined);
+  assert.ok(permission.approval);
 });
 
 test("normalizeHookEvent leaves non-question PreToolUse as running", () => {

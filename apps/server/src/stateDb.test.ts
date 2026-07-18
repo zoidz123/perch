@@ -22,7 +22,7 @@ test("fresh startup creates the versioned WAL database with foreign keys enabled
 
   assert.equal(state.path, join(root, "state.sqlite"));
   assert.equal(existsSync(state.path), true);
-  assert.equal(state.schemaVersion(), 4);
+  assert.equal(state.schemaVersion(), 9);
   assert.equal(state.journalMode(), "wal");
   assert.equal(state.foreignKeysEnabled(), true);
 
@@ -31,7 +31,12 @@ test("fresh startup creates the versioned WAL database with foreign keys enabled
     { version: 1, name: "shared-state-core" },
     { version: 2, name: "durable-executor-claims" },
     { version: 3, name: "authoritative-runtime-lifecycle" },
-    { version: 4, name: "durable-mate-owner" }
+    { version: 4, name: "durable-mate-owner" },
+    { version: 5, name: "durable-claude-approvals" },
+    { version: 6, name: "durable-claude-questions" },
+    { version: 7, name: "typed-claude-approval-kinds" },
+    { version: 8, name: "durable-claude-blocking-interactions" },
+    { version: 9, name: "claude-inbox-correlation-and-deltas" }
   ]);
   assert.deepEqual(
     inspect
@@ -39,6 +44,11 @@ test("fresh startup creates the versioned WAL database with foreign keys enabled
       .pluck()
       .all(),
     [
+      "claude_approvals",
+      "claude_inbox_deltas",
+      "claude_interactions",
+      "claude_questions",
+      "claude_tool_occurrences",
       "durable_owners",
       "legacy_imports",
       "notification_outbox",

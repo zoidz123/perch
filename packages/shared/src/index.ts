@@ -58,6 +58,7 @@ export type AgentSession = {
   // question card on the phone. Distinct from pendingApproval: the answer is a
   // choice among options, not an allow/deny.
   pendingQuestion?: PendingQuestion;
+  pendingClaudeInteraction?: PendingClaudeInteraction;
   // Composer messages held server-side until the session can accept input.
   queuedCount?: number;
   // Durable logical-worker/runtime identity. PTY sessions are replaceable
@@ -83,6 +84,20 @@ export type PendingApproval = {
   // Set after Perch delivers the selected PTY response. The prompt remains
   // pending until the rendered-screen resolution barrier confirms it closed.
   submittedDecision?: string;
+  // Durable Claude PermissionRequest metadata. Absent for Codex and degraded
+  // PTY-detected prompts. Chat text is only a notification; this versioned
+  // request id and state are the remote decision authority.
+  requestVersion?: 1;
+  state?: "pending" | "decided" | "decision_sent" | "continued" | "denied" | "expired" | "canceled" | "local_fallback";
+  decisionPolicy?: "boss_only";
+  expiresAt?: string;
+  claudeSessionId?: string;
+  runtimeGeneration?: number;
+  taskId?: string;
+  workerSessionId?: string;
+  toolInputHash?: string;
+  cwd?: string;
+  interactionKind?: "permission_request" | "exit_plan_mode" | "pty_manual_gate";
 };
 
 export type ApprovalDecision = {
@@ -149,6 +164,41 @@ export type PendingQuestion = {
   id: string;
   questions: QuestionItem[];
   at: string;
+  requestVersion?: 1;
+  state?: "waiting" | "answer_sent" | "continued" | "expired" | "local_fallback" | "simultaneous_fallback";
+  answerPolicy?: "boss_only";
+  remoteResolutionUnavailable?: boolean;
+  submittedAnswers?: Record<string, string>;
+  expiresAt?: string;
+  claudeSessionId?: string;
+  toolUseId?: string;
+  runtimeGeneration?: number;
+  taskId?: string;
+  workerSessionId?: string;
+  questionsHash?: string;
+  cwd?: string;
+};
+
+export type PendingClaudeInteraction = {
+  id: string;
+  requestVersion: 1;
+  kind: "elicitation" | "elicitation_result" | "permission_denied" | "pty_manual_gate";
+  state: "waiting" | "response_sent" | "confirmed" | "expired" | "local_fallback" | "observed";
+  summary: string;
+  at: string;
+  providerRequestId: string;
+  mode?: "form" | "url";
+  message?: string;
+  url?: string;
+  requestedSchema?: Record<string, unknown>;
+  proposedAction?: "accept" | "decline" | "cancel";
+  proposedContent?: Record<string, unknown>;
+  responseAction?: "accept" | "decline" | "cancel";
+  allowedActions: Array<"accept" | "decline" | "cancel">;
+  remoteResolutionUnavailable?: boolean;
+  runtimeGeneration?: number;
+  taskId?: string;
+  failureReason?: string;
 };
 
 export type DesktopContext = {
@@ -1041,6 +1091,8 @@ export type ApproveRequest = {
   // exact decision ids on PendingApproval and reject every other value.
   decision: string;
   id?: string;
+  requestVersion?: 1;
+  runtimeGeneration?: number | null;
 };
 
 export type ServerRequestResponse = {
@@ -1058,6 +1110,11 @@ export type ServerRequestResponse = {
 export type AnswerRequest = {
   id?: string;
   selections: number[][];
+  // Free-form "Other" text keyed by the exact question text. Structured
+  // Claude questions return these values through updatedInput.answers.
+  customAnswers?: Record<string, string>;
+  requestVersion?: 1;
+  runtimeGeneration?: number | null;
 };
 
 export type SubmitResponse = {

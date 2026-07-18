@@ -79,7 +79,7 @@ import {
   type HookRegistry
 } from "./hooks.js";
 import { usageLimitFromClaudeHook } from "./usageLimitDetect.js";
-import { KEY_DELAY_MS, questionKeystrokes } from "./askQuestion.js";
+import { ASK_USER_QUESTION_TOOL, KEY_DELAY_MS, questionKeystrokes } from "./askQuestion.js";
 import { buildOffer, tokensEqual, type DeviceRegistry } from "./pairing.js";
 import { EncryptedServerChannel } from "./e2ee/channel.js";
 import {
@@ -147,6 +147,14 @@ import { RecoveryContinuationCoordinator } from "./recoveryContinuation.js";
 import type { OwnerManager } from "./ownerManager.js";
 import { MateRecoveryCoordinator } from "./mateRecovery.js";
 import { PERCH_VERSION } from "./version.js";
+import {
+  CLAUDE_APPROVAL_DECISIONS,
+  ClaudeApprovalCoordinator,
+  publicRecord,
+  type ClaudeApprovalDecision
+} from "./claudeApprovals.js";
+import { ClaudeQuestionCoordinator, publicQuestion } from "./claudeQuestions.js";
+import { ClaudeInteractionCoordinator, publicInteraction } from "./claudeInteractions.js";
 
 export { markTaskWorkingFromActivity } from "./agentLauncher.js";
 
@@ -196,6 +204,9 @@ export type HttpServerOptions = {
   recoveryContinuationCoordinator?: RecoveryContinuationCoordinator;
   ownerManager?: OwnerManager;
   mateRecoveryCoordinator?: MateRecoveryCoordinator;
+  claudeApprovals?: ClaudeApprovalCoordinator;
+  claudeQuestions?: ClaudeQuestionCoordinator;
+  claudeInteractions?: ClaudeInteractionCoordinator;
 };
 
 const CODEX_ON_PATH_TTL_MS = 30_000;
@@ -224,6 +235,27 @@ function codexResolvableOnPath(): boolean {
 }
 
 export function createControlServer(options: HttpServerOptions) {
+  options.claudeApprovals ??= new ClaudeApprovalCoordinator(options.tasks, options.monitor, {
+    deadlineMs: process.env.PERCH_CLAUDE_APPROVAL_DEADLINE_MS
+      ? Number(process.env.PERCH_CLAUDE_APPROVAL_DEADLINE_MS)
+      : undefined
+  });
+  options.claudeApprovals.replay();
+  options.claudeQuestions ??= new ClaudeQuestionCoordinator(options.tasks, options.monitor, {
+    deadlineMs: process.env.PERCH_CLAUDE_QUESTION_DEADLINE_MS
+      ? Number(process.env.PERCH_CLAUDE_QUESTION_DEADLINE_MS)
+      : undefined
+  });
+  options.claudeQuestions.replay();
+  options.claudeInteractions ??= new ClaudeInteractionCoordinator(options.tasks, options.monitor, {
+    deadlineMs: Number(process.env.PERCH_CLAUDE_INTERACTION_DEADLINE_MS)
+  });
+  options.claudeInteractions.replay();
+  const inboxSequence = options.tasks.stateDb.claudeInbox.sequence();
+  options.tasks.stateDb.claudeInbox.prune(Math.max(0, inboxSequence - 10_000));
+  options.monitor.setClaudeManualGateHandler((sessionId, approval) => {
+    options.claudeInteractions!.recordManualGate(sessionId, approval.summary, approval.id);
+  });
   options.recoveryCoordinator ??= new RecoveryCoordinator(options);
   options.recoveryContinuationCoordinator ??= new RecoveryContinuationCoordinator(options);
   if (!options.mateRecoveryCoordinator && options.ownerManager && options.taskScheduler) {
@@ -696,6 +728,20 @@ async function dispatchWebSocketRpc(
     return rpcOk(200, { sessions: options.monitor.withLiveState(await options.adapter.listSessions()) });
   }
 
+  if (method === "GET" && pathname === "/claude-approvals") {
+    return rpcOk(200, { requests: options.claudeApprovals!.list().map(publicRecord) });
+  }
+  if (method === "GET" && pathname === "/claude-questions") {
+    return rpcOk(200, { requests: options.claudeQuestions!.list().map(publicQuestion) });
+  }
+  if (method === "GET" && pathname === "/claude-interactions") {
+    return rpcOk(200, { requests: options.claudeInteractions!.list().map(publicInteraction) });
+  }
+  if (method === "GET" && pathname === "/claude-inbox") {
+    const after = Math.max(0, Number(url.searchParams.get("after") ?? 0) || 0);
+    return rpcOk(200, claudeInboxSnapshot(options, after));
+  }
+
   const timelineMatch = pathname.match(/^\/sessions\/([^/]+)\/timeline$/);
   if (method === "GET" && timelineMatch) {
     const sessionId = decodeURIComponent(timelineMatch[1] ?? "");
@@ -973,8 +1019,41 @@ async function dispatchWebSocketRpc(
     if (typeof body.id === "string" && body.id.length > 0 && body.id !== pending.id) {
       return rpcError(409, "The pending approval has changed");
     }
+    if (pending.requestVersion === 1) {
+      if (typeof body.id !== "string" || body.id !== pending.id) {
+        return rpcError(409, "This Claude approval response must name the exact durable request");
+      }
+      if (!CLAUDE_APPROVAL_DECISIONS.includes(decision as ClaudeApprovalDecision) && !decision.startsWith("allow_always:")) {
+        return rpcError(400, "unsupported Claude permission decision");
+      }
+      if (body.requestVersion !== 1 || body.runtimeGeneration !== (pending.runtimeGeneration ?? null)) {
+        return rpcError(409, "Claude approval version or runtime generation changed");
+      }
+      const result = options.claudeApprovals!.decide(
+        canonicalSessionId,
+        body.id,
+        decision as ClaudeApprovalDecision,
+        approvalActor(auth)
+      );
+      if (result.status >= 400) return { status: result.status, body: result.body };
+      await audit(options.auditLog, {
+        action: decision === "allow" ? "approve" : "deny",
+        sessionId: canonicalSessionId,
+        approvalId: body.id,
+        decision,
+        ...auditPeer
+      });
+      options.monitor.publish({
+        type: "message",
+        sessionId: canonicalSessionId,
+        role: "system",
+        text: "Structured Claude decision sent; waiting for later Claude activity to confirm it",
+        at: new Date().toISOString()
+      });
+      return { status: result.status, body: result.body };
+    }
     if (pending.remoteResolutionUnavailable) {
-      return rpcError(409, "Structured remote resolution is unavailable; answer this Codex prompt on the desktop");
+      return rpcError(409, "Structured remote resolution is unavailable; answer this prompt on the desktop");
     }
     if (pending.decisions?.length) {
       if (typeof body.id !== "string" || body.id.length === 0) {
@@ -1051,6 +1130,34 @@ async function dispatchWebSocketRpc(
     if (typeof answer.id === "string" && answer.id.length > 0 && answer.id !== pending.id) {
       return rpcError(409, "The pending question has changed");
     }
+    if (pending.requestVersion === 1) {
+      if (typeof answer.id !== "string" || answer.id !== pending.id) {
+        return rpcError(409, "This Claude answer must name the exact durable question request");
+      }
+      if (answer.requestVersion !== 1 || answer.runtimeGeneration !== (pending.runtimeGeneration ?? null)) {
+        return rpcError(409, "Claude question version or runtime generation changed");
+      }
+      const result = options.claudeQuestions!.answer(
+        canonicalSessionId,
+        answer.id,
+        answer.selections,
+        answer.customAnswers,
+        approvalActor(auth)
+      );
+      if (result.status >= 400) return { status: result.status, body: result.body };
+      await audit(options.auditLog, { action: "answer", sessionId: canonicalSessionId, ...auditPeer });
+      options.monitor.publish({
+        type: "message",
+        sessionId: canonicalSessionId,
+        role: "system",
+        text: "Structured Claude answer sent; waiting for later Claude activity to confirm it",
+        at: new Date().toISOString()
+      });
+      return { status: result.status, body: result.body };
+    }
+    if (pending.remoteResolutionUnavailable) {
+      return rpcError(409, "Structured remote answering is unavailable; answer this question on the desktop");
+    }
     const keystrokes = questionKeystrokes(pending.questions, answer.selections);
     for (const [index, key] of keystrokes.entries()) {
       await options.adapter.sendInput(canonicalSessionId, key);
@@ -1069,6 +1176,21 @@ async function dispatchWebSocketRpc(
       at: new Date().toISOString()
     });
     return rpcOk(202, { ok: true });
+  }
+
+  const claudeInteractionMatch = pathname.match(/^\/sessions\/([^/]+)\/claude-interaction$/);
+  if (method === "POST" && claudeInteractionMatch) {
+    const canonical = canonicalSessionIdFor(options.adapter, decodeURIComponent(claudeInteractionMatch[1] ?? ""));
+    if (typeof body.id !== "string" || !["accept", "decline", "cancel"].includes(String(body.action))) {
+      return rpcError(400, "id and action are required");
+    }
+    const pendingInteraction = options.monitor.pendingClaudeInteraction(canonical);
+    if (body.requestVersion !== 1 || body.runtimeGeneration !== (pendingInteraction?.runtimeGeneration ?? null)) {
+      return rpcError(409, "Claude interaction version or runtime generation changed");
+    }
+    const content = body.content && typeof body.content === "object" && !Array.isArray(body.content) ? body.content as Record<string, unknown> : undefined;
+    const result = options.claudeInteractions!.respond(canonical, body.id, body.action as "accept" | "decline" | "cancel", content, approvalActor(auth));
+    return { status: result.status, body: result.body };
   }
 
   const enterMatch = pathname.match(/^\/sessions\/([^/]+)\/enter$/);
@@ -1290,6 +1412,24 @@ async function route(
   }
 
   try {
+    if (request.method === "GET" && pathname === "/claude-approvals") {
+      writeJson(response, 200, { requests: options.claudeApprovals!.list().map(publicRecord) });
+      return;
+    }
+    if (request.method === "GET" && pathname === "/claude-questions") {
+      writeJson(response, 200, { requests: options.claudeQuestions!.list().map(publicQuestion) });
+      return;
+    }
+    if (request.method === "GET" && pathname === "/claude-interactions") {
+      writeJson(response, 200, { requests: options.claudeInteractions!.list().map(publicInteraction) });
+      return;
+    }
+    if (request.method === "GET" && pathname === "/claude-inbox") {
+      const after = Math.max(0, Number(url.searchParams.get("after") ?? 0) || 0);
+      writeJson(response, 200, claudeInboxSnapshot(options, after));
+      return;
+    }
+
     const timelineMatch = pathname.match(/^\/sessions\/([^/]+)\/timeline$/);
     if (request.method === "GET" && timelineMatch) {
       const sessionId = decodeURIComponent(timelineMatch[1] ?? "");
@@ -1890,8 +2030,47 @@ async function route(
         writeJson(response, 409, { error: "The pending approval has changed" });
         return;
       }
+      if (pending.requestVersion === 1) {
+        if (typeof body.id !== "string" || body.id !== pending.id) {
+          writeJson(response, 409, { error: "This Claude approval response must name the exact durable request" });
+          return;
+        }
+        if (body.requestVersion !== 1 || body.runtimeGeneration !== (pending.runtimeGeneration ?? null)) {
+          writeJson(response, 409, { error: "Claude approval version or runtime generation changed" });
+          return;
+        }
+        if (!CLAUDE_APPROVAL_DECISIONS.includes(body.decision as ClaudeApprovalDecision) && !body.decision.startsWith("allow_always:")) {
+          writeJson(response, 400, { error: "unsupported Claude permission decision" });
+          return;
+        }
+        const result = options.claudeApprovals!.decide(
+          canonicalSessionId,
+          body.id,
+          body.decision as ClaudeApprovalDecision,
+          approvalActor(auth)
+        );
+        if (result.status < 400) {
+          await audit(options.auditLog, {
+            action: body.decision === "allow" ? "approve" : "deny",
+            sessionId: canonicalSessionId,
+            approvalId: body.id,
+            decision: body.decision,
+            remoteAddress: request.socket.remoteAddress,
+            ...(auth.kind === "device" ? { deviceId: auth.deviceId } : {})
+          });
+          options.monitor.publish({
+            type: "message",
+            sessionId: canonicalSessionId,
+            role: "system",
+            text: "Structured Claude decision sent; waiting for later Claude activity to confirm it",
+            at: new Date().toISOString()
+          });
+        }
+        writeJson(response, result.status, result.body);
+        return;
+      }
       if (pending.remoteResolutionUnavailable) {
-        writeJson(response, 409, { error: "Structured remote resolution is unavailable; answer this Codex prompt on the desktop" });
+        writeJson(response, 409, { error: "Structured remote resolution is unavailable; answer this prompt on the desktop" });
         return;
       }
 
@@ -1993,6 +2172,45 @@ async function route(
         return;
       }
 
+      if (pending.requestVersion === 1) {
+        if (typeof body.id !== "string" || body.id !== pending.id) {
+          writeJson(response, 409, { error: "This Claude answer must name the exact durable question request" });
+          return;
+        }
+        if (body.requestVersion !== 1 || body.runtimeGeneration !== (pending.runtimeGeneration ?? null)) {
+          writeJson(response, 409, { error: "Claude question version or runtime generation changed" });
+          return;
+        }
+        const result = options.claudeQuestions!.answer(
+          canonicalSessionId,
+          body.id,
+          body.selections,
+          body.customAnswers,
+          approvalActor(auth)
+        );
+        if (result.status < 400) {
+          await audit(options.auditLog, {
+            action: "answer",
+            sessionId: canonicalSessionId,
+            remoteAddress: request.socket.remoteAddress,
+            ...(auth.kind === "device" ? { deviceId: auth.deviceId } : {})
+          });
+          options.monitor.publish({
+            type: "message",
+            sessionId: canonicalSessionId,
+            role: "system",
+            text: "Structured Claude answer sent; waiting for later Claude activity to confirm it",
+            at: new Date().toISOString()
+          });
+        }
+        writeJson(response, result.status, result.body);
+        return;
+      }
+      if (pending.remoteResolutionUnavailable) {
+        writeJson(response, 409, { error: "Structured remote answering is unavailable; answer this question on the desktop" });
+        return;
+      }
+
       // Drive the real AskUserQuestion widget with its own keystrokes so the
       // desktop TUI visibly resolves, exactly like the approval path. Keys go
       // one at a time, spaced out: the widget drops a navigation run delivered
@@ -2019,6 +2237,25 @@ async function route(
         at: new Date().toISOString()
       });
       writeJson(response, 202, { ok: true });
+      return;
+    }
+
+    const claudeInteractionMatch = pathname.match(/^\/sessions\/([^/]+)\/claude-interaction$/);
+    if (request.method === "POST" && claudeInteractionMatch) {
+      const canonical = canonicalSessionIdFor(options.adapter, decodeURIComponent(claudeInteractionMatch[1] ?? ""));
+      const body = await readJson<Record<string, unknown>>(request);
+      if (typeof body.id !== "string" || !["accept", "decline", "cancel"].includes(String(body.action))) {
+        writeJson(response, 400, { error: "id and action are required" });
+        return;
+      }
+      const pendingInteraction = options.monitor.pendingClaudeInteraction(canonical);
+      if (body.requestVersion !== 1 || body.runtimeGeneration !== (pendingInteraction?.runtimeGeneration ?? null)) {
+        writeJson(response, 409, { error: "Claude interaction version or runtime generation changed" });
+        return;
+      }
+      const content = body.content && typeof body.content === "object" && !Array.isArray(body.content) ? body.content as Record<string, unknown> : undefined;
+      const result = options.claudeInteractions!.respond(canonical, body.id, body.action as "accept" | "decline" | "cancel", content, approvalActor(auth));
+      writeJson(response, result.status, result.body);
       return;
     }
 
@@ -4217,15 +4454,33 @@ async function handleHookReport(
   response: ServerResponse,
   options: HttpServerOptions
 ): Promise<void> {
+  let synchronousClaudeControl = false;
   try {
     const sessionId = String(request.headers["x-perch-session"] ?? "");
     const token = String(request.headers["x-perch-token"] ?? "");
+    const payload = await readJsonOrEmpty<HookEventPayload>(request);
+    const requestedEventName = hookEventName(payload);
+    synchronousClaudeControl = requestedEventName === "PermissionRequest" ||
+      requestedEventName === "Elicitation" || requestedEventName === "ElicitationResult" ||
+      (requestedEventName === "PreToolUse" &&
+        (payload.tool_name === ASK_USER_QUESTION_TOOL || payload.tool_name === "ExitPlanMode"));
     if (!sessionId || !options.hooks.verify(sessionId, token)) {
-      writeJson(response, 200, { ok: false });
+      // PermissionRequest is synchronous control, so authentication failure
+      // must be visible to the bridge and fall back to Claude's local dialog.
+      // Telemetry hooks retain their historical fail-open 200 response.
+      writeJson(
+        response,
+        synchronousClaudeControl ? 401 : 200,
+        synchronousClaudeControl ? { error: "Invalid Perch hook session or token" } : { ok: false }
+      );
+      return;
+    }
+    if (request.headers["x-perch-observe-only"] === "1" && requestedEventName === "PreToolUse") {
+      options.claudeApprovals!.recordPreToolUse(sessionId, payload);
+      writeJson(response, 200, { ok: true });
       return;
     }
 
-    const payload = await readJsonOrEmpty<HookEventPayload>(request);
     const normalized = normalizeHookEvent(payload);
     // The transcript format follows the agent that owns the session, not the
     // payload shape: codex emits Claude-compatible flat payloads, so shape
@@ -4338,7 +4593,18 @@ async function handleHookReport(
           })
         : undefined;
 
-    if (normalized.approval) {
+    let structuredClaudeApprovalId: string | undefined;
+    let structuredClaudeQuestionId: string | undefined;
+    let structuredClaudeInteractionId: string | undefined;
+    let handledStructuredClaudeQuestion = false;
+    const claudeQuestionControl = format === "claude" && eventName === "PreToolUse" && payload.tool_name === ASK_USER_QUESTION_TOOL;
+    const claudeExitPlanControl = format === "claude" && eventName === "PreToolUse" && payload.tool_name === "ExitPlanMode";
+    if (format === "claude" && eventName === "PreToolUse") {
+      options.claudeApprovals!.recordPreToolUse(sessionId, payload);
+    }
+    if (normalized.approval && format === "claude" && eventName === "PermissionRequest") {
+      structuredClaudeApprovalId = options.claudeApprovals!.register(sessionId, payload).record.id;
+    } else if (normalized.approval) {
       const at = new Date().toISOString();
       options.monitor.setPendingApproval(sessionId, {
         id: normalized.approval.id,
@@ -4357,13 +4623,103 @@ async function handleHookReport(
         at
       });
     }
+    if (claudeExitPlanControl) {
+      const registered = options.claudeApprovals!.registerExitPlan(sessionId, payload);
+      if (registered.record && ["pending", "decided", "decision_sent"].includes(registered.record.state)) {
+        structuredClaudeApprovalId = registered.record.id;
+        options.monitor.applyExternalStatus(sessionId, "needs_approval", "claude", "adapter");
+      }
+    }
 
-    if (normalized.question) {
+    if (format === "claude" && eventName === "PreToolUse" && payload.tool_name === ASK_USER_QUESTION_TOOL) {
+      const registered = options.claudeQuestions!.register(sessionId, payload);
+      handledStructuredClaudeQuestion = Boolean(registered.record);
+      structuredClaudeQuestionId = registered.record?.state === "waiting" || registered.record?.state === "answer_sent"
+        ? registered.record.id
+        : undefined;
+    }
+
+    if (format === "claude" && (eventName === "Elicitation" || eventName === "ElicitationResult")) {
+      structuredClaudeInteractionId = options.claudeInteractions!.register(sessionId, payload).record?.id;
+    }
+    if (format === "claude" && eventName === "PermissionDenied") {
+      options.claudeInteractions!.observePermissionDenied(sessionId, payload);
+    }
+
+    if (normalized.question && !handledStructuredClaudeQuestion) {
       options.monitor.setPendingQuestion(sessionId, {
         id: normalized.question.id,
         questions: normalized.question.questions,
-        at: new Date().toISOString()
+        at: new Date().toISOString(),
+        ...(format === "claude"
+          ? { state: "local_fallback" as const, remoteResolutionUnavailable: true }
+          : {})
       });
+    }
+
+    if (format === "claude" && eventName !== "PermissionRequest" && !claudeExitPlanControl) {
+      options.claudeApprovals!.confirmLaterActivity(sessionId, eventName);
+    }
+    if (
+      format === "claude" &&
+      !(eventName === "PreToolUse" && payload.tool_name === ASK_USER_QUESTION_TOOL)
+    ) {
+      options.claudeQuestions!.confirmLaterActivity(sessionId, eventName);
+    }
+    if (format === "claude" && eventName !== "Elicitation" && eventName !== "ElicitationResult") {
+      options.claudeInteractions!.confirmLaterActivity(sessionId, eventName);
+    }
+
+    if (structuredClaudeInteractionId) {
+      const record = await options.claudeInteractions!.wait(
+        structuredClaudeInteractionId,
+        () => !response.destroyed && !request.socket.destroyed
+      );
+      const output = options.claudeInteractions!.hookOutput(record);
+      if (output) writeJson(response, 200, output);
+      else { response.writeHead(204); response.end(); }
+      return;
+    }
+
+    if (structuredClaudeQuestionId) {
+      const record = await options.claudeQuestions!.waitForAnswer(
+        structuredClaudeQuestionId,
+        () => !response.destroyed && !request.socket.destroyed
+      );
+      const hookOutput = options.claudeQuestions!.hookOutput(record);
+      if (hookOutput) writeJson(response, 200, hookOutput);
+      else {
+        response.writeHead(204);
+        response.end();
+      }
+      return;
+    }
+    if (claudeQuestionControl) {
+      response.writeHead(204);
+      response.end();
+      return;
+    }
+    if (structuredClaudeApprovalId) {
+      const record = await options.claudeApprovals!.waitForDecision(
+        structuredClaudeApprovalId,
+        () => !response.destroyed && !request.socket.destroyed
+      );
+      const hookOutput = options.claudeApprovals!.hookOutput(record);
+      if (hookOutput) {
+        // Stdout from the installed command contains exactly this object. No
+        // acknowledgement, suggestions, or permission-rule updates are mixed
+        // into Claude's decision channel.
+        writeJson(response, 200, hookOutput);
+      } else {
+        response.writeHead(204);
+        response.end();
+      }
+      return;
+    }
+    if (claudeExitPlanControl) {
+      response.writeHead(204);
+      response.end();
+      return;
     }
 
     // SessionStart answers with Claude hook output carrying the capability
@@ -4409,7 +4765,13 @@ async function handleHookReport(
 
     writeJson(response, 200, { ok: true });
   } catch {
-    writeJson(response, 200, { ok: false });
+    writeJson(
+      response,
+      synchronousClaudeControl ? 503 : 200,
+      synchronousClaudeControl
+        ? { error: "Perch could not hold this Claude interaction; use the native local UI" }
+        : { ok: false }
+    );
   }
 }
 
@@ -4503,6 +4865,27 @@ function rpcBody<T extends Record<string, unknown>>(request: WebSocketRpcRequest
 
 function auditPeerFor(auth: ClientAuth): Pick<Parameters<AuditLog["write"]>[0], "deviceId"> {
   return auth.kind === "device" ? { deviceId: auth.deviceId } : {};
+}
+
+// Approval authority is deliberately not inferred from chat. A paired boss
+// device or the local administrative server token may decide; Mate only gets
+// the durable wake/reference and cannot authorize by replying in prose.
+function approvalActor(auth: ClientAuth): string {
+  return auth.kind === "device" ? `boss:device:${auth.deviceId}` : "boss:local-server-token";
+}
+
+function claudeInboxSnapshot(options: HttpServerOptions, after: number): Record<string, unknown> {
+  const sequence = options.tasks.stateDb.claudeInbox.sequence();
+  return {
+    version: 1,
+    sequence,
+    snapshot: {
+      permissions: options.claudeApprovals!.list().map(publicRecord),
+      questions: options.claudeQuestions!.list().map(publicQuestion),
+      interactions: options.claudeInteractions!.list().map(publicInteraction)
+    },
+    deltas: options.tasks.stateDb.claudeInbox.deltas(after)
+  };
 }
 
 async function readJson<T>(request: IncomingMessage): Promise<T> {

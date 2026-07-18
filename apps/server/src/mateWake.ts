@@ -40,14 +40,27 @@ export function wakeLine(
 ): string {
   const gate = event.kind === "needs_decision" ? parseNoMistakesGate(event.data) : undefined;
   const fallbackBody = event.message ?? task.title;
+  const approvalBody = event.kind === "needs_decision" && event.data?.reason === "approval_request"
+    ? approvalWakeBody(fallbackBody, event.data)
+    : undefined;
   const body = gate
     ? `${event.message ? `${event.message.replace(/\s+/g, " ").trim()} - ` : ""}${findingsWakeSummary(gate)}`
-    : event.kind === "checks_green"
+    : approvalBody ?? (event.kind === "checks_green"
       ? `${fallbackBody} - CI checks green; merge readiness not confirmed`
       : event.kind === "merge_ready"
         ? `${fallbackBody} - GitHub reports this PR is ready to merge`
-        : fallbackBody;
+        : fallbackBody);
   return `[perch] ${taskWakeIdentity(task)} · ${event.kind}: ${body}`;
+}
+
+function approvalWakeBody(fallback: string, data: Record<string, unknown>): string {
+  const context = data.context && typeof data.context === "object"
+    ? data.context as Record<string, unknown>
+    : {};
+  const tool = typeof context.tool === "string" ? context.tool : "Claude tool";
+  const command = typeof data.command === "string" ? data.command.replace(/\s+/g, " ").trim().slice(0, 180) : undefined;
+  const cwd = typeof data.cwd === "string" ? data.cwd.slice(0, 180) : undefined;
+  return [fallback, tool, command, cwd ? `cwd ${cwd}` : undefined].filter(Boolean).join(" - ");
 }
 
 // Supervisor wake channel: boss-relevant events inject one line into a

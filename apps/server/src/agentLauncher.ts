@@ -391,7 +391,12 @@ export function surfaceApprovalToTask(
       approvalId: approval.id,
       source: approval.source ?? "hook",
       decisions: approval.decisions,
-      context: approval.context
+      context: approval.context,
+      command: approval.command,
+      cwd: approval.cwd,
+      requestVersion: approval.requestVersion,
+      runtimeGeneration: approval.runtimeGeneration,
+      decisionPolicy: approval.decisionPolicy
     }
   });
 }

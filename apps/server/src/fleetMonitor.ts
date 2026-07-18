@@ -6,6 +6,7 @@ import type {
   CodexReasoningEffort,
   FleetEvent,
   PendingApproval,
+  PendingClaudeInteraction,
   PendingQuestion,
   PendingServerRequest,
   StartAgentRequest,
@@ -159,6 +160,7 @@ export class FleetMonitor {
   // Open AskUserQuestion prompts, alongside approvals in the overview. Both
   // gate the composer so typed text never lands in the focused widget.
   private readonly pendingQuestions = new Map<string, PendingQuestion>();
+  private readonly pendingClaudeInteractions = new Map<string, PendingClaudeInteraction>();
   private readonly queuedInputs = new Map<string, string[]>();
   // Prompts raised off the rendered screen rather than a hook, by session ->
   // prompt id. No hook will ever resolve one, so the detector retracts it when
@@ -210,6 +212,7 @@ export class FleetMonitor {
   private readonly onQueuedInputRejected?: (sessionId: string, count: number, reason: string) => void;
   private readonly onApprovalNeeded?: (sessionId: string, approval: PendingApproval) => void;
   private readonly onApprovalResolved?: (sessionId: string, approval: PendingApproval) => void;
+  private claudeManualGateHandler?: (sessionId: string, approval: PendingApproval) => void;
 
   constructor(
     private readonly adapter: AgentAdapter,
@@ -237,6 +240,10 @@ export class FleetMonitor {
 
   setRpcHandler(handler: WebSocketRpcHandler): void {
     this.rpcHandler = handler;
+  }
+
+  setClaudeManualGateHandler(handler: (sessionId: string, approval: PendingApproval) => void): void {
+    this.claudeManualGateHandler = handler;
   }
 
   setSessionModelFallback(fallback: (session: AgentSession) => SessionModel | undefined): void {
@@ -419,6 +426,15 @@ export class FleetMonitor {
     this.scheduleBroadcast();
   }
 
+  // Rehydrate durable provider-owned approval state without replaying its
+  // push or task-event side effects. The original request already emitted
+  // those before it was committed; reconnect and restart only restore truth.
+  restorePendingApproval(sessionId: string, approval: PendingApproval): void {
+    const canonical = this.canonicalSessionId(sessionId);
+    this.pendingApprovals.set(canonical, approval);
+    this.scheduleBroadcast();
+  }
+
   pendingApproval(sessionId: string): PendingApproval | undefined {
     return this.pendingApprovals.get(this.canonicalSessionId(sessionId));
   }
@@ -513,6 +529,11 @@ export class FleetMonitor {
     this.scheduleBroadcast();
   }
 
+  restorePendingQuestion(sessionId: string, question: PendingQuestion): void {
+    this.pendingQuestions.set(this.canonicalSessionId(sessionId), question);
+    this.scheduleBroadcast();
+  }
+
   pendingQuestion(sessionId: string): PendingQuestion | undefined {
     return this.pendingQuestions.get(this.canonicalSessionId(sessionId));
   }
@@ -522,6 +543,34 @@ export class FleetMonitor {
     if (this.pendingQuestions.delete(canonical)) {
       this.scheduleBroadcast();
     }
+  }
+
+  setPendingClaudeInteraction(sessionId: string, interaction: PendingClaudeInteraction): void {
+    const canonical = this.canonicalSessionId(sessionId);
+    const existing = this.pendingClaudeInteractions.get(canonical);
+    this.pendingClaudeInteractions.set(canonical, interaction);
+    if (!existing) {
+      this.pushRouter?.approvalNeeded(canonical, this.findSession(canonical), {
+        id: interaction.id,
+        summary: interaction.summary,
+        at: interaction.at
+      });
+    }
+    this.applyExternalStatus(canonical, "needs_approval", "claude", "hook");
+    this.scheduleBroadcast();
+  }
+
+  restorePendingClaudeInteraction(sessionId: string, interaction: PendingClaudeInteraction): void {
+    this.pendingClaudeInteractions.set(this.canonicalSessionId(sessionId), interaction);
+    this.scheduleBroadcast();
+  }
+
+  pendingClaudeInteraction(sessionId: string): PendingClaudeInteraction | undefined {
+    return this.pendingClaudeInteractions.get(this.canonicalSessionId(sessionId));
+  }
+
+  resolveClaudeInteraction(sessionId: string): void {
+    if (this.pendingClaudeInteractions.delete(this.canonicalSessionId(sessionId))) this.scheduleBroadcast();
   }
 
   // Composer gating: while a permission prompt is open, pasted text would land
@@ -612,6 +661,7 @@ export class FleetMonitor {
       this.pendingApprovals.has(sessionId) ||
       this.pendingServerRequests.has(sessionId) ||
       this.pendingQuestions.has(sessionId) ||
+      this.pendingClaudeInteractions.has(sessionId) ||
       this.sessionState.get(sessionId)?.status === "needs_approval"
     );
   }
@@ -934,6 +984,7 @@ export class FleetMonitor {
         // delivered.
         this.pendingApprovals.delete(event.sessionId);
         this.pendingQuestions.delete(event.sessionId);
+        this.pendingClaudeInteractions.delete(event.sessionId);
         this.screenPrompts.delete(event.sessionId);
         this.usageLimits.delete(event.sessionId);
         const rejected = this.queuedInputs.get(event.sessionId)?.length ?? 0;
@@ -1002,6 +1053,7 @@ export class FleetMonitor {
       this.pendingApprovals,
       this.pendingServerRequests,
       this.pendingQuestions,
+      this.pendingClaudeInteractions,
       this.screenPrompts,
       this.usageLimits,
       this.sessionModels,
@@ -1102,8 +1154,12 @@ export class FleetMonitor {
         // the question is the more specific/actionable one, so it wins.
         const serverRequest = this.pendingServerRequests.get(session.id);
         const question = this.pendingQuestions.get(session.id);
+        const claudeInteraction = this.pendingClaudeInteractions.get(session.id);
         if (serverRequest) {
           result.pendingServerRequest = serverRequest;
+          result.status = "needs_approval";
+        } else if (claudeInteraction) {
+          result.pendingClaudeInteraction = claudeInteraction;
           result.status = "needs_approval";
         } else if (question) {
           result.pendingQuestion = question;
@@ -1206,8 +1262,9 @@ export class FleetMonitor {
   // the open dialog. Recognizing the frame on the rendered screen raises the
   // SAME `needs_approval` state a hook would, which buys the decision card, the
   // push, and `inputGated()` - so the message queues instead of answering the
-  // dialog. `/sessions/:id/approve` already answers Claude's numbered prompts
-  // with "1" (or Esc to dismiss), which is exactly what this dialog wants.
+  // dialog. Claude screen detection is degraded/manual-local only: it never
+  // proves a remote decision landed. Existing structured Codex behavior is
+  // unchanged.
   private detectScreenPrompt(sessionId: string, screen: string): void {
     const session = this.sessions.find((candidate) => candidate.id === sessionId);
     const agent = session?.agent ?? this.sessionState.get(sessionId)?.agent;
@@ -1246,18 +1303,22 @@ export class FleetMonitor {
     }
 
     this.screenPrompts.set(sessionId, detected);
-    this.setPendingApproval(sessionId, {
+    const degradedClaude = agent === "claude";
+    const approval: PendingApproval = {
       id: detected.id,
       summary: detected.summary,
       command: detected.options.map((option, index) => `${index + 1}. ${option}`).join("\n"),
       at: new Date().toISOString(),
       source: "screen",
-      ...(detected.remoteResolutionUnavailable ? { remoteResolutionUnavailable: true } : {}),
-      ...(detected.decisions
+      ...(degradedClaude ? { interactionKind: "pty_manual_gate" as const } : {}),
+      ...(detected.remoteResolutionUnavailable || degradedClaude ? { remoteResolutionUnavailable: true } : {}),
+      ...(!degradedClaude && detected.decisions
         ? { decisions: detected.decisions.map(({ input: _, ...decision }) => decision) }
         : {}),
       ...(detected.context ? { context: detected.context } : {})
-    });
+    };
+    this.setPendingApproval(sessionId, approval);
+    if (degradedClaude) this.claudeManualGateHandler?.(sessionId, approval);
   }
 
   private scheduleDetailCapture(sessionId: string): void {

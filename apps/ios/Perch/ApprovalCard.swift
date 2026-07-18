@@ -1,8 +1,8 @@
 import SwiftUI
 
 // The killer moment of the product: the agent is blocked on a permission
-// prompt and one tap from anywhere resumes it. The server answers the real
-// TUI dialog, so the desktop terminal visibly resolves too.
+// prompt and one tap from anywhere resumes it. Structured Claude requests are
+// answered through the waiting hook; only degraded prompts use local UI.
 struct ApprovalCard: View {
     let approval: PendingApproval
     let onDecision: (String) async -> Void
@@ -43,7 +43,9 @@ struct ApprovalCard: View {
             }
 
             if approval.remoteResolutionUnavailable == true {
-                Text("Structured remote resolution is unavailable. Answer this prompt in the desktop Codex session.")
+                Text(approval.requestVersion == 1
+                    ? "Remote approval expired or disconnected. Answer Claude's native dialog on the desktop."
+                    : "Structured remote resolution is unavailable. Answer this prompt in the desktop Codex session.")
                     .font(.system(size: 12, weight: .medium))
                     .foregroundStyle(Style.warningText)
                     .fixedSize(horizontal: false, vertical: true)
@@ -102,7 +104,9 @@ struct ApprovalCard: View {
                     submitted,
                     advertised: approval.decisions?.map { ($0.id, $0.label) } ?? []
                 )
-                Text("Sent \(label). Waiting for the terminal to confirm resolution…")
+                Text(approval.requestVersion == 1
+                    ? "Sent \(label). Waiting for later Claude activity to confirm it…"
+                    : "Sent \(label). Waiting for the terminal to confirm resolution…")
                     .font(.system(size: 11))
                     .foregroundStyle(Style.textSecondary)
                     .fixedSize(horizontal: false, vertical: true)
