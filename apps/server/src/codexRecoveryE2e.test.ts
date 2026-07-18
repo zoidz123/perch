@@ -7,6 +7,7 @@ import { homedir, tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { test } from "node:test";
 import type { Task } from "@perch/shared";
+import WebSocket from "ws";
 
 const RUN_REAL = process.env.PERCH_REAL_CODEX_E2E === "1";
 const repoRoot = resolve(import.meta.dirname, "../../..");
@@ -22,6 +23,7 @@ test("private-home E2E: real Codex thread survives server restart and explicit d
   assertIsolatedRecoveryTarget(home, port);
   const secret = randomUUID();
   let server: ChildProcess | undefined;
+  let disposableThread: string | undefined;
   try {
     server = startServer(home, port);
     const token = await waitForToken(home);
@@ -44,8 +46,13 @@ test("private-home E2E: real Codex thread survives server restart and explicit d
       task.runtime?.state === "live" && Boolean(task.runtime.providerSessionId)
     );
     const originalThread = original.runtime!.providerSessionId!;
+    disposableThread = originalThread;
     const originalSession = original.sessionId!;
     const originalGeneration = original.runtime!.generation;
+    const freshSnapshot = await terminalSnapshot(port, token, originalSession);
+    assert.equal(freshSnapshot.cols, 100);
+    assert.equal(freshSnapshot.rows, 32);
+    assert.match(freshSnapshot.data, /\x1b\[>[0-9;]+u/, "fresh live attach must restore Codex keyboard mode");
     await waitForWorkerWorkingEvent(port, token, created.task.id);
     original = await waitForTask(port, token, created.task.id, (task) => task.state === "working");
 
@@ -89,12 +96,36 @@ test("private-home E2E: real Codex thread survives server restart and explicit d
       })
     });
     await waitForTerminalText(port, token, recovered.sessionId!, `RECOVERY_E2E_CONTEXT_${secret}`);
+
+    const recoveredSnapshot = await terminalSnapshot(port, token, recovered.sessionId!);
+    assert.equal(recoveredSnapshot.cols, 100);
+    assert.equal(recoveredSnapshot.rows, 32);
+    assert.match(
+      recoveredSnapshot.data,
+      /\x1b\[>[0-9;]+u/,
+      "crash-recovery attach must restore the same Codex keyboard mode as a fresh attach"
+    );
+
+    const firstLine = `RECOVERY_MULTILINE_ONE_${secret}`;
+    const secondLine = `RECOVERY_MULTILINE_TWO_${secret}`;
+    await sendTerminalInput(port, token, recovered.sessionId!, `${firstLine}\x1b[13;2u${secondLine}`);
+    const multilineSnapshot = await terminalSnapshot(port, token, recovered.sessionId!);
+    assert.ok(multilineSnapshot.data.includes(firstLine), "recovered composer must retain the first draft line");
+    assert.ok(multilineSnapshot.data.includes(secondLine), "Shift+Enter must insert a second draft line");
+    await sendTerminalInput(port, token, recovered.sessionId!, "\x15");
     await request(port, token, `/tasks/${encodeURIComponent(created.task.id)}/teardown`, {
       method: "POST",
       body: JSON.stringify({ force: true })
     });
   } finally {
     if (server) await stopServer(server, home, port).catch(() => {});
+    if (disposableThread) {
+      try {
+        execFileSync("codex", ["delete", disposableThread, "--force"], { cwd: repoRoot, stdio: "ignore" });
+      } catch {
+        console.error(`codex-recovery-e2e could not delete disposable thread ${disposableThread}`);
+      }
+    }
     rmSync(home, { recursive: true, force: true });
     execFileSync("git", ["worktree", "prune"], { cwd: repoRoot });
   }
@@ -174,12 +205,28 @@ async function waitForTask(
   taskId: string,
   predicate: (task: Task) => boolean
 ): Promise<Task> {
+  const trusted = new Set<string>();
+  let latest: Task | undefined;
   for (let attempt = 0; attempt < 300; attempt += 1) {
     const { task } = await request<{ task: Task }>(port, token, `/tasks/${encodeURIComponent(taskId)}`);
+    latest = task;
     if (predicate(task)) return task;
+    if (task.sessionId && !trusted.has(task.sessionId)) {
+      if (await acceptTrustPromptIfPresent(port, token, task.sessionId)) trusted.add(task.sessionId);
+    }
+    if (task.sessionId) await dismissCodexHookMenuIfPresent(port, token, task.sessionId);
     await delay(250);
   }
-  throw new Error(`task ${taskId} did not reach expected state`);
+  const logs = latest?.sessionId
+    ? await request<{ events: Array<{ text?: string }> }>(
+        port,
+        token,
+        `/sessions/${encodeURIComponent(latest.sessionId)}/logs?lines=200`
+      ).catch(() => undefined)
+    : undefined;
+  throw new Error(
+    `task ${taskId} did not reach expected state: ${JSON.stringify({ latest, logs })}\n${serverLogs.slice(-12_000)}`
+  );
 }
 
 async function waitForRecoveredTurn(port: number, token: string, taskId: string, sessionId: string): Promise<void> {
@@ -208,6 +255,7 @@ async function waitForWorkerWorkingEvent(port: number, token: string, taskId: st
 }
 
 async function waitForTerminalText(port: number, token: string, sessionId: string, expected: string): Promise<void> {
+  let trusted = false;
   for (let attempt = 0; attempt < 300; attempt += 1) {
     const logs = await request<{ events: Array<{ type: string; text?: string }> }>(
       port,
@@ -219,9 +267,49 @@ async function waitForTerminalText(port: number, token: string, sessionId: strin
       .map((event) => event.text ?? "")
       .join("");
     if (terminal.includes(expected)) return;
+    if (!trusted && isTrustPrompt(terminal)) {
+      await request(port, token, `/sessions/${encodeURIComponent(sessionId)}/submit`, {
+        method: "POST",
+        body: JSON.stringify({ text: "1" })
+      });
+      trusted = true;
+    }
     await delay(250);
   }
   throw new Error(`session ${sessionId} did not emit ${expected}`);
+}
+
+async function acceptTrustPromptIfPresent(port: number, token: string, sessionId: string): Promise<boolean> {
+  const logs = await request<{ events: Array<{ text?: string }> }>(
+    port,
+    token,
+    `/sessions/${encodeURIComponent(sessionId)}/logs?lines=200`
+  ).catch(() => undefined);
+  const text = logs?.events.map((event) => event.text ?? "").join("") ?? "";
+  if (!isTrustPrompt(text)) return false;
+  await request(port, token, `/sessions/${encodeURIComponent(sessionId)}/submit`, {
+    method: "POST",
+    body: JSON.stringify({ text: "1" })
+  });
+  return true;
+}
+
+async function dismissCodexHookMenuIfPresent(port: number, token: string, sessionId: string): Promise<boolean> {
+  const logs = await request<{ events: Array<{ text?: string }> }>(
+    port,
+    token,
+    `/sessions/${encodeURIComponent(sessionId)}/logs?lines=200`
+  ).catch(() => undefined);
+  const text = logs?.events.map((event) => event.text ?? "").join("") ?? "";
+  const hookToggle = text.includes("Turn hooks on or off") && text.includes("Press esc to go back");
+  const hookSummary = text.includes("Lifecycle hooks from config") && text.includes("esc to close");
+  if (!hookToggle && !hookSummary) return false;
+  await sendTerminalInput(port, token, sessionId, "\x1b");
+  return true;
+}
+
+function isTrustPrompt(text: string): boolean {
+  return text.includes("Do you trust the contents of this directory?") || text.includes("Yes, I trust this folder");
 }
 
 async function request<T = unknown>(
@@ -237,6 +325,67 @@ async function request<T = unknown>(
   const body = await response.json() as T & { error?: string };
   if (!response.ok) throw new Error(body.error ?? `HTTP ${response.status}`);
   return body;
+}
+
+async function terminalSnapshot(
+  port: number,
+  token: string,
+  sessionId: string
+): Promise<{ data: string; cols: number; rows: number }> {
+  return await new Promise((resolvePromise, reject) => {
+    const socket = new WebSocket(`ws://127.0.0.1:${port}/?token=${encodeURIComponent(token)}`);
+    const timer = setTimeout(() => {
+      socket.terminate();
+      reject(new Error(`timed out waiting for terminal snapshot for ${sessionId}`));
+    }, 10_000);
+    socket.on("open", () => {
+      // Match a real desktop attach: geometry arrives before subscription, so
+      // Codex redraws at the terminal's actual size before Perch snapshots it.
+      socket.send(JSON.stringify({ type: "resize", sessionId, cols: 100, rows: 32 }));
+      socket.send(JSON.stringify({ type: "subscribe", sessionId }));
+    });
+    socket.on("message", (raw) => {
+      const message = JSON.parse(raw.toString()) as {
+        type?: string;
+        event?: { type?: string; sessionId?: string; data?: string; cols?: number; rows?: number };
+      };
+      if (
+        message.type === "event" &&
+        message.event?.type === "terminal_snapshot" &&
+        message.event.sessionId === sessionId &&
+        typeof message.event.data === "string" &&
+        typeof message.event.cols === "number" &&
+        typeof message.event.rows === "number"
+      ) {
+        clearTimeout(timer);
+        socket.close();
+        resolvePromise({ data: message.event.data, cols: message.event.cols, rows: message.event.rows });
+      }
+    });
+    socket.on("error", (error) => {
+      clearTimeout(timer);
+      reject(error);
+    });
+  });
+}
+
+async function sendTerminalInput(port: number, token: string, sessionId: string, data: string): Promise<void> {
+  await new Promise<void>((resolvePromise, reject) => {
+    const socket = new WebSocket(`ws://127.0.0.1:${port}/?token=${encodeURIComponent(token)}`);
+    socket.on("open", () => {
+      socket.send(JSON.stringify({ type: "input", sessionId, data }), (error) => {
+        if (error) {
+          reject(error);
+          return;
+        }
+        setTimeout(() => {
+          socket.close();
+          resolvePromise();
+        }, 250);
+      });
+    });
+    socket.on("error", reject);
+  });
 }
 
 const delay = (ms: number) => new Promise((resolvePromise) => setTimeout(resolvePromise, ms));

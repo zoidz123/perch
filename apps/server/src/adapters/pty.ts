@@ -81,6 +81,13 @@ type Disposable = {
   dispose(): void;
 };
 
+type CodexModeReplay = {
+  scanTail?: string;
+  keyboard?: string;
+  modifyOtherKeys?: string;
+  cursor?: string;
+};
+
 export type PtyProcess = {
   pid: number;
   write(data: string): void;
@@ -122,6 +129,11 @@ type PtySessionState = {
   pendingRaw: string;
   seq: number;
   lastFlushAt: number;
+  // xterm's serializer restores screen contents and common DEC modes, but it
+  // does not know about kitty keyboard enhancement or cursor visibility.
+  // Codex enables those before a late attach (notably crash recovery), so keep
+  // the current Codex-only mode bytes available for snapshot replay.
+  codexModeReplay: CodexModeReplay;
   flushTimer?: ReturnType<typeof setTimeout>;
   // Set once the process exits; the record survives briefly for the fleet,
   // with heavy resources already released.
@@ -326,7 +338,7 @@ export class PtyAgentAdapter implements AgentAdapter {
     this.flush(sessionId, state);
     await state.writeQueue;
     return {
-      data: state.serialize.serialize(),
+      data: state.serialize.serialize() + serializeCodexModes(state.codexModeReplay),
       cols: state.cols,
       rows: state.rows,
       seq: state.seq
@@ -588,12 +600,16 @@ export class PtyAgentAdapter implements AgentAdapter {
       rows,
       pendingRaw: "",
       seq: 0,
-      lastFlushAt: 0
+      lastFlushAt: 0,
+      codexModeReplay: {}
     };
 
     state.disposables.push(
       child.onData((chunk) => {
         state.rawText = trimBuffer(state.rawText + chunk);
+        if (state.session.agent === "codex") {
+          updateCodexModes(state.codexModeReplay, chunk);
+        }
         // Feed the headless terminal (snapshot/tail source) off the hot path;
         // delta delivery to clients does not wait for it.
         state.writeQueue = state.writeQueue.then(() => writeTerminal(state.terminal, chunk)).catch(() => {});
@@ -871,6 +887,37 @@ function trimBuffer(text: string): string {
   }
 
   return text.slice(-MAX_BUFFER_BYTES);
+}
+
+// Codex uses terminal modes that @xterm/addon-serialize does not model. The
+// most important one is kitty keyboard enhancement: without replaying it to a
+// terminal that attaches after Codex booted, Shift+Enter is encoded as plain
+// Enter. Keep only the latest active modes rather than replaying terminal
+// history, so a recovery snapshot is equivalent to the current TUI state.
+function updateCodexModes(state: CodexModeReplay, chunk: string): void {
+  const scan = (state.scanTail ?? "") + chunk;
+  const pattern = /\x1b\[(?:([><=])([0-9;]*)u|>4;([0-9]+)m|\?25([hl]))/g;
+  let match: RegExpExecArray | null;
+  while ((match = pattern.exec(scan)) !== null) {
+    if (match[1]) {
+      const operation = match[1];
+      const flags = match[2] ?? "";
+      state.keyboard = operation === "<" || (operation === "=" && /^0*(?:;0*)*$/.test(flags))
+        ? undefined
+        : match[0];
+    } else if (match[3]) {
+      state.modifyOtherKeys = Number(match[3]) === 0 ? undefined : match[0];
+    } else if (match[4]) {
+      state.cursor = match[0];
+    }
+  }
+  // A mode escape is tiny. Retaining the last 32 bytes covers a sequence split
+  // across PTY chunks, while re-reading a complete sequence is idempotent.
+  state.scanTail = scan.slice(-32);
+}
+
+function serializeCodexModes(state: CodexModeReplay): string {
+  return `${state.keyboard ?? ""}${state.modifyOtherKeys ?? ""}${state.cursor ?? ""}`;
 }
 
 function writeTerminal(terminal: HeadlessTerminal, chunk: string): Promise<void> {
