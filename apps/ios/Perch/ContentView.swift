@@ -1256,6 +1256,7 @@ struct AgentGlyph: View {
             }
         }
         .frame(width: 30, height: 30)
+        .accessibilityLabel(accessibilityLabel)
     }
 
     // Brand marks where we have them; letter tiles for the rest.
@@ -1281,6 +1282,15 @@ struct AgentGlyph: View {
         case .claude: Color(red: 0.86, green: 0.58, blue: 0.35)
         case .codex: Style.textSecondary
         case .shell, .unknown: Style.textFaint
+        }
+    }
+
+    private var accessibilityLabel: String {
+        switch agent {
+        case .claude: "Claude agent"
+        case .codex: "Codex agent"
+        case .shell: "Shell agent"
+        case .unknown: "Unknown agent"
         }
     }
 }
