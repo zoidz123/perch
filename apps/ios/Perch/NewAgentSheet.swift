@@ -150,19 +150,39 @@ struct NewAgentSheet: View {
     // row and the model sent at launch agree.
     @ViewBuilder
     private var modelPicker: some View {
-        let catalog = store.models?.providers.first { $0.provider == agent }
-        let options: [AgentModelOption] = catalog?.agentOptions ?? agent.pickerModelOptions
-        if !options.isEmpty {
+        let rows = modelRows
+        if !rows.isEmpty {
             VStack(alignment: .leading, spacing: 10) {
                 sectionLabel("Model")
                 VStack(spacing: 0) {
-                    ForEach(Array(options.enumerated()), id: \.element.id) { index, option in
-                        modelRow(id: option.id, label: option.label, detail: option.detail)
-                        if index != options.count - 1 { Divider().overlay(Style.hairline) }
+                    ForEach(Array(rows.enumerated()), id: \.element.id) { index, row in
+                        modelRow(id: row.id, label: row.label, detail: row.detail, removed: row.isRemoved)
+                        if index != rows.count - 1 { Divider().overlay(Style.hairline) }
                     }
                 }
             }
         }
+    }
+
+    // Newest visible models, plus the current selection when it falls outside
+    // them so a saved/default pick is never silently dropped (a still-offered
+    // model kept normally, a removed one flagged).
+    private var modelRows: [ModelPickerRow] {
+        let selected = model ?? resolvedModel(for: agent)
+        let label = selected.map { store.modelLabel(for: $0) } ?? ""
+        if let catalog = store.models?.providers.first(where: { $0.provider == agent }) {
+            return catalog.pickerRows(selectedId: selected, selectedLabel: label, selectedDetail: nil)
+        }
+        let compact = agent.pickerModelOptions.map {
+            ModelPickerRow(id: $0.id, label: $0.label, detail: $0.detail, isRemoved: false)
+        }
+        return compactModelPickerRows(
+            compact: compact,
+            offeredIds: Set(agent.modelOptions.map(\.id)),
+            selectedId: selected,
+            selectedLabel: label,
+            selectedDetail: nil
+        )
     }
 
     private func resolvedModel(for agent: AgentKind) -> String? {
@@ -172,20 +192,30 @@ struct NewAgentSheet: View {
         return options.first(where: { $0.id == configured })?.id ?? options.first?.id
     }
 
-    private func modelRow(id: String, label: String, detail: String?) -> some View {
+    private func modelRow(id: String, label: String, detail: String?, removed: Bool = false) -> some View {
         let selected = (model ?? resolvedModel(for: agent)) == id
         return Button {
             model = id
         } label: {
             HStack(spacing: 10) {
                 VStack(alignment: .leading, spacing: 2) {
-                    Text(label)
-                        .font(.system(size: 15, weight: .medium))
-                        .foregroundStyle(Style.textPrimary)
+                    HStack(spacing: 6) {
+                        Text(label)
+                            .font(.system(size: 15, weight: .medium))
+                            .foregroundStyle(removed ? Style.textSecondary : Style.textPrimary)
+                        if removed {
+                            Text("Removed")
+                                .font(.system(size: 10, weight: .semibold))
+                                .foregroundStyle(Style.textFaint)
+                                .padding(.horizontal, 6)
+                                .padding(.vertical, 2)
+                                .background(Capsule().fill(Style.secondaryFill))
+                        }
+                    }
                     if let detail, !detail.isEmpty {
                         Text(detail)
                             .font(.system(size: 12))
-                            .foregroundStyle(Style.textSecondary)
+                            .foregroundStyle(removed ? Style.textFaint : Style.textSecondary)
                             .lineLimit(2)
                             .multilineTextAlignment(.leading)
                             .fixedSize(horizontal: false, vertical: true)

@@ -34,48 +34,56 @@ const execFile = promisify(execFileCallback);
 //  - Gateway/provider ids are enrichment metadata. They are never local launch
 //    ids unless a runtime source maps them to `runtimeId`.
 
-const CLAUDE_MODELS: ModelCatalogEntry[] = [
-  {
-    id: "claude-fable-5",
-    runtimeId: "claude-fable-5",
-    label: "Fable 5",
-    detail: "1M context",
-    nativeProviderId: "claude-fable-5",
+// Versioned discovery adapter for the Claude CLI's `/model` alias vocabulary.
+//
+// The installed CLI is authoritative for WHICH aliases are selectable: the
+// live catalog is built purely from the aliases `claude /model` reports (see
+// `claudeCatalogFromCli`), and this table never adds or withholds an alias the
+// CLI does not list. It only supplies, for the aliases we recognize, a
+// friendly versioned LABEL and a recency RANK so the picker surfaces the newest
+// models first - the CLI emits them in a legacy order (`sonnet, opus, haiku,
+// fable, ...`) that would otherwise bury Fable behind the picker's 3-row limit.
+//
+// Unrecognized aliases still appear (labeled from the raw id, sorted after
+// known ones), so a newly shipped model is never hidden. `[1m]` context-window
+// variants inherit their base alias's label with a "1M context" detail. The
+// `nativeProviderId` is the full id the CLI stamps on transcripts for that
+// alias, used only for enrichment.
+//
+// Verified against `claude` 2.1.x (`claude /model` -> "Available: sonnet, opus,
+// haiku, fable, best, sonnet[1m], opus[1m], fable[1m], opusplan, default, or a
+// full model ID.") on 2026-07-18. Update this table when the CLI's alias set or
+// versioned names change; it is label/order metadata, not a source of truth for
+// which models exist.
+type ClaudeAliasMeta = { label: string; detail?: string; rank: number; nativeProviderId?: string };
+const CLAUDE_ALIAS_CATALOG: Record<string, ClaudeAliasMeta> = {
+  fable: { label: "Fable 5", detail: "1M context", rank: 0, nativeProviderId: "claude-fable-5" },
+  opus: { label: "Opus 4.8", detail: "1M context", rank: 1, nativeProviderId: "claude-opus-4-8" },
+  sonnet: { label: "Sonnet 5", detail: "1M context", rank: 2, nativeProviderId: "claude-sonnet-5" },
+  haiku: { label: "Haiku 4.5", detail: "200K context", rank: 3, nativeProviderId: "claude-haiku-4-5" },
+  best: { label: "Best available", detail: "Latest highest-capability Claude model", rank: 4 },
+  opusplan: { label: "Opus Plan", detail: "Opus while planning, cheaper model while editing", rank: 5 }
+};
+
+// The concrete aliases surfaced in the offline/fallback catalog, in picker
+// order. A subset of the adapter above (the meta-aliases `best`/`opusplan` and
+// the `[1m]` opt-ins are live-only). Only used when the CLI query is
+// unavailable or errors - never as normal behavior.
+const CLAUDE_FALLBACK_ALIASES = ["fable", "opus", "sonnet", "haiku"];
+
+const CLAUDE_MODELS: ModelCatalogEntry[] = CLAUDE_FALLBACK_ALIASES.map((alias) => {
+  const meta = CLAUDE_ALIAS_CATALOG[alias];
+  return {
+    id: alias,
+    runtimeId: alias,
+    label: meta.label,
+    ...(meta.detail ? { detail: meta.detail } : {}),
+    ...(meta.nativeProviderId ? { nativeProviderId: meta.nativeProviderId } : {}),
     runtimeSource: "claude-cli-fallback",
     source: ["static-fallback"],
     status: "fallback"
-  },
-  {
-    id: "opus",
-    runtimeId: "opus",
-    label: "Opus 4.8",
-    detail: "1M context",
-    nativeProviderId: "claude-opus-4-8",
-    runtimeSource: "claude-cli-fallback",
-    source: ["static-fallback"],
-    status: "fallback"
-  },
-  {
-    id: "sonnet",
-    runtimeId: "sonnet",
-    label: "Sonnet 5",
-    detail: "1M context",
-    nativeProviderId: "claude-sonnet-5",
-    runtimeSource: "claude-cli-fallback",
-    source: ["static-fallback"],
-    status: "fallback"
-  },
-  {
-    id: "haiku",
-    runtimeId: "haiku",
-    label: "Haiku 4.5",
-    detail: "200K context",
-    nativeProviderId: "claude-haiku-4-5",
-    runtimeSource: "claude-cli-fallback",
-    source: ["static-fallback"],
-    status: "fallback"
-  }
-];
+  };
+});
 
 // The model a fresh Claude MATE launches with when neither the start request
 // nor the configured mate defaults (settings mateDefaults / PERCH_MATE_MODEL)
@@ -163,6 +171,7 @@ export const MATE_CODEX_FALLBACK = {
 // mapped back onto a catalog entry, so a settings.json pinned to a full id
 // still resolves to a versioned label.
 const CLAUDE_FULL_ID_ALIASES: Record<string, string> = {
+  "claude-fable-5": "fable",
   "claude-opus-4-8": "opus",
   "claude-sonnet-5": "sonnet",
   "claude-haiku-4-5": "haiku"
@@ -329,9 +338,24 @@ function claudeCatalogFromCli(deps: ModelsDeps, raw: unknown): { catalog: Provid
   if (!result) return null;
   const match = result.match(/Available:\s*([^\n.]+)(?:\.|$)/i);
   if (!match) return null;
-  const aliases = match[1].split(",").map((value) => value.trim()).filter((value) => value && value !== "default" && !/^or a full model id$/i.test(value));
-  const options = aliases.map((runtimeId) => claudeRuntimeEntry(runtimeId));
-  if (!options.length) return null;
+  // The CLI is authoritative for the alias list; dedupe repeats and drop the
+  // non-model sentinels (`default`, "or a full model ID") it appends.
+  const seen = new Set<string>();
+  const aliases: string[] = [];
+  for (const value of match[1].split(",")) {
+    const alias = value.trim();
+    if (!alias || alias === "default" || /^or a full model id$/i.test(alias) || seen.has(alias)) continue;
+    seen.add(alias);
+    aliases.push(alias);
+  }
+  if (!aliases.length) return null;
+  // Order frontier-first via the versioned adapter's rank (unknown aliases keep
+  // their CLI order after known ones) so the picker's 3-row limit surfaces the
+  // newest models (Fable 5) rather than the CLI's legacy sonnet-first order.
+  const options = aliases
+    .map((runtimeId, index) => ({ entry: claudeRuntimeEntry(runtimeId), rank: claudeAliasRank(runtimeId, index) }))
+    .sort((a, b) => a.rank - b.rank)
+    .map(({ entry }) => entry);
   const catalog: ProviderModelCatalog = {
     provider: "claude", label: "Claude", options, roleDefaults: roleDefaultsFor("claude", options), runtimeSource: "claude-cli", source: ["claude-cli"], status: "available"
   };
@@ -343,10 +367,34 @@ function claudeCatalogFromCli(deps: ModelsDeps, raw: unknown): { catalog: Provid
   return { catalog, sourceStatuses: [{ name: "claude-cli", role: "runtime", ok: true, status: "ok" }] };
 }
 
+// Rank a live CLI alias for picker ordering: known base aliases sort by their
+// adapter rank, their `[1m]` opt-ins sort just after every base alias, and
+// unrecognized aliases keep CLI order at the end so a newly shipped model still
+// appears (just not ahead of the versioned models we know).
+function claudeAliasRank(runtimeId: string, cliIndex: number): number {
+  const bare = runtimeId.replace(/\[[^\]]*\]/g, "").trim();
+  const meta = CLAUDE_ALIAS_CATALOG[bare];
+  if (!meta) return 1000 + cliIndex;
+  return /\[1m\]/i.test(runtimeId) ? 100 + meta.rank : meta.rank;
+}
+
 function claudeRuntimeEntry(runtimeId: string): ModelCatalogEntry {
-  const known = CLAUDE_MODELS.find((entry) => entry.id === runtimeId);
-  return known ? { ...known, runtimeSource: "claude-cli", source: ["claude-cli"], status: "available" } : {
-    id: runtimeId, runtimeId, label: readableModelId(runtimeId), runtimeSource: "claude-cli", source: ["claude-cli"], status: "available"
+  // Preserve the exact CLI alias as the launch id; resolve its label/detail
+  // from the versioned adapter, honoring the `[1m]` context opt-in.
+  const wants1m = /\[1m\]/i.test(runtimeId);
+  const bare = runtimeId.replace(/\[[^\]]*\]/g, "").trim();
+  const meta = CLAUDE_ALIAS_CATALOG[bare];
+  const label = meta?.label ?? readableModelId(runtimeId);
+  const detail = wants1m ? "1M context" : meta?.detail;
+  return {
+    id: runtimeId,
+    runtimeId,
+    label,
+    ...(detail ? { detail } : {}),
+    ...(meta?.nativeProviderId ? { nativeProviderId: meta.nativeProviderId } : {}),
+    runtimeSource: "claude-cli",
+    source: ["claude-cli"],
+    status: "available"
   };
 }
 
@@ -471,7 +519,7 @@ function codexCatalogFromModelList(
 // highest-capability entry first and its worker entry is Opus.
 function roleDefaultsFor(agent: AgentKind, options: ModelCatalogEntry[]): Partial<Record<"orchestrator" | "crew", PerchModelRoleDefault>> {
   if (agent === "claude") {
-    const orchestrator = options.find((option) => option.id === "best") ?? options.find((option) => option.id === "claude-fable-5") ?? options[0];
+    const orchestrator = options.find((option) => option.id === "best") ?? options.find((option) => option.id === "fable") ?? options[0];
     const crew = options.find((option) => option.id === "opus") ?? options[0];
     return {
       ...(orchestrator ? { orchestrator: { model: orchestrator.runtimeId ?? orchestrator.id } } : {}),

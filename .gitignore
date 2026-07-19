@@ -19,6 +19,7 @@ dist
 *.key
 *.mobileprovision
 DerivedData/
+.build/
 *.xcuserstate
 **/xcuserdata/
 coverage/
