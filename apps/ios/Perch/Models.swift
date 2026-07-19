@@ -851,6 +851,11 @@ struct OptimisticMessage: Identifiable, Equatable {
     let item: TimelineItem
     var deadline: Date
     var failed = false
+    // The server returned 202 (input accepted + injected). That is the
+    // authoritative delivery signal; the canonical timeline row only confirms
+    // it. An acknowledged message is never declared "Not delivered", even if
+    // its row is delayed (e.g. a resumed session's timeline briefly behind).
+    var acknowledged = false
 
     var id: String { item.id }
 }
