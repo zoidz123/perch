@@ -54,6 +54,7 @@
     "typecheck": "npm run build -w @perch/shared && npm run build -w @perch/relay && npm run typecheck -w @perch/server && npm run typecheck -w @perch/relay",
     "dev:server": "npm run dev -w @perch/server",
     "ios:simulator": "scripts/run-ios-simulator.sh",
+    "ios:testflight": "scripts/release-ios-testflight.sh",
     "open:ios": "open apps/ios/Perch.xcodeproj"
   },
   "bin": {

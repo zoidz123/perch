@@ -232,3 +232,19 @@ xcodebuild \
   -destination 'platform=iOS Simulator,name=iPhone 17 Pro' \
   build
 ```
+
+## TestFlight release
+
+To upload a TestFlight build, Xcode must be signed in with an Apple ID that belongs to your Apple Developer team.
+Set `PERCH_IOS_TEAM_ID` to your Apple Developer team ID and run the release pipeline from the repository root:
+
+```sh
+PERCH_IOS_TEAM_ID=<your-team-id> npm run ios:testflight
+```
+
+The pipeline archives with automatic signing and passes `DEVELOPMENT_TEAM` from `PERCH_IOS_TEAM_ID` because the Xcode project intentionally leaves its development team unset.
+`-allowProvisioningUpdates` lets Xcode create or refresh the required signing assets using the signed-in Apple ID session.
+The upload export options let App Store Connect manage the app version and build number automatically.
+
+After upload, wait for App Store Connect to finish processing the build before it appears in TestFlight.
+Answer the export-compliance prompt in App Store Connect when it appears.
