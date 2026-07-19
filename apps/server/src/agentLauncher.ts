@@ -363,7 +363,7 @@ async function prepareCodexRemote(
   const hookEnv: Record<string, string> = {
     PERCH_SESSION_ID: sessionId,
     PERCH_HOOK_URL: `http://127.0.0.1:${options.port}/hooks`,
-    PERCH_HOOK_TOKEN: options.hooks.register(sessionId).token,
+    PERCH_HOOK_TOKEN: options.hooks.ensure(sessionId).token,
     ...taskCapabilityEnvironment(options.tasks, request, cwd)
   };
   const handle = await options.codexControl.prepareRemote(cwd, { effort, env: hookEnv });
