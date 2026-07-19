@@ -272,6 +272,15 @@ export async function startManagedAgent(
       options.projects.touch(input.projectRoot ?? lease?.repoRoot ?? cwd);
     }
 
+    // A resumed Claude session forks its transcript into a fresh jsonl (new
+    // uuid) and abandons the resumed-from file the SessionStart hook names, so
+    // the tailer must actively re-resolve to the live fork - the Claude
+    // analogue of the codex rollout scan. Scoped to `--resume` launches only;
+    // fresh sessions do not fork, and codex resume uses `resume` (no dashes).
+    if (isClaudeResumeLaunch(request)) {
+      options.timeline.followClaudeResume(session.id, isAllowedTranscriptPath);
+    }
+
     if (typeof request.initialPrompt === "string" && request.initialPrompt.trim().length > 0) {
       if (input.initialPromptSource) {
         options.timeline.recordSource(session.id, request.initialPrompt, input.initialPromptSource);
@@ -318,6 +327,16 @@ function cloneStartRequest(request: StartAgentRequest): StartAgentRequest {
     ...(request.labels ? { labels: { ...request.labels } } : {}),
     ...(request.desktop ? { desktop: { ...request.desktop } } : {})
   };
+}
+
+// Is this a resumed Claude launch (`claude --resume <id>`)? Only these fork the
+// transcript, and only Claude uses the `--resume` flag - codex resume is a bare
+// `resume` subcommand - so this both scopes and disambiguates the re-resolver.
+function isClaudeResumeLaunch(request: StartAgentRequest): boolean {
+  return (
+    launchAgentKind(request.command, request.agent) === "claude" &&
+    (request.args ?? []).includes("--resume")
+  );
 }
 
 // Is this launch a Codex session? The New Agent sheet sends agent: "codex";
