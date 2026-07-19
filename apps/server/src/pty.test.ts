@@ -101,6 +101,8 @@ test("PTY adapter starts sessions and streams coalesced raw deltas", async () =>
   assert.equal(session.cwd, "/tmp/perch-test");
   assert.equal(spawnOptions?.cols, 88);
   assert.equal(spawnOptions?.rows, 24);
+  assert.equal(spawnOptions?.name, "xterm-256color");
+  assert.equal(spawnOptions?.env.TERM, "xterm-256color");
   assert.equal(adapter.sessionAliases().get("workspace:1::surface:2"), session.id);
   assert.equal((await adapter.listSessions()).length, 1);
   assert.equal((await adapter.getTopology()).windows[0]?.workspaces[0]?.title, "Perch agents");
@@ -208,7 +210,65 @@ test("PTY adapter renders control sequences for the on-demand text path", async 
   const text = recent.events[0]?.type === "terminal_output" ? recent.events[0].text : "";
   assert.equal(text, "Codex\nready");
   assert.doesNotMatch(text ?? "", /\x1b|\[31m|1049/);
+  const snapshot = await adapter.snapshot(session.id);
+  assert.ok(snapshot.data.includes("\x1b[?1049h"), "xterm serialization must restore the active alternate screen");
 
+  adapter.stop();
+});
+
+test("late Codex recovery snapshots restore enhanced keyboard state and preserve multiline input", async () => {
+  let child: FakePtyProcess | undefined;
+  const spawn: SpawnPty = () => {
+    child = new FakePtyProcess();
+    return child;
+  };
+  const adapter = new PtyAgentAdapter(spawn);
+  const session = await adapter.startAgent({
+    command: "codex",
+    agent: "codex",
+    args: ["resume", "12345678-1234-4234-9234-123456789abc"],
+    title: "Recovered Codex"
+  });
+
+  // Codex emits this before a crash-recovered PTY can be attached. Split the
+  // sequence across chunks to exercise the real node-pty boundary as well.
+  child?.emitData("\x1b[?2004h\x1b[>");
+  child?.emitData("7u\x1b[?25l\x1b[2J\x1b[H╭─ composer ─╮\r\n│              │\r\n╰──────────────╯");
+  const snapshot = await adapter.snapshot(session.id);
+
+  assert.ok(snapshot.data.includes("╭─ composer ─╮"), "the recovered composer must survive snapshot replay");
+  assert.ok(snapshot.data.includes("\x1b[?2004h"), "xterm still restores its modeled bracketed-paste mode");
+  assert.ok(snapshot.data.includes("\x1b[>7u"), "the late terminal must regain Codex keyboard enhancement");
+  assert.ok(snapshot.data.endsWith("\x1b[?25l"), "the late terminal must regain Codex cursor visibility");
+
+  // Ghostty encodes Shift+Enter as CSI-u once the replayed keyboard mode is
+  // active. Perch must forward that byte sequence unchanged to the resumed
+  // Codex process so the composer inserts a newline instead of submitting.
+  const multiline = "first line\x1b[13;2u second line";
+  await adapter.sendInput(session.id, multiline);
+  assert.equal(child?.writes.at(-1), multiline);
+
+  // A later Codex mode reset must also be reflected; snapshots describe the
+  // current terminal state, not an enable sequence left in startup history.
+  child?.emitData("\x1b[<u\x1b[?25h");
+  const reset = await adapter.snapshot(session.id);
+  assert.equal(reset.data.includes("\x1b[>7u"), false);
+  assert.ok(reset.data.endsWith("\x1b[?25h"));
+
+  adapter.stop();
+});
+
+test("terminal mode snapshot replay remains Codex-only", async () => {
+  let child: FakePtyProcess | undefined;
+  const adapter = new PtyAgentAdapter(() => {
+    child = new FakePtyProcess();
+    return child;
+  });
+  const session = await adapter.startAgent({ command: "claude", agent: "claude", title: "Claude" });
+  child?.emitData("\x1b[>7u\x1b[?25lClaude");
+  const snapshot = await adapter.snapshot(session.id);
+  assert.equal(snapshot.data.includes("\x1b[>7u"), false);
+  assert.equal(snapshot.data.includes("\x1b[?25l"), false);
   adapter.stop();
 });
 
