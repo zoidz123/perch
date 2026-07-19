@@ -260,6 +260,12 @@ export class CodexAppServerClient {
   private pendingInterrupt: Promise<void> | null = null;
   private notificationProtocol: "unknown" | "legacy" | "raw" = "unknown";
   private completedTurnIds = new Set<string>();
+  // Raw turn/item traffic observed since the last reported completion. A
+  // daemon-driven TUI turn can settle with only a thread/status/changed idle
+  // (the daemon never broadcasts turn/completed to a client that did not
+  // submit the turn); this flag makes that idle a completion boundary while
+  // an initial idle attach with no observed progress stays silent.
+  private observedTurnActivity = false;
   private seqCounter = 0;
   private status: AgentSessionStatus = "idle";
 
@@ -373,6 +379,7 @@ export class CodexAppServerClient {
     this.transport = null;
     this.connected = false;
     this._turnId = null;
+    this.observedTurnActivity = false;
     this.notificationProtocol = "unknown";
     this.completedTurnIds.clear();
     if (!opts?.preserveThreadState) {
@@ -412,6 +419,7 @@ export class CodexAppServerClient {
     const result = (await this.request("thread/start", params)) as ThreadResult;
     this._threadId = result.thread.id;
     this._turnId = null;
+    this.observedTurnActivity = false;
     this.threadDefaults = { ...opts };
     return { threadId: result.thread.id, model: result.model };
   }
@@ -439,6 +447,7 @@ export class CodexAppServerClient {
     const result = (await this.request("thread/resume", params)) as ThreadResult;
     this._threadId = result.thread.id;
     this._turnId = null;
+    this.observedTurnActivity = false;
     this.threadDefaults = {
       model: opts.model ?? defaults.model,
       cwd: opts.cwd ?? defaults.cwd,
@@ -1014,6 +1023,13 @@ export class CodexAppServerClient {
     if (this.notificationProtocol === "legacy") return false;
     if (this.notificationProtocol === "unknown") this.notificationProtocol = "raw";
 
+    // Any turn or item traffic is observed turn progress; it arms the
+    // thread/status/changed idle handler below to report a completion even
+    // when the daemon never sends turn/completed for a TUI-driven turn.
+    if (method === "turn/started" || method.startsWith("item/")) {
+      this.observedTurnActivity = true;
+    }
+
     if (method === "thread/started") {
       // The daemon broadcasts this when the `--remote` TUI opens its thread.
       // Adopt it if we do not already own one, so the control plane can resume
@@ -1065,11 +1081,15 @@ export class CodexAppServerClient {
 
     if (method === "thread/status/changed") {
       const statusType = (params.status as Record<string, unknown> | undefined)?.type;
-      if (statusType === "idle" && this.pendingTurnCompletion) {
+      if (statusType === "idle" && (this.pendingTurnCompletion || this.observedTurnActivity)) {
+        // With a locally pending RPC turn OR observed remote turn progress,
+        // this idle transition is the turn's completion boundary: report it
+        // so onTurnComplete (and the task-completion reconciler behind it)
+        // fires even though no turn/completed was broadcast to this client.
         this.emitRawTurnCompletion(this._turnId, "completed");
       } else if (statusType === "idle") {
-        // A daemon-driven TUI turn is not necessarily one submitted by this
-        // client, so there is no pending promise to settle. Its idle event is
+        // A bare idle with no observed turn progress (e.g. the initial
+        // attach to a daemon-owned thread) is not a completed turn. It is
         // still authoritative fleet state and must clear the active badge.
         this._turnId = null;
         this.setStatus("idle");
@@ -1126,6 +1146,7 @@ export class CodexAppServerClient {
   private emitRawTurnCompletion(turnId: string | null, status: string | null): void {
     const activeTurnId = this._turnId ?? this.pendingTurnCompletion?.turnId;
     if (turnId && activeTurnId && turnId !== activeTurnId) return;
+    this.observedTurnActivity = false;
     const aborted = status === "cancelled" || status === "canceled" || status === "aborted" || status === "interrupted";
     // A turn can settle via more than one raw notification (turn/completed,
     // thread/status idle, a final_answer item); report it exactly once.

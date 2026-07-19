@@ -552,6 +552,10 @@ export class HookRegistry {
     }
   }
 
+  // Deliberate credential rotation: mints a fresh token and revokes any prior
+  // token for the session. Launch paths must use ensure() instead - a codex
+  // `--remote` launch registers the same session twice (daemon env, then PTY
+  // env), and re-minting here silently invalidated the daemon's copy.
   register(sessionId: string): { token: string } {
     for (const [token, registered] of this.tokens) {
       if (registered === sessionId) this.tokens.delete(token);
@@ -561,6 +565,19 @@ export class HookRegistry {
     this.correlations.set(sessionId, { sessionId });
     this.persist();
     return { token };
+  }
+
+  // Idempotent registration: returns the session's live token when one exists,
+  // minting only for a new session. Every registration path for the same live
+  // session (codex daemon env + PTY env) shares one credential this way.
+  ensure(sessionId: string): { token: string } {
+    for (const [token, registered] of this.tokens) {
+      if (registered === sessionId) {
+        if (!this.correlations.has(sessionId)) this.correlations.set(sessionId, { sessionId });
+        return { token };
+      }
+    }
+    return this.register(sessionId);
   }
 
   unregister(sessionId: string): void {
