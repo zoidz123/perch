@@ -33,14 +33,17 @@ struct AgentModelOption: Identifiable, Hashable {
 extension AgentKind {
     // Fallback catalog used only when the server's `/models` endpoint is
     // unavailable (older server, offline). The server (models.ts) is the single
-    // source of truth - it also resolves the CLI's configured default, which
-    // can't be known client-side. These labels/context match models.ts and are
-    // kept in sync by hand; the versioned names verified 2026-07-04.
+    // source of truth - it queries the installed Claude CLI's `/model` aliases
+    // and also resolves the CLI's configured default, which can't be known
+    // client-side. These ids are the CLI's aliases (`fable`, `opus`, `sonnet`,
+    // `haiku`) so a fallback selection launches the same model the live catalog
+    // would; labels/context match models.ts, kept in sync by hand. Verified
+    // against claude 2.1.x on 2026-07-18.
     var modelOptions: [AgentModelOption] {
         switch self {
         case .claude:
             return [
-                AgentModelOption(id: "claude-fable-5", label: "Fable 5", detail: "1M context"),
+                AgentModelOption(id: "fable", label: "Fable 5", detail: "1M context"),
                 AgentModelOption(id: "opus", label: "Opus 4.8", detail: "1M context"),
                 AgentModelOption(id: "sonnet", label: "Sonnet 5", detail: "1M context"),
                 AgentModelOption(id: "haiku", label: "Haiku 4.5", detail: "200K context")
@@ -74,6 +77,8 @@ extension AgentKind {
         }
     }
 
+    // Offline fallback for the picker (older server / catalog not yet loaded):
+    // the compact three-newest window, matching the live behavior.
     var pickerModelOptions: [AgentModelOption] {
         Array(modelOptions.prefix(3))
     }
@@ -134,10 +139,44 @@ struct ProviderModelCatalog: Codable, Hashable {
     var source: [String]?
     var status: String?
 
-    // The server orders the catalog newest-first. Pickers show its three newest
-    // visible entries, rather than carrying a client-side list of model names.
+    // The server orders the catalog newest-first. Pickers stay compact - the
+    // three newest visible entries - rather than exposing the full CLI alias
+    // list; the same limit applies to Claude and Codex.
     var agentOptions: [AgentModelOption] {
         options.filter { $0.hidden != true }.prefix(3).map(\.agentOption)
+    }
+
+    // Every id the CLI currently offers (id and runtimeId), used to tell a saved
+    // selection the CLI still offers from one it no longer does.
+    var offeredModelIds: Set<String> {
+        var ids = Set<String>()
+        for option in options {
+            ids.insert(option.id)
+            if let runtimeId = option.runtimeId { ids.insert(runtimeId) }
+        }
+        return ids
+    }
+
+    // The compact picker rows for a saved/queued selection: the three newest
+    // visible models, plus the selection itself when it falls outside them - a
+    // still-offered model kept as a normal row, or a removed one flagged so it
+    // is never silently dropped. `selectedLabel`/`selectedDetail` resolve the
+    // selection's display when it is not one of the compact rows.
+    func pickerRows(
+        selectedId: String?,
+        selectedLabel: String,
+        selectedDetail: String?
+    ) -> [ModelPickerRow] {
+        let compact = agentOptions.map {
+            ModelPickerRow(id: $0.id, label: $0.label, detail: $0.detail, isRemoved: false)
+        }
+        return compactModelPickerRows(
+            compact: compact,
+            offeredIds: offeredModelIds,
+            selectedId: selectedId,
+            selectedLabel: selectedLabel,
+            selectedDetail: selectedDetail
+        )
     }
 
     func roleDefault(for role: String) -> PerchModelRoleDefault? {

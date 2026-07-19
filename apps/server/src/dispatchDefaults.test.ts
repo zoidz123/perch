@@ -27,7 +27,7 @@ import { DEFAULT_MAX_SLOTS, WorktreePool } from "./worktrees.js";
 // override, the built-in fallback prefers Codex when the CLI is on PATH and
 // otherwise keeps the historical Claude/no-launch-model behavior.
 
-const MATE_RESOLVED_DEFAULT = { agent: "claude", model: "claude-fable-5", modelSource: "auto" };
+const MATE_RESOLVED_DEFAULT = { agent: "claude", model: "fable", modelSource: "auto" };
 
 class CapturingAdapter implements AgentAdapter {
   readonly name = "fake-pty";

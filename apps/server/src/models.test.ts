@@ -64,7 +64,7 @@ test("claude options carry versioned names + context windows", () => {
   assert.deepEqual(
     claude.options.map((o) => [o.id, o.label, o.detail]),
     [
-      ["claude-fable-5", "Fable 5", "1M context"],
+      ["fable", "Fable 5", "1M context"],
       ["opus", "Opus 4.8", "1M context"],
       ["sonnet", "Sonnet 5", "1M context"],
       ["haiku", "Haiku 4.5", "200K context"]
@@ -85,7 +85,13 @@ test("claude CLI /model output supplies the live runtime catalog", () => {
   );
   assert.equal(claude.runtimeSource, "claude-cli");
   assert.equal(claude.status, "available");
-  assert.deepEqual(claude.options.map((option) => option.runtimeId), ["sonnet", "opus", "haiku", "fable", "best", "nebula"]);
+  // The CLI is authoritative for the alias set; the server reorders it
+  // frontier-first (fable ahead of the CLI's legacy sonnet-first order) and
+  // keeps unknown aliases (nebula) after known ones in CLI order.
+  assert.deepEqual(claude.options.map((option) => option.runtimeId), ["fable", "opus", "sonnet", "haiku", "best", "nebula"]);
+  // The live `fable` alias now carries its versioned label, not "Fable".
+  assert.equal(claude.options.find((o) => o.id === "fable")?.label, "Fable 5");
+  assert.equal(claude.options.find((o) => o.id === "nebula")?.label, "Nebula");
   assert.equal(claude.roleDefaults?.orchestrator?.model, "best");
   assert.equal(claude.roleDefaults?.crew?.model, "opus");
 });
@@ -216,7 +222,7 @@ test("Perch role defaults ignore a provider CLI default", () => {
   const claude = providerOf(registry, "claude");
   const codex = providerOf(registry, "codex");
   assert.equal(claude.defaultId, "haiku");
-  assert.equal(claude.roleDefaults?.orchestrator?.model, "claude-fable-5");
+  assert.equal(claude.roleDefaults?.orchestrator?.model, "fable");
   assert.equal(codex.defaultId, "gpt-5.6-terra");
   assert.equal(codex.roleDefaults?.orchestrator?.model, "gpt-5.6-sol");
 });
@@ -235,7 +241,7 @@ test("mate auto resolves through the registry orchestrator role default", () => 
   });
   assert.deepEqual(resolveMateLaunch({ agent: "claude", model: "auto" }, registry), {
     agent: "claude",
-    model: "claude-fable-5",
+    model: "fable",
     modelSource: "auto"
   });
   assert.equal(resolveMateLaunch({ agent: "codex", model: "auto" }, undefined).model, MATE_CODEX_FALLBACK.model);
@@ -448,4 +454,181 @@ test("labelForClaudeModelId maps transcript ids, stripping window/date suffixes"
   assert.equal(labelForClaudeModelId("claude-opus-4-8"), "Opus 4.8");
   assert.equal(labelForClaudeModelId("claude-haiku-4-5-20251001"), "Haiku 4.5");
   assert.equal(labelForClaudeModelId("claude-unheard-of-9"), undefined);
+});
+
+// The exact `result` string the installed `claude` CLI (2.1.x) returns for
+// `claude --print --output-format json --no-session-persistence /model`.
+const REAL_CLAUDE_MODEL_RESULT =
+  "Current model: Fable 5\nUsage: /model <name>. Available: sonnet, opus, haiku, fable, best, sonnet[1m], opus[1m], fable[1m], opusplan, default, or a full model ID.";
+
+test("live Claude catalog surfaces Fable 5 first with versioned labels (real CLI output)", () => {
+  const claude = providerOf(
+    collectModels({
+      readClaudeSettings: () => null,
+      readCodexConfig: () => null,
+      claudeModelList: { result: REAL_CLAUDE_MODEL_RESULT }
+    }),
+    "claude"
+  );
+  assert.equal(claude.runtimeSource, "claude-cli");
+  assert.equal(claude.status, "available");
+  // Exact CLI aliases preserved as launch ids, reordered frontier-first so the
+  // picker's 3-row window surfaces Fable/Opus/Sonnet instead of the CLI's
+  // legacy sonnet-first order. `[1m]` opt-ins sort after their base aliases.
+  assert.deepEqual(
+    claude.options.map((o) => o.id),
+    ["fable", "opus", "sonnet", "haiku", "best", "opusplan", "fable[1m]", "opus[1m]", "sonnet[1m]"]
+  );
+  // The regression: the live `fable` alias must read "Fable 5", not "Fable".
+  const fable = claude.options.find((o) => o.id === "fable");
+  assert.equal(fable?.label, "Fable 5");
+  assert.equal(fable?.detail, "1M context");
+  // The picker's top-3 (visible, newest-first) are the versioned frontier trio.
+  assert.deepEqual(
+    claude.options.filter((o) => o.hidden !== true).slice(0, 3).map((o) => [o.id, o.label]),
+    [["fable", "Fable 5"], ["opus", "Opus 4.8"], ["sonnet", "Sonnet 5"]]
+  );
+  // `[1m]` variants keep their exact id and a distinct "(1M)" label, and rank
+  // after the base entries so they never enter the compact three-row picker.
+  const fable1m = claude.options.find((o) => o.id === "fable[1m]");
+  assert.equal(fable1m?.label, "Fable 5 (1M)");
+  assert.equal(fable1m?.detail, "1M context");
+  // Meta-aliases get readable labels, not raw ids.
+  assert.equal(claude.options.find((o) => o.id === "best")?.label, "Best available");
+  assert.equal(claude.options.find((o) => o.id === "opusplan")?.label, "Opus Plan");
+});
+
+test("live Claude catalog dedupes repeated aliases and drops sentinels", () => {
+  const claude = providerOf(
+    collectModels({
+      readClaudeSettings: () => null,
+      readCodexConfig: () => null,
+      claudeModelList: {
+        result: "Current model: Fable 5\nUsage: /model <name>. Available: sonnet, sonnet, fable, default, or a full model ID."
+      }
+    }),
+    "claude"
+  );
+  assert.deepEqual(claude.options.map((o) => o.id), ["fable", "sonnet"]);
+  assert.ok(!claude.options.some((o) => o.id === "default"));
+});
+
+test("live Claude catalog keeps unknown aliases, labeled and sorted after known ones", () => {
+  const claude = providerOf(
+    collectModels({
+      readClaudeSettings: () => null,
+      readCodexConfig: () => null,
+      claudeModelList: {
+        result: "Current model: X\nUsage: /model <name>. Available: sonnet, aurora-9, fable, or a full model ID."
+      }
+    }),
+    "claude"
+  );
+  // Known aliases lead frontier-first; the unrecognized alias trails in CLI
+  // order and is never hidden.
+  assert.deepEqual(claude.options.map((o) => o.id), ["fable", "sonnet", "aurora-9"]);
+  const aurora = claude.options.find((o) => o.id === "aurora-9");
+  assert.equal(aurora?.label, "Aurora 9");
+  assert.equal(aurora?.status, "available");
+});
+
+test("malformed Claude CLI output falls back to the static catalog, not an empty picker", () => {
+  for (const bad of [{ result: "unexpected banner with no available line" }, { result: "" }, { notResult: true }, "raw string with no Available marker"]) {
+    const claude = providerOf(
+      collectModels({ readClaudeSettings: () => null, readCodexConfig: () => null, claudeModelList: bad }),
+      "claude"
+    );
+    // Static fallback is used (marked as such), never a silent empty list.
+    assert.equal(claude.runtimeSource, "claude-cli-fallback");
+    assert.equal(claude.status, "fallback");
+    assert.deepEqual(claude.options.map((o) => o.id), ["fable", "opus", "sonnet", "haiku"]);
+    assert.equal(claude.options.find((o) => o.id === "fable")?.label, "Fable 5");
+  }
+});
+
+test("Claude CLI unavailable/timeout degrades to static fallback while codex stays live", async () => {
+  const home = mkdtempSync(join(tmpdir(), "perch-claude-unavailable-"));
+  const cachePath = join(home, "model-registry.json");
+  try {
+    const res = await collectModelRegistry({
+      cachePath,
+      readClaudeSettings: () => null,
+      readCodexConfig: () => null,
+      listCodexModels: async () => LIVE_CODEX_MODELS,
+      listClaudeModels: async () => {
+        throw new Error("timed out waiting for Claude /model");
+      }
+    });
+    // Codex behavior is unchanged: it is still live from the app-server.
+    const codex = providerOf(res, "codex");
+    assert.equal(codex.runtimeSource, "codex-app-server");
+    assert.equal(codex.options[0]?.id, "gpt-5.6-sol");
+    // Claude degrades to the clearly-marked static fallback (still has Fable 5),
+    // and the failure is surfaced as a source status rather than hidden.
+    const claude = providerOf(res, "claude");
+    assert.equal(claude.runtimeSource, "claude-cli-fallback");
+    assert.equal(claude.options.find((o) => o.id === "fable")?.label, "Fable 5");
+    const claudeSource = res.sources?.find((s) => s.name === "claude-cli");
+    assert.equal(claudeSource?.ok, false);
+    assert.match(claudeSource?.reason ?? "", /timed out|fallback/i);
+  } finally {
+    rmSync(home, { recursive: true, force: true });
+  }
+});
+
+test("live Claude query wins over a prior cache when the CLI version changes its models", async () => {
+  const home = mkdtempSync(join(tmpdir(), "perch-claude-version-"));
+  const cachePath = join(home, "model-registry.json");
+  try {
+    const first = await collectModelRegistry({
+      cachePath,
+      readClaudeSettings: () => null,
+      readCodexConfig: () => null,
+      listCodexModels: async () => LIVE_CODEX_MODELS,
+      listClaudeModels: async () => ({
+        result: "Current model: Fable 5\nUsage: /model <name>. Available: sonnet, opus, fable, or a full model ID."
+      })
+    });
+    assert.deepEqual(providerOf(first, "claude").options.map((o) => o.id), ["fable", "opus", "sonnet"]);
+    assert.equal(first.cache?.stale, false);
+
+    // A CLI upgrade changes the offered aliases; the live query - not the cache -
+    // is authoritative, so the new model appears immediately.
+    const second = await collectModelRegistry({
+      cachePath,
+      readClaudeSettings: () => null,
+      readCodexConfig: () => null,
+      listCodexModels: async () => LIVE_CODEX_MODELS,
+      listClaudeModels: async () => ({
+        result: "Current model: Fable 5\nUsage: /model <name>. Available: sonnet, opus, fable, quasar, or a full model ID."
+      })
+    });
+    const claude = providerOf(second, "claude");
+    assert.equal(second.cache?.stale, false);
+    assert.ok(claude.options.some((o) => o.id === "quasar"), "new CLI model must appear without restart");
+    assert.equal(claude.options.find((o) => o.id === "quasar")?.label, "Quasar");
+  } finally {
+    rmSync(home, { recursive: true, force: true });
+  }
+});
+
+test("a saved Claude selection stays labeled through both live and static catalogs", () => {
+  // Live catalog: a settings.json default resolves against the CLI aliases.
+  const live = providerOf(
+    collectModels({
+      readClaudeSettings: () => JSON.stringify({ model: "fable" }),
+      readCodexConfig: () => null,
+      claudeModelList: { result: REAL_CLAUDE_MODEL_RESULT }
+    }),
+    "claude"
+  );
+  assert.ok(live.options.some((o) => o.id === "fable" && o.label === "Fable 5"));
+
+  // A full-id saved selection still resolves to the versioned label.
+  const resolved = resolveSessionModel(
+    "claude",
+    { model: "claude-fable-5" },
+    { readClaudeSettings: () => JSON.stringify({ model: "fable" }) }
+  );
+  assert.equal(resolved.modelLabel, "Fable 5");
 });

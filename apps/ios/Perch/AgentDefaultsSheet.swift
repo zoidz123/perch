@@ -330,13 +330,34 @@ struct AgentDefaultsSheet: View {
         return advertised.flatMap { levels.contains($0) ? $0 : nil } ?? levels.first
     }
 
+    // The compact model rows for a saved selection: the newest visible models,
+    // plus the saved selection when it falls outside them so it is never
+    // silently dropped (a still-offered model kept normally, a removed one
+    // flagged). Falls back to the static per-agent list on an older server.
+    private func modelRows(for agent: AgentKind, selected: String?) -> [ModelPickerRow] {
+        let label = selected.map { store.modelLabel(for: $0) } ?? ""
+        if let catalog = store.models?.providers.first(where: { $0.provider == agent }) {
+            return catalog.pickerRows(selectedId: selected, selectedLabel: label, selectedDetail: nil)
+        }
+        let compact = agent.pickerModelOptions.map {
+            ModelPickerRow(id: $0.id, label: $0.label, detail: $0.detail, isRemoved: false)
+        }
+        return compactModelPickerRows(
+            compact: compact,
+            offeredIds: Set(agent.modelOptions.map(\.id)),
+            selectedId: selected,
+            selectedLabel: label,
+            selectedDetail: nil
+        )
+    }
+
     @ViewBuilder
     private func modelList(
         for agent: AgentKind,
         selected: String?,
         select: @escaping (String) -> Void
     ) -> some View {
-        let rows = options(for: agent)
+        let rows = modelRows(for: agent, selected: selected)
         if rows.isEmpty {
             Text("No models available for \(agent.displayName)")
                 .font(.system(size: 13))
@@ -344,7 +365,12 @@ struct AgentDefaultsSheet: View {
         } else {
             optionCard {
                 ForEach(Array(rows.enumerated()), id: \.element.id) { index, option in
-                    optionRow(label: option.label, detail: option.detail, selected: selected == option.id) {
+                    optionRow(
+                        label: option.label,
+                        detail: option.detail,
+                        selected: selected == option.id,
+                        removed: option.isRemoved
+                    ) {
                         select(option.id)
                     }
                     if index != rows.count - 1 { Divider().overlay(Style.hairline) }
@@ -365,17 +391,27 @@ struct AgentDefaultsSheet: View {
             )
     }
 
-    private func optionRow(label: String, detail: String?, selected: Bool, tap: @escaping () -> Void) -> some View {
+    private func optionRow(label: String, detail: String?, selected: Bool, removed: Bool = false, tap: @escaping () -> Void) -> some View {
         Button(action: tap) {
             HStack(spacing: 10) {
                 VStack(alignment: .leading, spacing: 2) {
-                    Text(label)
-                        .font(.system(size: 15, weight: .medium))
-                        .foregroundStyle(Style.textPrimary)
+                    HStack(spacing: 6) {
+                        Text(label)
+                            .font(.system(size: 15, weight: .medium))
+                            .foregroundStyle(removed ? Style.textSecondary : Style.textPrimary)
+                        if removed {
+                            Text("Removed")
+                                .font(.system(size: 10, weight: .semibold))
+                                .foregroundStyle(Style.textFaint)
+                                .padding(.horizontal, 6)
+                                .padding(.vertical, 2)
+                                .background(Capsule().fill(Style.secondaryFill))
+                        }
+                    }
                     if let detail, !detail.isEmpty {
                         Text(detail)
                             .font(.system(size: 12))
-                            .foregroundStyle(Style.textSecondary)
+                            .foregroundStyle(removed ? Style.textFaint : Style.textSecondary)
                             .lineLimit(2)
                             .multilineTextAlignment(.leading)
                             .fixedSize(horizontal: false, vertical: true)

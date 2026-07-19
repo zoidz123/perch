@@ -256,7 +256,7 @@ test("POST /mate/start uses the Claude registry role default when nothing names 
     const started = await fetch(`http://127.0.0.1:${port}/mate/start`, { ...authed, method: "POST" });
     assert.equal(started.status, 201, await started.text());
     assert.equal(adapter.requests.at(-1)?.agent, "claude");
-    assert.equal(adapter.requests.at(-1)?.model, "claude-fable-5");
+    assert.equal(adapter.requests.at(-1)?.model, "fable");
 
     // A configured mate default model still wins over the fallback.
     const patched = await fetch(`http://127.0.0.1:${port}/config`, {
@@ -287,7 +287,7 @@ test("POST /mate/start uses the Claude registry role default when nothing names 
     });
     assert.equal(explicitClaude.status, 201, await explicitClaude.text());
     assert.equal(adapter.requests.at(-1)?.agent, "claude");
-    assert.equal(adapter.requests.at(-1)?.model, "claude-fable-5");
+    assert.equal(adapter.requests.at(-1)?.model, "fable");
 
     // A configured Codex mate carries the configured model; the fallback does
     // not overwrite it.
