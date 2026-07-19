@@ -55,16 +55,16 @@ const execFile = promisify(execFileCallback);
 // full model ID.") on 2026-07-18. Update this table when the CLI's alias set or
 // versioned names change; it is label/order metadata, not a source of truth for
 // which models exist.
-// Context windows: the current frontier models carry a 1M window as their
-// model context (corroborated by the Vercel Gateway GET /v1/models metadata:
-// anthropic/claude-fable-5, opus-4-8, and sonnet-5 all report
-// context_window 1000000); Haiku 4.5 is 200K. So base `fable`/`opus`/`sonnet`
-// accurately read "1M context" - they are already 1M, not a smaller window that
-// only the `[1m]` alias upgrades. The `[1m]` aliases are the CLI's explicit 1M
-// opt-in; they rank after the base entries and so never enter the compact
-// three-row picker (no redundant duplicate rows). The Gateway is cited only as
-// context-window metadata evidence - the installed Claude CLI remains the sole
-// authority for WHICH aliases are selectable.
+// Perch-central Claude enrichment. The installed Claude CLI is the sole
+// authority for WHICH aliases are selectable (parsed from `/model`); this table
+// only supplies the versioned label, recency rank, and context detail the CLI
+// does not report. The current frontier models carry a 1M context window as
+// their model context, so base `fable`/`opus`/`sonnet` accurately read "1M
+// context" - they are already 1M, not a smaller window that only the `[1m]`
+// alias upgrades. Haiku 4.5 is 200K. The `[1m]` aliases are the CLI's explicit
+// 1M opt-in; they rank after the base entries and so never enter the compact
+// three-row picker (no redundant duplicate rows), keeping a distinct "X (1M)"
+// label only for the edge case of a saved `[1m]` selection.
 type ClaudeAliasMeta = { label: string; detail?: string; rank: number; nativeProviderId?: string };
 const CLAUDE_ALIAS_CATALOG: Record<string, ClaudeAliasMeta> = {
   fable: { label: "Fable 5", detail: "1M context", rank: 0, nativeProviderId: "claude-fable-5" },
