@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { appendFileSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { appendFileSync, mkdtempSync, rmSync, utimesSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
@@ -240,6 +240,119 @@ async function waitFor(condition: () => boolean): Promise<void> {
   }
   throw new Error("condition not met in time");
 }
+
+function claudeUser(uuid: string, text: string): string {
+  return `${JSON.stringify({ type: "user", uuid, timestamp: "2026-07-18T00:00:00Z", message: { role: "user", content: text } })}\n`;
+}
+
+function claudeAssistant(uuid: string, text: string): string {
+  return `${JSON.stringify({ type: "assistant", uuid, timestamp: "2026-07-18T00:00:00Z", message: { role: "assistant", content: [{ type: "text", text }] } })}\n`;
+}
+
+function textsFor(store: TimelineStore, sessionId: string): string[] {
+  return store
+    .fetch(sessionId, 0, 500)
+    .items.map((item) => item.text)
+    .filter((text): text is string => typeof text === "string");
+}
+
+// Freeze reproduction: a plain tailer follows only the file it attached to.
+// When Claude resumes and forks into a new jsonl, the resumed-from file goes
+// quiet and every post-resume row lands in the fork the tailer never opens.
+test("without re-resolution a resumed Claude timeline freezes at the resume boundary", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "perch-resume-freeze-"));
+  const resumedFrom = join(dir, "resumed-from.jsonl");
+  writeFileSync(resumedFrom, claudeUser("root-1", "kickoff") + claudeAssistant("pre-1", "before resume"));
+
+  const store = new TimelineStore();
+  store.attach("pty:freeze", resumedFrom);
+  await waitFor(() => textsFor(store, "pty:freeze").includes("before resume"));
+
+  // Claude forks: new turns go to a brand-new file, never the attached one.
+  const fork = join(dir, "fork.jsonl");
+  writeFileSync(
+    fork,
+    claudeUser("root-1", "kickoff") + claudeAssistant("pre-1", "before resume") + claudeAssistant("post-1", "after resume")
+  );
+  await new Promise((resolve) => setTimeout(resolve, 200));
+
+  assert.equal(textsFor(store, "pty:freeze").includes("after resume"), false);
+  store.stop();
+  rmSync(dir, { recursive: true, force: true });
+});
+
+// The fix: followClaudeResume re-resolves the newest lineage descendant in the
+// project dir and re-points the tailer, so post-resume rows surface. The fork
+// replays the resumed-from rows verbatim (same uuids), so re-attaching to the
+// full fork re-emits nothing from before the resume.
+test("followClaudeResume re-attaches to the forked transcript and surfaces post-resume rows", async () => {
+  const previous = process.env.PERCH_RESUME_SCAN_MS;
+  process.env.PERCH_RESUME_SCAN_MS = "30";
+  const dir = mkdtempSync(join(tmpdir(), "perch-resume-fix-"));
+  const resumedFrom = join(dir, "resumed-from.jsonl");
+  writeFileSync(resumedFrom, claudeUser("root-1", "kickoff") + claudeAssistant("pre-1", "before resume"));
+  // The resumed-from file is frozen at resume; force its mtime into the past so
+  // the later fork is unambiguously newer regardless of filesystem resolution.
+  utimesSync(resumedFrom, new Date(Date.now() - 60_000), new Date(Date.now() - 60_000));
+
+  const store = new TimelineStore();
+  try {
+    store.followClaudeResume("pty:fix");
+    store.attach("pty:fix", resumedFrom);
+    await waitFor(() => textsFor(store, "pty:fix").includes("before resume"));
+    assert.equal(textsFor(store, "pty:fix").includes("after resume"), false);
+
+    // Claude forks: replayed prefix (same uuids) plus the live post-resume turn.
+    const fork = join(dir, "fork.jsonl");
+    writeFileSync(
+      fork,
+      claudeUser("root-1", "kickoff") + claudeAssistant("pre-1", "before resume") + claudeAssistant("post-1", "after resume")
+    );
+
+    await waitFor(() => textsFor(store, "pty:fix").includes("after resume"));
+    const texts = textsFor(store, "pty:fix");
+    // The replayed prefix dedups by uuid: exactly one copy of the pre-resume row.
+    assert.equal(texts.filter((text) => text === "before resume").length, 1);
+    assert.equal(texts.filter((text) => text === "after resume").length, 1);
+  } finally {
+    store.stop();
+    rmSync(dir, { recursive: true, force: true });
+    if (previous === undefined) delete process.env.PERCH_RESUME_SCAN_MS;
+    else process.env.PERCH_RESUME_SCAN_MS = previous;
+  }
+});
+
+// Lineage safety: a concurrent unrelated session writing a newer file in the
+// same project dir must never be adopted. Confirmation is by the shared root
+// message uuid, not mtime alone.
+test("followClaudeResume ignores an unrelated newer session in the same dir", async () => {
+  const previous = process.env.PERCH_RESUME_SCAN_MS;
+  process.env.PERCH_RESUME_SCAN_MS = "30";
+  const dir = mkdtempSync(join(tmpdir(), "perch-resume-lineage-"));
+  const resumedFrom = join(dir, "resumed-from.jsonl");
+  writeFileSync(resumedFrom, claudeUser("root-1", "kickoff") + claudeAssistant("pre-1", "before resume"));
+  utimesSync(resumedFrom, new Date(Date.now() - 60_000), new Date(Date.now() - 60_000));
+
+  const store = new TimelineStore();
+  try {
+    store.followClaudeResume("pty:lineage");
+    store.attach("pty:lineage", resumedFrom);
+    await waitFor(() => textsFor(store, "pty:lineage").includes("before resume"));
+
+    // A different conversation (different root uuid), newer, same directory.
+    const unrelated = join(dir, "unrelated.jsonl");
+    writeFileSync(unrelated, claudeUser("other-root", "different chat") + claudeAssistant("other-1", "unrelated reply"));
+
+    // Give the resolver several scan intervals to (wrongly) adopt it.
+    await new Promise((resolve) => setTimeout(resolve, 250));
+    assert.equal(textsFor(store, "pty:lineage").includes("unrelated reply"), false);
+  } finally {
+    store.stop();
+    rmSync(dir, { recursive: true, force: true });
+    if (previous === undefined) delete process.env.PERCH_RESUME_SCAN_MS;
+    else process.env.PERCH_RESUME_SCAN_MS = previous;
+  }
+});
 
 test("normalizes codex rollout rows: messages, tool calls, outputs", () => {
   const next = seqCounter();

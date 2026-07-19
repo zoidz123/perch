@@ -1,5 +1,16 @@
 import { createHash } from "node:crypto";
-import { closeSync, existsSync, openSync, readSync, realpathSync, statSync, watch, type FSWatcher } from "node:fs";
+import {
+  closeSync,
+  existsSync,
+  openSync,
+  readdirSync,
+  readSync,
+  realpathSync,
+  statSync,
+  watch,
+  type FSWatcher
+} from "node:fs";
+import { dirname, join } from "node:path";
 import { StringDecoder } from "node:string_decoder";
 import type { CodexReasoningEffort, TimelineItem, TimelineItemKind, TimelineItemSource } from "@perch/shared";
 
@@ -119,6 +130,10 @@ export class TimelineStore {
   private readonly seenIds = new Map<string, Set<string>>();
   private readonly seqs = new Map<string, number>();
   private readonly tailers = new Map<string, JsonlTailer>();
+  // Active transcript re-resolvers for resumed Claude sessions (see
+  // followClaudeResume). Keyed by perch session id and stopped alongside the
+  // session's tailer in detach/prune/stop.
+  private readonly resumeResolvers = new Map<string, ClaudeResumeResolver>();
   private readonly listeners = new Set<TimelineListener>();
   private readonly modelListeners = new Set<ModelListener>();
   private readonly codexThreadSettingsListeners = new Set<CodexThreadSettingsListener>();
@@ -210,7 +225,32 @@ export class TimelineStore {
     tailer.start();
   }
 
+  // Keep a resumed Claude session's tailer pointed at its newest transcript.
+  // `claude --resume` forks the conversation into a fresh jsonl (new uuid) in
+  // the same project dir and abandons the resumed-from file, often only at the
+  // first post-resume turn (which for an idle mate can be hours later). No
+  // further SessionStart hook names the fork, so this active re-resolution -
+  // the Claude analogue of the codex rollout scan - is the only way to follow
+  // it. Lineage is confirmed by the shared root message uuid, so a concurrent
+  // unrelated session in the same dir is never adopted. Idempotent per session;
+  // the resolver reads whatever transcript the SessionStart hook attaches, so
+  // calling this before the first attach is safe (it waits).
+  followClaudeResume(sessionId: string, isPathAllowed?: (path: string) => boolean): void {
+    if (this.resumeResolvers.has(sessionId)) {
+      return;
+    }
+    const resolver = new ClaudeResumeResolver(
+      () => this.tailers.get(sessionId)?.path,
+      (path) => this.attach(sessionId, path, isPathAllowed, "claude"),
+      isPathAllowed
+    );
+    this.resumeResolvers.set(sessionId, resolver);
+    resolver.start();
+  }
+
   detach(sessionId: string): void {
+    this.resumeResolvers.get(sessionId)?.stop();
+    this.resumeResolvers.delete(sessionId);
     this.tailers.get(sessionId)?.stop();
     this.tailers.delete(sessionId);
   }
@@ -280,6 +320,11 @@ export class TimelineStore {
         this.detach(sessionId);
       }
     }
+    for (const sessionId of this.resumeResolvers.keys()) {
+      if (!activeSessionIds.has(sessionId)) {
+        this.detach(sessionId);
+      }
+    }
   }
 
   // The worker's most recent assistant reply, so a watchdog stall note can
@@ -326,6 +371,10 @@ export class TimelineStore {
   }
 
   stop(): void {
+    for (const resolver of this.resumeResolvers.values()) {
+      resolver.stop();
+    }
+    this.resumeResolvers.clear();
     for (const tailer of this.tailers.values()) {
       tailer.stop();
     }
@@ -497,6 +546,199 @@ class JsonlTailer {
       this.reading = false;
     }
   }
+}
+
+// --- Claude resume-fork re-resolution ---------------------------------------
+// `claude --resume <id>` forks: it replays the resumed-from transcript into a
+// fresh <newId>.jsonl in the same project dir and writes every new turn there,
+// abandoning the old file. Only one SessionStart hook fires (naming the
+// resumed-from file), so without active re-resolution the tailer follows a
+// frozen file. This resolver polls the project dir for the newest transcript
+// in the same conversation lineage and re-points the tailer to it.
+
+const RESUME_SCAN_MS = 2500;
+function resumeScanMs(): number {
+  const value = Number(process.env.PERCH_RESUME_SCAN_MS);
+  return Number.isFinite(value) && value >= 20 ? value : RESUME_SCAN_MS;
+}
+// The fork replays from the conversation root, so the lineage anchor (the first
+// message-row uuid) lands in the first handful of rows; a bounded head read is
+// enough to identify a candidate's lineage and never grows with transcript size.
+const LINEAGE_PROBE_BYTES = 256 * 1024;
+
+class ClaudeResumeResolver {
+  private timer?: ReturnType<typeof setInterval>;
+  private stopped = false;
+  private anchorUuid?: string;
+  private anchorDir?: string;
+  // Files positively identified as a different lineage. A transcript's first
+  // message-row uuid is immutable once written, so a non-match is permanent.
+  private readonly rejected = new Set<string>();
+
+  constructor(
+    private readonly currentPath: () => string | undefined,
+    private readonly repoint: (path: string) => void,
+    private readonly isPathAllowed?: (path: string) => boolean
+  ) {}
+
+  start(): void {
+    this.tick();
+    this.timer = setInterval(() => this.tick(), resumeScanMs());
+    this.timer.unref?.();
+  }
+
+  stop(): void {
+    this.stopped = true;
+    if (this.timer) {
+      clearInterval(this.timer);
+      this.timer = undefined;
+    }
+  }
+
+  private tick(): void {
+    if (this.stopped) {
+      return;
+    }
+    const current = this.currentPath();
+    if (!current) {
+      // The SessionStart hook has not attached the resumed-from transcript yet.
+      return;
+    }
+    if (!this.anchorUuid) {
+      // Establish the lineage anchor from the resumed-from transcript once. The
+      // root message uuid is replayed into every fork descendant, so it is a
+      // stable identity for the whole conversation lineage.
+      const uuid = firstMessageUuid(current);
+      if (!uuid) {
+        // Transcript empty or not readable yet; retry on the next tick.
+        return;
+      }
+      this.anchorUuid = uuid;
+      this.anchorDir = dirname(current);
+    }
+    let currentMtime: number;
+    try {
+      currentMtime = statSync(current).mtimeMs;
+    } catch {
+      return;
+    }
+    const newest = newestLineageDescendant(
+      this.anchorDir!,
+      this.anchorUuid,
+      current,
+      currentMtime,
+      this.rejected,
+      this.isPathAllowed
+    );
+    if (newest && newest !== current) {
+      this.repoint(newest);
+    }
+  }
+}
+
+// Read the first bytes of a transcript, tolerant of the file not existing yet.
+function readTranscriptHead(path: string, maxBytes: number): string | undefined {
+  try {
+    const fd = openSync(path, "r");
+    try {
+      const size = statSync(path).size;
+      const length = Math.min(size, maxBytes);
+      if (length <= 0) {
+        return "";
+      }
+      const buffer = Buffer.alloc(length);
+      const bytesRead = readSync(fd, buffer, 0, length, 0);
+      return buffer.subarray(0, bytesRead).toString("utf8");
+    } finally {
+      closeSync(fd);
+    }
+  } catch {
+    return undefined;
+  }
+}
+
+// The uuid of a transcript's first user/assistant row, which is the stable
+// identity of its conversation lineage: a resume fork replays this row verbatim
+// (rewriting sessionId but preserving uuid). Undefined until such a row exists.
+function firstMessageUuid(path: string): string | undefined {
+  const head = readTranscriptHead(path, LINEAGE_PROBE_BYTES);
+  if (!head) {
+    return undefined;
+  }
+  for (const line of head.split("\n")) {
+    const trimmed = line.trim();
+    if (!trimmed) {
+      continue;
+    }
+    let row: Record<string, unknown>;
+    try {
+      row = JSON.parse(trimmed) as Record<string, unknown>;
+    } catch {
+      // A partial trailing line from the bounded read; earlier lines already
+      // covered the head, so stop looking here.
+      continue;
+    }
+    if ((row.type === "user" || row.type === "assistant") && typeof row.uuid === "string") {
+      return row.uuid;
+    }
+  }
+  return undefined;
+}
+
+// The newest transcript in `dir` that belongs to the same conversation lineage
+// as `anchorUuid` and is strictly newer than the currently-tailed file - i.e.
+// the live fork after a resume. Lineage is confirmed by the shared root uuid, so
+// an unrelated concurrent session in the same dir is never adopted; a file whose
+// root uuid differs is remembered so its head is read at most once.
+function newestLineageDescendant(
+  dir: string,
+  anchorUuid: string,
+  currentPath: string,
+  currentMtime: number,
+  rejected: Set<string>,
+  isPathAllowed?: (path: string) => boolean
+): string | undefined {
+  let best: string | undefined;
+  let bestMtime = currentMtime;
+  let names: string[];
+  try {
+    names = readdirSync(dir);
+  } catch {
+    return undefined;
+  }
+  for (const name of names) {
+    if (!name.endsWith(".jsonl")) {
+      continue;
+    }
+    const candidate = join(dir, name);
+    if (candidate === currentPath || rejected.has(candidate)) {
+      continue;
+    }
+    let mtime: number;
+    try {
+      mtime = statSync(candidate).mtimeMs;
+    } catch {
+      continue;
+    }
+    if (mtime <= bestMtime) {
+      continue;
+    }
+    if (isPathAllowed && !isPathAllowed(candidate)) {
+      continue;
+    }
+    const root = firstMessageUuid(candidate);
+    if (root === undefined) {
+      // No complete message row yet (a fork mid-creation); re-check next tick.
+      continue;
+    }
+    if (root !== anchorUuid) {
+      rejected.add(candidate);
+      continue;
+    }
+    best = candidate;
+    bestMtime = mtime;
+  }
+  return best;
 }
 
 // --- Claude transcript row normalization ------------------------------------

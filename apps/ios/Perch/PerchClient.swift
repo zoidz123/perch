@@ -417,7 +417,12 @@ final class PerchStore: ObservableObject {
     // done: they carry their own retry affordance and must not keep the
     // thinking indicator alive.
     func hasPendingOptimistic(_ sessionId: String) -> Bool {
-        optimisticBySession[sessionId]?.contains { !$0.failed } ?? false
+        // An acknowledged message is delivered (server 202), so it no longer
+        // keeps the thinking indicator alive on its own - the running-session
+        // path in the view does that while the agent works. This also keeps a
+        // delivered-but-not-yet-reconciled bubble from becoming an infinite
+        // spinner if its canonical row is delayed.
+        optimisticBySession[sessionId]?.contains { !$0.failed && !$0.acknowledged } ?? false
     }
 
     func isOptimisticFailed(_ sessionId: String, _ itemId: String) -> Bool {
@@ -433,6 +438,11 @@ final class PerchStore: ObservableObject {
                 guard let self,
                       let message = self.optimisticBySession[sessionId]?.first(where: { $0.id == itemId }),
                       !message.failed else {
+                    return
+                }
+                // Server-accepted (202): delivered. Stop waiting - a delayed or
+                // missing canonical row must never turn it into "Not delivered".
+                if message.acknowledged {
                     return
                 }
                 let remaining = message.deadline.timeIntervalSinceNow
@@ -466,6 +476,7 @@ final class PerchStore: ObservableObject {
         }
         setOptimistic(sessionId, itemId) {
             $0.failed = false
+            $0.acknowledged = false
             $0.deadline = Date().addingTimeInterval(Self.optimisticTimeout)
         }
         armOptimisticExpiry(sessionId, itemId)
@@ -485,9 +496,14 @@ final class PerchStore: ObservableObject {
         }
     }
 
-    // A server-queued send waits behind a permission prompt, so its optimistic
-    // row gets the longer leash rather than expiring while the boss decides.
+    // The server accepted and injected the input (202). That is the
+    // authoritative delivery signal, so mark the row acknowledged - the
+    // canonical timeline row now only confirms it and can never turn a
+    // delivered message into a false "Not delivered". A server-queued send
+    // additionally waits behind a permission prompt, so it keeps the longer
+    // leash rather than expiring while the boss decides.
     private func noteSubmitResult(_ result: SubmitResult, sessionId: String, itemId: String) {
+        setOptimistic(sessionId, itemId) { $0.acknowledged = true }
         guard result.queued ?? false else {
             return
         }
