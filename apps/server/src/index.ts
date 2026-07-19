@@ -67,7 +67,7 @@ const ptyAdapter = new PtyAgentAdapter(undefined, {
   sessionEnv: (sessionId, request) => ({
     PERCH_SESSION_ID: sessionId,
     PERCH_HOOK_URL: `http://127.0.0.1:${config.port}/hooks`,
-    PERCH_HOOK_TOKEN: hooks.register(sessionId).token,
+    PERCH_HOOK_TOKEN: hooks.ensure(sessionId).token,
     ...taskCapabilityEnvironment(tasks, request)
   }),
   onSessionExit: (sessionId, exitContext) => {
