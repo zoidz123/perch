@@ -55,6 +55,16 @@ const execFile = promisify(execFileCallback);
 // full model ID.") on 2026-07-18. Update this table when the CLI's alias set or
 // versioned names change; it is label/order metadata, not a source of truth for
 // which models exist.
+// Context windows: the current frontier models carry a 1M window as their
+// model context (corroborated by the Vercel Gateway GET /v1/models metadata:
+// anthropic/claude-fable-5, opus-4-8, and sonnet-5 all report
+// context_window 1000000); Haiku 4.5 is 200K. So base `fable`/`opus`/`sonnet`
+// accurately read "1M context" - they are already 1M, not a smaller window that
+// only the `[1m]` alias upgrades. The `[1m]` aliases are the CLI's explicit 1M
+// opt-in; they rank after the base entries and so never enter the compact
+// three-row picker (no redundant duplicate rows). The Gateway is cited only as
+// context-window metadata evidence - the installed Claude CLI remains the sole
+// authority for WHICH aliases are selectable.
 type ClaudeAliasMeta = { label: string; detail?: string; rank: number; nativeProviderId?: string };
 const CLAUDE_ALIAS_CATALOG: Record<string, ClaudeAliasMeta> = {
   fable: { label: "Fable 5", detail: "1M context", rank: 0, nativeProviderId: "claude-fable-5" },
@@ -62,7 +72,7 @@ const CLAUDE_ALIAS_CATALOG: Record<string, ClaudeAliasMeta> = {
   sonnet: { label: "Sonnet 5", detail: "1M context", rank: 2, nativeProviderId: "claude-sonnet-5" },
   haiku: { label: "Haiku 4.5", detail: "200K context", rank: 3, nativeProviderId: "claude-haiku-4-5" },
   best: { label: "Best available", detail: "Latest highest-capability Claude model", rank: 4 },
-  opusplan: { label: "Opus Plan", detail: "Opus while planning, cheaper model while editing", rank: 5 }
+  opusplan: { label: "Opus Plan", detail: "Uses Opus in plan mode, Sonnet otherwise", rank: 5 }
 };
 
 // The concrete aliases surfaced in the offline/fallback catalog, in picker
@@ -380,11 +390,14 @@ function claudeAliasRank(runtimeId: string, cliIndex: number): number {
 
 function claudeRuntimeEntry(runtimeId: string): ModelCatalogEntry {
   // Preserve the exact CLI alias as the launch id; resolve its label/detail
-  // from the versioned adapter, honoring the `[1m]` context opt-in.
+  // from the versioned adapter, honoring the `[1m]` context opt-in. The `[1m]`
+  // variants get a "(1M)" label suffix so they read as distinct rows from their
+  // base alias when the whole offered set is shown.
   const wants1m = /\[1m\]/i.test(runtimeId);
   const bare = runtimeId.replace(/\[[^\]]*\]/g, "").trim();
   const meta = CLAUDE_ALIAS_CATALOG[bare];
-  const label = meta?.label ?? readableModelId(runtimeId);
+  const baseLabel = meta?.label ?? readableModelId(runtimeId);
+  const label = wants1m ? `${baseLabel} (1M)` : baseLabel;
   const detail = wants1m ? "1M context" : meta?.detail;
   return {
     id: runtimeId,

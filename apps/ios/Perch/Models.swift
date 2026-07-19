@@ -77,6 +77,8 @@ extension AgentKind {
         }
     }
 
+    // Offline fallback for the picker (older server / catalog not yet loaded):
+    // the compact three-newest window, matching the live behavior.
     var pickerModelOptions: [AgentModelOption] {
         Array(modelOptions.prefix(3))
     }
@@ -137,8 +139,9 @@ struct ProviderModelCatalog: Codable, Hashable {
     var source: [String]?
     var status: String?
 
-    // The server orders the catalog newest-first. Pickers show its three newest
-    // visible entries, rather than carrying a client-side list of model names.
+    // The server orders the catalog newest-first. Pickers stay compact - the
+    // three newest visible entries - rather than exposing the full CLI alias
+    // list; the same limit applies to Claude and Codex.
     var agentOptions: [AgentModelOption] {
         options.filter { $0.hidden != true }.prefix(3).map(\.agentOption)
     }

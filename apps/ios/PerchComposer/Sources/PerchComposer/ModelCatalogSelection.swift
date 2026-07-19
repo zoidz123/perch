@@ -26,7 +26,9 @@ public struct PickerCatalogOption: Equatable {
 }
 
 // The compact picker window: the catalog's newest-first visible entries capped
-// at `limit`. Ordering is the server's; the client only trims.
+// at `limit` (default 3). Ordering is the server's; the client only trims. The
+// same compact window applies to Claude and Codex - the full CLI alias list is
+// deliberately not surfaced in the picker. Mirrors ProviderModelCatalog.agentOptions.
 public func compactVisibleOptions(_ options: [PickerCatalogOption], limit: Int = 3) -> [PickerCatalogOption] {
     Array(options.filter { !$0.hidden }.prefix(limit))
 }

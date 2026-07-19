@@ -488,10 +488,10 @@ test("live Claude catalog surfaces Fable 5 first with versioned labels (real CLI
     claude.options.filter((o) => o.hidden !== true).slice(0, 3).map((o) => [o.id, o.label]),
     [["fable", "Fable 5"], ["opus", "Opus 4.8"], ["sonnet", "Sonnet 5"]]
   );
-  // `[1m]` variants keep their exact id but inherit the versioned base label
-  // and a 1M-context detail.
+  // `[1m]` variants keep their exact id and a distinct "(1M)" label, and rank
+  // after the base entries so they never enter the compact three-row picker.
   const fable1m = claude.options.find((o) => o.id === "fable[1m]");
-  assert.equal(fable1m?.label, "Fable 5");
+  assert.equal(fable1m?.label, "Fable 5 (1M)");
   assert.equal(fable1m?.detail, "1M context");
   // Meta-aliases get readable labels, not raw ids.
   assert.equal(claude.options.find((o) => o.id === "best")?.label, "Best available");

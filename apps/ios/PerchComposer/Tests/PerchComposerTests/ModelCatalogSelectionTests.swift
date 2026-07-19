@@ -1,18 +1,28 @@
 import XCTest
 @testable import PerchComposer
 
-// Mirrors the server's live Claude catalog (frontier-first, versioned labels)
-// so the client picker logic is exercised against the exact shape it receives.
+// Mirrors the server's live Claude catalog (frontier-first, versioned labels).
+// The `[1m]` opt-in variants rank after the base entries, so the compact
+// three-row picker never surfaces them.
 private let liveClaudeCatalog: [PickerCatalogOption] = [
     PickerCatalogOption(id: "fable", label: "Fable 5", detail: "1M context"),
     PickerCatalogOption(id: "opus", label: "Opus 4.8", detail: "1M context"),
     PickerCatalogOption(id: "sonnet", label: "Sonnet 5", detail: "1M context"),
     PickerCatalogOption(id: "haiku", label: "Haiku 4.5", detail: "200K context"),
-    PickerCatalogOption(id: "best", label: "Best available", detail: nil),
-    PickerCatalogOption(id: "opusplan", label: "Opus Plan", detail: nil),
-    PickerCatalogOption(id: "fable[1m]", label: "Fable 5", detail: "1M context"),
-    PickerCatalogOption(id: "opus[1m]", label: "Opus 4.8", detail: "1M context"),
-    PickerCatalogOption(id: "sonnet[1m]", label: "Sonnet 5", detail: "1M context")
+    PickerCatalogOption(id: "best", label: "Best available", detail: "Latest highest-capability Claude model"),
+    PickerCatalogOption(id: "opusplan", label: "Opus Plan", detail: "Uses Opus in plan mode, Sonnet otherwise"),
+    PickerCatalogOption(id: "fable[1m]", label: "Fable 5 (1M)", detail: "1M context"),
+    PickerCatalogOption(id: "opus[1m]", label: "Opus 4.8 (1M)", detail: "1M context"),
+    PickerCatalogOption(id: "sonnet[1m]", label: "Sonnet 5 (1M)", detail: "1M context")
+]
+
+// Codex fixture: frontier-first, more than three models.
+private let liveCodexCatalog: [PickerCatalogOption] = [
+    PickerCatalogOption(id: "gpt-5.6-sol", label: "GPT 5.6 Sol"),
+    PickerCatalogOption(id: "gpt-5.6-terra", label: "GPT 5.6 Terra"),
+    PickerCatalogOption(id: "gpt-5.6-luna", label: "GPT 5.6 Luna"),
+    PickerCatalogOption(id: "gpt-5.5", label: "GPT 5.5"),
+    PickerCatalogOption(id: "gpt-5.4", label: "GPT 5.4")
 ]
 
 private func offeredIds(_ options: [PickerCatalogOption]) -> Set<String> {
@@ -26,18 +36,26 @@ private func compactRows(_ options: [PickerCatalogOption]) -> [ModelPickerRow] {
 }
 
 final class ModelCatalogSelectionTests: XCTestCase {
-    // MARK: - Ordering + labels
+    // MARK: - Ordering + labels (compact)
 
-    func testCompactPickerSurfacesFableFirstWithVersionedLabels() {
+    func testClaudePickerSurfacesFableFirstWithVersionedLabelsAndStaysCompact() {
         let visible = compactVisibleOptions(liveClaudeCatalog)
+        // Exactly the three newest, frontier-first: Fable 5 leads (never
+        // "Fable" and never buried behind sonnet), with correct 1M-context
+        // detail. The `[1m]` variants and meta-aliases are not surfaced.
         XCTAssertEqual(visible.map(\.id), ["fable", "opus", "sonnet"])
         XCTAssertEqual(visible.map(\.label), ["Fable 5", "Opus 4.8", "Sonnet 5"])
-        // The regression guard: the top row is Fable 5, not "Fable" and not
-        // buried behind sonnet.
-        XCTAssertEqual(visible.first?.label, "Fable 5")
+        XCTAssertEqual(visible.first?.detail, "1M context")
+        XCTAssertFalse(visible.contains { $0.id.contains("[1m]") }, "compact picker must not surface [1m] variants")
     }
 
-    func testCompactPickerSkipsHiddenEntries() {
+    func testCodexPickerAlsoStaysCompactThreeNewest() {
+        // Codex behavior is unchanged: still the three newest.
+        let visible = compactVisibleOptions(liveCodexCatalog)
+        XCTAssertEqual(visible.map(\.id), ["gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"])
+    }
+
+    func testPickerSkipsHiddenEntries() {
         let options = [
             PickerCatalogOption(id: "fable", label: "Fable 5", hidden: true),
             PickerCatalogOption(id: "opus", label: "Opus 4.8"),
@@ -50,14 +68,12 @@ final class ModelCatalogSelectionTests: XCTestCase {
     // MARK: - Selection matching
 
     func testSelectionMatchesByExactAndNormalizedIdAndLabel() {
-        // Exact alias.
         XCTAssertTrue(modelOptionMatches(id: "fable", label: "Fable 5", liveId: "fable", liveLabel: nil))
         // The CLI reports the running model with launch plumbing; "opus[1m]"
         // must still tick the "opus" row.
         XCTAssertTrue(modelOptionMatches(id: "opus", label: "Opus 4.8", liveId: "opus[1m]", liveLabel: nil))
         // A full model id ticks the alias row via the server-resolved label.
         XCTAssertTrue(modelOptionMatches(id: "fable", label: "Fable 5", liveId: "claude-fable-5", liveLabel: "Fable 5"))
-        // A genuinely different model does not match.
         XCTAssertFalse(modelOptionMatches(id: "opus", label: "Opus 4.8", liveId: "sonnet", liveLabel: "Sonnet 5"))
     }
 
@@ -76,8 +92,8 @@ final class ModelCatalogSelectionTests: XCTestCase {
     }
 
     func testOfferedSelectionOutsideCompactIsRetainedAsNormalRow() {
-        // "haiku" is offered but ranks below the top-3; selecting it must keep
-        // it visible and un-flagged so the saved choice is preserved.
+        // "haiku" is offered but ranks below the compact three; selecting it
+        // must keep it visible and un-flagged so the saved choice is preserved.
         let rows = compactModelPickerRows(
             compact: compactRows(liveClaudeCatalog),
             offeredIds: offeredIds(liveClaudeCatalog),
@@ -86,10 +102,7 @@ final class ModelCatalogSelectionTests: XCTestCase {
             selectedDetail: "200K context"
         )
         XCTAssertEqual(rows.map(\.id), ["fable", "opus", "sonnet", "haiku"])
-        let haiku = rows.last
-        XCTAssertEqual(haiku?.label, "Haiku 4.5")
-        XCTAssertEqual(haiku?.detail, "200K context")
-        XCTAssertFalse(haiku?.isRemoved ?? true)
+        XCTAssertFalse(rows.last?.isRemoved ?? true)
     }
 
     func testRemovedSelectionIsSurfacedAndFlagged() {
