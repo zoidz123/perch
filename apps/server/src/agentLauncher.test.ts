@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { EventEmitter } from "node:events";
-import { mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import type { AddressInfo } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -222,6 +222,8 @@ function fixture(durableBoundary?: "afterLaunch" | "durable") {
     timeline,
     projects: new ProjectRegistry(env),
     worktrees: new WorktreePool({ env }),
+    // Trust seeding targets a scratch state file, never the real ~/.claude.json.
+    claudeStateFile: join(home, ".claude.json"),
     tasks,
     prPoller: new PrPoller(tasks, async () => {
       throw new Error("gh disabled in tests");
@@ -652,6 +654,102 @@ test("a failed spawn unwinds Codex control, pre-minted identity, and the worktre
     );
     // No orphan session was left running (spawn never returned one).
     assert.equal(fx.adapter.stopped.length, 0);
+  } finally {
+    await fx.cleanup(repo);
+  }
+});
+
+// Claude's folder-trust dialog renders before hooks load, so dispatch answers
+// it ahead of launch: the launcher seeds .claude.json trust for the pool
+// worktree, but only for Claude workers and only when the worktree's repo is
+// a registered project (registration is the human trust decision).
+test("dispatching a Claude worker seeds folder trust for the pool worktree", async () => {
+  const fx = fixture();
+  const repo = makeRepo();
+  const baseUrl = await listen(fx.server, fx.options);
+  fx.options.projects.touch(repo);
+
+  try {
+    const response = await fetch(`${baseUrl}/tasks`, {
+      ...authed,
+      method: "POST",
+      body: JSON.stringify({ title: "trusted", project: repo, dispatch: true, agent: "claude", prompt: "go" })
+    });
+    assert.equal(response.status, 201, await response.text());
+    const worktree = fx.adapter.requests[0]?.cwd;
+    assert.ok(worktree, "claude worker launched into a pool worktree");
+    const state = JSON.parse(readFileSync(join(fx.home, ".claude.json"), "utf8"));
+    const entry = state.projects[realpathSync(worktree!)];
+    assert.deepEqual(entry, { hasTrustDialogAccepted: true });
+  } finally {
+    await fx.cleanup(repo);
+  }
+});
+
+test("a Claude trust-seed failure logs the manual fallback and still launches", async () => {
+  const fx = fixture();
+  const repo = makeRepo();
+  const baseUrl = await listen(fx.server, fx.options);
+  const warnings: string[] = [];
+  const logs: string[] = [];
+  const warn = console.warn;
+  const log = console.log;
+  fx.options.projects.touch(repo);
+  writeFileSync(join(fx.home, ".claude.json"), "{ corrupt");
+  console.warn = (...args: unknown[]) => warnings.push(args.map(String).join(" "));
+  console.log = (...args: unknown[]) => logs.push(args.map(String).join(" "));
+
+  try {
+    const response = await fetch(`${baseUrl}/tasks`, {
+      ...authed,
+      method: "POST",
+      body: JSON.stringify({ title: "fallback", project: repo, dispatch: true, agent: "claude", prompt: "go" })
+    });
+    assert.equal(response.status, 201, await response.text());
+    assert.ok(fx.adapter.requests[0]?.cwd, "Claude still launches so its manual trust gate can run");
+    assert.ok(warnings.some((message) => message.includes("launching anyway so Claude can show the manual trust gate")));
+    assert.ok(!logs.some((message) => message.includes("claude trust seeded")));
+    assert.equal(readFileSync(join(fx.home, ".claude.json"), "utf8"), "{ corrupt");
+  } finally {
+    console.warn = warn;
+    console.log = log;
+    await fx.cleanup(repo);
+  }
+});
+
+test("dispatching a Codex worker never touches the Claude state file", async () => {
+  const fx = fixture();
+  const repo = makeRepo();
+  const baseUrl = await listen(fx.server, fx.options);
+  fx.options.projects.touch(repo);
+
+  try {
+    const response = await fetch(`${baseUrl}/tasks`, {
+      ...authed,
+      method: "POST",
+      body: JSON.stringify({ title: "codex", project: repo, dispatch: true, agent: "codex", prompt: "go" })
+    });
+    assert.equal(response.status, 201, await response.text());
+    assert.ok(fx.adapter.requests[0]?.cwd, "codex worker launched into a pool worktree");
+    assert.equal(existsSync(join(fx.home, ".claude.json")), false);
+  } finally {
+    await fx.cleanup(repo);
+  }
+});
+
+test("a Claude worktree for an unregistered project is not trust-seeded", async () => {
+  const fx = fixture();
+  const repo = makeRepo();
+  const baseUrl = await listen(fx.server, fx.options);
+
+  try {
+    const response = await fetch(`${baseUrl}/tasks`, {
+      ...authed,
+      method: "POST",
+      body: JSON.stringify({ title: "untrusted", project: repo, dispatch: true, agent: "claude", prompt: "go" })
+    });
+    assert.equal(response.status, 201, await response.text());
+    assert.equal(existsSync(join(fx.home, ".claude.json")), false);
   } finally {
     await fx.cleanup(repo);
   }

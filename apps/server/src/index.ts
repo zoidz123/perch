@@ -11,6 +11,7 @@ import {
   surfaceApprovalToTask
 } from "./agentLauncher.js";
 import { ChartRegistry, wireChartArchive } from "./charts.js";
+import { claudeStateFilePath } from "./claudeTrust.js";
 import { readConfig } from "./config.js";
 import { FleetMonitor } from "./fleetMonitor.js";
 import { removeAttachments, removePidFile, writePidFile } from "./home.js";
@@ -441,6 +442,7 @@ const server = createControlServer({
   worktrees,
   tasks,
   prPoller,
+  claudeStateFile: claudeStateFilePath(),
   codexControl,
   taskCompletion,
   metrics,

@@ -177,6 +177,10 @@ export type HttpServerOptions = {
   worktrees: WorktreePool;
   tasks: TaskStore;
   prPoller: PrPoller;
+  // Claude's state file (.claude.json) for pre-launch worktree trust seeding
+  // (see agentLauncher). The entrypoint wires the real path; absent in test
+  // fixtures means the launcher never seeds.
+  claudeStateFile?: string;
   // Codex `--remote` control plane. Absent (or with no acquirable daemon) means
   // every Codex session runs on the plain PTY path and the model chip is off.
   codexControl?: CodexControlPlane;
