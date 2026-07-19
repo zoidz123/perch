@@ -9,7 +9,7 @@ Perch requires macOS, Node.js 20 or newer, and npm 10 or newer.
 Install the pinned release:
 
 ```sh
-npm install --global perchctl@0.1.2
+npm install --global perchctl@0.1.3
 ```
 
 Install at least one supported provider CLI, then complete its own sign-in flow:
@@ -198,7 +198,7 @@ Do not attach tokens, pairing offers, device records, keypairs, or provider conf
 
 ## Updating
 
-The pinned package for this source is `perchctl@0.1.2` and installs the `perch` executable plus both Darwin no-mistakes architectures.
+The pinned package for this source is `perchctl@0.1.3` and installs the `perch` executable plus both Darwin no-mistakes architectures.
 Update to another explicit published version with npm, then restart the local server so it runs the new build:
 
 ```sh

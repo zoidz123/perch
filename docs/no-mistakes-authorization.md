@@ -57,7 +57,7 @@ If task evidence cannot be appended, authorization fails closed.
 
 ## Packaged runtime
 
-`perchctl@0.1.2` contains signed Darwin arm64 and x64 binaries from fork release `v1.39.0-perch.1` at commit `2d35e552b4cbc191b06abcadc3b05fd3da510d26`.
+`perchctl@0.1.3` contains signed Darwin arm64 and x64 binaries from fork release `v1.39.0-perch.1` at commit `2d35e552b4cbc191b06abcadc3b05fd3da510d26`.
 The runtime resolver selects only the matching packaged architecture and verifies exact bytes before use.
 It never downloads during installation, works with `npm --ignore-scripts`, and never falls back to a PATH binary for Perch-managed execution.
 
