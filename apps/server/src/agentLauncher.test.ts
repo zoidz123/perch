@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { EventEmitter } from "node:events";
-import { existsSync, mkdtempSync, readFileSync, realpathSync, rmSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import type { AddressInfo } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -680,9 +680,39 @@ test("dispatching a Claude worker seeds folder trust for the pool worktree", asy
     assert.ok(worktree, "claude worker launched into a pool worktree");
     const state = JSON.parse(readFileSync(join(fx.home, ".claude.json"), "utf8"));
     const entry = state.projects[realpathSync(worktree!)];
-    assert.equal(entry?.hasTrustDialogAccepted, true);
-    assert.equal(entry?.projectOnboardingSeenCount, 0);
+    assert.deepEqual(entry, { hasTrustDialogAccepted: true });
   } finally {
+    await fx.cleanup(repo);
+  }
+});
+
+test("a Claude trust-seed failure logs the manual fallback and still launches", async () => {
+  const fx = fixture();
+  const repo = makeRepo();
+  const baseUrl = await listen(fx.server, fx.options);
+  const warnings: string[] = [];
+  const logs: string[] = [];
+  const warn = console.warn;
+  const log = console.log;
+  fx.options.projects.touch(repo);
+  writeFileSync(join(fx.home, ".claude.json"), "{ corrupt");
+  console.warn = (...args: unknown[]) => warnings.push(args.map(String).join(" "));
+  console.log = (...args: unknown[]) => logs.push(args.map(String).join(" "));
+
+  try {
+    const response = await fetch(`${baseUrl}/tasks`, {
+      ...authed,
+      method: "POST",
+      body: JSON.stringify({ title: "fallback", project: repo, dispatch: true, agent: "claude", prompt: "go" })
+    });
+    assert.equal(response.status, 201, await response.text());
+    assert.ok(fx.adapter.requests[0]?.cwd, "Claude still launches so its manual trust gate can run");
+    assert.ok(warnings.some((message) => message.includes("launching anyway so Claude can show the manual trust gate")));
+    assert.ok(!logs.some((message) => message.includes("claude trust seeded")));
+    assert.equal(readFileSync(join(fx.home, ".claude.json"), "utf8"), "{ corrupt");
+  } finally {
+    console.warn = warn;
+    console.log = log;
     await fx.cleanup(repo);
   }
 });

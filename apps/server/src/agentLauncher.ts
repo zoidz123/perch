@@ -197,7 +197,12 @@ export async function startManagedAgent(
     launchAgentKind(request.command, request.agent) === "claude" &&
     options.projects.find(lease.repoRoot)
   ) {
-    seedClaudeWorktreeTrust(options.claudeStateFile, lease.path);
+    const trustSeeded = seedClaudeWorktreeTrust(options.claudeStateFile, lease.path);
+    if (!trustSeeded) {
+      console.warn(
+        `claude trust: could not pre-trust ${lease.path}; launching anyway so Claude can show the manual trust gate`
+      );
+    }
   }
 
   const launchModel = resolveSessionModel(launchAgentKind(request.command, request.agent), {
