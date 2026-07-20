@@ -22,19 +22,18 @@ struct CrewSessionRow: View {
                         .foregroundStyle(Style.textSecondary)
                         .lineLimit(1)
                 }
-
-                HStack(spacing: 6) {
-                    Text(statusLabel)
-                        .font(.system(size: 11, weight: .semibold))
-                        .foregroundStyle(statusColor)
-                        .padding(.horizontal, 7)
-                        .padding(.vertical, 3)
-                        .background(statusColor.opacity(0.14), in: Capsule())
-                    WorkerStatusDot(status: session.status)
-                }
             }
 
             Spacer(minLength: 8)
+
+            Text(statusLabel)
+                .font(.system(size: 11, weight: .semibold))
+                .foregroundStyle(statusColor)
+                .padding(.horizontal, 7)
+                .padding(.vertical, 3)
+                .background(statusColor.opacity(0.14), in: Capsule())
+
+            WorkerStatusDot(status: session.status)
 
             Image(systemName: "chevron.right")
                 .font(.system(size: 14, weight: .semibold))
