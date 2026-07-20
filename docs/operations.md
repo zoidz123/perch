@@ -9,7 +9,7 @@ Perch requires macOS, Node.js 20 or newer, and npm 10 or newer.
 Install the pinned release:
 
 ```sh
-npm install --global perchctl@0.1.3
+npm install --global perchctl@0.1.4
 ```
 
 Install at least one supported provider CLI, then complete its own sign-in flow:
@@ -198,7 +198,7 @@ Do not attach tokens, pairing offers, device records, keypairs, or provider conf
 
 ## Updating
 
-The pinned package for this source is `perchctl@0.1.3` and installs the `perch` executable plus both Darwin no-mistakes architectures.
+The pinned package for this source is `perchctl@0.1.4` and installs the `perch` executable plus both Darwin no-mistakes architectures.
 Update to another explicit published version with npm, then restart the local server so it runs the new build:
 
 ```sh
@@ -232,3 +232,19 @@ xcodebuild \
   -destination 'platform=iOS Simulator,name=iPhone 17 Pro' \
   build
 ```
+
+## TestFlight release
+
+To upload a TestFlight build, Xcode must be signed in with an Apple ID that belongs to your Apple Developer team.
+Set `PERCH_IOS_TEAM_ID` to your Apple Developer team ID and run the release pipeline from the repository root:
+
+```sh
+PERCH_IOS_TEAM_ID=<your-team-id> npm run ios:testflight
+```
+
+The pipeline archives with automatic signing and passes `DEVELOPMENT_TEAM` from `PERCH_IOS_TEAM_ID` because the Xcode project intentionally leaves its development team unset.
+`-allowProvisioningUpdates` lets Xcode create or refresh the required signing assets using the signed-in Apple ID session.
+The upload export options let App Store Connect manage the app version and build number automatically.
+
+After upload, wait for App Store Connect to finish processing the build before it appears in TestFlight.
+Answer the export-compliance prompt in App Store Connect when it appears.

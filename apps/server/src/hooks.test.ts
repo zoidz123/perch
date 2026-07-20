@@ -190,6 +190,37 @@ test("hook registry verifies per-session tokens and correlates transcripts", () 
   assert.equal(registry.verify("pty:1", token), false);
 });
 
+test("ensure shares one live token across daemon and PTY registration while register still rotates", () => {
+  const home = mkdtempSync(join(tmpdir(), "perch-hook-ensure-"));
+  const env = { PERCH_HOME: home } as NodeJS.ProcessEnv;
+  const registry = new HookRegistry(env);
+
+  // Codex `--remote` launch order: prepareCodexRemote seeds the daemon env,
+  // then the PTY sessionEnv registers the same session id. Both must hold the
+  // one live token or every daemon-originated hook post 401s.
+  const daemon = registry.ensure("pty:codex");
+  const pty = registry.ensure("pty:codex");
+  assert.equal(pty.token, daemon.token);
+  assert.equal(registry.verify("pty:codex", daemon.token), true);
+
+  // ensure never clobbers an established transcript correlation.
+  registry.correlate("pty:codex", "codex-thread", "/tmp/rollout.jsonl");
+  registry.ensure("pty:codex");
+  assert.equal(registry.correlation("pty:codex")?.transcriptPath, "/tmp/rollout.jsonl");
+
+  // The durable registry restores the same shared token after a restart.
+  assert.equal(new HookRegistry(env).ensure("pty:codex").token, daemon.token);
+
+  // Deliberate rotation stays explicit: register() mints fresh and revokes.
+  const rotated = registry.register("pty:codex");
+  assert.notEqual(rotated.token, daemon.token);
+  assert.equal(registry.verify("pty:codex", daemon.token), false);
+  assert.equal(registry.verify("pty:codex", rotated.token), true);
+  assert.equal(registry.ensure("pty:codex").token, rotated.token);
+
+  rmSync(home, { recursive: true, force: true });
+});
+
 test("hook auth survives restart with 0600 storage and prunes stale sessions", () => {
   const home = mkdtempSync(join(tmpdir(), "perch-hook-auth-"));
   const env = { PERCH_HOME: home } as NodeJS.ProcessEnv;

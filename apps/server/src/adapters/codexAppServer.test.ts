@@ -1,7 +1,12 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { PassThrough } from "node:stream";
 import { CodexAppServerClient, type CodexTransport } from "./codexAppServer.js";
+import { TaskCompletionReconciler } from "../taskCompletion.js";
+import { TaskStore } from "../tasks.js";
 import type { TimelineItem, AgentSessionStatus, PendingServerRequest } from "@perch/shared";
 
 // A scripted codex app-server over PassThrough streams: parses the client's
@@ -460,6 +465,81 @@ test("a daemon-owned thread idle notification clears the fleet status without a 
   server.push("thread/status/changed", { status: { type: "idle" } });
   await tick();
   assert.deepEqual(statuses, ["running", "idle"]);
+});
+
+test("a daemon-driven remote turn settling via thread idle fires onTurnComplete once", async () => {
+  // Production remote topology: the TUI submits the turn, so this control
+  // client has no pending RPC turn and the daemon never sends it a
+  // turn/completed. The idle transition is the only completion boundary.
+  const done: Array<{ message: string }> = [];
+  const { client, server } = await connectedClient({ onTurnComplete: (ev) => done.push(ev) });
+  await client.startThread();
+  server.push("turn/started", { turn: { id: "remote-turn" } });
+  server.push("item/completed", { item: { type: "agentMessage", id: "a1", text: "opened the PR" } });
+  server.push("thread/status/changed", { status: { type: "idle" } });
+  await tick();
+  assert.deepEqual(done, [{ message: "opened the PR" }]);
+  // A later idle without new turn progress must not double-report.
+  server.push("thread/status/changed", { status: { type: "idle" } });
+  await tick();
+  assert.deepEqual(done, [{ message: "opened the PR" }]);
+});
+
+test("idle after item traffic with no turn/started still reports the remote turn", async () => {
+  const done: Array<{ message: string }> = [];
+  const { client, server } = await connectedClient({ onTurnComplete: (ev) => done.push(ev) });
+  await client.startThread();
+  server.push("item/agentMessage/delta", { itemId: "m1", delta: "working" });
+  server.push("item/completed", { item: { type: "agentMessage", id: "m1", text: "working on it" } });
+  server.push("thread/status/changed", { status: { type: "idle" } });
+  await tick();
+  assert.deepEqual(done, [{ message: "working on it" }]);
+});
+
+test("an initial idle attach with no observed turn progress never reports a completion", async () => {
+  const done: Array<{ message: string }> = [];
+  const statuses: AgentSessionStatus[] = [];
+  const { client, server } = await connectedClient({
+    onTurnComplete: (ev) => done.push(ev),
+    onStatus: (s) => statuses.push(s)
+  });
+  await client.startThread();
+  server.push("thread/status/changed", { status: { type: "idle" } });
+  await tick();
+  assert.deepEqual(done, []);
+  assert.ok(!statuses.includes("running"));
+});
+
+test("thread-idle fallback drives the completion reconciler for a daemon-driven remote turn", async () => {
+  const home = mkdtempSync(join(tmpdir(), "perch-codex-idle-reconcile-"));
+  const tasks = new TaskStore({ PERCH_HOME: home } as NodeJS.ProcessEnv);
+  const reconciler = new TaskCompletionReconciler({ tasks });
+  try {
+    const task = tasks.create({ title: "remote codex turn", project: "/tmp/repo" });
+    tasks.update(task.id, { sessionId: "sess_1" });
+    tasks.recordEvent(task.id, { kind: "working", source: "system", message: "worker session active" });
+
+    // Same wiring as attachCodexControl: adapter callbacks feed the reconciler.
+    const { client, server } = await connectedClient({
+      onTurnStarted: () => reconciler.onTurnStarted("sess_1", "codex"),
+      onTurnComplete: () => reconciler.onTurnCompleted("sess_1", "codex")
+    });
+    await client.startThread();
+    server.push("turn/started", { turn: { id: "remote-turn" } });
+    await tick();
+    server.push("thread/status/changed", { status: { type: "idle" } });
+    await tick();
+
+    const events = tasks.events(task.id);
+    const kinds = events.map((event) => event.kind);
+    assert.ok(kinds.includes("turn_started"), "turn start reaches the ledger");
+    assert.ok(kinds.includes("turn_completed"), "the idle fallback appends turn_completed");
+    const stalled = events.find((event) => event.kind === "stalled");
+    assert.equal(stalled?.data?.reason, "turn_outcome_missing");
+  } finally {
+    tasks.close();
+    rmSync(home, { recursive: true, force: true });
+  }
 });
 
 test("protocol auto-detect: once legacy is seen, raw notifications are ignored", async () => {
