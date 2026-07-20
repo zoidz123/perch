@@ -77,8 +77,6 @@ export class ClaudeInteractionCoordinator {
       ...(runtime ? { runtimeGeneration: runtime.generation } : {}),
       ...(task ? { taskId: task.id } : {})
     });
-    this.monitor.restorePendingClaudeInteraction(sessionId, pendingInteraction(record));
-    this.recordTask(record, "blocked", record.summary);
     return record;
   }
 
@@ -152,10 +150,16 @@ export class ClaudeInteractionCoordinator {
     for (const record of this.tasks.stateDb.claudeInteractions.effective()) {
       if (record.state === "waiting" && record.expiresAt && this.now() >= Date.parse(record.expiresAt)) {
         this.tasks.stateDb.claudeInteractions.transition(record.id, "waiting", "expired", "Remote interaction expired while Perch was offline");
+        this.monitor.resolveClaudeInteraction(record.perchSessionId);
         continue;
       }
-      if (["waiting", "response_sent", "expired", "local_fallback", "observed"].includes(record.state)) {
+      if (isActionableInteractionState(record.state)) {
         this.monitor.restorePendingClaudeInteraction(record.perchSessionId, pendingInteraction(record));
+      } else {
+        // Older servers replayed observed and terminal evidence into the
+        // pending map. Clear that legacy gate during startup while preserving
+        // the durable record in claude_interactions.
+        this.monitor.resolveClaudeInteraction(record.perchSessionId);
       }
     }
   }
@@ -172,6 +176,10 @@ export class ClaudeInteractionCoordinator {
     if (!record.taskId) return;
     try { this.tasks.recordEvent(record.taskId, { kind, source: "system", message, data: { interactionId: record.id, interactionKind: record.kind, runtimeGeneration: record.runtimeGeneration } }); } catch {}
   }
+}
+
+function isActionableInteractionState(state: ClaudeInteractionRecord["state"]): boolean {
+  return state === "waiting" || state === "response_sent";
 }
 
 export function pendingInteraction(record: ClaudeInteractionRecord): PendingClaudeInteraction {
