@@ -12,7 +12,7 @@ import { FleetMonitor } from "./fleetMonitor.js";
 import { HookRegistry } from "./hooks.js";
 import { createControlServer, MAX_TASK_EVENT_MESSAGE_BYTES } from "./http.js";
 import { DeviceRegistry } from "./pairing.js";
-import { PrPoller, type GhRunner, type PrFinder } from "./prPoller.js";
+import { PrPoller, type GhRunner, type PrFinder, type RepoResolver } from "./prPoller.js";
 import { ProjectRegistry } from "./projects.js";
 import { TaskStore } from "./tasks.js";
 import { TimelineStore } from "./timeline.js";
@@ -49,7 +49,8 @@ async function withServer(
   runGh: GhRunner = async () => {
     throw new Error("gh disabled in tests");
   },
-  findPr: PrFinder = async () => undefined
+  findPr: PrFinder = async () => undefined,
+  resolveLocalRepo?: RepoResolver
 ): Promise<void> {
   const home = mkdtempSync(join(tmpdir(), "perch-task-events-http-"));
   const env = { PERCH_HOME: home } as NodeJS.ProcessEnv;
@@ -71,7 +72,7 @@ async function withServer(
     projects: new ProjectRegistry(env),
     worktrees: new WorktreePool({ env }),
     tasks,
-    prPoller: new PrPoller(tasks, runGh, { findPr })
+    prPoller: new PrPoller(tasks, runGh, { findPr, resolveLocalRepo })
   };
   const server = createControlServer(options);
   await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
@@ -483,35 +484,70 @@ test("done with an already-merged PR from the wrong branch is rejected before ta
   );
 });
 
-test("done with a matching PR URL keeps the normal attachment path", async () => {
+test("remote ship modes keep the normal matching-PR attachment path", async () => {
   await withServer(
     async ({ home, port, tasks, hooks }) => {
       const project = makeProject(home);
-      const task = tasks.create({ title: "ship matching pr", project });
-      const { token } = hooks.register("pty:worker");
-      tasks.update(task.id, { sessionId: "pty:worker", branch: "perch/expected" });
-      tasks.recordEvent(task.id, { kind: "working", source: "worker" });
+      for (const mode of ["direct-PR", "no-mistakes"] as const) {
+        const sessionId = `pty:${mode}`;
+        const task = tasks.create({ title: `ship matching pr via ${mode}`, project, mode });
+        const { token } = hooks.register(sessionId);
+        tasks.update(task.id, { sessionId, branch: "perch/expected" });
+        tasks.recordEvent(task.id, { kind: "working", source: "worker" });
 
-      const accepted = await post(
-        port,
-        task.id,
-        { "x-perch-session": "pty:worker", "x-perch-token": token },
-        { kind: "done", message: "ready https://github.com/o/r/pull/45" }
-      );
+        const accepted = await post(
+          port,
+          task.id,
+          { "x-perch-session": sessionId, "x-perch-token": token },
+          { kind: "done", message: "ready https://github.com/o/r/pull/45" }
+        );
 
-      assert.equal(accepted.status, 200);
-      const current = tasks.find(task.id);
-      assert.equal(current?.state, "completion_requested");
-      assert.equal(current?.pr?.url, "https://github.com/o/r/pull/45");
-      assert.equal(current?.pr?.repo, "o/r");
-      assert.equal(current?.pr?.headRepo, "o/r");
-      assert.equal(current?.pr?.head, "perch/expected");
+        assert.equal(accepted.status, 200, mode);
+        const current = tasks.find(task.id);
+        assert.equal(current?.state, "completion_requested", mode);
+        assert.equal(current?.pr?.url, "https://github.com/o/r/pull/45", mode);
+        assert.equal(current?.pr?.repo, "o/r", mode);
+        assert.equal(current?.pr?.headRepo, "o/r", mode);
+        assert.equal(current?.pr?.head, "perch/expected", mode);
+      }
     },
     async () => ({
       state: "OPEN",
       headRefName: "perch/expected",
       headRepository: { nameWithOwner: "o/r" }
     })
+  );
+});
+
+test("local-only done requests completion without resolving a GitHub repo", async () => {
+  let repoResolutions = 0;
+  await withServer(
+    async ({ home, port, tasks, hooks }) => {
+      const project = mkdtempSync(join(home, "local-only-"));
+      const task = tasks.create({ title: "commit local work", project, mode: "local-only" });
+      const { token } = hooks.register("pty:worker");
+      tasks.update(task.id, { sessionId: "pty:worker", branch: "perch/local-only" });
+      tasks.recordEvent(task.id, { kind: "working", source: "worker" });
+
+      const accepted = await post(
+        port,
+        task.id,
+        { "x-perch-session": "pty:worker", "x-perch-token": token },
+        { kind: "done", message: "committed the requested work locally" }
+      );
+
+      assert.equal(accepted.status, 200);
+      assert.equal(repoResolutions, 0, "local-only completion must not inspect GitHub remotes");
+      assert.equal(tasks.find(task.id)?.state, "completion_requested");
+      assert.equal(tasks.find(task.id)?.pr, undefined);
+      assert.equal(tasks.events(task.id).at(-1)?.kind, "completion_requested");
+    },
+    undefined,
+    undefined,
+    async () => {
+      repoResolutions += 1;
+      return "o/r";
+    }
   );
 });
 
