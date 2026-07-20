@@ -3823,10 +3823,10 @@ async function handleTaskEvent(
   }
   let prUrl = typeof body.pr === "string" ? body.pr : extractPrUrl(message);
   let pr: TaskPr | undefined;
-  // Scouts deliver their terminal report in the done event itself. Ship mode
-  // is irrelevant to that contract, and PR discovery/attachment belongs only
-  // to tasks that deliver code.
-  if (body.kind === "done" && task.kind !== "scout" && !prUrl && !task.pr?.merged && task.branch) {
+  // Scouts deliver reports, and local-only tasks deliberately have no remote
+  // delivery contract. Only remote ship modes discover and validate PRs.
+  const requiresPr = task.kind !== "scout" && task.mode !== "local-only";
+  if (body.kind === "done" && requiresPr && !prUrl && !task.pr?.merged && task.branch) {
     const discovered = await options.prPoller.discoverTaskPr(task);
     if (!discovered.ok) {
       writeJson(response, 409, { error: discovered.reason });
@@ -3834,7 +3834,7 @@ async function handleTaskEvent(
     }
     prUrl = discovered.prUrl;
   }
-  if (body.kind === "done" && task.kind !== "scout" && prUrl && !task.pr?.merged) {
+  if (body.kind === "done" && requiresPr && prUrl && !task.pr?.merged) {
     const checkoutPath = (task.worktreeId ? options.worktrees.find(task.worktreeId)?.path : undefined) ?? task.project;
     const attachment = await options.prPoller.resolveTaskPr(task, prUrl, checkoutPath);
     if (!attachment.ok) {
