@@ -177,30 +177,12 @@ final class PerchStore: ObservableObject {
     }
 
     // The home screen shows only perch-owned agent sessions (`perch claude`,
-    // `perch codex`, ...), attention first, then most recent activity.
+    // `perch codex`, ...) in the server's spawn order - a key that never
+    // changes while a session lives, so rows hold their positions while
+    // activity streams in. Live status is conveyed by each row's status
+    // indicator, never by reordering.
     var agentSessions: [AgentSession] {
-        sessions
-            .filter { $0.id.hasPrefix("pty:") }
-            .sorted { a, b in
-                let pa = statusPriority(a.status)
-                let pb = statusPriority(b.status)
-                if pa != pb {
-                    return pa < pb
-                }
-                return a.lastActivityAt > b.lastActivityAt
-            }
-    }
-
-    private func statusPriority(_ status: AgentSessionStatus) -> Int {
-        switch status {
-        case .needsApproval: 0
-        case .running: 1
-        case .waiting: 2
-        case .idle: 3
-        case .unknown: 4
-        case .done: 5
-        case .error: 6
-        }
+        sessions.filter { $0.id.hasPrefix("pty:") }
     }
 
     // Parses a pairing offer, finds the fastest reachable endpoint, and

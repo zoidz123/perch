@@ -1,7 +1,7 @@
 import Foundation
 
 // Pure grouping for the Workspace home screen: live tasks nest under their
-// project; attention sorts first; untasked sessions fall to "Solo agents".
+// project in stable dispatch order; untasked sessions fall to "Solo agents".
 // Foundation-only, no SwiftUI - the app compiles this same file, and the
 // PerchWorkspace package runs its unit tests under `swift test` on macOS
 // (single source of truth lives in apps/ios/PerchWorkspace).
@@ -10,6 +10,7 @@ protocol WorkspaceTaskLike {
     var id: String { get }
     var project: String { get }
     var state: String { get }
+    var createdAt: String { get }
     var updatedAt: String { get }
     var sessionId: String? { get }
 }
@@ -71,41 +72,35 @@ enum WorkspaceGrouping {
         }
     }
 
-    // Within a project: needs_you/blocked first (that IS the signal - no
-    // derived counts anywhere), then working by recency, then done.
-    static func stateRank(_ state: String) -> Int {
-        switch state {
-        case "needs_you", "blocked", "completion_requested": 0
-        case "working": 1
-        case "queued": 2
-        case "done": 3
-        case "failed": 4
-        case "landed": 5
-        default: 6
+    // Stable ordering for live task lists: creation time then id - keys that
+    // never change during a task's lifetime, so concurrent workers hold their
+    // positions while state and activity updates stream in. Live status is
+    // conveyed by each row's status indicator, never by reordering. ISO
+    // timestamps compare lexicographically.
+    static func stableOrder<T: WorkspaceTaskLike>(_ tasks: [T]) -> [T] {
+        tasks.sorted { a, b in
+            a.createdAt != b.createdAt ? a.createdAt < b.createdAt : a.id < b.id
         }
     }
 
     // Live tasks define the project groups (a task-less project never
-    // renders). Projects holding attention-state tasks sort first, then by
-    // most-recent task activity; ISO timestamps compare lexicographically.
+    // renders). Rows within a group and the groups themselves use the stable
+    // order above: a group sits at the position of its oldest live task
+    // (project path as tiebreaker), so nothing reshuffles the home screen
+    // while workers run.
     static func projectGroups<T: WorkspaceTaskLike>(_ tasks: [T]) -> [WorkspaceProjectGroup<T>] {
         var byProject: [String: [T]] = [:]
         for task in tasks where task.state != "closed" {
             byProject[task.project, default: []].append(task)
         }
         let groups = byProject.map { project, grouped in
-            WorkspaceProjectGroup(project: project, tasks: grouped.sorted { a, b in
-                let ra = stateRank(a.state)
-                let rb = stateRank(b.state)
-                if ra != rb { return ra < rb }
-                return a.updatedAt > b.updatedAt
-            })
+            WorkspaceProjectGroup(project: project, tasks: stableOrder(grouped))
         }
         return groups.sorted { a, b in
-            let aAttention = a.tasks.contains { stateRank($0.state) == 0 }
-            let bAttention = b.tasks.contains { stateRank($0.state) == 0 }
-            if aAttention != bAttention { return aAttention }
-            return (a.tasks.map(\.updatedAt).max() ?? "") > (b.tasks.map(\.updatedAt).max() ?? "")
+            let ca = a.tasks.first?.createdAt ?? ""
+            let cb = b.tasks.first?.createdAt ?? ""
+            if ca != cb { return ca < cb }
+            return a.project < b.project
         }
     }
 
@@ -166,7 +161,7 @@ enum WorkspaceGrouping {
         }
     }
 
-    // "/Users/example/Desktop/perch" -> "~/Desktop/perch" for the dim path in a
+    // "/Users/example/Projects/perch" -> "~/Projects/perch" for the dim path in a
     // project sub-header (middle truncation is the renderer's job). These are
     // Mac paths rendered on the phone, so NSHomeDirectory() (the app sandbox)
     // can never match; shorten any macOS user home, like sessionShortPath.
