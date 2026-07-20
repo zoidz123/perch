@@ -32,5 +32,8 @@ paseo/
 .review-sim-derived
 .perch/
 
+# Local nested checkout; not a submodule of this repo.
+apps/site/
+
 # Generated on demand / in CI, never committed.
 docs/README.md

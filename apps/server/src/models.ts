@@ -44,8 +44,9 @@ const execFile = promisify(execFileCallback);
 // models first - the CLI emits them in a legacy order (`sonnet, opus, haiku,
 // fable, ...`) that would otherwise bury Fable behind the picker's 3-row limit.
 //
-// Unrecognized aliases still appear (labeled from the raw id, sorted after
-// known ones), so a newly shipped model is never hidden. `[1m]` context-window
+// Unrecognized aliases stay in the catalog (labeled from the raw id, sorted
+// after known ones) so saved selections keep resolving, but only the hardcoded
+// CLAUDE_VISIBLE_ALIASES are surfaced for selection. `[1m]` context-window
 // variants inherit their base alias's label with a "1M context" detail. The
 // `nativeProviderId` is the full id the CLI stamps on transcripts for that
 // alias, used only for enrichment.
@@ -76,6 +77,14 @@ const CLAUDE_ALIAS_CATALOG: Record<string, ClaudeAliasMeta> = {
   opusplan: { label: "Opus Plan", detail: "Uses Opus in plan mode, Sonnet otherwise", rank: 5 }
 };
 
+// The user-visible/selectable model set is hardcoded per provider: everything
+// else the CLIs report (Claude's `best`/`opusplan` meta-aliases, `haiku`, the
+// `[1m]` opt-ins, older Codex families) stays in the catalog as `hidden`
+// entries so a configured or live value keeps resolving its label and role
+// defaults, but is never offered in the app picker or `perch models`.
+const CLAUDE_VISIBLE_ALIASES = new Set(["fable", "opus", "sonnet"]);
+const CODEX_VISIBLE_MODELS = new Set(["gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"]);
+
 // The concrete aliases surfaced in the offline/fallback catalog, in picker
 // order. A subset of the adapter above (the meta-aliases `best`/`opusplan` and
 // the `[1m]` opt-ins are live-only). Only used when the CLI query is
@@ -90,6 +99,7 @@ const CLAUDE_MODELS: ModelCatalogEntry[] = CLAUDE_FALLBACK_ALIASES.map((alias) =
     label: meta.label,
     ...(meta.detail ? { detail: meta.detail } : {}),
     ...(meta.nativeProviderId ? { nativeProviderId: meta.nativeProviderId } : {}),
+    ...(CLAUDE_VISIBLE_ALIASES.has(alias) ? {} : { hidden: true }),
     runtimeSource: "claude-cli-fallback",
     source: ["static-fallback"],
     status: "fallback"
@@ -102,6 +112,7 @@ const CLAUDE_BUNDLED_MODELS: ModelCatalogEntry[] = Object.entries(CLAUDE_ALIAS_C
   label: meta.label,
   ...(meta.detail ? { detail: meta.detail } : {}),
   ...(meta.nativeProviderId ? { nativeProviderId: meta.nativeProviderId } : {}),
+  ...(CLAUDE_VISIBLE_ALIASES.has(alias) ? {} : { hidden: true }),
   runtimeSource: "bundled",
   source: ["bundled"],
   status: "available"
@@ -459,11 +470,13 @@ function claudeRuntimeEntry(runtimeId: string): ModelCatalogEntry {
   const baseLabel = meta?.label ?? readableModelId(runtimeId);
   const label = wants1m ? `${baseLabel} (1M)` : baseLabel;
   const detail = wants1m ? "1M context" : meta?.detail;
+  const hidden = wants1m || !CLAUDE_VISIBLE_ALIASES.has(bare);
   return {
     id: runtimeId,
     runtimeId,
     label,
     ...(detail ? { detail } : {}),
+    ...(hidden ? { hidden: true } : {}),
     ...(meta?.nativeProviderId
       ? { nativeProviderId: wants1m ? `${meta.nativeProviderId}[1m]` : meta.nativeProviderId }
       : {}),
@@ -657,7 +670,13 @@ function normalizeCodexModelList(rawList: unknown): ModelCatalogEntry[] {
       ...(defaultReasoningEffort ? { defaultReasoningEffort } : {}),
       ...(serviceTiers.length > 0 ? { serviceTiers } : {}),
       ...(typeof raw?.isDefault === "boolean" ? { isDefault: raw.isDefault } : {}),
-      ...(typeof raw?.hidden === "boolean" ? { hidden: raw.hidden } : {}),
+      // The runtime's own hidden flag is honored, and anything outside the
+      // hardcoded visible trio is forced hidden (still selectable via config).
+      ...(!CODEX_VISIBLE_MODELS.has(runtimeId)
+        ? { hidden: true }
+        : typeof raw?.hidden === "boolean"
+          ? { hidden: raw.hidden }
+          : {}),
       ...(typeof raw?.deprecated === "boolean" ? { deprecated: raw.deprecated } : {})
     });
   }
@@ -682,7 +701,8 @@ function codexFallbackModel(
     status: "fallback",
     supportedReasoningEfforts: opts.efforts,
     defaultReasoningEffort: opts.defaultEffort ?? "medium",
-    ...(opts.isDefault ? { isDefault: opts.isDefault } : {})
+    ...(opts.isDefault ? { isDefault: opts.isDefault } : {}),
+    ...(CODEX_VISIBLE_MODELS.has(id) ? {} : { hidden: true })
   };
 }
 
@@ -870,6 +890,11 @@ function labelForModel(model: string, catalog: ProviderModelCatalog | null): str
     const aliasId = CLAUDE_FULL_ID_ALIASES[bare] ?? bare;
     const alias = catalog.options.find((entry) => entry.id === aliasId);
     if (alias) return alias.label;
+    // Meta-aliases (`best`, `opusplan`) may be absent from the catalog in
+    // scope (the static fallback only lists concrete models); the bundled
+    // alias table still maps them to a readable label.
+    const aliasMeta = CLAUDE_ALIAS_CATALOG[aliasId];
+    if (aliasMeta) return aliasMeta.label;
     const fullIdLabel = labelForClaudeModelId(model);
     if (fullIdLabel) return fullIdLabel;
   }

@@ -694,15 +694,19 @@ function modelInventory(registry, config) {
       if (entry.status === "unknown") continue;
       const model = entry.runtimeId ?? entry.id;
       const aliases = modelAliases(entry, model);
+      const selectedRoles = Object.entries(selected)
+        .filter(([, value]) => value?.agent === provider.provider && [model, ...aliases].includes(value?.model))
+        .map(([role]) => role);
+      // Hidden catalog entries (meta-aliases, older families) are not offered,
+      // but one that is actively selected stays listed rather than vanishing.
+      if (entry.hidden === true && selectedRoles.length === 0) continue;
       rows.push({
         model,
         agent: provider.provider,
         efforts: entry.supportedReasoningEfforts ?? [],
         aliases,
         source: entry.runtimeSource === "codex-app-server" ? "live" : "bundled",
-        selected: Object.entries(selected)
-          .filter(([, value]) => value?.agent === provider.provider && [model, ...aliases].includes(value?.model))
-          .map(([role]) => role)
+        selected: selectedRoles
       });
     }
   }
