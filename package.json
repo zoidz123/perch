@@ -1,7 +1,7 @@
 {
   "name": "perchctl",
   "private": false,
-  "version": "0.1.5",
+  "version": "0.1.6",
   "type": "module",
   "description": "A durable local-first orchestrator for Claude Code and Codex agents on macOS.",
   "license": "MIT",

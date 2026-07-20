@@ -1,6 +1,6 @@
 # Perch CLI
 
-This guide describes `perchctl@0.1.5`.
+This guide describes `perchctl@0.1.6`.
 `perch --help` prints the canonical command list, and `perch --version` prints the version from the root package manifest.
 
 ## Launch and control
