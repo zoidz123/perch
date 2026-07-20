@@ -716,6 +716,11 @@ struct TaskPrCheckModel: Codable, Equatable {
 // project header; the fields it reads are already on every task record.
 extension AgentTask: WorkspaceTaskLike {}
 
+extension AgentSession: WorkspaceSessionLike {
+    var taskId: String? { labels?["task"] }
+    var parentSessionId: String? { labels?["parent"] }
+}
+
 typealias UsageWindow = PerchUsage.UsageWindow
 typealias UsageCredits = PerchUsage.UsageCredits
 typealias ProviderUsage = PerchUsage.ProviderUsage

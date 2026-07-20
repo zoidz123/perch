@@ -445,7 +445,7 @@ struct HomeView: View {
     // pinned above everything, never listed here.
     private var otherSessions: [AgentSession] {
         let otherIds = Set(WorkspaceGrouping.otherSessionIds(
-            sessionIds: store.agentSessions.map(\.id),
+            sessions: store.agentSessions,
             tasks: liveTasks,
             mateSessionId: store.mateSession?.id
         ))
@@ -577,7 +577,12 @@ struct HomeView: View {
         if let runtimeSessionId = task.runtime?.ptySessionId, let session = store.sessionsById[runtimeSessionId] {
             return session
         }
-        return task.sessionId.flatMap { store.sessionsById[$0] }
+        let sessionId = WorkspaceGrouping.sessionId(
+            forTaskId: task.id,
+            linkedSessionId: task.sessionId,
+            sessions: store.agentSessions
+        )
+        return sessionId.flatMap { store.sessionsById[$0] }
     }
 
     private var transportBanner: some View {
@@ -1346,7 +1351,9 @@ struct SessionDetailView: View {
 
     // The task this session is the worker for (dispatched crew work).
     private var sessionTask: AgentTask? {
-        store.tasks.first { $0.sessionId == sessionId }
+        store.tasks.first { task in
+            task.sessionId == sessionId || session?.taskId == task.id
+        }
     }
 
     // The mate's own chat: the Charts hub button lives on this composer, where
