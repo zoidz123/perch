@@ -15,9 +15,19 @@ protocol WorkspaceTaskLike {
 }
 
 protocol WorkspaceSessionLike {
+    associatedtype Status: Equatable
     var id: String { get }
     var taskId: String? { get }
     var parentSessionId: String? { get }
+    var status: Status { get set }
+}
+
+enum WorkspaceStatusIndicator: Equatable {
+    case active
+    case attention
+    case error
+    case idle
+    case hidden
 }
 
 struct WorkspaceProjectGroup<T: WorkspaceTaskLike> {
@@ -34,6 +44,31 @@ enum WorkspaceGrouping {
     // omit workerName and retain the old title-only presentation.
     static func workerIdentity(workerName: String?, title: String) -> String {
         workerName ?? title
+    }
+
+    // Status events are smaller and faster than the next fleet snapshot.
+    // Update only the addressed session, and return nil for duplicates so
+    // socket traffic does not invalidate the home screen unnecessarily.
+    static func applyingStatus<S: WorkspaceSessionLike>(
+        _ status: S.Status,
+        to sessionId: String,
+        in sessions: [S]
+    ) -> [S]? {
+        guard let index = sessions.firstIndex(where: { $0.id == sessionId }) else { return nil }
+        guard sessions[index].status != status else { return nil }
+        var updated = sessions
+        updated[index].status = status
+        return updated
+    }
+
+    static func statusIndicator(for status: String?) -> WorkspaceStatusIndicator {
+        switch status {
+        case "running", "working": .active
+        case "needs_approval": .attention
+        case "error": .error
+        case "idle", "waiting", "unknown": .idle
+        default: .hidden
+        }
     }
 
     // Within a project: needs_you/blocked first (that IS the signal - no

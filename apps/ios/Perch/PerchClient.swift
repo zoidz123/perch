@@ -1848,6 +1848,10 @@ final class PerchStore: ObservableObject {
             handleLiveTimelineItem(sessionId, item)
         case let .assistantStream(sessionId, itemId, text, done, _):
             handleAssistantStream(sessionId, itemId: itemId, text: text, done: done)
+        case let .status(sessionId, status, _):
+            if let updated = WorkspaceGrouping.applyingStatus(status, to: sessionId, in: sessions) {
+                sessions = updated
+            }
         case let .chart(_, chartId, _, _, _):
             // Registered or file changed: bump so an open review reloads, and
             // refetch the registry so cards appear/update without a pull.

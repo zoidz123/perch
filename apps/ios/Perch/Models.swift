@@ -264,7 +264,7 @@ struct AgentSession: Identifiable, Codable, Equatable {
     let paneId: String?
     let surfaceId: String?
     let kind: SurfaceKind
-    let status: AgentSessionStatus
+    var status: AgentSessionStatus
     // The exact model + reasoning effort the session is running right now,
     // resolved server-side and kept live as it changes. `model` is the CLI id
     // (e.g. "gpt-5.5", "opus"); `modelLabel` is the versioned display name

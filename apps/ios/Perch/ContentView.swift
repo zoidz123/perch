@@ -1198,16 +1198,16 @@ struct WorkerStatusDot: View {
     let status: AgentSessionStatus?
 
     var body: some View {
-        switch status {
-        case .needsApproval:
+        switch WorkspaceGrouping.statusIndicator(for: status?.rawValue) {
+        case .attention:
             dot(Style.warning)
-        case .running:
+        case .active:
             PulsingDot()
         case .error:
             dot(Style.errorText)
-        case .idle, .waiting, .unknown:
+        case .idle:
             dot(Style.dotIdle)
-        case .done, nil:
+        case .hidden:
             EmptyView()
         }
     }
