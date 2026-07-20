@@ -242,8 +242,36 @@ final class WorkspaceGroupingTests: XCTestCase {
             projectName: "company-research",
             state: "needs_you",
             sessionStatus: "needs_approval",
+            createdAt: nil,
             updatedAt: "2026-07-20T19:04:23Z"
         )])
+    }
+
+    func testProjectSectionRowsHoldDispatchOrderWhileWorkersChurn() {
+        let sessions = [
+            FixtureSession(id: "pty:mate", title: "mate", workerName: nil, taskId: nil, parentSessionId: nil)
+        ]
+        let before = [
+            FixtureTask(id: "w-1", project: "/p/app", state: "working", createdAt: "2026-07-06T09:00:00Z", updatedAt: "2026-07-06T09:00:00Z", sessionId: "pty:1"),
+            FixtureTask(id: "w-2", project: "/p/app", state: "working", createdAt: "2026-07-06T09:05:00Z", updatedAt: "2026-07-06T09:05:00Z", sessionId: "pty:2")
+        ]
+        // Activity flips states and bumps updatedAt (the bug: recency/state
+        // sorting swapped the two concurrent workers on every update).
+        let after = [
+            FixtureTask(id: "w-1", project: "/p/app", state: "needs_you", createdAt: "2026-07-06T09:00:00Z", updatedAt: "2026-07-06T09:31:00Z", sessionId: "pty:1"),
+            FixtureTask(id: "w-2", project: "/p/app", state: "working", createdAt: "2026-07-06T09:05:00Z", updatedAt: "2026-07-06T09:30:00Z", sessionId: "pty:2")
+        ]
+
+        let rowIds = { (tasks: [FixtureTask]) -> [[String]] in
+            WorkspaceGrouping.projectSections(
+                tasks: tasks,
+                sessions: sessions,
+                mateSessionId: "pty:mate",
+                knownProjects: []
+            ).map { $0.rows.map(\.id) }
+        }
+        XCTAssertEqual(rowIds(before), [["task:w-1", "task:w-2"]])
+        XCTAssertEqual(rowIds(after), rowIds(before))
     }
 
     func testStatusPayloadUpdatesSessionRowIndicator() throws {

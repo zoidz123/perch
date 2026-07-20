@@ -60,6 +60,9 @@ struct WorkspaceCrewRowModel: Identifiable, Equatable {
     let projectName: String
     let state: String
     let sessionStatus: String?
+    // Ledger dispatch time - the stable ordering key. Nil for session-backed
+    // rows, whose task record has not landed yet.
+    let createdAt: String?
     let updatedAt: String
 }
 
@@ -181,6 +184,7 @@ enum WorkspaceGrouping {
                 projectName: projectName,
                 state: task.state,
                 sessionStatus: linkedSession?.statusValue,
+                createdAt: task.createdAt,
                 updatedAt: task.updatedAt
             ))
         }
@@ -198,10 +202,15 @@ enum WorkspaceGrouping {
                 projectName: displayName(forProject: project),
                 state: stateForSessionStatus(session.statusValue),
                 sessionStatus: session.statusValue,
+                createdAt: nil,
                 updatedAt: session.lastActivityAt
             ))
         }
 
+        // Stable section order: a section sits at the position of its oldest
+        // dispatched row (its first row after rowComesFirst); sections holding
+        // only session-backed rows sort after, and the project path breaks
+        // every tie. Attention never reorders - the row indicators carry it.
         let activeSections = rowsByProject.map { project, rows in
             WorkspaceProjectSectionModel(
                 project: project,
@@ -209,10 +218,14 @@ enum WorkspaceGrouping {
                 rows: rows.sorted(by: rowComesFirst)
             )
         }.sorted { a, b in
-            let aAttention = a.rows.contains { stateRank($0.state) == 0 }
-            let bAttention = b.rows.contains { stateRank($0.state) == 0 }
-            if aAttention != bAttention { return aAttention }
-            return (a.rows.map(\.updatedAt).max() ?? "") > (b.rows.map(\.updatedAt).max() ?? "")
+            let ca = a.rows.first?.createdAt
+            let cb = b.rows.first?.createdAt
+            if ca != cb {
+                guard let ca else { return false }
+                guard let cb else { return true }
+                return ca < cb
+            }
+            return a.project < b.project
         }
 
         let covered = Set(activeSections.map(\.project))
@@ -227,11 +240,19 @@ enum WorkspaceGrouping {
         return activeSections + idleSections
     }
 
+    // Stable row order within a section: ledger dispatch order (createdAt,
+    // then row id - keys that never change while a worker runs), so
+    // concurrent workers hold their positions while state and activity
+    // updates stream in. Live status is conveyed by each row's status
+    // indicator, never by reordering. Session-backed rows carry no ledger
+    // createdAt yet and sort after task rows by their stable row id.
     private static func rowComesFirst(_ a: WorkspaceCrewRowModel, _ b: WorkspaceCrewRowModel) -> Bool {
-        let aRank = stateRank(a.state)
-        let bRank = stateRank(b.state)
-        if aRank != bRank { return aRank < bRank }
-        return a.updatedAt > b.updatedAt
+        switch (a.createdAt, b.createdAt) {
+        case let (ca?, cb?): ca != cb ? ca < cb : a.id < b.id
+        case (.some, nil): true
+        case (nil, .some): false
+        case (nil, nil): a.id < b.id
+        }
     }
 
     private static func stateForSessionStatus(_ status: String) -> String {
