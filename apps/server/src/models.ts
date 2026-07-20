@@ -275,8 +275,24 @@ export async function collectModelRegistry(deps: ModelRegistryDeps = {}): Promis
       ...(codexResult.status === "rejected" ? [runtimeFailure("codex-app-server", codexResult.reason)] : []),
       ...(claudeResult.status === "rejected" ? [runtimeFailure("claude-cli", claudeResult.reason)] : [])
     ];
-    if (codexResult.status === "rejected") throw codexResult.reason;
-    if (failed.length) response.sources = [...failed, ...(response.sources ?? [])];
+    if (failed.length) {
+      response.sources = [...failed, ...(response.sources ?? [])];
+      const anyConfiguredSourceSucceeded =
+        (Boolean(deps.listCodexModels) && codexResult.status === "fulfilled") ||
+        (Boolean(deps.listClaudeModels) && claudeResult.status === "fulfilled");
+      if (!anyConfiguredSourceSucceeded) {
+        if (codexResult.status === "rejected") throw codexResult.reason;
+        if (claudeResult.status === "rejected") throw claudeResult.reason;
+        throw new Error("model discovery failed");
+      }
+      response.cache = {
+        path: cachePath,
+        hit: false,
+        stale: false,
+        reason: "partial runtime discovery; unavailable providers use fallback"
+      };
+      return response;
+    }
     response.cache = { path: cachePath, hit: false, stale: false };
     writeModelRegistryCache(cachePath, response);
     return response;
@@ -404,7 +420,9 @@ function claudeRuntimeEntry(runtimeId: string): ModelCatalogEntry {
     runtimeId,
     label,
     ...(detail ? { detail } : {}),
-    ...(meta?.nativeProviderId ? { nativeProviderId: meta.nativeProviderId } : {}),
+    ...(meta?.nativeProviderId
+      ? { nativeProviderId: wants1m ? `${meta.nativeProviderId}[1m]` : meta.nativeProviderId }
+      : {}),
     runtimeSource: "claude-cli",
     source: ["claude-cli"],
     status: "available"
@@ -638,6 +656,49 @@ function unknownModelEntry(id: string, source: string): ModelCatalogEntry {
 
 function findModelEntry(options: ModelCatalogEntry[], id: string): ModelCatalogEntry | undefined {
   return options.find((entry) => entry.id === id || entry.runtimeId === id);
+}
+
+export type ModelIdentifierMatch = {
+  agent: AgentKind;
+  model: string;
+  aliases: string[];
+  supportedEfforts: CodexReasoningEffort[];
+  defaultEffort?: CodexReasoningEffort;
+};
+
+export function resolveModelIdentifier(
+  registry: ModelsResponse,
+  identifier: string,
+  agent?: AgentKind
+): ModelIdentifierMatch[] {
+  const direct: ModelIdentifierMatch[] = [];
+  const aliases: ModelIdentifierMatch[] = [];
+  for (const provider of registry.providers) {
+    if (agent && provider.provider !== agent) continue;
+    for (const entry of provider.options) {
+      const model = entry.runtimeId ?? entry.id;
+      const entryAliases = uniqueStrings(
+        [entry.id, entry.runtimeId, entry.nativeProviderId, entry.apiId]
+          .filter((value): value is string => typeof value === "string")
+      )
+        .filter((value) => value !== model);
+      const match: ModelIdentifierMatch = {
+        agent: provider.provider,
+        model,
+        aliases: entryAliases,
+        supportedEfforts: entry.supportedReasoningEfforts ?? [],
+        ...(entry.defaultReasoningEffort ? { defaultEffort: entry.defaultReasoningEffort } : {})
+      };
+      if (identifier === entry.id || identifier === entry.runtimeId) direct.push(match);
+      else if (entryAliases.includes(identifier)) aliases.push(match);
+    }
+  }
+  const agents = new Set([...direct, ...aliases].map((match) => match.agent));
+  const matches = [...agents].flatMap((matchAgent) => {
+    const agentDirect = direct.filter((match) => match.agent === matchAgent);
+    return agentDirect.length ? agentDirect : aliases.filter((match) => match.agent === matchAgent);
+  });
+  return [...new Map(matches.map((match) => [`${match.agent}:${match.model}`, match])).values()];
 }
 
 // The reasoning efforts a given model supports, resolved from a model registry

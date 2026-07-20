@@ -824,8 +824,12 @@ async function dispatchWebSocketRpc(
       const update = strictConfigPatch(body);
       const resolveEfforts = await codexEffortResolver(options);
       const responseBody = await buildConfigResponse(options, {
-        dispatchDefaults: options.settings.updateDispatchDefaults(update.dispatchDefaults ?? {}, resolveEfforts),
-        mateDefaults: options.settings.updateMateDefaults(update.mateDefaults ?? {}, resolveEfforts)
+        dispatchDefaults: update.dispatchDefaults === undefined
+          ? options.settings.dispatchDefaults()
+          : options.settings.updateDispatchDefaults(update.dispatchDefaults, resolveEfforts),
+        mateDefaults: update.mateDefaults === undefined
+          ? options.settings.mateDefaults()
+          : options.settings.updateMateDefaults(update.mateDefaults, resolveEfforts)
       });
       await audit(options.auditLog, { action: "set_config", ...auditPeer });
       return rpcOk(200, responseBody);
@@ -1638,8 +1642,12 @@ async function route(
       try {
         const update = strictConfigPatch(body);
         const resolveEfforts = await codexEffortResolver(options);
-        dispatchDefaults = options.settings.updateDispatchDefaults(update.dispatchDefaults ?? {}, resolveEfforts);
-        mateDefaults = options.settings.updateMateDefaults(update.mateDefaults ?? {}, resolveEfforts);
+        dispatchDefaults = update.dispatchDefaults === undefined
+          ? options.settings.dispatchDefaults()
+          : options.settings.updateDispatchDefaults(update.dispatchDefaults, resolveEfforts);
+        mateDefaults = update.mateDefaults === undefined
+          ? options.settings.mateDefaults()
+          : options.settings.updateMateDefaults(update.mateDefaults, resolveEfforts);
       } catch (error) {
         writeJson(response, 400, { error: error instanceof Error ? error.message : String(error) });
         return;
