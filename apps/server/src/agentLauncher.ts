@@ -15,7 +15,7 @@ import type { AuditLog, AuditRecord } from "./audit.js";
 import { seedClaudeWorktreeTrust } from "./claudeTrust.js";
 import type { CodexControlPlane } from "./codexControl.js";
 import type { FleetMonitor } from "./fleetMonitor.js";
-import { findCodexRollout, isAllowedTranscriptPath, type HookRegistry } from "./hooks.js";
+import { claudeTranscriptPath, findCodexRollout, isAllowedTranscriptPath, type HookRegistry } from "./hooks.js";
 import { resolveSessionModel } from "./models.js";
 import { assertLocalRuntimeModelId } from "./modelSwitch.js";
 import type { ProjectRegistry } from "./projects.js";
@@ -44,6 +44,13 @@ export type ManagedAgentLauncherOptions = {
   // The server entrypoint wires the real path; absent means no seeding.
   claudeStateFile?: string;
   codexControl?: CodexControlPlane;
+  // Reinstalls the provider's hook entries ahead of a launch. Provider config
+  // (~/.claude/settings.json, ~/.codex/hooks.json) is shared state that other
+  // tools rewrite wholesale from stale snapshots, dropping perch's entries and
+  // silencing every hook for sessions launched afterwards; the boot-time
+  // install alone cannot heal that. The entrypoint wires the real installers;
+  // absent in tests that must not touch real config.
+  installHooks?: (agent: AgentKind) => void;
   taskCompletion?: TaskCompletionReconciler;
   runtimeManager?: RuntimeManager;
   recoveryCoordinator?: RecoveryCoordinator;
@@ -205,6 +212,22 @@ export async function startManagedAgent(
     }
   }
 
+  // Self-heal hook installation before the agent process starts (it reads its
+  // hook config once, at startup). Idempotent and a fast no-op when the
+  // entries are already present; failure never blocks the launch - the
+  // pre-minted identity below keeps the timeline attached regardless.
+  try {
+    options.installHooks?.(launchAgentKind(request.command, request.agent));
+  } catch (error) {
+    console.warn(
+      `hooks: launch-time reinstall failed: ${error instanceof Error ? error.message : error}`
+    );
+  }
+
+  // Hook-independent Claude session identity: mint the provider session id
+  // ourselves so the transcript location is known before the process exists.
+  const claudeIdentity = prepareClaudeIdentity(request, cwd);
+
   const launchModel = resolveSessionModel(launchAgentKind(request.command, request.agent), {
     model: request.model,
     effort: request.effort
@@ -267,6 +290,24 @@ export async function startManagedAgent(
       })
     );
 
+    // Attach the timeline tailer to the pre-minted transcript path right at
+    // launch. The file does not exist yet; the tailer polls for its creation
+    // and reads it from offset 0, so rows written before this attach (or
+    // during any later gap) backfill and the timeline is complete, never
+    // live-from-now. Hook correlation, when it arrives, re-points to the same
+    // path and is a no-op; when hooks are lost entirely this is the only
+    // attachment, and the watchdog's activity feed (timeline.lastActivityAt)
+    // stays truthful. Recording the provider session id here also makes
+    // recovery available from launch instead of provider_session_unknown.
+    if (claudeIdentity && session.id === request.sessionId) {
+      options.hooks.correlate(session.id, claudeIdentity.agentSessionId, claudeIdentity.transcriptPath);
+      if (isAllowedTranscriptPath(claudeIdentity.transcriptPath)) {
+        options.timeline.attach(session.id, claudeIdentity.transcriptPath, isAllowedTranscriptPath, "claude");
+      }
+      options.runtimeManager?.recordProviderSession(session.id, "claude", claudeIdentity.agentSessionId);
+      options.ownerManager?.recordProviderSession(session.id, "claude", claudeIdentity.agentSessionId);
+    }
+
     const shouldRegisterProject = input.registerProject ?? request.labels?.role !== "mate";
     if (shouldRegisterProject) {
       options.projects.touch(input.projectRoot ?? lease?.repoRoot ?? cwd);
@@ -327,6 +368,33 @@ function cloneStartRequest(request: StartAgentRequest): StartAgentRequest {
     ...(request.labels ? { labels: { ...request.labels } } : {}),
     ...(request.desktop ? { desktop: { ...request.desktop } } : {})
   };
+}
+
+const CLAUDE_SESSION_UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+// Pre-mint a fresh Claude launch's provider session id (`--session-id <uuid>`,
+// supported since well before the 2.1.x floor the hook installer already
+// requires) and derive its transcript path, so timeline attachment never
+// depends on a SessionStart hook arriving. Skipped for resumed/continued
+// sessions - those keep their provider identity and fork transcripts, which
+// followClaudeResume owns - and when the caller passed --session-id itself.
+// Mutates request: adopts/mints request.sessionId (the PTY adapter honors
+// pre-minted pty: ids, mirroring the codex --remote path) and appends the flag.
+function prepareClaudeIdentity(
+  request: StartAgentRequest,
+  cwd: string
+): { agentSessionId: string; transcriptPath: string } | undefined {
+  if (launchAgentKind(request.command, request.agent) !== "claude") return undefined;
+  const args = request.args ?? [];
+  if (args.includes("--resume") || args.includes("--continue") || args.includes("--session-id")) {
+    return undefined;
+  }
+  const sessionId = request.sessionId ?? `pty:${randomUUID()}`;
+  const agentSessionId = sessionId.startsWith("pty:") ? sessionId.slice("pty:".length) : "";
+  if (!CLAUDE_SESSION_UUID.test(agentSessionId)) return undefined;
+  request.sessionId = sessionId;
+  request.args = [...args, "--session-id", agentSessionId];
+  return { agentSessionId, transcriptPath: claudeTranscriptPath(cwd, agentSessionId) };
 }
 
 // Is this a resumed Claude launch (`claude --resume <id>`)? Only these fork the
