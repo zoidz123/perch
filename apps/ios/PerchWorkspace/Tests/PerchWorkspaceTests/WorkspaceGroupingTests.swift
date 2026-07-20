@@ -7,6 +7,7 @@ private struct FixtureTask: WorkspaceTaskLike, Codable {
     let workerName: String?
     let project: String
     let state: String
+    let createdAt: String
     let updatedAt: String
     let sessionId: String?
 
@@ -16,6 +17,7 @@ private struct FixtureTask: WorkspaceTaskLike, Codable {
         workerName: String? = nil,
         project: String,
         state: String,
+        createdAt: String = "2026-07-06T00:00:00Z",
         updatedAt: String,
         sessionId: String?
     ) {
@@ -24,6 +26,7 @@ private struct FixtureTask: WorkspaceTaskLike, Codable {
         self.workerName = workerName
         self.project = project
         self.state = state
+        self.createdAt = createdAt
         self.updatedAt = updatedAt
         self.sessionId = sessionId
     }
@@ -67,49 +70,73 @@ final class WorkspaceGroupingTests: XCTestCase {
     func testWorkerIdentityDecodesNewAndHistoricalTaskRecords() throws {
         let named = try JSONDecoder().decode(
             FixtureTask.self,
-            from: Data(#"{"id":"named","title":"fix auth","workerName":"Wren","project":"/p","state":"working","updatedAt":"t","sessionId":"pty:a"}"#.utf8)
+            from: Data(#"{"id":"named","title":"fix auth","workerName":"Wren","project":"/p","state":"working","createdAt":"t","updatedAt":"t","sessionId":"pty:a"}"#.utf8)
         )
         XCTAssertEqual(WorkspaceGrouping.workerIdentity(workerName: named.workerName, title: named.title), "Wren")
         XCTAssertEqual(named.title, "fix auth")
 
         let historical = try JSONDecoder().decode(
             FixtureTask.self,
-            from: Data(#"{"id":"historical","title":"old work","project":"/p","state":"closed","updatedAt":"t","sessionId":null}"#.utf8)
+            from: Data(#"{"id":"historical","title":"old work","project":"/p","state":"closed","createdAt":"t","updatedAt":"t","sessionId":null}"#.utf8)
         )
         XCTAssertNil(historical.workerName)
         XCTAssertEqual(WorkspaceGrouping.workerIdentity(workerName: historical.workerName, title: historical.title), "old work")
     }
 
-    func testTasksGroupByProjectWithAttentionFirst() {
+    func testTasksGroupByProjectInStableDispatchOrder() {
         let tasks = [
-            FixtureTask(project: "/Users/example/Projects/perch", state: "working", updatedAt: "2026-07-06T10:00:00Z", sessionId: "pty:a"),
-            FixtureTask(project: "/Users/example/Projects/perch", state: "completion_requested", updatedAt: "2026-07-06T12:30:00Z", sessionId: "pty:verify"),
-            FixtureTask(project: "/Users/example/Projects/sample-app", state: "needs_you", updatedAt: "2026-07-06T08:00:00Z", sessionId: "pty:b"),
-            FixtureTask(project: "/Users/example/Projects/perch", state: "done", updatedAt: "2026-07-06T11:00:00Z", sessionId: "pty:c"),
-            FixtureTask(project: "/Users/example/Projects/perch", state: "working", updatedAt: "2026-07-06T12:00:00Z", sessionId: "pty:d"),
-            FixtureTask(project: "/Users/example/Projects/perch", state: "closed", updatedAt: "2026-07-06T13:00:00Z", sessionId: "pty:e")
+            FixtureTask(id: "t-a", project: "/Users/example/Projects/perch", state: "working", createdAt: "2026-07-06T07:00:00Z", updatedAt: "2026-07-06T10:00:00Z", sessionId: "pty:a"),
+            FixtureTask(id: "t-verify", project: "/Users/example/Projects/perch", state: "completion_requested", createdAt: "2026-07-06T11:00:00Z", updatedAt: "2026-07-06T12:30:00Z", sessionId: "pty:verify"),
+            FixtureTask(id: "t-b", project: "/Users/example/Projects/sample-app", state: "needs_you", createdAt: "2026-07-06T09:30:00Z", updatedAt: "2026-07-06T12:45:00Z", sessionId: "pty:b"),
+            FixtureTask(id: "t-c", project: "/Users/example/Projects/perch", state: "done", createdAt: "2026-07-06T10:00:00Z", updatedAt: "2026-07-06T11:00:00Z", sessionId: "pty:c"),
+            FixtureTask(id: "t-d", project: "/Users/example/Projects/perch", state: "working", createdAt: "2026-07-06T07:00:00Z", updatedAt: "2026-07-06T12:00:00Z", sessionId: "pty:d"),
+            FixtureTask(id: "t-e", project: "/Users/example/Projects/perch", state: "closed", createdAt: "2026-07-06T06:00:00Z", updatedAt: "2026-07-06T13:00:00Z", sessionId: "pty:e")
         ]
 
         let groups = WorkspaceGrouping.projectGroups(tasks)
         XCTAssertEqual(groups.count, 2)
 
-        // Both projects hold attention. The newer completion request puts
-        // perch first, and the closed task never renders.
+        // Rows sit in dispatch order (createdAt, id tiebreak); neither
+        // attention state nor fresher activity moves a row, and the closed
+        // task never renders. perch leads because its oldest live task
+        // predates sample-app's, even though sample-app holds attention.
         XCTAssertEqual(groups[0].project, "/Users/example/Projects/perch")
         XCTAssertEqual(groups[0].name, "perch")
-        XCTAssertEqual(groups[0].tasks.map(\.sessionId), ["pty:verify", "pty:d", "pty:a", "pty:c"])
+        XCTAssertEqual(groups[0].tasks.map(\.sessionId), ["pty:a", "pty:d", "pty:c", "pty:verify"])
 
         XCTAssertEqual(groups[1].project, "/Users/example/Projects/sample-app")
         XCTAssertEqual(groups[1].tasks.map(\.sessionId), ["pty:b"])
     }
 
-    func testQuietProjectsOrderByRecency() {
+    func testOrderHoldsWhileConcurrentWorkersChurn() {
+        let before = [
+            FixtureTask(id: "w-1", project: "/p/app", state: "working", createdAt: "2026-07-06T09:00:00Z", updatedAt: "2026-07-06T09:00:00Z", sessionId: "pty:1"),
+            FixtureTask(id: "w-2", project: "/p/app", state: "working", createdAt: "2026-07-06T09:05:00Z", updatedAt: "2026-07-06T09:05:00Z", sessionId: "pty:2"),
+            FixtureTask(id: "w-3", project: "/p/lib", state: "working", createdAt: "2026-07-06T09:10:00Z", updatedAt: "2026-07-06T09:10:00Z", sessionId: "pty:3")
+        ]
+        // Activity bumps updatedAt and flips states (the bug: recency/state
+        // sorting swapped concurrent workers on every update).
+        let after = [
+            FixtureTask(id: "w-1", project: "/p/app", state: "needs_you", createdAt: "2026-07-06T09:00:00Z", updatedAt: "2026-07-06T09:31:00Z", sessionId: "pty:1"),
+            FixtureTask(id: "w-2", project: "/p/app", state: "working", createdAt: "2026-07-06T09:05:00Z", updatedAt: "2026-07-06T09:30:00Z", sessionId: "pty:2"),
+            FixtureTask(id: "w-3", project: "/p/lib", state: "done", createdAt: "2026-07-06T09:10:00Z", updatedAt: "2026-07-06T09:32:00Z", sessionId: "pty:3")
+        ]
+
+        let rows = { (tasks: [FixtureTask]) -> [[String]] in
+            WorkspaceGrouping.projectGroups(tasks).map { $0.tasks.map(\.id) }
+        }
+        XCTAssertEqual(rows(before), [["w-1", "w-2"], ["w-3"]])
+        XCTAssertEqual(rows(after), rows(before))
+    }
+
+    func testGroupsOrderByOldestTaskThenProjectPath() {
         let tasks = [
-            FixtureTask(project: "/p/old", state: "working", updatedAt: "2026-07-01T00:00:00Z", sessionId: nil),
-            FixtureTask(project: "/p/new", state: "done", updatedAt: "2026-07-06T00:00:00Z", sessionId: nil)
+            FixtureTask(id: "young", project: "/p/newer", state: "working", createdAt: "2026-07-06T00:00:00Z", updatedAt: "2026-07-07T00:00:00Z", sessionId: nil),
+            FixtureTask(id: "old", project: "/p/older", state: "done", createdAt: "2026-07-01T00:00:00Z", updatedAt: "2026-07-01T00:00:00Z", sessionId: nil),
+            FixtureTask(id: "tie", project: "/p/a-tied", state: "working", createdAt: "2026-07-06T00:00:00Z", updatedAt: "2026-07-06T00:00:00Z", sessionId: nil)
         ]
         let groups = WorkspaceGrouping.projectGroups(tasks)
-        XCTAssertEqual(groups.map(\.project), ["/p/new", "/p/old"])
+        XCTAssertEqual(groups.map(\.project), ["/p/older", "/p/a-tied", "/p/newer"])
     }
 
     func testScopedGroupsAppendIdleKnownProjectsAsBareHeaders() {
@@ -215,8 +242,36 @@ final class WorkspaceGroupingTests: XCTestCase {
             projectName: "company-research",
             state: "needs_you",
             sessionStatus: "needs_approval",
+            createdAt: nil,
             updatedAt: "2026-07-20T19:04:23Z"
         )])
+    }
+
+    func testProjectSectionRowsHoldDispatchOrderWhileWorkersChurn() {
+        let sessions = [
+            FixtureSession(id: "pty:mate", title: "mate", workerName: nil, taskId: nil, parentSessionId: nil)
+        ]
+        let before = [
+            FixtureTask(id: "w-1", project: "/p/app", state: "working", createdAt: "2026-07-06T09:00:00Z", updatedAt: "2026-07-06T09:00:00Z", sessionId: "pty:1"),
+            FixtureTask(id: "w-2", project: "/p/app", state: "working", createdAt: "2026-07-06T09:05:00Z", updatedAt: "2026-07-06T09:05:00Z", sessionId: "pty:2")
+        ]
+        // Activity flips states and bumps updatedAt (the bug: recency/state
+        // sorting swapped the two concurrent workers on every update).
+        let after = [
+            FixtureTask(id: "w-1", project: "/p/app", state: "needs_you", createdAt: "2026-07-06T09:00:00Z", updatedAt: "2026-07-06T09:31:00Z", sessionId: "pty:1"),
+            FixtureTask(id: "w-2", project: "/p/app", state: "working", createdAt: "2026-07-06T09:05:00Z", updatedAt: "2026-07-06T09:30:00Z", sessionId: "pty:2")
+        ]
+
+        let rowIds = { (tasks: [FixtureTask]) -> [[String]] in
+            WorkspaceGrouping.projectSections(
+                tasks: tasks,
+                sessions: sessions,
+                mateSessionId: "pty:mate",
+                knownProjects: []
+            ).map { $0.rows.map(\.id) }
+        }
+        XCTAssertEqual(rowIds(before), [["task:w-1", "task:w-2"]])
+        XCTAssertEqual(rowIds(after), rowIds(before))
     }
 
     func testStatusPayloadUpdatesSessionRowIndicator() throws {
