@@ -37,6 +37,8 @@ Any failure preserves the previous mode.
 ```text
 perch config show [--global|--project PATH] [--effective] [--json]
 perch config get <key> [--global|--project PATH] [--effective] [--json]
+perch config set mate <model> [--effort <level>] [--agent claude|codex]
+perch config set dispatch <model> [--effort <level>] [--agent claude|codex]
 perch config set --global <key> <value>
 perch config set --project PATH <key> <value> [--yes]
 perch config unset --global <key>
@@ -45,11 +47,17 @@ perch config validate [--global|--project PATH] [--effective] [--json]
 ```
 
 Mutations always require an explicit scope.
+The mate and dispatch model commands are global by definition and resolve the model to one agent before writing the complete agent, model, and effort tuple atomically.
+An omitted effort uses the selected model's registry default.
+Unknown models report closest matches, unsupported efforts report the valid levels, and ambiguous cross-agent ids require an interactive choice or `--agent`.
 Global keys are `dispatch.agent`, `dispatch.model`, `dispatch.effort`, `mate.agent`, `mate.model`, and `mate.effort`.
+Setting those dotted global keys remains supported for compatibility and prints a deprecation notice recommending the atomic role command.
 Project-only keys are `task.mode` and `task.yolo`.
 Agent values are `claude` or `codex`, task mode is `direct-PR`, `no-mistakes`, or `local-only`, and yolo is a strict boolean.
 
 Effective output includes `effectiveValue`, `source`, `scope`, `storedValue`, `defaultValue`, and `overriddenBy` for every key.
+Configuration listings also report each role's resolved agent and warn about a saved agent and model tuple that the current registry cannot validate.
+Warnings never rewrite saved configuration.
 Text and JSON redact secret-shaped keys identically.
 Environment overrides have higher precedence than stored global launch defaults.
 Task mode precedence is explicit task, project, then built-in `direct-PR`.
@@ -64,6 +72,20 @@ Read-only runtime keys are:
 - `runtime.no-mistakes.protocol`
 
 Updating Perch is the only supported way to replace the bundled runtime.
+
+## Models
+
+```text
+perch models
+perch models --json
+```
+
+`perch models` lists Claude models from Perch's bundled `CLAUDE_ALIAS_CATALOG` and Codex models from the live app-server catalog with its existing static fallback.
+Claude listing does not invoke the Claude CLI, an external API, or a gateway.
+The table shows model id, agent, supported effort levels, aliases, source, and whether the model is selected for mate or dispatch.
+Every row identifies its source as live or bundled.
+If Codex is missing or its listing mechanism is unavailable, the command retains the bundled fallback models, prints a source note, and still succeeds.
+`--json` returns the model rows, source notes, and raw source statuses for scripts.
 
 ## Pairing, server, and diagnostics
 

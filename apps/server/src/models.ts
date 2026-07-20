@@ -55,16 +55,17 @@ const execFile = promisify(execFileCallback);
 // full model ID.") on 2026-07-18. Update this table when the CLI's alias set or
 // versioned names change; it is label/order metadata, not a source of truth for
 // which models exist.
-// Perch-central Claude enrichment. The installed Claude CLI is the sole
-// authority for WHICH aliases are selectable (parsed from `/model`); this table
-// only supplies the versioned label, recency rank, and context detail the CLI
-// does not report. The current frontier models carry a 1M context window as
-// their model context, so base `fable`/`opus`/`sonnet` accurately read "1M
-// context" - they are already 1M, not a smaller window that only the `[1m]`
-// alias upgrades. Haiku 4.5 is 200K. The `[1m]` aliases are the CLI's explicit
-// 1M opt-in; they rank after the base entries and so never enter the compact
-// three-row picker (no redundant duplicate rows), keeping a distinct "X (1M)"
-// label only for the edge case of a saved `[1m]` selection.
+// Perch-central Claude catalog. The installed Claude CLI remains the authority
+// for the app picker's live aliases, while this table is the only Claude source
+// for `perch models`. It also supplies the versioned label, recency rank, and
+// context detail the CLI does not report.
+// The current frontier models carry a 1M context window as their model context,
+// so base `fable`/`opus`/`sonnet` accurately read "1M context" - they are already
+// 1M, not a smaller window that only the `[1m]` alias upgrades.
+// Haiku 4.5 is 200K.
+// The `[1m]` aliases are the CLI's explicit 1M opt-in; they rank after the base
+// entries and so never enter the compact three-row picker, keeping a distinct
+// "X (1M)" label only for the edge case of a saved `[1m]` selection.
 type ClaudeAliasMeta = { label: string; detail?: string; rank: number; nativeProviderId?: string };
 const CLAUDE_ALIAS_CATALOG: Record<string, ClaudeAliasMeta> = {
   fable: { label: "Fable 5", detail: "1M context", rank: 0, nativeProviderId: "claude-fable-5" },
@@ -94,6 +95,17 @@ const CLAUDE_MODELS: ModelCatalogEntry[] = CLAUDE_FALLBACK_ALIASES.map((alias) =
     status: "fallback"
   };
 });
+
+const CLAUDE_BUNDLED_MODELS: ModelCatalogEntry[] = Object.entries(CLAUDE_ALIAS_CATALOG).map(([alias, meta]) => ({
+  id: alias,
+  runtimeId: alias,
+  label: meta.label,
+  ...(meta.detail ? { detail: meta.detail } : {}),
+  ...(meta.nativeProviderId ? { nativeProviderId: meta.nativeProviderId } : {}),
+  runtimeSource: "bundled",
+  source: ["bundled"],
+  status: "available"
+}));
 
 // The model a fresh Claude MATE launches with when neither the start request
 // nor the configured mate defaults (settings mateDefaults / PERCH_MATE_MODEL)
@@ -275,8 +287,24 @@ export async function collectModelRegistry(deps: ModelRegistryDeps = {}): Promis
       ...(codexResult.status === "rejected" ? [runtimeFailure("codex-app-server", codexResult.reason)] : []),
       ...(claudeResult.status === "rejected" ? [runtimeFailure("claude-cli", claudeResult.reason)] : [])
     ];
-    if (codexResult.status === "rejected") throw codexResult.reason;
-    if (failed.length) response.sources = [...failed, ...(response.sources ?? [])];
+    if (failed.length) {
+      response.sources = [...failed, ...(response.sources ?? [])];
+      const anyConfiguredSourceSucceeded =
+        (Boolean(deps.listCodexModels) && codexResult.status === "fulfilled") ||
+        (Boolean(deps.listClaudeModels) && claudeResult.status === "fulfilled");
+      if (!anyConfiguredSourceSucceeded) {
+        if (codexResult.status === "rejected") throw codexResult.reason;
+        if (claudeResult.status === "rejected") throw claudeResult.reason;
+        throw new Error("model discovery failed");
+      }
+      response.cache = {
+        path: cachePath,
+        hit: false,
+        stale: false,
+        reason: "partial runtime discovery; unavailable providers use fallback"
+      };
+      return response;
+    }
     response.cache = { path: cachePath, hit: false, stale: false };
     writeModelRegistryCache(cachePath, response);
     return response;
@@ -304,6 +332,38 @@ export async function collectModelRegistry(deps: ModelRegistryDeps = {}): Promis
       sources: [failure, ...(fallback.sources ?? [])]
     };
   }
+}
+
+export async function collectCliModelRegistry(deps: ModelRegistryDeps = {}): Promise<ModelsResponse> {
+  const response = await collectModelRegistry({
+    ...deps,
+    readClaudeSettings: () => null,
+    listClaudeModels: undefined,
+    claudeModelList: undefined
+  });
+  const claude: ProviderModelCatalog = {
+    provider: "claude",
+    label: "Claude",
+    options: CLAUDE_BUNDLED_MODELS,
+    roleDefaults: roleDefaultsFor("claude", CLAUDE_BUNDLED_MODELS),
+    runtimeSource: "bundled",
+    source: ["bundled"],
+    status: "available"
+  };
+  return {
+    ...response,
+    sources: [
+      ...(response.sources ?? []).filter((source) => source.name === "codex-app-server" || source.role === "cache"),
+      {
+        name: "claude-bundled",
+        role: "runtime",
+        ok: true,
+        status: "ok",
+        reason: "bundled CLAUDE_ALIAS_CATALOG"
+      }
+    ],
+    providers: response.providers.map((provider) => provider.provider === "claude" ? claude : provider)
+  };
 }
 
 function claudeCatalog(deps: ModelsDeps): { catalog: ProviderModelCatalog; sourceStatuses: ModelRegistrySourceStatus[] } {
@@ -404,7 +464,9 @@ function claudeRuntimeEntry(runtimeId: string): ModelCatalogEntry {
     runtimeId,
     label,
     ...(detail ? { detail } : {}),
-    ...(meta?.nativeProviderId ? { nativeProviderId: meta.nativeProviderId } : {}),
+    ...(meta?.nativeProviderId
+      ? { nativeProviderId: wants1m ? `${meta.nativeProviderId}[1m]` : meta.nativeProviderId }
+      : {}),
     runtimeSource: "claude-cli",
     source: ["claude-cli"],
     status: "available"
@@ -638,6 +700,49 @@ function unknownModelEntry(id: string, source: string): ModelCatalogEntry {
 
 function findModelEntry(options: ModelCatalogEntry[], id: string): ModelCatalogEntry | undefined {
   return options.find((entry) => entry.id === id || entry.runtimeId === id);
+}
+
+export type ModelIdentifierMatch = {
+  agent: AgentKind;
+  model: string;
+  aliases: string[];
+  supportedEfforts: CodexReasoningEffort[];
+  defaultEffort?: CodexReasoningEffort;
+};
+
+export function resolveModelIdentifier(
+  registry: ModelsResponse,
+  identifier: string,
+  agent?: AgentKind
+): ModelIdentifierMatch[] {
+  const direct: ModelIdentifierMatch[] = [];
+  const aliases: ModelIdentifierMatch[] = [];
+  for (const provider of registry.providers) {
+    if (agent && provider.provider !== agent) continue;
+    for (const entry of provider.options) {
+      const model = entry.runtimeId ?? entry.id;
+      const entryAliases = uniqueStrings(
+        [entry.id, entry.runtimeId, entry.nativeProviderId, entry.apiId]
+          .filter((value): value is string => typeof value === "string")
+      )
+        .filter((value) => value !== model);
+      const match: ModelIdentifierMatch = {
+        agent: provider.provider,
+        model,
+        aliases: entryAliases,
+        supportedEfforts: entry.supportedReasoningEfforts ?? [],
+        ...(entry.defaultReasoningEffort ? { defaultEffort: entry.defaultReasoningEffort } : {})
+      };
+      if (identifier === entry.id || identifier === entry.runtimeId) direct.push(match);
+      else if (entryAliases.includes(identifier)) aliases.push(match);
+    }
+  }
+  const agents = new Set([...direct, ...aliases].map((match) => match.agent));
+  const matches = [...agents].flatMap((matchAgent) => {
+    const agentDirect = direct.filter((match) => match.agent === matchAgent);
+    return agentDirect.length ? agentDirect : aliases.filter((match) => match.agent === matchAgent);
+  });
+  return [...new Map(matches.map((match) => [`${match.agent}:${match.model}`, match])).values()];
 }
 
 // The reasoning efforts a given model supports, resolved from a model registry
