@@ -428,7 +428,8 @@ test("GET /sessions fills missing Claude mate model with a friendly label and no
     const body = (await response.json()) as { sessions: AgentSession[] };
     const mate = body.sessions.find((session) => session.labels?.role === "mate");
     assert.equal(mate?.model, MATE_CLAUDE_FALLBACK_MODEL);
-    assert.equal(mate?.modelLabel, "Best");
+    // The internal `best` alias maps to its catalog label, never the raw id.
+    assert.equal(mate?.modelLabel, "Best available");
     assert.equal(mate?.effort, undefined);
   } finally {
     timeline.stop();
