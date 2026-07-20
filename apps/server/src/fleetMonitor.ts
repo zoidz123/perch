@@ -547,6 +547,10 @@ export class FleetMonitor {
 
   setPendingClaudeInteraction(sessionId: string, interaction: PendingClaudeInteraction): void {
     const canonical = this.canonicalSessionId(sessionId);
+    if (!isActionableClaudeInteraction(interaction)) {
+      this.resolveClaudeInteraction(canonical);
+      return;
+    }
     const existing = this.pendingClaudeInteractions.get(canonical);
     this.pendingClaudeInteractions.set(canonical, interaction);
     if (!existing) {
@@ -561,16 +565,29 @@ export class FleetMonitor {
   }
 
   restorePendingClaudeInteraction(sessionId: string, interaction: PendingClaudeInteraction): void {
-    this.pendingClaudeInteractions.set(this.canonicalSessionId(sessionId), interaction);
+    const canonical = this.canonicalSessionId(sessionId);
+    if (!isActionableClaudeInteraction(interaction)) {
+      this.resolveClaudeInteraction(canonical);
+      return;
+    }
+    this.pendingClaudeInteractions.set(canonical, interaction);
     this.scheduleBroadcast();
   }
 
   pendingClaudeInteraction(sessionId: string): PendingClaudeInteraction | undefined {
-    return this.pendingClaudeInteractions.get(this.canonicalSessionId(sessionId));
+    const interaction = this.pendingClaudeInteractions.get(this.canonicalSessionId(sessionId));
+    return interaction && isActionableClaudeInteraction(interaction) ? interaction : undefined;
   }
 
   resolveClaudeInteraction(sessionId: string): void {
-    if (this.pendingClaudeInteractions.delete(this.canonicalSessionId(sessionId))) this.scheduleBroadcast();
+    const canonical = this.canonicalSessionId(sessionId);
+    const removed = this.pendingClaudeInteractions.delete(canonical);
+    if (!this.hasPromptGate(canonical) && this.sessionState.get(canonical)?.status === "needs_approval") {
+      this.applyExternalStatus(canonical, "running", undefined, "system");
+      return;
+    }
+    if (!this.inputGated(canonical)) void this.flushQueuedInputs(canonical);
+    if (removed) this.scheduleBroadcast();
   }
 
   // Composer gating: while a permission prompt is open, pasted text would land
@@ -661,8 +678,17 @@ export class FleetMonitor {
       this.pendingApprovals.has(sessionId) ||
       this.pendingServerRequests.has(sessionId) ||
       this.pendingQuestions.has(sessionId) ||
-      this.pendingClaudeInteractions.has(sessionId) ||
+      isActionableClaudeInteraction(this.pendingClaudeInteractions.get(sessionId)) ||
       this.sessionState.get(sessionId)?.status === "needs_approval"
+    );
+  }
+
+  private hasPromptGate(sessionId: string): boolean {
+    return (
+      this.pendingApprovals.has(sessionId) ||
+      this.pendingServerRequests.has(sessionId) ||
+      this.pendingQuestions.has(sessionId) ||
+      isActionableClaudeInteraction(this.pendingClaudeInteractions.get(sessionId))
     );
   }
 
@@ -1158,7 +1184,7 @@ export class FleetMonitor {
         if (serverRequest) {
           result.pendingServerRequest = serverRequest;
           result.status = "needs_approval";
-        } else if (claudeInteraction) {
+        } else if (isActionableClaudeInteraction(claudeInteraction)) {
           result.pendingClaudeInteraction = claudeInteraction;
           result.status = "needs_approval";
         } else if (question) {
@@ -1418,6 +1444,12 @@ function captureText(events: AgentEvent[]): string {
 
 function hasDirectAgentDetail(event: FleetEvent): boolean {
   return event.name?.startsWith("pty.") ?? false;
+}
+
+function isActionableClaudeInteraction(
+  interaction: PendingClaudeInteraction | undefined
+): interaction is PendingClaudeInteraction {
+  return interaction?.state === "waiting" || interaction?.state === "response_sent";
 }
 
 function lastLines(text: string, count: number): string {
