@@ -264,7 +264,7 @@ struct AgentSession: Identifiable, Codable, Equatable {
     let paneId: String?
     let surfaceId: String?
     let kind: SurfaceKind
-    let status: AgentSessionStatus
+    var status: AgentSessionStatus
     // The exact model + reasoning effort the session is running right now,
     // resolved server-side and kept live as it changes. `model` is the CLI id
     // (e.g. "gpt-5.5", "opus"); `modelLabel` is the versioned display name
@@ -715,6 +715,11 @@ struct TaskPrCheckModel: Codable, Equatable {
 // Workspace home grouping (WorkspaceGrouping.swift): tasks nest under their
 // project header; the fields it reads are already on every task record.
 extension AgentTask: WorkspaceTaskLike {}
+
+extension AgentSession: WorkspaceSessionLike {
+    var taskId: String? { labels?["task"] }
+    var parentSessionId: String? { labels?["parent"] }
+}
 
 typealias UsageWindow = PerchUsage.UsageWindow
 typealias UsageCredits = PerchUsage.UsageCredits

@@ -2,6 +2,7 @@ import XCTest
 @testable import PerchWorkspace
 
 private struct FixtureTask: WorkspaceTaskLike, Codable {
+    let id: String
     let title: String
     let workerName: String?
     let project: String
@@ -10,6 +11,7 @@ private struct FixtureTask: WorkspaceTaskLike, Codable {
     let sessionId: String?
 
     init(
+        id: String = "task",
         title: String = "work",
         workerName: String? = nil,
         project: String,
@@ -17,6 +19,7 @@ private struct FixtureTask: WorkspaceTaskLike, Codable {
         updatedAt: String,
         sessionId: String?
     ) {
+        self.id = id
         self.title = title
         self.workerName = workerName
         self.project = project
@@ -26,18 +29,42 @@ private struct FixtureTask: WorkspaceTaskLike, Codable {
     }
 }
 
+private struct FixtureSession: WorkspaceSessionLike, Codable {
+    let id: String
+    let workerName: String?
+    let labels: [String: String]?
+    var status: String
+
+    var taskId: String? { labels?["task"] }
+    var parentSessionId: String? { labels?["parent"] }
+
+    init(
+        id: String,
+        workerName: String?,
+        taskId: String?,
+        parentSessionId: String?,
+        status: String = "idle"
+    ) {
+        self.id = id
+        self.workerName = workerName
+        labels = ["task": taskId, "parent": parentSessionId]
+            .compactMapValues { $0 }
+        self.status = status
+    }
+}
+
 final class WorkspaceGroupingTests: XCTestCase {
     func testWorkerIdentityDecodesNewAndHistoricalTaskRecords() throws {
         let named = try JSONDecoder().decode(
             FixtureTask.self,
-            from: Data(#"{"title":"fix auth","workerName":"Wren","project":"/p","state":"working","updatedAt":"t","sessionId":"pty:a"}"#.utf8)
+            from: Data(#"{"id":"named","title":"fix auth","workerName":"Wren","project":"/p","state":"working","updatedAt":"t","sessionId":"pty:a"}"#.utf8)
         )
         XCTAssertEqual(WorkspaceGrouping.workerIdentity(workerName: named.workerName, title: named.title), "Wren")
         XCTAssertEqual(named.title, "fix auth")
 
         let historical = try JSONDecoder().decode(
             FixtureTask.self,
-            from: Data(#"{"title":"old work","project":"/p","state":"closed","updatedAt":"t","sessionId":null}"#.utf8)
+            from: Data(#"{"id":"historical","title":"old work","project":"/p","state":"closed","updatedAt":"t","sessionId":null}"#.utf8)
         )
         XCTAssertNil(historical.workerName)
         XCTAssertEqual(WorkspaceGrouping.workerIdentity(workerName: historical.workerName, title: historical.title), "old work")
@@ -102,17 +129,68 @@ final class WorkspaceGroupingTests: XCTestCase {
 
     func testOrphanSessionsFallToSoloAgents() {
         let tasks = [
-            FixtureTask(project: "/p", state: "working", updatedAt: "t", sessionId: "pty:tasked"),
-            FixtureTask(project: "/p", state: "closed", updatedAt: "t", sessionId: "pty:closed-worker")
+            FixtureTask(id: "live", project: "/p", state: "working", updatedAt: "t", sessionId: "pty:tasked"),
+            FixtureTask(id: "closed", project: "/p", state: "closed", updatedAt: "t", sessionId: "pty:closed-worker")
+        ]
+        let sessions = [
+            FixtureSession(id: "pty:tasked", workerName: nil, taskId: "live", parentSessionId: "pty:mate"),
+            FixtureSession(id: "pty:closed-worker", workerName: nil, taskId: "closed", parentSessionId: "pty:mate"),
+            FixtureSession(id: "pty:manual", workerName: nil, taskId: nil, parentSessionId: nil),
+            FixtureSession(id: "pty:mate", workerName: nil, taskId: nil, parentSessionId: nil)
         ]
         let others = WorkspaceGrouping.otherSessionIds(
-            sessionIds: ["pty:tasked", "pty:closed-worker", "pty:manual", "pty:mate"],
+            sessions: sessions,
             tasks: tasks,
             mateSessionId: "pty:mate"
         )
         // The tasked worker nests under its project and the mate is pinned
         // above everything; a closed task no longer owns its session.
         XCTAssertEqual(others, ["pty:closed-worker", "pty:manual"])
+    }
+
+    func testCrewSessionMetadataKeepsWorkerOutOfSoloAndLinksItToTask() throws {
+        let tasks = [
+            FixtureTask(
+                id: "fix-ios-regression-crew-d242",
+                project: "/Users/example/Desktop/perch",
+                state: "working",
+                updatedAt: "t",
+                sessionId: nil
+            )
+        ]
+        let worker = try JSONDecoder().decode(
+            FixtureSession.self,
+            from: Data(#"{"id":"pty:worker","workerName":"Alder","labels":{"task":"fix-ios-regression-crew-d242","parent":"pty:mate"},"status":"running"}"#.utf8)
+        )
+        let sessions = [
+            FixtureSession(id: "pty:mate", workerName: nil, taskId: nil, parentSessionId: nil),
+            worker,
+            FixtureSession(id: "pty:manual", workerName: nil, taskId: nil, parentSessionId: nil)
+        ]
+
+        XCTAssertEqual(
+            WorkspaceGrouping.sessionId(forTaskId: tasks[0].id, linkedSessionId: tasks[0].sessionId, sessions: sessions),
+            "pty:worker"
+        )
+        XCTAssertEqual(
+            WorkspaceGrouping.otherSessionIds(sessions: sessions, tasks: tasks, mateSessionId: "pty:mate"),
+            ["pty:manual"]
+        )
+        XCTAssertEqual(WorkspaceGrouping.projectGroups(tasks).first?.name, "perch")
+        XCTAssertEqual(WorkspaceGrouping.workerIdentity(workerName: sessions[1].workerName, title: "Fix iOS regression"), "Alder")
+    }
+
+    func testStatusPayloadUpdatesSessionRowIndicator() throws {
+        let session = try JSONDecoder().decode(
+            FixtureSession.self,
+            from: Data(#"{"id":"pty:worker","workerName":"Birch","labels":{"task":"task","parent":"pty:mate"},"status":"idle"}"#.utf8)
+        )
+
+        let updated = WorkspaceGrouping.applyingStatus("needs_approval", to: session.id, in: [session])
+
+        XCTAssertEqual(updated?.first?.status, "needs_approval")
+        XCTAssertEqual(WorkspaceGrouping.statusIndicator(for: updated?.first?.status), .attention)
+        XCTAssertNil(WorkspaceGrouping.applyingStatus("needs_approval", to: session.id, in: updated ?? []))
     }
 
     func testHomeRelativePath() {

@@ -163,7 +163,9 @@ struct TaskRow: View {
     }
 
     private var liveSessionId: String? {
-        [task.runtime?.ptySessionId, task.sessionId].compactMap { $0 }.first { store.sessionsById[$0] != nil }
+        [task.runtime?.ptySessionId, task.sessionId, session?.id]
+            .compactMap { $0 }
+            .first { store.sessionsById[$0] != nil }
     }
 
     private var workerAgent: AgentKind {

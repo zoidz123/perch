@@ -7,10 +7,27 @@ import Foundation
 // (single source of truth lives in apps/ios/PerchWorkspace).
 
 protocol WorkspaceTaskLike {
+    var id: String { get }
     var project: String { get }
     var state: String { get }
     var updatedAt: String { get }
     var sessionId: String? { get }
+}
+
+protocol WorkspaceSessionLike {
+    associatedtype Status: Equatable
+    var id: String { get }
+    var taskId: String? { get }
+    var parentSessionId: String? { get }
+    var status: Status { get set }
+}
+
+enum WorkspaceStatusIndicator: Equatable {
+    case active
+    case attention
+    case error
+    case idle
+    case hidden
 }
 
 struct WorkspaceProjectGroup<T: WorkspaceTaskLike> {
@@ -27,6 +44,31 @@ enum WorkspaceGrouping {
     // omit workerName and retain the old title-only presentation.
     static func workerIdentity(workerName: String?, title: String) -> String {
         workerName ?? title
+    }
+
+    // Status events are smaller and faster than the next fleet snapshot.
+    // Update only the addressed session, and return nil for duplicates so
+    // socket traffic does not invalidate the home screen unnecessarily.
+    static func applyingStatus<S: WorkspaceSessionLike>(
+        _ status: S.Status,
+        to sessionId: String,
+        in sessions: [S]
+    ) -> [S]? {
+        guard let index = sessions.firstIndex(where: { $0.id == sessionId }) else { return nil }
+        guard sessions[index].status != status else { return nil }
+        var updated = sessions
+        updated[index].status = status
+        return updated
+    }
+
+    static func statusIndicator(for status: String?) -> WorkspaceStatusIndicator {
+        switch status {
+        case "running", "working": .active
+        case "needs_approval": .attention
+        case "error": .error
+        case "idle", "waiting", "unknown": .idle
+        default: .hidden
+        }
     }
 
     // Within a project: needs_you/blocked first (that IS the signal - no
@@ -84,15 +126,44 @@ enum WorkspaceGrouping {
         return groups
     }
 
-    // Orphans: sessions owned by no live task and not the mate itself. These
-    // render under "Solo agents".
-    static func otherSessionIds<T: WorkspaceTaskLike>(
-        sessionIds: [String],
+    // Resolve a task's worker through both ledger linkage and the session's
+    // authoritative task label. The latter survives stale or delayed task
+    // snapshots and is the source of truth for crew parentage.
+    static func sessionId<S: WorkspaceSessionLike>(
+        forTaskId taskId: String,
+        linkedSessionId: String?,
+        sessions: [S]
+    ) -> String? {
+        if let labeledSession = sessions.first(where: { $0.taskId == taskId }) {
+            return labeledSession.id
+        }
+        if let linkedSessionId, sessions.contains(where: { $0.id == linkedSessionId }) {
+            return linkedSessionId
+        }
+        return nil
+    }
+
+    // Orphans: sessions owned by no live task and not parented to the mate.
+    // Crew labels keep a worker out of "Solo agents" even while the task
+    // snapshot catches up to the fleet snapshot.
+    static func otherSessionIds<T: WorkspaceTaskLike, S: WorkspaceSessionLike>(
+        sessions: [S],
         tasks: [T],
         mateSessionId: String?
     ) -> [String] {
-        let taskSessionIds = Set(tasks.filter { $0.state != "closed" }.compactMap(\.sessionId))
-        return sessionIds.filter { !taskSessionIds.contains($0) && $0 != mateSessionId }
+        let liveTasks = tasks.filter { $0.state != "closed" }
+        let taskSessionIds = Set(liveTasks.compactMap(\.sessionId))
+        let taskIds = Set(liveTasks.map(\.id))
+        let closedTaskIds = Set(tasks.filter { $0.state == "closed" }.map(\.id))
+        return sessions.compactMap { session in
+            let isTaskWorker = taskSessionIds.contains(session.id)
+                || session.taskId.map(taskIds.contains) == true
+            let belongsToClosedTask = session.taskId.map(closedTaskIds.contains) == true
+            let isMateChild = mateSessionId != nil
+                && session.parentSessionId == mateSessionId
+                && !belongsToClosedTask
+            return !isTaskWorker && !isMateChild && session.id != mateSessionId ? session.id : nil
+        }
     }
 
     // "/Users/example/Desktop/perch" -> "~/Desktop/perch" for the dim path in a
