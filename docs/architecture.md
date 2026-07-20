@@ -56,9 +56,13 @@ SQLite stores the current task projection, immutable task events, runtime genera
 The task lifecycle describes work meaning, while runtime state describes the replaceable process executing it.
 
 ```text
-task:     queued -> working -> needs_you or blocked -> done -> landed -> closed
+task:     queued -> working -> needs_you or blocked -> completion_requested -> done -> landed -> closed
 runtime:  starting -> live -> recoverable -> recovering -> live generation + 1
 ```
+
+A provider turn ending does not complete a task.
+Each worker turn must append a task outcome, and worker `done` is translated to `completion_requested` until Mate verifies the deliverable.
+See [Worker task API and turn lifecycle](worker-task-api.md) for the endpoint contracts and exact completion flow.
 
 Losing a runtime records `runtime_interrupted` without changing the task's semantic state.
 Dispatch and recovery operations use durable leases and idempotency keys so a server restart can resume work without intentionally launching duplicates.

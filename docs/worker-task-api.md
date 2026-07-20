@@ -1,0 +1,313 @@
+# Worker task API and turn lifecycle
+
+Perch separates provider turns, worker-reported task outcomes, and verified task completion.
+A Claude or Codex turn ending is runtime evidence only.
+A worker must report an outcome for the turn, and a worker's `done` report becomes a completion request that Mate must verify before the task enters `done`.
+
+This guide documents the HTTP surface used to dispatch and supervise workers, the event endpoint workers call, and the hooks that enforce the per-turn reporting contract.
+It does not catalog unrelated device, configuration, usage, or chart-review routes.
+
+## Actors and credentials
+
+The local server normally listens at `http://127.0.0.1:8787`.
+Workers receive these values in their PTY environment:
+
+| Variable | Purpose |
+| --- | --- |
+| `PERCH_SESSION_ID` | Identifies the Perch-owned provider session. |
+| `PERCH_HOOK_URL` | Points to the server's `POST /hooks` endpoint. |
+| `PERCH_HOOK_TOKEN` | Authenticates only that session's hook and worker requests. |
+
+Workers derive the server base URL with `${PERCH_HOOK_URL%/hooks}`.
+They never receive the server bearer token.
+
+Mate reads the local server token and uses bearer authentication:
+
+```sh
+TOKEN=$(cat "${PERCH_HOME:-$HOME/.perch}/token")
+BASE=${PERCH_HOOK_URL%/hooks}
+curl -s -H "Authorization: Bearer $TOKEN" "$BASE/tasks"
+```
+
+| Credential | Intended caller | Accepted by |
+| --- | --- | --- |
+| Session headers `x-perch-session` and `x-perch-token` | Provider hooks and the worker | `POST /hooks`, the worker form of `POST /tasks/:id/events`, and adjacent worker capabilities such as chart registration |
+| `Authorization: Bearer <server-token>` | Mate and local CLI tools | Authenticated task and session routes |
+| Paired device bearer token | iPhone | Most authenticated read and control routes, but not completion verification |
+
+For `POST /tasks/:id/events`, the session in `x-perch-session` must be the session currently linked to that task.
+Hook-token events are persisted with `source: "worker"`.
+Bearer-authenticated events are persisted with `source: "system"` and do not satisfy the worker's per-turn outcome requirement.
+
+## Endpoint map
+
+| Method and path | Caller | Purpose |
+| --- | --- | --- |
+| `POST /tasks` | Mate | Create a task and, with `dispatch: true`, acquire a worktree, start a worker, and link the runtime. |
+| `GET /tasks` | Mate, CLI, phone | List durable task projections. |
+| `GET /tasks/:id` | Mate, CLI, phone | Read one task and its immutable ordered event log. |
+| `POST /tasks/:id/events` | Worker | Report `working`, `needs_decision`, `blocked`, `done`, `failed`, or `note`. |
+| `POST /hooks` | Installed provider hook | Report provider lifecycle signals such as turn start and turn completion. |
+| `POST /tasks/:id/completion` | Mate with the server token | Accept or reject the latest worker completion request. |
+| `POST /tasks/:id/decision` | Mate or phone | Answer a structured no-mistakes review gate reported through `needs_decision`. |
+| `GET /sessions` | Mate, CLI, phone | Read live fleet and provider-session status. |
+| `POST /sessions/:sessionId/input` | Mate, CLI, phone | Send or queue follow-up text to the worker session. |
+| `POST /tasks/:id/recover` | Mate, CLI, phone | Resume the same verified provider conversation in a new runtime generation. |
+| `POST /tasks/:id/teardown` | Mate, CLI, phone | Stop the worker, release its worktree, and close the task when the landed gate permits it. |
+
+The authenticated routes use JSON request and response bodies.
+Errors use an HTTP status plus an `{ "error": "..." }` body.
+
+## Dispatch and read endpoints
+
+### `POST /tasks`
+
+Mate normally sends:
+
+```json
+{
+  "title": "Fix the upload retry",
+  "project": "/absolute/path/to/project",
+  "kind": "ship",
+  "prompt": "Reproduce the failed retry, fix it, and add the focused regression test.",
+  "dispatch": true,
+  "parent": "<mate-session-id>",
+  "idempotencyKey": "dispatch-upload-retry-v1"
+}
+```
+
+`kind` is `ship` or `scout`.
+The optional `mode` is `direct-PR`, `no-mistakes`, or `local-only`; otherwise the project setting and then the built-in default decide it.
+Optional `agent`, `model`, and `effort` values override dispatch defaults for this task only.
+Reusing an `idempotencyKey` returns the original durable dispatch instead of launching another worker.
+
+With `dispatch: true`, the server appends the standard worker brief to `prompt`.
+That brief contains the exact event commands, worktree and branch rules, and the mode-specific definition of done.
+
+### `GET /tasks` and `GET /tasks/:id`
+
+`GET /tasks` returns `{ "tasks": [...] }`.
+An optional `planId` query filters tasks linked to one finalized plan.
+
+`GET /tasks/:id` returns:
+
+```json
+{
+  "task": { "id": "...", "state": "completion_requested" },
+  "events": [
+    { "seq": 1, "kind": "created", "source": "system", "at": "..." },
+    { "seq": 8, "kind": "completion_requested", "source": "worker", "at": "..." }
+  ]
+}
+```
+
+Mate uses this detail endpoint before acting on a wake notification.
+The event `seq` is the stable identifier used for completion decisions and turn-boundary evidence.
+
+## Worker event endpoint
+
+### `POST /tasks/:id/events`
+
+A worker reports an outcome with its session credentials:
+
+```sh
+curl -sf -X POST "${PERCH_HOOK_URL%/hooks}/tasks/<task-id>/events" \
+  -H "x-perch-session: $PERCH_SESSION_ID" \
+  -H "x-perch-token: $PERCH_HOOK_TOKEN" \
+  -H "content-type: application/json" \
+  -d '{"kind":"blocked","message":"Waiting for the signing credential"}'
+```
+
+The request body is:
+
+```json
+{
+  "kind": "working | needs_decision | blocked | done | failed | note",
+  "message": "optional human-readable evidence",
+  "pr": "optional pull request URL",
+  "data": { "optional": "structured evidence" }
+}
+```
+
+`message` and serialized `data` are each limited to 32 KiB.
+`data` must be a JSON object.
+The successful response is `{ "task": <updated-task> }`.
+
+| Worker wire verb | Durable event | Resulting task state | Meaning |
+| --- | --- | --- | --- |
+| `working` | `working` | `working` | The worker started or resumed meaningful work. |
+| `needs_decision` | `needs_decision` | `needs_you` | Work is parked on a human or Mate decision. |
+| `blocked` | `blocked` | `blocked` | Work is parked on an external dependency. |
+| `done` | `completion_requested` | `completion_requested` | The worker claims the definition of done is met and asks Mate to verify it. |
+| `failed` | `failed` | `failed` | The worker cannot complete the task. |
+| `note` | `note` | unchanged | Supplemental durable evidence that is not the turn's outcome. |
+
+The `done` name is retained as the worker wire verb for compatibility.
+It never directly creates trusted `done` state.
+
+For a non-scout, non-`local-only` task, a `done` request must resolve to a valid pull request unless the attached task PR is already merged.
+The worker may send `pr`, include the URL in `message`, or let the server discover the unique PR for the server-minted branch.
+The server validates the PR against the task checkout and attaches it before recording the completion request.
+
+## What happens when a provider turn completes
+
+Every managed worker turn has two independent channels:
+
+1. The provider lifecycle channel says a turn started or ended.
+2. The worker event channel says what the turn accomplished for the durable task.
+
+The server records the lifecycle channel as `turn_started` and `turn_completed` events with `source: "hook"`.
+These events never change task state.
+
+```text
+provider turn starts
+        |
+        | record turn_started and taskEventSeqAtStart
+        v
+worker performs the turn
+        |
+        +---- POST one outcome: needs_decision, blocked, done, or failed
+        |
+        v
+provider turn completes
+        |
+        +---- outcome exists after baseline -> record turn_completed
+        |
+        `---- no outcome after baseline -> record turn_completed + stalled
+                                           and wake Mate
+```
+
+At turn start, Perch snapshots the latest immutable task-event sequence in `taskEventSeqAtStart`.
+At turn completion, it looks only for a later event whose source is `worker` and whose kind is `needs_decision`, `blocked`, `completion_requested`, or `failed`.
+An old report from a previous turn cannot satisfy the new turn.
+A `working` heartbeat or `note` also cannot satisfy it because neither explains the turn's parked or finished outcome.
+
+If the outcome exists, `turn_completed.data` includes `outcomeEventSeq` and `outcomeKind`.
+If it does not, `turn_completed.data.retryNeeded` is `true`, and the server atomically records a `stalled` event with `data.reason: "turn_outcome_missing"`.
+The task's semantic state is otherwise unchanged.
+
+Claude and Codex provide the boundaries differently:
+
+- Claude and plain Codex PTY fallback use verified `UserPromptSubmit` and `Stop` hook reports sent to `POST /hooks`.
+- Daemon-controlled Codex uses app-server turn-start and turn-completed notifications internally, avoiding duplicate evidence from compatibility hooks.
+- On Claude's first `Stop` without an outcome, Perch returns additional hook context asking the worker to report one accurate outcome before stopping.
+  Claude's `stop_hook_active` loop guard permits only this one continuation.
+- A Codex turn-completed notification is settled and cannot be continued in the same way, so the durable `stalled` event wakes Mate to retry or steer the worker.
+
+Provider prose is never treated as the outcome.
+Even if the final assistant message says the work is finished, Mate must rely on the durable worker event and verify the deliverable.
+
+## Completion verification
+
+When the worker posts `done`, the lifecycle is:
+
+```text
+working -> completion_requested -> done -> landed -> closed
+                    |                ^
+                    | reject         | accept
+                    v                |
+                  working -----------+
+```
+
+`completion_requested` wakes Mate.
+Mate reads `GET /tasks/:id`, checks the original `task.prompt`, the worker's claim, worktree or repository evidence, the attached PR, and relevant tests or checks.
+
+Mate then calls `POST /tasks/:id/completion` with the local server bearer token:
+
+```json
+{
+  "action": "accept",
+  "requestSeq": 8,
+  "idempotencyKey": "accept-task-123-request-8"
+}
+```
+
+To reject:
+
+```json
+{
+  "action": "reject",
+  "requestSeq": 8,
+  "feedback": "The regression test does not cover the user-visible retry path.",
+  "idempotencyKey": "reject-task-123-request-8-v1"
+}
+```
+
+`requestSeq` must identify the latest `completion_requested` event.
+This prevents a delayed decision from accepting a newer claim after the worker has retried.
+An idempotency key may be retried with the same decision, but reusing it for different decision data returns `409`.
+
+Accept records `completion_accepted` and moves the task to `done`.
+If the attached PR merged during review, the server then records the merge and advances the task to `landed`.
+
+Reject requires non-empty `feedback`, records `completion_rejected`, and moves the task back to `working`.
+The server best-effort delivers `[perch] Completion rejected: <feedback>` to a live worker session.
+The rejection and feedback remain durable even if immediate delivery fails, so Mate can recover or steer the worker later.
+
+Only the local server token may call this endpoint.
+A worker hook token cannot accept its own work, and a paired device token receives `403` rather than silently acting as Mate.
+Mate should re-read the task after any `409` response.
+
+## Structured no-mistakes decisions
+
+`POST /tasks/:id/decision` is narrower than ordinary worker steering.
+It answers the latest structured no-mistakes gate that the worker previously persisted with a `needs_decision` event.
+
+```json
+{
+  "action": "fix",
+  "findingIds": ["r1"],
+  "instructions": "Keep the existing public API shape."
+}
+```
+
+`action` is `approve`, `fix`, or `skip`.
+`findingIds` and `instructions` are used only with `fix`.
+The server translates the decision into the no-mistakes response command and queue-gates delivery to the worker.
+Worker hook credentials are not accepted because a worker cannot answer its own review gate.
+
+## Steering, recovery, and teardown
+
+`GET /sessions` returns the live fleet view, including the worker session ID needed by the input endpoint and provider statuses such as running, waiting, or needing approval.
+
+### `POST /sessions/:sessionId/input`
+
+Mate sends a concise follow-up with:
+
+```json
+{ "text": "Please add the missing end-to-end assertion.\n" }
+```
+
+The server either submits the text or queues it behind a provider interaction that must be resolved first.
+Accepted follow-up input starts a new turn and can return a rejected or parked task to `working` only through the normal activity path.
+
+### `POST /tasks/:id/recover`
+
+Recovery accepts an optional stable key:
+
+```json
+{ "idempotencyKey": "recover-task-123-after-server-restart" }
+```
+
+The server resumes the exact verified provider conversation in a new PTY runtime generation while preserving the task, event log, worktree, branch, and worker identity.
+Recovery changes runtime state, not task meaning.
+A `409` means recovery is already running or is unavailable for the current durable runtime.
+
+### `POST /tasks/:id/teardown`
+
+The normal body is `{}`.
+`{ "force": true }` is reserved for an explicit discard decision.
+
+Teardown stops the worker, releases its worktree, and records task closure only after the landed gate proves that work is safe to release.
+Dirty or unlanded work and live holders cause refusal rather than silent data loss.
+
+## State and event rules to preserve
+
+- Task state describes the meaning of the work; runtime state describes the replaceable provider process.
+- Provider turn completion is evidence, not task completion.
+- Each turn needs a new worker outcome after that turn's sequence baseline.
+- Worker `done` is a completion claim, not trusted completion.
+- Only Mate's server-token decision can create trusted `done` state.
+- Rejection is the only valid path from `completion_requested` back to `working`.
+- Event history is append-only, so decisions and recovery never rewrite the evidence that produced them.
+- Workers report sparsely: one `working` event at the start, then only real state changes and one accurate outcome before ending each turn.

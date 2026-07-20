@@ -719,6 +719,7 @@ extension AgentTask: WorkspaceTaskLike {}
 extension AgentSession: WorkspaceSessionLike {
     var taskId: String? { labels?["task"] }
     var parentSessionId: String? { labels?["parent"] }
+    var statusValue: String { status.rawValue }
 }
 
 typealias UsageWindow = PerchUsage.UsageWindow

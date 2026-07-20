@@ -8,6 +8,8 @@ import Foundation
 
 protocol WorkspaceTaskLike {
     var id: String { get }
+    var title: String { get }
+    var workerName: String? { get }
     var project: String { get }
     var state: String { get }
     var createdAt: String { get }
@@ -18,8 +20,13 @@ protocol WorkspaceTaskLike {
 protocol WorkspaceSessionLike {
     associatedtype Status: Equatable
     var id: String { get }
+    var title: String { get }
+    var workerName: String? { get }
+    var cwd: String? { get }
     var taskId: String? { get }
     var parentSessionId: String? { get }
+    var lastActivityAt: String { get }
+    var statusValue: String { get }
     var status: Status { get set }
 }
 
@@ -38,6 +45,29 @@ struct WorkspaceProjectGroup<T: WorkspaceTaskLike> {
     var name: String {
         (project as NSString).lastPathComponent
     }
+}
+
+enum WorkspaceCrewRowSource: Equatable {
+    case task(String)
+    case session(String)
+}
+
+struct WorkspaceCrewRowModel: Identifiable, Equatable {
+    let id: String
+    let source: WorkspaceCrewRowSource
+    let workerName: String
+    let taskTitle: String
+    let projectName: String
+    let state: String
+    let sessionStatus: String?
+    let updatedAt: String
+}
+
+struct WorkspaceProjectSectionModel: Identifiable, Equatable {
+    var id: String { project }
+    let project: String
+    let name: String
+    let rows: [WorkspaceCrewRowModel]
 }
 
 enum WorkspaceGrouping {
@@ -119,6 +149,120 @@ enum WorkspaceGrouping {
             groups.append(WorkspaceProjectGroup(project: project, tasks: []))
         }
         return groups
+    }
+
+    // The exact render model for the mate's Workspace section. Task-backed
+    // rows preserve the durable ledger presentation. A labeled child session
+    // without a matching live task still becomes a crew row instead of being
+    // classified out of Solo agents and then disappearing from the screen.
+    static func projectSections<T: WorkspaceTaskLike, S: WorkspaceSessionLike>(
+        tasks: [T],
+        sessions: [S],
+        mateSessionId: String?,
+        knownProjects: [String]
+    ) -> [WorkspaceProjectSectionModel] {
+        guard let mateSessionId else { return [] }
+
+        let liveTasks = tasks.filter { $0.state != "closed" }
+        let liveTaskIds = Set(liveTasks.map(\.id))
+        let liveTaskSessionIds = Set(liveTasks.compactMap(\.sessionId))
+        var rowsByProject: [String: [WorkspaceCrewRowModel]] = [:]
+
+        for task in liveTasks {
+            let linkedSession = sessions.first { session in
+                session.taskId == task.id || session.id == task.sessionId
+            }
+            let projectName = displayName(forProject: task.project)
+            rowsByProject[task.project, default: []].append(WorkspaceCrewRowModel(
+                id: "task:\(task.id)",
+                source: .task(task.id),
+                workerName: task.workerName ?? linkedSession?.workerName ?? task.title,
+                taskTitle: task.title,
+                projectName: projectName,
+                state: task.state,
+                sessionStatus: linkedSession?.statusValue,
+                updatedAt: task.updatedAt
+            ))
+        }
+
+        for session in sessions {
+            guard session.parentSessionId == mateSessionId, let taskId = session.taskId else { continue }
+            guard !liveTaskIds.contains(taskId), !liveTaskSessionIds.contains(session.id) else { continue }
+            let project = projectForCrewSession(session.cwd, knownProjects: knownProjects)
+            let taskTitle = taskTitle(fromSessionTitle: session.title)
+            rowsByProject[project, default: []].append(WorkspaceCrewRowModel(
+                id: "session:\(session.id)",
+                source: .session(session.id),
+                workerName: session.workerName ?? taskTitle,
+                taskTitle: taskTitle,
+                projectName: displayName(forProject: project),
+                state: stateForSessionStatus(session.statusValue),
+                sessionStatus: session.statusValue,
+                updatedAt: session.lastActivityAt
+            ))
+        }
+
+        let activeSections = rowsByProject.map { project, rows in
+            WorkspaceProjectSectionModel(
+                project: project,
+                name: displayName(forProject: project),
+                rows: rows.sorted(by: rowComesFirst)
+            )
+        }.sorted { a, b in
+            let aAttention = a.rows.contains { stateRank($0.state) == 0 }
+            let bAttention = b.rows.contains { stateRank($0.state) == 0 }
+            if aAttention != bAttention { return aAttention }
+            return (a.rows.map(\.updatedAt).max() ?? "") > (b.rows.map(\.updatedAt).max() ?? "")
+        }
+
+        let covered = Set(activeSections.map(\.project))
+        let idleSections = knownProjects.compactMap { project -> WorkspaceProjectSectionModel? in
+            guard !covered.contains(project) else { return nil }
+            return WorkspaceProjectSectionModel(
+                project: project,
+                name: displayName(forProject: project),
+                rows: []
+            )
+        }
+        return activeSections + idleSections
+    }
+
+    private static func rowComesFirst(_ a: WorkspaceCrewRowModel, _ b: WorkspaceCrewRowModel) -> Bool {
+        let aRank = stateRank(a.state)
+        let bRank = stateRank(b.state)
+        if aRank != bRank { return aRank < bRank }
+        return a.updatedAt > b.updatedAt
+    }
+
+    private static func stateForSessionStatus(_ status: String) -> String {
+        switch status {
+        case "needs_approval": "needs_you"
+        case "error": "blocked"
+        case "done": "done"
+        case "running", "working": "working"
+        default: "queued"
+        }
+    }
+
+    private static func projectForCrewSession(_ cwd: String?, knownProjects: [String]) -> String {
+        guard let cwd, !cwd.isEmpty else { return "Unknown project" }
+        let name = displayName(forProject: cwd)
+        return knownProjects.first { displayName(forProject: $0) == name } ?? name
+    }
+
+    private static func taskTitle(fromSessionTitle title: String) -> String {
+        let parts = title.split(separator: "-", maxSplits: 1).map {
+            $0.trimmingCharacters(in: .whitespaces)
+        }
+        guard parts.count == 2 else { return title }
+        switch parts[0].lowercased() {
+        case "claude", "codex", "shell": return parts[1]
+        default: return title
+        }
+    }
+
+    private static func displayName(forProject project: String) -> String {
+        (project as NSString).lastPathComponent
     }
 
     // Resolve a task's worker through both ledger linkage and the session's
