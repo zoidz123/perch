@@ -466,9 +466,11 @@ struct HomeView: View {
     }
 
     // With no mate on deck the crew has nothing to nest under; those tasks
-    // ride in Solo agents instead of vanishing.
+    // ride in Solo agents instead of vanishing. Stable order (createdAt/id) -
+    // the server serves tasks recency-first, which would reshuffle rows on
+    // every activity update.
     private var orphanTasks: [AgentTask] {
-        store.mateSession == nil ? liveTasks : []
+        store.mateSession == nil ? WorkspaceGrouping.stableOrder(liveTasks) : []
     }
 
     private var sessionList: some View {
