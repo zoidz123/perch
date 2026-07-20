@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
@@ -315,45 +315,41 @@ test("codex hook installer is idempotent and writes trust hashes", () => {
   rmSync(home, { recursive: true, force: true });
 });
 
-test("codex installer maintains the perch block in ~/.codex/AGENTS.md", () => {
+test("codex installer does not create ~/.codex/AGENTS.md", () => {
   const home = mkdtempSync(join(tmpdir(), "perch-codex-agents-"));
   const env = { CODEX_HOME: home } as NodeJS.ProcessEnv;
 
   assert.equal(installCodexHooks(env), true);
-  const agents = readFileSync(join(home, "AGENTS.md"), "utf8");
-  assert.match(agents, /<!-- perch begin -->/);
-  assert.match(agents, /<!-- perch end -->/);
-  // The block's FIRST line self-gates on PERCH_SESSION_ID.
-  const afterBegin = agents.slice(agents.indexOf("<!-- perch begin -->\n") + "<!-- perch begin -->\n".length);
-  assert.ok(afterBegin.startsWith("This perch-managed block applies ONLY when PERCH_SESSION_ID is set"));
-  // The note points at the served authoring guide and the register curl.
-  assert.match(agents, /\$\{PERCH_HOOK_URL%\/hooks\}\/charts\/authoring/);
-  assert.match(agents, /\.charts\/<slug>\.html/);
-
-  // Re-run: no drift.
-  assert.equal(installCodexHooks(env), true);
-  assert.equal(readFileSync(join(home, "AGENTS.md"), "utf8"), agents);
+  assert.equal(existsSync(join(home, "AGENTS.md")), false);
 
   rmSync(home, { recursive: true, force: true });
 });
 
-test("codex AGENTS.md block upgrades stale content and preserves user text outside the markers", () => {
+test("codex installer removes existing perch blocks and preserves every other byte", () => {
   const home = mkdtempSync(join(tmpdir(), "perch-codex-agents-up-"));
   const env = { CODEX_HOME: home } as NodeJS.ProcessEnv;
-  writeFileSync(
-    join(home, "AGENTS.md"),
-    "# My global rules\n\n<!-- perch begin -->\nan old perch note\n<!-- perch end -->\n\nTrailing user text.\n"
-  );
+  const prefix = "# My global rules\r\n\r\n";
+  const suffix = "\n\nTrailing user text.\n";
+  writeFileSync(join(home, "AGENTS.md"), `${prefix}<!-- perch begin -->\nan old perch note\n<!-- perch end -->${suffix}`);
 
   assert.equal(installCodexHooks(env), true);
   const agents = readFileSync(join(home, "AGENTS.md"), "utf8");
-  // User text on both sides of the block survives byte-for-byte.
-  assert.ok(agents.startsWith("# My global rules\n\n<!-- perch begin -->"));
-  assert.match(agents, /<!-- perch end -->\n\nTrailing user text\.\n$/);
-  // The stale block content was replaced, and only one block exists.
-  assert.ok(!agents.includes("an old perch note"));
-  assert.equal((agents.match(/<!-- perch begin -->/g) ?? []).length, 1);
-  assert.match(agents, /charts\/authoring/);
+  assert.equal(agents, prefix + suffix);
+
+  rmSync(home, { recursive: true, force: true });
+});
+
+test("codex installer leaves an AGENTS.md without perch markers untouched", () => {
+  const home = mkdtempSync(join(tmpdir(), "perch-codex-agents-user-"));
+  const env = { CODEX_HOME: home } as NodeJS.ProcessEnv;
+  const original = "# My global rules\r\n\r\nKeep my exact bytes.\n";
+  writeFileSync(join(home, "AGENTS.md"), original);
+  // A write would collide with this sentinel, proving the no-marker path does
+  // not even attempt an atomic replacement.
+  mkdirSync(join(home, "AGENTS.md.perch-tmp"));
+
+  assert.equal(installCodexHooks(env), true);
+  assert.equal(readFileSync(join(home, "AGENTS.md"), "utf8"), original);
 
   rmSync(home, { recursive: true, force: true });
 });
@@ -372,10 +368,10 @@ test("codex AGENTS.md block leaves an orphaned begin marker untouched", () => {
   rmSync(home, { recursive: true, force: true });
 });
 
-test("codex AGENTS.md write failure does not block trust persistence", () => {
+test("codex AGENTS.md migration failure does not block trust persistence", () => {
   const home = mkdtempSync(join(tmpdir(), "perch-codex-agents-fail-"));
   const env = { CODEX_HOME: home } as NodeJS.ProcessEnv;
-  const original = "# My global rules\n";
+  const original = "# My global rules\n<!-- perch begin -->\nold note\n<!-- perch end -->\n";
   writeFileSync(join(home, "AGENTS.md"), original);
   mkdirSync(join(home, "AGENTS.md.perch-tmp"));
 

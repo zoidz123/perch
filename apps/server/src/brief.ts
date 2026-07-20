@@ -1,4 +1,5 @@
-import type { Task } from "@perch/shared";
+import type { AgentKind, Task } from "@perch/shared";
+import { CHART_CAPABILITY_NOTE } from "./hooks.js";
 
 // The dispatch brief: Perch task reporting and delivery instructions.
 // Appended to the user's kickoff prompt when a task is dispatched, it tells
@@ -14,7 +15,12 @@ export type PlanBrief = {
   edit?: { relativePath: string; stagedPath: string };
 };
 
-export function dispatchBrief(task: Task, worktreePath: string | undefined, plan: PlanBrief = {}): string {
+export function dispatchBrief(
+  task: Task,
+  worktreePath: string | undefined,
+  plan: PlanBrief = {},
+  agent?: AgentKind
+): string {
   const verb = (kind: string, example: string) =>
     `curl -sf -X POST "\${PERCH_HOOK_URL%/hooks}/tasks/${task.id}/events" \\\n` +
     `  -H "x-perch-session: $PERCH_SESSION_ID" -H "x-perch-token: $PERCH_HOOK_TOKEN" \\\n` +
@@ -96,7 +102,7 @@ export function dispatchBrief(task: Task, worktreePath: string | undefined, plan
           ]
         : [];
 
-  return [
+  const brief = [
     "",
     "---",
     `PERCH TASK BRIEF (task ${task.id})`,
@@ -127,4 +133,5 @@ export function dispatchBrief(task: Task, worktreePath: string | undefined, plan
     "The done: reporting verb requests mate verification; it does not mark the task done by itself.",
     "Never request completion until the definition of done above is actually met."
   ].join("\n");
+  return agent === "codex" ? `${brief}\n\n${CHART_CAPABILITY_NOTE}` : brief;
 }
