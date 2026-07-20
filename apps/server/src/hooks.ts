@@ -43,7 +43,7 @@ function shellQuote(value: string): string {
   return `'${value.replaceAll("'", `'"'"'`)}'`;
 }
 
-export function claudeHookShimContent(): string {
+export function perchHookShimContent(): string {
   return `#!/bin/sh
 event="$1"
 [ -n "$PERCH_SESSION_ID" ] || exit 0
@@ -132,9 +132,9 @@ esac
 `;
 }
 
-function installClaudeHookShim(env: NodeJS.ProcessEnv): void {
+function installPerchHookShim(env: NodeJS.ProcessEnv): void {
   const path = perchHookPath(env);
-  const content = claudeHookShimContent();
+  const content = perchHookShimContent();
   if (existsSync(path) && readFileSync(path, "utf8") === content) {
     return;
   }
@@ -144,9 +144,9 @@ function installClaudeHookShim(env: NodeJS.ProcessEnv): void {
 
 // The capability note delivered to every perch session that needs it: Claude
 // receives it as SessionStart additionalContext through the hook above; codex
-// task workers receive it in their dispatch brief. Lives server-side so it
-// versions with the server, and points at the served authoring guide - external
-// users have no perch repo checkout to read.
+// receives it the same way in solo sessions and keeps it in task-worker briefs.
+// Lives server-side so it versions with the server, and points at the served
+// authoring guide - external users have no perch repo checkout to read.
 export const CHART_CAPABILITY_NOTE = [
   "You are running under perch: the boss watches and steers this session from a phone or another desktop.",
   "When a deliverable is easier reviewed visually than as prose - a plan, a comparison, findings - you can draw a chart: one HTML file the boss reviews and annotates on phone or desktop.",
@@ -270,7 +270,7 @@ export function installClaudeHooks(env: NodeJS.ProcessEnv = process.env): boolea
     }
   }
 
-  installClaudeHookShim(env);
+  installPerchHookShim(env);
 
   const hooks: Record<string, HookEntry[]> = { ...(settings.hooks ?? {}) };
   let changed = false;
@@ -527,6 +527,12 @@ const CODEX_TRUST_END = "# perch-codex-trust end";
 const CODEX_AGENTS_BEGIN = "<!-- perch begin -->";
 const CODEX_AGENTS_END = "<!-- perch end -->";
 
+function codexHookCommand(event: (typeof CODEX_HOOK_EVENTS)[number], env: NodeJS.ProcessEnv): string {
+  return event === "SessionStart"
+    ? `${shellQuote(perchHookPath(env))} session-start`
+    : HOOK_COMMAND;
+}
+
 export function codexHookHash(eventLabel: string, command: string, timeoutSec: number): string {
   // Mirrors NormalizedHookIdentity -> canonical JSON -> sha256. matcher and
   // None-valued handler fields are omitted by the TOML round-trip; async
@@ -571,16 +577,16 @@ export function installCodexHooks(env: NodeJS.ProcessEnv = process.env): boolean
     }
   }
 
+  installPerchHookShim(env);
+
   const hooks: Record<string, HookEntry[]> = { ...(file.hooks ?? {}) };
   let changed = false;
   for (const event of CODEX_HOOK_EVENTS) {
     const entries = [...(hooks[event] ?? [])];
-    const withoutPerch = entries.filter((entry) => !isPerchEntry(entry));
-    // Codex hooks keep discarding output (including the SessionStart response
-    // body meant for Claude); codex task workers get the capability note in
-    // their dispatch brief instead.
+    const withoutPerch = entries.filter((entry) => !isPerchEntry(entry, env));
+    const command = codexHookCommand(event, env);
     const perchEntry: HookEntry = {
-      hooks: [{ type: "command", command: HOOK_COMMAND, timeout: CODEX_HOOK_TIMEOUT_SEC }]
+      hooks: [{ type: "command", command, timeout: CODEX_HOOK_TIMEOUT_SEC }]
     };
     const next = [...withoutPerch, perchEntry];
     if (JSON.stringify(next) !== JSON.stringify(entries)) {
@@ -598,7 +604,7 @@ export function installCodexHooks(env: NodeJS.ProcessEnv = process.env): boolean
   // trust persistence.
   removeCodexAgentsNote(home);
 
-  return writeCodexTrust(home, hooksPath, hooks);
+  return writeCodexTrust(home, hooksPath, hooks, env);
 }
 
 // Removes blocks installed by older perch versions from ~/.codex/AGENTS.md.
@@ -635,7 +641,8 @@ function removeCodexAgentsNote(home: string): void {
 function writeCodexTrust(
   home: string,
   hooksPath: string,
-  hooks: Record<string, HookEntry[]>
+  hooks: Record<string, HookEntry[]>,
+  env: NodeJS.ProcessEnv
 ): boolean {
   const configPath = join(home, "config.toml");
   let config = "";
@@ -650,12 +657,13 @@ function writeCodexTrust(
   const lines: string[] = [CODEX_TRUST_BEGIN];
   for (const event of CODEX_HOOK_EVENTS) {
     const entries = hooks[event] ?? [];
-    const groupIndex = entries.findIndex((entry) => isPerchEntry(entry));
+    const groupIndex = entries.findIndex((entry) => isPerchEntry(entry, env));
     if (groupIndex < 0) {
       continue;
     }
     const label = CODEX_EVENT_LABELS[event];
-    const hash = codexHookHash(label, HOOK_COMMAND, CODEX_HOOK_TIMEOUT_SEC);
+    const command = codexHookCommand(event, env);
+    const hash = codexHookHash(label, command, CODEX_HOOK_TIMEOUT_SEC);
     lines.push(`[hooks.state."${hooksPath}:${label}:${groupIndex}:0"]`);
     lines.push(`trusted_hash = "${hash}"`);
   }
