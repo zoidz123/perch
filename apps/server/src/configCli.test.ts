@@ -110,7 +110,8 @@ function stubRegistry() {
         provider: "claude",
         options: [
           { id: "fable", runtimeId: "fable", nativeProviderId: "claude-fable-5", runtimeSource: "bundled" },
-          { id: "shared", runtimeId: "shared", runtimeSource: "bundled" }
+          { id: "shared", runtimeId: "shared", runtimeSource: "bundled" },
+          { id: "best", runtimeId: "best", runtimeSource: "bundled", hidden: true }
         ]
       },
       {
@@ -342,7 +343,17 @@ test("models lists both agents, marks selected roles, emits JSON, and notes an a
       assert.match(table.stdout, /MODEL\s+AGENT\s+EFFORTS\s+ALIASES\s+SOURCE\s+SELECTED/);
       assert.match(table.stdout, /fable\s+claude\s+-\s+claude-fable-5\s+bundled\s+mate/);
       assert.match(table.stdout, /gpt-5\.6-sol\s+codex\s+low,medium,high\s+-\s+bundled\s+dispatch/);
+      // Hidden catalog entries are not offered in the listing.
+      assert.doesNotMatch(table.stdout, /^best\s/m);
       assert.match(table.stderr, /Note: codex-app-server: codex binary not found/);
+
+      // ...unless actively selected: a mate configured to a hidden model must
+      // not vanish from the inventory.
+      state.mateDefaults = { agent: "claude", model: "best" };
+      const selectedHidden = await runCli(serverUrl, home, ["models"]);
+      assert.equal(selectedHidden.code, 0, selectedHidden.stderr);
+      assert.match(selectedHidden.stdout, /^best\s+claude\s+.*mate/m);
+      state.mateDefaults = { agent: "claude", model: "fable" };
 
       const json = await runCli(serverUrl, home, ["models", "--json"]);
       assert.equal(json.code, 0, json.stderr);
