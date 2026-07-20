@@ -1,10 +1,13 @@
 import assert from "node:assert/strict";
+import { spawnSync } from "node:child_process";
 import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
 import { createHash } from "node:crypto";
 import {
+  applyPerchUninstall,
+  claudeHookShimContent,
   claudeSettingsPath,
   codexHookHash,
   findCodexRollout,
@@ -12,7 +15,9 @@ import {
   installClaudeHooks,
   installCodexHooks,
   isAllowedTranscriptPath,
-  normalizeHookEvent
+  normalizeHookEvent,
+  perchHookPath,
+  planPerchUninstall
 } from "./hooks.js";
 
 function makeEnv(settings?: object): NodeJS.ProcessEnv {
@@ -20,7 +25,7 @@ function makeEnv(settings?: object): NodeJS.ProcessEnv {
   if (settings) {
     writeFileSync(join(dir, "settings.json"), JSON.stringify(settings, null, 2));
   }
-  return { CLAUDE_CONFIG_DIR: dir };
+  return { CLAUDE_CONFIG_DIR: dir, PERCH_HOME: join(dir, ".perch") };
 }
 
 test("installs hook entries for every event, idempotently, preserving user hooks", () => {
@@ -40,16 +45,16 @@ test("installs hook entries for every event, idempotently, preserving user hooks
     entry.hooks.map((hook) => hook.command)
   );
   assert.ok(stopCommands.some((command: string) => command.includes("echo user-stop-hook")));
-  assert.ok(stopCommands.some((command: string) => command.includes("$PERCH_HOOK_URL")));
+  assert.ok(stopCommands.some((command: string) => command.includes(perchHookPath(env))));
 
-  // Every perch event is present and env-gated.
+  // Every perch event is present and routed through the installed shim.
   for (const event of ["SessionStart", "UserPromptSubmit", "PermissionRequest", "Stop"]) {
     const entries = first.hooks[event] ?? [];
     const perch = entries.filter((entry: { hooks: Array<{ command: string }> }) =>
-      entry.hooks.some((hook) => hook.command.includes("$PERCH_HOOK_URL"))
+      entry.hooks.some((hook) => hook.command.includes(perchHookPath(env)))
     );
     assert.equal(perch.length, 1, event);
-    assert.match(perch[0].hooks[0].command, /PERCH_SESSION_ID/);
+    assert.match(perch[0].hooks[0].command, /perch-hook/);
   }
 
   // Second run changes nothing.
@@ -60,7 +65,7 @@ test("installs hook entries for every event, idempotently, preserving user hooks
   rmSync(env.CLAUDE_CONFIG_DIR as string, { recursive: true, force: true });
 });
 
-test("SessionStart and Stop echo structured responses while other hooks stay silent", () => {
+test("migrates inline commands to a shim that preserves event semantics", () => {
   // A pre-existing install with the old shared command (which discarded the
   // /hooks response body for every event, SessionStart included).
   const oldCommand =
@@ -77,49 +82,56 @@ test("SessionStart and Stop echo structured responses while other hooks stay sil
   // Exactly one perch SessionStart entry: the old command was upgraded in
   // place, not duplicated.
   const perchStart = settings.hooks.SessionStart.filter((entry: { hooks: Array<{ command: string }> }) =>
-    entry.hooks.some((hook) => hook.command.includes("$PERCH_HOOK_URL"))
+    entry.hooks.some((hook) => hook.command.includes(perchHookPath(env)))
   );
   assert.equal(perchStart.length, 1);
   const startCommand: string = perchStart[0].hooks[0].command;
-  // SessionStart echoes the response body (the capability note) to stdout,
-  // still gated and fail-silent: only stderr is discarded.
-  assert.ok(!startCommand.includes(">/dev/null 2>&1"));
-  assert.match(startCommand, /@- 2>\/dev\/null; exit 0$/);
-  assert.match(startCommand, /PERCH_SESSION_ID/);
+  assert.match(startCommand, /perch-hook' session-start$/);
   const perchStop = settings.hooks.Stop.filter((entry: { hooks: Array<{ command: string }> }) =>
-    entry.hooks.some((hook) => hook.command.includes("$PERCH_HOOK_URL"))
+    entry.hooks.some((hook) => hook.command.includes(perchHookPath(env)))
   );
   assert.equal(perchStop.length, 1);
   const stopCommand: string = perchStop[0].hooks[0].command;
-  assert.ok(!stopCommand.includes(">/dev/null 2>&1"));
-  assert.match(stopCommand, /@- 2>\/dev\/null; exit 0$/);
+  assert.match(stopCommand, /perch-hook' stop$/);
 
   // Telemetry hooks keep discarding output.
   for (const event of ["UserPromptSubmit", "SessionEnd"]) {
     const perch = settings.hooks[event].filter((entry: { hooks: Array<{ command: string }> }) =>
-      entry.hooks.some((hook) => hook.command.includes("$PERCH_HOOK_URL"))
+      entry.hooks.some((hook) => hook.command.includes(perchHookPath(env)))
     );
     assert.equal(perch.length, 1, event);
-    assert.ok(perch[0].hooks[0].command.includes(">/dev/null 2>&1"), event);
+    assert.match(perch[0].hooks[0].command, /perch-hook'/, event);
   }
 
   const preTool = settings.hooks.PreToolUse.filter((entry: { hooks: Array<{ command: string }> }) =>
-    entry.hooks.some((hook) => hook.command.includes("$PERCH_HOOK_URL"))
+    entry.hooks.some((hook) => hook.command.includes(perchHookPath(env)))
   );
   assert.equal(preTool.length, 3);
   assert.deepEqual(preTool.map((entry: { matcher?: string }) => entry.matcher), [undefined, "AskUserQuestion", "ExitPlanMode"]);
-  assert.match(preTool[0].hooks[0].command, /x-perch-observe-only/);
+  assert.match(preTool[0].hooks[0].command, /pre-tool-observer$/);
   for (const entry of preTool.slice(1)) {
     assert.equal(entry.hooks[0].timeout, 600);
-    assert.match(entry.hooks[0].command, /printf "%s" "\$response"/);
+    assert.match(entry.hooks[0].command, /(question|plan-decision)$/);
   }
   for (const event of ["PermissionRequest", "Elicitation", "ElicitationResult"]) {
     const entry = settings.hooks[event].find((candidate: { hooks: Array<{ command: string }> }) =>
-      candidate.hooks.some((hook) => hook.command.includes("$PERCH_HOOK_URL"))
+      candidate.hooks.some((hook) => hook.command.includes(perchHookPath(env)))
     );
     assert.equal(entry.hooks[0].timeout, 600);
-    assert.match(entry.hooks[0].command, /--max-time 570/);
+    assert.match(entry.hooks[0].command, /(permission-request|elicitation|elicitation-result)$/);
   }
+
+  const shim = readFileSync(perchHookPath(env), "utf8");
+  assert.equal(shim, claudeHookShimContent());
+  assert.equal(statSync(perchHookPath(env)).mode & 0o777, 0o700);
+  assert.match(shim, /--max-time 3/);
+  assert.match(shim, /--max-time 570/);
+  assert.match(shim, /x-perch-observe-only: 1/);
+  assert.match(shim, /session-start\|stop/);
+  assert.match(shim, /Perch remote approval unavailable/);
+  assert.match(shim, /Perch remote question expired/);
+  assert.match(shim, /Perch remote MCP interaction unavailable/);
+  assert.equal(spawnSync("sh", ["-n", perchHookPath(env)]).status, 0);
 
   // Second run changes nothing.
   assert.equal(installClaudeHooks(env), true);
@@ -134,6 +146,19 @@ test("rewriting settings preserves the original file mode", () => {
 
   assert.equal(installClaudeHooks(env), true);
   assert.equal(statSync(claudeSettingsPath(env)).mode & 0o777, 0o600);
+
+  rmSync(env.CLAUDE_CONFIG_DIR as string, { recursive: true, force: true });
+});
+
+test("updating only shim logic does not rewrite Claude settings", () => {
+  const env = makeEnv({ theme: "dark" });
+  assert.equal(installClaudeHooks(env), true);
+  const settings = readFileSync(claudeSettingsPath(env), "utf8");
+  writeFileSync(perchHookPath(env), "#!/bin/sh\nexit 0\n");
+
+  assert.equal(installClaudeHooks(env), true);
+  assert.equal(readFileSync(claudeSettingsPath(env), "utf8"), settings);
+  assert.equal(readFileSync(perchHookPath(env), "utf8"), claudeHookShimContent());
 
   rmSync(env.CLAUDE_CONFIG_DIR as string, { recursive: true, force: true });
 });
@@ -173,6 +198,108 @@ test("leaves an unparseable settings file untouched", () => {
   assert.equal(installClaudeHooks(env), false);
   assert.equal(readFileSync(claudeSettingsPath(env), "utf8"), "{not json");
   rmSync(env.CLAUDE_CONFIG_DIR as string, { recursive: true, force: true });
+});
+
+test("install then uninstall restores user config byte-for-byte across marker generations", () => {
+  const root = mkdtempSync(join(tmpdir(), "perch-uninstall-roundtrip-"));
+  const claudeHome = join(root, "claude");
+  const codexRoot = join(root, "codex");
+  const env = {
+    CLAUDE_CONFIG_DIR: claudeHome,
+    CODEX_HOME: codexRoot,
+    PERCH_HOME: join(root, "perch")
+  } as NodeJS.ProcessEnv;
+  mkdirSync(claudeHome, { recursive: true });
+  mkdirSync(codexRoot, { recursive: true });
+
+  const claudeOriginal = `${JSON.stringify({
+    theme: "dark",
+    hooks: { Stop: [{ hooks: [{ type: "command", command: "echo user-claude-hook" }] }] }
+  }, null, 2)}\n`;
+  const codexOriginal = `${JSON.stringify({
+    notify: ["say", "done"],
+    hooks: { SessionStart: [{ hooks: [{ type: "command", command: "echo user-codex-hook" }] }] }
+  }, null, 2)}\n`;
+  const configOriginal = "[features]\nmemories = true\n";
+  const agentsOriginal = "# User global instructions\n";
+  writeFileSync(join(claudeHome, "settings.json"), claudeOriginal);
+  writeFileSync(join(codexRoot, "hooks.json"), codexOriginal);
+  writeFileSync(join(codexRoot, "config.toml"), configOriginal);
+  writeFileSync(join(codexRoot, "AGENTS.md"), agentsOriginal);
+
+  assert.equal(installClaudeHooks(env), true);
+  assert.equal(installCodexHooks(env), true);
+
+  // PR 16 stopped creating this block and removes it during install. Inject a
+  // skipped-upgrade legacy block after install to prove direct uninstall still
+  // owns it without changing the surrounding user bytes.
+  writeFileSync(
+    join(codexRoot, "AGENTS.md"),
+    `${agentsOriginal}<!-- perch begin -->\nlegacy perch note\n<!-- perch end -->`
+  );
+
+  // A skipped-version install can contain both a slim entry and an old inline
+  // entry. Uninstall owns and removes both while preserving the user hook.
+  const installedClaude = JSON.parse(readFileSync(join(claudeHome, "settings.json"), "utf8"));
+  installedClaude.hooks.Stop.push({
+    hooks: [{ type: "command", command: "curl -sf \"$PERCH_HOOK_URL\"", timeout: 10 }]
+  });
+  writeFileSync(join(claudeHome, "settings.json"), `${JSON.stringify(installedClaude, null, 2)}\n`);
+
+  const changes = planPerchUninstall(env);
+  assert.ok(changes.some((change) => change.path === join(claudeHome, "settings.json")));
+  assert.ok(changes.some((change) => change.path === join(codexRoot, "hooks.json")));
+  assert.ok(changes.some((change) => change.path === join(codexRoot, "AGENTS.md")));
+  applyPerchUninstall(changes);
+
+  assert.equal(readFileSync(join(claudeHome, "settings.json"), "utf8"), claudeOriginal);
+  assert.equal(readFileSync(join(codexRoot, "hooks.json"), "utf8"), codexOriginal);
+  assert.equal(readFileSync(join(codexRoot, "config.toml"), "utf8"), configOriginal);
+  assert.equal(readFileSync(join(codexRoot, "AGENTS.md"), "utf8"), agentsOriginal);
+  assert.equal(existsSync(perchHookPath(env)), false);
+
+  rmSync(root, { recursive: true, force: true });
+});
+
+test("uninstall refuses invalid JSON before changing any file", () => {
+  const root = mkdtempSync(join(tmpdir(), "perch-uninstall-invalid-"));
+  const claudeHome = join(root, "claude");
+  const codexRoot = join(root, "codex");
+  const env = {
+    CLAUDE_CONFIG_DIR: claudeHome,
+    CODEX_HOME: codexRoot,
+    PERCH_HOME: join(root, "perch")
+  } as NodeJS.ProcessEnv;
+  mkdirSync(claudeHome, { recursive: true });
+  mkdirSync(codexRoot, { recursive: true });
+  writeFileSync(join(claudeHome, "settings.json"), "{not json");
+  writeFileSync(join(codexRoot, "hooks.json"), "{}\n");
+  writeFileSync(join(codexRoot, "config.toml"), "# perch-codex-trust begin\nowned\n# perch-codex-trust end\n");
+  mkdirSync(join(env.PERCH_HOME as string, "bin"), { recursive: true });
+  writeFileSync(perchHookPath(env), "shim\n");
+
+  const beforeConfig = readFileSync(join(codexRoot, "config.toml"), "utf8");
+  assert.throws(() => planPerchUninstall(env), /not valid JSON/);
+  assert.equal(readFileSync(join(codexRoot, "config.toml"), "utf8"), beforeConfig);
+  assert.equal(readFileSync(perchHookPath(env), "utf8"), "shim\n");
+
+  rmSync(root, { recursive: true, force: true });
+});
+
+test("uninstall removes a features table that Perch created", () => {
+  const root = mkdtempSync(join(tmpdir(), "perch-uninstall-features-"));
+  const codexRoot = join(root, "codex");
+  const env = { CODEX_HOME: codexRoot, PERCH_HOME: join(root, "perch") } as NodeJS.ProcessEnv;
+  mkdirSync(codexRoot, { recursive: true });
+  writeFileSync(join(codexRoot, "hooks.json"), "{}\n");
+  writeFileSync(join(codexRoot, "config.toml"), "");
+
+  assert.equal(installCodexHooks(env), true);
+  assert.match(readFileSync(join(codexRoot, "config.toml"), "utf8"), /\[features\] # perch-codex/);
+  applyPerchUninstall(planPerchUninstall(env));
+  assert.equal(readFileSync(join(codexRoot, "config.toml"), "utf8"), "");
+
+  rmSync(root, { recursive: true, force: true });
 });
 
 test("hook registry verifies per-session tokens and correlates transcripts", () => {
