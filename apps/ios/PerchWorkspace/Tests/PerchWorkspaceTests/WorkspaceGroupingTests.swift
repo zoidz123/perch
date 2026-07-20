@@ -31,24 +31,34 @@ private struct FixtureTask: WorkspaceTaskLike, Codable {
 
 private struct FixtureSession: WorkspaceSessionLike, Codable {
     let id: String
+    let title: String
     let workerName: String?
+    let cwd: String?
     let labels: [String: String]?
+    let lastActivityAt: String
     var status: String
 
     var taskId: String? { labels?["task"] }
     var parentSessionId: String? { labels?["parent"] }
+    var statusValue: String { status }
 
     init(
         id: String,
+        title: String = "agent",
         workerName: String?,
+        cwd: String? = nil,
         taskId: String?,
         parentSessionId: String?,
+        lastActivityAt: String = "t",
         status: String = "idle"
     ) {
         self.id = id
+        self.title = title
         self.workerName = workerName
+        self.cwd = cwd
         labels = ["task": taskId, "parent": parentSessionId]
             .compactMapValues { $0 }
+        self.lastActivityAt = lastActivityAt
         self.status = status
     }
 }
@@ -160,7 +170,7 @@ final class WorkspaceGroupingTests: XCTestCase {
         ]
         let worker = try JSONDecoder().decode(
             FixtureSession.self,
-            from: Data(#"{"id":"pty:worker","workerName":"Alder","labels":{"task":"fix-ios-regression-crew-d242","parent":"pty:mate"},"status":"running"}"#.utf8)
+            from: Data(#"{"id":"pty:worker","title":"codex - Fix iOS regression","workerName":"Alder","cwd":"/work/perch","labels":{"task":"fix-ios-regression-crew-d242","parent":"pty:mate"},"lastActivityAt":"t","status":"running"}"#.utf8)
         )
         let sessions = [
             FixtureSession(id: "pty:mate", workerName: nil, taskId: nil, parentSessionId: nil),
@@ -180,10 +190,39 @@ final class WorkspaceGroupingTests: XCTestCase {
         XCTAssertEqual(WorkspaceGrouping.workerIdentity(workerName: sessions[1].workerName, title: "Fix iOS regression"), "Alder")
     }
 
+    func testCrewSessionPayloadProducesVisibleWorkspaceRowWithoutTaskSnapshot() throws {
+        let worker = try JSONDecoder().decode(
+            FixtureSession.self,
+            from: Data(#"{"id":"pty:worker","title":"codex - Render check: count files","workerName":"Alder","cwd":"/Users/example/.perch/worktrees/company-research-fd0e/1/company-research","labels":{"task":"render-check-count-files-fd0e","parent":"pty:mate"},"lastActivityAt":"2026-07-20T19:04:23Z","status":"needs_approval"}"#.utf8)
+        )
+        let mate = FixtureSession(id: "pty:mate", title: "mate", workerName: nil, taskId: nil, parentSessionId: nil)
+
+        let sections = WorkspaceGrouping.projectSections(
+            tasks: [FixtureTask](),
+            sessions: [mate, worker],
+            mateSessionId: mate.id,
+            knownProjects: ["/Users/example/Desktop/company-research"]
+        )
+
+        XCTAssertEqual(sections.count, 1)
+        XCTAssertEqual(sections[0].name, "company-research")
+        XCTAssertEqual(sections[0].project, "/Users/example/Desktop/company-research")
+        XCTAssertEqual(sections[0].rows, [WorkspaceCrewRowModel(
+            id: "session:pty:worker",
+            source: .session("pty:worker"),
+            workerName: "Alder",
+            taskTitle: "Render check: count files",
+            projectName: "company-research",
+            state: "needs_you",
+            sessionStatus: "needs_approval",
+            updatedAt: "2026-07-20T19:04:23Z"
+        )])
+    }
+
     func testStatusPayloadUpdatesSessionRowIndicator() throws {
         let session = try JSONDecoder().decode(
             FixtureSession.self,
-            from: Data(#"{"id":"pty:worker","workerName":"Birch","labels":{"task":"task","parent":"pty:mate"},"status":"idle"}"#.utf8)
+            from: Data(#"{"id":"pty:worker","title":"codex - task","workerName":"Birch","cwd":"/work/project","labels":{"task":"task","parent":"pty:mate"},"lastActivityAt":"t","status":"idle"}"#.utf8)
         )
 
         let updated = WorkspaceGrouping.applyingStatus("needs_approval", to: session.id, in: [session])

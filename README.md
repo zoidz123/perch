@@ -70,6 +70,7 @@ See the [complete CLI guide](docs/cli.md) for verified arguments, options, defau
 - [CLI](docs/cli.md)
 - [Operations](docs/operations.md)
 - [Architecture](docs/architecture.md)
+- [Worker task API and turn lifecycle](docs/worker-task-api.md)
 - [Security](docs/security.md)
 - [No-mistakes authorization](docs/no-mistakes-authorization.md)
 - [Release and version synchronization](docs/releasing.md)
