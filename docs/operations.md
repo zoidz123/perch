@@ -33,6 +33,21 @@ perch doctor
 It also reports GitHub CLI authentication because direct-PR task delivery and PR polling use `gh`.
 The compatible no-mistakes runtime is already inside the npm package and needs no separate install, PATH entry, or lifecycle download.
 
+## Uninstall
+
+Stop the local server, remove Perch-managed agent configuration, and then remove the global npm package:
+
+```sh
+perch server stop
+perch uninstall
+npm rm --global perchctl
+```
+
+`perch uninstall --dry-run` prints the exact changes without writing them.
+The command preserves user hooks and `~/.perch` state by default.
+Use `perch uninstall --purge-data` to remove the local ledger, worktrees, pairing data, tokens, and charts too.
+The command refuses to run while the server is live unless `--force` is supplied.
+
 ## Projects and task defaults
 
 Mate dispatches work into registered projects.

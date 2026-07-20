@@ -6,6 +6,7 @@ import {
   readdirSync,
   readFileSync,
   realpathSync,
+  rmSync,
   renameSync,
   statSync,
   writeFileSync
@@ -24,6 +25,8 @@ import { ASK_USER_QUESTION_TOOL, extractQuestions, questionId } from "./askQuest
 // user's Claude session.
 
 const HOOK_MARKER = "$PERCH_HOOK_URL";
+const HOOK_SHIM_NAME = "perch-hook";
+const HOOK_SHIM_MARKER = "/.perch/bin/perch-hook";
 // One command serves every event: the payload on stdin carries
 // hook_event_name. Gated on PERCH_SESSION_ID so it is a no-op outside perch
 // terminals, capped at 3s, and always exits 0.
@@ -31,49 +34,113 @@ const HOOK_COMMAND =
   '[ -z "$PERCH_SESSION_ID" ] || curl -sf --max-time 3 -X POST "$PERCH_HOOK_URL" ' +
   '-H "content-type: application/json" -H "x-perch-session: $PERCH_SESSION_ID" ' +
   '-H "x-perch-token: $PERCH_HOOK_TOKEN" --data-binary @- >/dev/null 2>&1; exit 0';
-// The Claude SessionStart variant echoes the server's response body to stdout:
-// the server answers that one event with hookSpecificOutput.additionalContext
-// (the chart capability note below), which Claude injects into the session's
-// context - solo agents learn charts exist with zero setup. Still fail-silent:
-// curl -sf prints nothing on failure, an empty body prints nothing, exit 0.
-const HOOK_COMMAND_SESSION_START =
-  '[ -z "$PERCH_SESSION_ID" ] || curl -sf --max-time 3 -X POST "$PERCH_HOOK_URL" ' +
-  '-H "content-type: application/json" -H "x-perch-session: $PERCH_SESSION_ID" ' +
-  '-H "x-perch-token: $PERCH_HOOK_TOKEN" --data-binary @- 2>/dev/null; exit 0';
-// Claude Stop hooks support structured stdout that can continue the same
-// agentic loop once. The server uses that only when the correlated turn has no
-// accepted task outcome. The command still fails open if the server is down.
-const HOOK_COMMAND_STOP = HOOK_COMMAND_SESSION_START;
-const CLAUDE_PRETOOL_OBSERVER_COMMAND =
-  '[ -z "$PERCH_SESSION_ID" ] || curl -sf --max-time 3 -X POST "$PERCH_HOOK_URL" ' +
-  '-H "content-type: application/json" -H "x-perch-observe-only: 1" -H "x-perch-session: $PERCH_SESSION_ID" ' +
-  '-H "x-perch-token: $PERCH_HOOK_TOKEN" --data-binary @- >/dev/null 2>&1; exit 0';
+export function perchHookPath(env: NodeJS.ProcessEnv = process.env): string {
+  const home = env.PERCH_HOME ?? join(homedir(), ".perch");
+  return join(home, "bin", HOOK_SHIM_NAME);
+}
 
-// Claude blocking interactions use synchronous command hooks. Claude's documented
-// command-hook window is ten minutes; the server owns a shorter internal
-// deadline and returns either the exact allow/deny JSON or an empty body. An
-// empty/error response exits 0 so Claude visibly opens its native dialog.
-// Other Claude events and every Codex hook keep their existing behavior.
-const CLAUDE_PERMISSION_HOOK_COMMAND =
-  'if [ -z "$PERCH_SESSION_ID" ]; then exit 0; fi; ' +
-  'response="$(curl -sf --max-time 570 -X POST "$PERCH_HOOK_URL" ' +
-  '-H "content-type: application/json" -H "x-perch-session: $PERCH_SESSION_ID" ' +
-  '-H "x-perch-token: $PERCH_HOOK_TOKEN" --data-binary @- 2>/dev/null)" || { ' +
-  'printf "%s\\n" "Perch remote approval unavailable; use Claude native dialog." >&2; exit 0; }; ' +
-  'if [ -z "$response" ]; then printf "%s\\n" "Perch remote approval expired; use Claude native dialog." >&2; exit 0; fi; ' +
-  'printf "%s" "$response"; exit 0';
+function shellQuote(value: string): string {
+  return `'${value.replaceAll("'", `'"'"'`)}'`;
+}
 
-const CLAUDE_QUESTION_HOOK_COMMAND =
-  'if [ -z "$PERCH_SESSION_ID" ]; then exit 0; fi; ' +
-  'response="$(curl -sf --max-time 570 -X POST "$PERCH_HOOK_URL" ' +
-  '-H "content-type: application/json" -H "x-perch-session: $PERCH_SESSION_ID" ' +
-  '-H "x-perch-token: $PERCH_HOOK_TOKEN" --data-binary @- 2>/dev/null)" || { ' +
-  'printf "%s\\n" "Perch remote question unavailable; use Claude native question UI." >&2; exit 0; }; ' +
-  'if [ -z "$response" ]; then printf "%s\\n" "Perch remote question expired; use Claude native question UI." >&2; exit 0; fi; ' +
-  'printf "%s" "$response"; exit 0';
+export function claudeHookShimContent(): string {
+  return `#!/bin/sh
+event="$1"
+[ -n "$PERCH_SESSION_ID" ] || exit 0
 
-const CLAUDE_PLAN_HOOK_COMMAND = CLAUDE_QUESTION_HOOK_COMMAND.replaceAll("question", "plan decision");
-const CLAUDE_ELICITATION_HOOK_COMMAND = CLAUDE_QUESTION_HOOK_COMMAND.replaceAll("question", "MCP interaction");
+post_telemetry() {
+  curl -sf --max-time 3 -X POST "$PERCH_HOOK_URL" \\
+    -H "content-type: application/json" \\
+    -H "x-perch-session: $PERCH_SESSION_ID" \\
+    -H "x-perch-token: $PERCH_HOOK_TOKEN" \\
+    --data-binary @- >/dev/null 2>&1
+  exit 0
+}
+
+post_echo() {
+  curl -sf --max-time 3 -X POST "$PERCH_HOOK_URL" \\
+    -H "content-type: application/json" \\
+    -H "x-perch-session: $PERCH_SESSION_ID" \\
+    -H "x-perch-token: $PERCH_HOOK_TOKEN" \\
+    --data-binary @- 2>/dev/null
+  exit 0
+}
+
+post_observer() {
+  curl -sf --max-time 3 -X POST "$PERCH_HOOK_URL" \\
+    -H "content-type: application/json" \\
+    -H "x-perch-observe-only: 1" \\
+    -H "x-perch-session: $PERCH_SESSION_ID" \\
+    -H "x-perch-token: $PERCH_HOOK_TOKEN" \\
+    --data-binary @- >/dev/null 2>&1
+  exit 0
+}
+
+post_blocking() {
+  unavailable="$1"
+  expired="$2"
+  response="$(curl -sf --max-time 570 -X POST "$PERCH_HOOK_URL" \\
+    -H "content-type: application/json" \\
+    -H "x-perch-session: $PERCH_SESSION_ID" \\
+    -H "x-perch-token: $PERCH_HOOK_TOKEN" \\
+    --data-binary @- 2>/dev/null)" || {
+      printf "%s\\n" "$unavailable" >&2
+      exit 0
+    }
+  if [ -z "$response" ]; then
+    printf "%s\\n" "$expired" >&2
+    exit 0
+  fi
+  printf "%s" "$response"
+  exit 0
+}
+
+case "$event" in
+  session-start|stop)
+    post_echo
+    ;;
+  pre-tool-observer)
+    post_observer
+    ;;
+  permission-request)
+    post_blocking \
+      "Perch remote approval unavailable; use Claude native dialog." \
+      "Perch remote approval expired; use Claude native dialog."
+    ;;
+  question)
+    post_blocking \
+      "Perch remote question unavailable; use Claude native question UI." \
+      "Perch remote question expired; use Claude native question UI."
+    ;;
+  plan-decision)
+    post_blocking \
+      "Perch remote plan decision unavailable; use Claude native plan decision UI." \
+      "Perch remote plan decision expired; use Claude native plan decision UI."
+    ;;
+  elicitation|elicitation-result)
+    post_blocking \
+      "Perch remote MCP interaction unavailable; use Claude native MCP interaction UI." \
+      "Perch remote MCP interaction expired; use Claude native MCP interaction UI."
+    ;;
+  user-prompt-submit|post-tool-use|post-tool-use-failure|permission-denied|notification|session-end)
+    post_telemetry
+    ;;
+  *)
+    exit 0
+    ;;
+esac
+`;
+}
+
+function installClaudeHookShim(env: NodeJS.ProcessEnv): void {
+  const path = perchHookPath(env);
+  const content = claudeHookShimContent();
+  if (existsSync(path) && readFileSync(path, "utf8") === content) {
+    return;
+  }
+  mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
+  writeFileAtomic(path, content, 0o700);
+}
 
 // The capability note delivered to every perch session that needs it: Claude
 // receives it as SessionStart additionalContext through the hook above; codex
@@ -177,9 +244,9 @@ function lexicallyExists(path: string): boolean {
   }
 }
 
-function writeFileAtomic(path: string, content: string): void {
+function writeFileAtomic(path: string, content: string, defaultMode?: number): void {
   const tmp = `${path}.perch-tmp`;
-  const mode = existsSync(path) ? statSync(path).mode & 0o777 : undefined;
+  const mode = existsSync(path) ? statSync(path).mode & 0o777 : defaultMode;
   writeFileSync(tmp, content);
   if (mode !== undefined) {
     chmodSync(tmp, mode);
@@ -203,6 +270,8 @@ export function installClaudeHooks(env: NodeJS.ProcessEnv = process.env): boolea
     }
   }
 
+  installClaudeHookShim(env);
+
   const hooks: Record<string, HookEntry[]> = { ...(settings.hooks ?? {}) };
   let changed = false;
 
@@ -213,7 +282,7 @@ export function installClaudeHooks(env: NodeJS.ProcessEnv = process.env): boolea
     if (wanted.has(event)) {
       continue;
     }
-    const withoutPerch = entries.filter((entry) => !isPerchEntry(entry));
+    const withoutPerch = entries.filter((entry) => !isPerchEntry(entry, env));
     if (withoutPerch.length !== entries.length) {
       changed = true;
       if (withoutPerch.length > 0) {
@@ -226,27 +295,18 @@ export function installClaudeHooks(env: NodeJS.ProcessEnv = process.env): boolea
 
   for (const event of CLAUDE_HOOK_EVENTS) {
     const entries = [...(hooks[event] ?? [])];
-    const withoutPerch = entries.filter((entry) => !isPerchEntry(entry));
+    const withoutPerch = entries.filter((entry) => !isPerchEntry(entry, env));
     // Replacing marker-matched entries also UPGRADES an older installed perch
     // command in place (e.g. SessionStart gaining the echo variant).
-    const command =
-      event === "PermissionRequest"
-        ? CLAUDE_PERMISSION_HOOK_COMMAND
-        : event === "Elicitation" || event === "ElicitationResult"
-          ? CLAUDE_ELICITATION_HOOK_COMMAND
-        : event === "PreToolUse"
-          ? CLAUDE_QUESTION_HOOK_COMMAND
-        : event === "SessionStart"
-        ? HOOK_COMMAND_SESSION_START
-        : event === "Stop"
-          ? HOOK_COMMAND_STOP
-          : HOOK_COMMAND;
+    const shim = shellQuote(perchHookPath(env));
+    const eventArgument = event.replace(/([a-z0-9])([A-Z])/g, "$1-$2").toLowerCase();
+    const command = `${shim} ${eventArgument}`;
     const synchronous = event === "PermissionRequest" || event === "PreToolUse" || event === "Elicitation" || event === "ElicitationResult";
     const perchEntries: HookEntry[] = event === "PreToolUse"
       ? [
-          { hooks: [{ type: "command", command: CLAUDE_PRETOOL_OBSERVER_COMMAND, timeout: 10 }] },
-          { matcher: ASK_USER_QUESTION_TOOL, hooks: [{ type: "command", command, timeout: 600 }] },
-          { matcher: "ExitPlanMode", hooks: [{ type: "command", command: CLAUDE_PLAN_HOOK_COMMAND, timeout: 600 }] }
+          { hooks: [{ type: "command", command: `${shim} pre-tool-observer`, timeout: 10 }] },
+          { matcher: ASK_USER_QUESTION_TOOL, hooks: [{ type: "command", command: `${shim} question`, timeout: 600 }] },
+          { matcher: "ExitPlanMode", hooks: [{ type: "command", command: `${shim} plan-decision`, timeout: 600 }] }
         ]
       : [{ hooks: [{ type: "command", command, timeout: synchronous ? 600 : 10 }] }];
     const next = [...withoutPerch, ...perchEntries];
@@ -265,8 +325,179 @@ export function installClaudeHooks(env: NodeJS.ProcessEnv = process.env): boolea
   return true;
 }
 
-function isPerchEntry(entry: HookEntry): boolean {
-  return entry.hooks?.some((hook) => hook.command?.includes(HOOK_MARKER)) ?? false;
+function isPerchEntry(entry: HookEntry, env: NodeJS.ProcessEnv = process.env): boolean {
+  const shimPath = perchHookPath(env);
+  return entry.hooks?.some((hook) =>
+    hook.command?.includes(HOOK_MARKER) ||
+    hook.command?.includes(shimPath) ||
+    hook.command?.includes(HOOK_SHIM_MARKER)
+  ) ?? false;
+}
+
+export type UninstallChange = {
+  path: string;
+  before: string | null;
+  after: string | null;
+};
+
+function readJsonConfig(path: string): Record<string, unknown> | undefined {
+  if (!existsSync(path)) {
+    return undefined;
+  }
+  const raw = readFileSync(path, "utf8");
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch {
+    throw new Error(`refusing to uninstall: ${path} is not valid JSON`);
+  }
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+    throw new Error(`refusing to uninstall: ${path} must contain a JSON object`);
+  }
+  return parsed as Record<string, unknown>;
+}
+
+function withoutPerchHooks(
+  file: Record<string, unknown>,
+  path: string,
+  env: NodeJS.ProcessEnv
+): Record<string, unknown> {
+  if (file.hooks === undefined) {
+    return file;
+  }
+  if (!file.hooks || typeof file.hooks !== "object" || Array.isArray(file.hooks)) {
+    throw new Error(`refusing to uninstall: ${path} has an invalid hooks object`);
+  }
+  const hooks = { ...(file.hooks as Record<string, unknown>) };
+  for (const [event, value] of Object.entries(hooks)) {
+    if (!Array.isArray(value)) {
+      throw new Error(`refusing to uninstall: ${path} has invalid hook entries for ${event}`);
+    }
+    const entries = value as HookEntry[];
+    const remaining = entries.filter((entry) => !isPerchEntry(entry, env));
+    if (remaining.length > 0) {
+      hooks[event] = remaining;
+    } else {
+      delete hooks[event];
+    }
+  }
+  const next = { ...file };
+  if (Object.keys(hooks).length > 0) {
+    next.hooks = hooks;
+  } else {
+    delete next.hooks;
+  }
+  return next;
+}
+
+function removeMarkedBlock(content: string, beginMarker: string, endMarker: string): string {
+  let next = content;
+  while (true) {
+    const begin = next.indexOf(beginMarker);
+    if (begin < 0) {
+      return next;
+    }
+    const end = next.indexOf(endMarker, begin + beginMarker.length);
+    if (end < 0) {
+      return next;
+    }
+    let prefix = next.slice(0, begin);
+    let suffix = next.slice(end + endMarker.length);
+    if (prefix.endsWith("\n\n")) {
+      prefix = prefix.slice(0, -1);
+    }
+    if (suffix.startsWith("\n")) {
+      suffix = suffix.slice(1);
+    }
+    next = prefix + suffix;
+  }
+}
+
+function removeCodexAgentsBlocks(content: string): string {
+  let next = content;
+  let begin = next.indexOf(CODEX_AGENTS_BEGIN);
+  while (begin >= 0) {
+    const end = next.indexOf(CODEX_AGENTS_END, begin + CODEX_AGENTS_BEGIN.length);
+    if (end < 0) {
+      break;
+    }
+    next = next.slice(0, begin) + next.slice(end + CODEX_AGENTS_END.length);
+    begin = next.indexOf(CODEX_AGENTS_BEGIN, begin);
+  }
+  return next;
+}
+
+function withoutCodexTrust(config: string): string {
+  let next = removeMarkedBlock(config, CODEX_TRUST_BEGIN, CODEX_TRUST_END);
+  next = next.replace(/(?:^|\n)\[features\] # perch-codex\nhooks = true(?:\n|$)/, (match) =>
+    match.startsWith("\n") && match.endsWith("\n") ? "\n" : ""
+  );
+  next = next.replace(/^hooks = true # perch-codex\n/m, "");
+  return next.trim().length === 0 ? "" : next;
+}
+
+function addTextChange(changes: UninstallChange[], path: string, after: string): void {
+  const before = readFileSync(path, "utf8");
+  if (before !== after) {
+    changes.push({ path, before, after });
+  }
+}
+
+export function planPerchUninstall(env: NodeJS.ProcessEnv = process.env): UninstallChange[] {
+  const claudePath = claudeSettingsPath(env);
+  const codexRoot = codexHome(env);
+  const codexHooksPath = join(codexRoot, "hooks.json");
+
+  // Parse and validate every JSON surface before planning any write so one bad
+  // file makes the entire uninstall a no-op.
+  const claude = readJsonConfig(claudePath);
+  const codex = readJsonConfig(codexHooksPath);
+  const claudeNext = claude ? withoutPerchHooks(claude, claudePath, env) : undefined;
+  const codexNext = codex ? withoutPerchHooks(codex, codexHooksPath, env) : undefined;
+
+  const changes: UninstallChange[] = [];
+  if (claudeNext) {
+    addTextChange(changes, claudePath, `${JSON.stringify(claudeNext, null, 2)}\n`);
+  }
+  if (codexNext) {
+    addTextChange(changes, codexHooksPath, `${JSON.stringify(codexNext, null, 2)}\n`);
+  }
+
+  const configPath = join(codexRoot, "config.toml");
+  if (existsSync(configPath)) {
+    addTextChange(changes, configPath, withoutCodexTrust(readFileSync(configPath, "utf8")));
+  }
+
+  const agentsPath = join(codexRoot, "AGENTS.md");
+  if (existsSync(agentsPath)) {
+    addTextChange(
+      changes,
+      agentsPath,
+      removeCodexAgentsBlocks(readFileSync(agentsPath, "utf8"))
+    );
+  }
+
+  const shimPath = perchHookPath(env);
+  if (existsSync(shimPath)) {
+    changes.push({ path: shimPath, before: readFileSync(shimPath, "utf8"), after: null });
+  }
+  return changes;
+}
+
+function removeFileAtomic(path: string): void {
+  const tmp = `${path}.perch-remove`;
+  renameSync(path, tmp);
+  rmSync(tmp, { force: true });
+}
+
+export function applyPerchUninstall(changes: UninstallChange[]): void {
+  for (const change of changes) {
+    if (change.after === null) {
+      removeFileAtomic(change.path);
+    } else {
+      writeFileAtomic(change.path, change.after);
+    }
+  }
 }
 
 // --- Codex hooks ------------------------------------------------------------
@@ -386,16 +617,7 @@ function removeCodexAgentsNote(home: string): void {
     return;
   }
 
-  let next = current;
-  let begin = next.indexOf(CODEX_AGENTS_BEGIN);
-  while (begin >= 0) {
-    const end = next.indexOf(CODEX_AGENTS_END, begin + CODEX_AGENTS_BEGIN.length);
-    if (end < 0) {
-      break;
-    }
-    next = next.slice(0, begin) + next.slice(end + CODEX_AGENTS_END.length);
-    begin = next.indexOf(CODEX_AGENTS_BEGIN, begin);
-  }
+  const next = removeCodexAgentsBlocks(current);
 
   if (next !== current) {
     try {
@@ -447,7 +669,7 @@ function writeCodexTrust(
     next = config.slice(0, begin) + block + config.slice(end + CODEX_TRUST_END.length);
   } else {
     // Appending [hooks.state."..."] table headers at EOF is always valid TOML.
-    next = `${config.replace(/\n*$/, "\n\n")}${block}\n`;
+    next = `${config.length > 0 ? config.replace(/\n*$/, "\n\n") : ""}${block}\n`;
   }
 
   // Hooks must also be feature-enabled. Only ever ADD the flag; if the user
@@ -466,7 +688,7 @@ function writeCodexTrust(
     } else if (anyFeaturesTable.test(next)) {
       return false;
     } else {
-      next = `${next.replace(/\n*$/, "\n\n")}[features] # perch-codex\nhooks = true\n`;
+      next = `${next.length > 0 ? next.replace(/\n*$/, "\n\n") : ""}[features] # perch-codex\nhooks = true\n`;
     }
   }
 

@@ -80,6 +80,11 @@ async function main() {
     return;
   }
 
+  if (parsed.command === "uninstall") {
+    await runUninstall(parsed.options);
+    return;
+  }
+
   await ensureServerRunning(parsed.options);
 
   if (parsed.command === "ls") {
@@ -1264,6 +1269,100 @@ function delay(ms) {
   return new Promise((resolvePromise) => setTimeout(resolvePromise, ms));
 }
 
+async function runUninstall(options) {
+  if ((await fetchHealth(options)) && !options.force) {
+    throw new Error("perch server is running; stop it first with `perch server stop`, or rerun with `perch uninstall --force`");
+  }
+
+  const hooksModuleUrl = new URL("../apps/server/dist/hooks.js", import.meta.url);
+  let hooks;
+  try {
+    hooks = await import(hooksModuleUrl.href);
+  } catch {
+    throw new Error("server build missing uninstall helpers - reinstall perchctl or run `npm run build`");
+  }
+  const changes = hooks.planPerchUninstall(process.env);
+
+  if (options.dryRun) {
+    if (changes.length === 0 && !options.purgeData) {
+      console.log("No Perch-managed configuration found.");
+      return;
+    }
+    for (const change of changes) {
+      process.stdout.write(formatFileDiff(change));
+    }
+    if (options.purgeData) {
+      console.log(`delete ${prettyPath(PERCH_HOME)}/ recursively`);
+    }
+    return;
+  }
+
+  hooks.applyPerchUninstall(changes);
+  if (options.purgeData && existsSync(PERCH_HOME)) {
+    const resolvedHome = resolve(PERCH_HOME);
+    if (resolvedHome === "/" || resolvedHome === resolve(homedir())) {
+      throw new Error(`refusing to purge unsafe PERCH_HOME: ${resolvedHome}`);
+    }
+    rmSync(resolvedHome, { recursive: true, force: true });
+  }
+
+  for (const change of changes) {
+    console.log(`${change.after === null ? "removed" : "updated"} ${prettyPath(change.path)}`);
+  }
+  if (options.purgeData) {
+    console.log(`removed ${prettyPath(PERCH_HOME)} state`);
+  } else {
+    console.log(`kept ${prettyPath(PERCH_HOME)} state (use --purge-data to remove it)`);
+  }
+}
+
+function formatFileDiff(change) {
+  const beforeLines = change.before === null ? [] : change.before.split("\n");
+  const afterLines = change.after === null ? [] : change.after.split("\n");
+  const from = change.before === null ? "/dev/null" : change.path;
+  const to = change.after === null ? "/dev/null" : change.path;
+  const lengths = Array.from({ length: beforeLines.length + 1 }, () =>
+    Array(afterLines.length + 1).fill(0)
+  );
+  for (let beforeIndex = beforeLines.length - 1; beforeIndex >= 0; beforeIndex -= 1) {
+    for (let afterIndex = afterLines.length - 1; afterIndex >= 0; afterIndex -= 1) {
+      lengths[beforeIndex][afterIndex] = beforeLines[beforeIndex] === afterLines[afterIndex]
+        ? lengths[beforeIndex + 1][afterIndex + 1] + 1
+        : Math.max(lengths[beforeIndex + 1][afterIndex], lengths[beforeIndex][afterIndex + 1]);
+    }
+  }
+  const body = [];
+  let beforeIndex = 0;
+  let afterIndex = 0;
+  while (beforeIndex < beforeLines.length || afterIndex < afterLines.length) {
+    if (
+      beforeIndex < beforeLines.length &&
+      afterIndex < afterLines.length &&
+      beforeLines[beforeIndex] === afterLines[afterIndex]
+    ) {
+      body.push(` ${beforeLines[beforeIndex]}`);
+      beforeIndex += 1;
+      afterIndex += 1;
+    } else if (
+      afterIndex < afterLines.length &&
+      (beforeIndex === beforeLines.length || lengths[beforeIndex][afterIndex + 1] >= lengths[beforeIndex + 1][afterIndex])
+    ) {
+      body.push(`+${afterLines[afterIndex]}`);
+      afterIndex += 1;
+    } else {
+      body.push(`-${beforeLines[beforeIndex]}`);
+      beforeIndex += 1;
+    }
+  }
+  const lines = [
+    `--- ${from}`,
+    `+++ ${to}`,
+    `@@ -1,${beforeLines.length} +1,${afterLines.length} @@`,
+    ...body
+  ];
+  return `${lines.join("\n")}\n`;
+}
+
 function parseArgs(argv) {
   const options = {
     server: process.env.PERCH_SERVER_URL ?? process.env.PERCH_URL ?? DEFAULT_SERVER_URL,
@@ -1271,7 +1370,10 @@ function parseArgs(argv) {
     cwd: process.env.PERCH_CWD ?? process.cwd(),
     title: undefined,
     attach: true,
-    newMate: false
+    newMate: false,
+    dryRun: false,
+    purgeData: false,
+    force: false
   };
   const args = [];
   let command;
@@ -1344,6 +1446,18 @@ function parseArgs(argv) {
     }
     if (command === "mate" && arg === "--new") {
       options.newMate = true;
+      continue;
+    }
+    if (command === "uninstall" && arg === "--dry-run") {
+      options.dryRun = true;
+      continue;
+    }
+    if (command === "uninstall" && arg === "--purge-data") {
+      options.purgeData = true;
+      continue;
+    }
+    if (command === "uninstall" && arg === "--force") {
+      options.force = true;
       continue;
     }
 
@@ -1890,6 +2004,7 @@ function printHelp() {
   perch worktrees
   perch worktrees release <id> [--force]
   perch doctor [--json] [--fix [--yes]]
+  perch uninstall [--dry-run] [--purge-data] [--force]
   perch server [status|start|stop|logs]
 
 Options:
@@ -1899,6 +2014,9 @@ Options:
   --title <title>   Session title shown in the mobile app
   --no-attach       Start the session and exit instead of attaching this terminal
   --new             With perch mate, intentionally start a fresh conversation
+  --dry-run         With perch uninstall, print exact file diffs without writing
+  --purge-data      With perch uninstall, also remove ~/.perch state
+  --force           With perch uninstall, proceed while the server is running
   --version         Print the canonical perchctl package version
 
 The server starts automatically when needed (log: ~/.perch/server.log).
