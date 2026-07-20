@@ -116,6 +116,7 @@ import { isProviderPrefixedModelId, modelSwitchSteps } from "./modelSwitch.js";
 import { collectUsage } from "./usage.js";
 import { listCodexModelsOnce } from "./adapters/codexAppServer.js";
 import {
+  collectCliModelRegistry,
   collectModelRegistry,
   DISPATCH_CODEX_FALLBACK,
   listClaudeModels,
@@ -805,7 +806,10 @@ async function dispatchWebSocketRpc(
   }
 
   if (method === "GET" && pathname === "/models") {
-    return rpcOk(200, await collectModelRegistry({ listCodexModels: listCodexModelsOnce, listClaudeModels }));
+    const registry = url.searchParams.get("claude") === "bundled"
+      ? await collectCliModelRegistry({ listCodexModels: listCodexModelsOnce })
+      : await collectModelRegistry({ listCodexModels: listCodexModelsOnce, listClaudeModels });
+    return rpcOk(200, registry);
   }
 
   if (method === "GET" && pathname === "/config") {
@@ -824,8 +828,12 @@ async function dispatchWebSocketRpc(
       const update = strictConfigPatch(body);
       const resolveEfforts = await codexEffortResolver(options);
       const responseBody = await buildConfigResponse(options, {
-        dispatchDefaults: options.settings.updateDispatchDefaults(update.dispatchDefaults ?? {}, resolveEfforts),
-        mateDefaults: options.settings.updateMateDefaults(update.mateDefaults ?? {}, resolveEfforts)
+        dispatchDefaults: update.dispatchDefaults === undefined
+          ? options.settings.dispatchDefaults()
+          : options.settings.updateDispatchDefaults(update.dispatchDefaults, resolveEfforts),
+        mateDefaults: update.mateDefaults === undefined
+          ? options.settings.mateDefaults()
+          : options.settings.updateMateDefaults(update.mateDefaults, resolveEfforts)
       });
       await audit(options.auditLog, { action: "set_config", ...auditPeer });
       return rpcOk(200, responseBody);
@@ -1638,8 +1646,12 @@ async function route(
       try {
         const update = strictConfigPatch(body);
         const resolveEfforts = await codexEffortResolver(options);
-        dispatchDefaults = options.settings.updateDispatchDefaults(update.dispatchDefaults ?? {}, resolveEfforts);
-        mateDefaults = options.settings.updateMateDefaults(update.mateDefaults ?? {}, resolveEfforts);
+        dispatchDefaults = update.dispatchDefaults === undefined
+          ? options.settings.dispatchDefaults()
+          : options.settings.updateDispatchDefaults(update.dispatchDefaults, resolveEfforts);
+        mateDefaults = update.mateDefaults === undefined
+          ? options.settings.mateDefaults()
+          : options.settings.updateMateDefaults(update.mateDefaults, resolveEfforts);
       } catch (error) {
         writeJson(response, 400, { error: error instanceof Error ? error.message : String(error) });
         return;
@@ -1671,8 +1683,13 @@ async function route(
     // Launch-time model catalog: versioned names + the CLI's resolved default,
     // read from the local Claude/Codex config on this Mac. The single source of
     // truth for the New Agent picker; the app carries only a small fallback.
+    // The perch CLI opts into the bundled-only Claude catalog with
+    // `?claude=bundled`; the default picker response keeps its existing behavior.
     if (request.method === "GET" && pathname === "/models") {
-      writeJson(response, 200, await collectModelRegistry({ listCodexModels: listCodexModelsOnce, listClaudeModels }));
+      const registry = url.searchParams.get("claude") === "bundled"
+        ? await collectCliModelRegistry({ listCodexModels: listCodexModelsOnce })
+        : await collectModelRegistry({ listCodexModels: listCodexModelsOnce, listClaudeModels });
+      writeJson(response, 200, registry);
       return;
     }
 

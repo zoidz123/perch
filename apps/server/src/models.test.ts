@@ -5,11 +5,13 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
   collectModelRegistry,
+  collectCliModelRegistry,
   collectModels,
   labelForClaudeModelId,
   MATE_CLAUDE_FALLBACK_MODEL,
   MATE_CODEX_FALLBACK,
   resolveMateLaunch,
+  resolveModelIdentifier,
   resolveSessionModel,
   supportedEffortsForModel
 } from "./models.js";
@@ -94,6 +96,57 @@ test("claude CLI /model output supplies the live runtime catalog", () => {
   assert.equal(claude.options.find((o) => o.id === "nebula")?.label, "Nebula");
   assert.equal(claude.roleDefaults?.orchestrator?.model, "best");
   assert.equal(claude.roleDefaults?.crew?.model, "opus");
+});
+
+test("model identifiers resolve ids and aliases to their owning agent", () => {
+  const registry = collectModels({
+    readClaudeSettings: () => null,
+    readCodexConfig: () => null,
+    codexModelList: LIVE_CODEX_MODELS
+  });
+  assert.deepEqual(resolveModelIdentifier(registry, "gpt-5.6-sol").map((match) => match.agent), ["codex"]);
+  assert.deepEqual(resolveModelIdentifier(registry, "fable").map((match) => match.agent), ["claude"]);
+  const fullClaudeId = resolveModelIdentifier(registry, "claude-fable-5");
+  assert.equal(fullClaudeId.length, 1);
+  assert.equal(fullClaudeId[0]?.agent, "claude");
+  assert.equal(fullClaudeId[0]?.model, "fable");
+
+  const liveRegistry = collectModels({
+    readClaudeSettings: () => null,
+    readCodexConfig: () => null,
+    claudeModelList: {
+      result: "Current model: Fable 5\nUsage: /model <name>. Available: fable, fable[1m], or a full model ID."
+    }
+  });
+  assert.equal(resolveModelIdentifier(liveRegistry, "claude-fable-5")[0]?.model, "fable");
+  assert.equal(resolveModelIdentifier(liveRegistry, "claude-fable-5[1m]")[0]?.model, "fable[1m]");
+});
+
+test("CLI model registry uses bundled Claude rows and live Codex without Claude discovery", async () => {
+  let claudeDiscoveryCalls = 0;
+  let claudeSettingsReads = 0;
+  const registry = await collectCliModelRegistry({
+    readClaudeSettings: () => {
+      claudeSettingsReads += 1;
+      return JSON.stringify({ model: "some-external-claude-model" });
+    },
+    readCodexConfig: () => null,
+    listCodexModels: async () => LIVE_CODEX_MODELS,
+    listClaudeModels: async () => {
+      claudeDiscoveryCalls += 1;
+      throw new Error("must not be called");
+    }
+  });
+  assert.equal(claudeDiscoveryCalls, 0);
+  assert.equal(claudeSettingsReads, 0);
+  const claude = providerOf(registry, "claude");
+  assert.equal(claude.runtimeSource, "bundled");
+  assert.deepEqual(claude.options.map((option) => option.id), ["fable", "opus", "sonnet", "haiku", "best", "opusplan"]);
+  assert.ok(claude.options.every((option) => option.runtimeSource === "bundled"));
+  const codex = providerOf(registry, "codex");
+  assert.equal(codex.runtimeSource, "codex-app-server");
+  assert.ok(codex.options.every((option) => option.runtimeSource === "codex-app-server"));
+  assert.deepEqual(registry.sources?.map((source) => source.name), ["codex-app-server", "claude-bundled"]);
 });
 
 test("mate fallback uses Claude's frontier-tracking best alias (bin/perch.mjs mirrors it)", () => {
@@ -571,6 +624,34 @@ test("Claude CLI unavailable/timeout degrades to static fallback while codex sta
     const claudeSource = res.sources?.find((s) => s.name === "claude-cli");
     assert.equal(claudeSource?.ok, false);
     assert.match(claudeSource?.reason ?? "", /timed out|fallback/i);
+  } finally {
+    rmSync(home, { recursive: true, force: true });
+  }
+});
+
+test("Codex unavailable degrades to static fallback while Claude stays live", async () => {
+  const home = mkdtempSync(join(tmpdir(), "perch-codex-unavailable-"));
+  try {
+    const res = await collectModelRegistry({
+      cachePath: join(home, "model-registry.json"),
+      readClaudeSettings: () => null,
+      readCodexConfig: () => null,
+      listCodexModels: async () => {
+        throw new Error("codex binary not found");
+      },
+      listClaudeModels: async () => ({
+        result: "Current model: Fable 5\nUsage: /model <name>. Available: sonnet, opus, fable, or a full model ID."
+      })
+    });
+    const claude = providerOf(res, "claude");
+    assert.equal(claude.runtimeSource, "claude-cli");
+    assert.deepEqual(claude.options.map((option) => option.id), ["fable", "opus", "sonnet"]);
+    const codex = providerOf(res, "codex");
+    assert.equal(codex.runtimeSource, "static-fallback");
+    assert.ok(codex.options.length > 0);
+    const codexSource = res.sources?.find((source) => source.name === "codex-app-server");
+    assert.equal(codexSource?.ok, false);
+    assert.match(codexSource?.reason ?? "", /binary not found/);
   } finally {
     rmSync(home, { recursive: true, force: true });
   }

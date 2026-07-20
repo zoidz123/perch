@@ -112,6 +112,11 @@ async function main() {
     return;
   }
 
+  if (parsed.command === "models") {
+    await runModelsCommand(parsed.args, parsed.options);
+    return;
+  }
+
   if (parsed.command === "worktrees") {
     await runWorktreesCommand(parsed.args, parsed.options);
     return;
@@ -643,9 +648,87 @@ async function fetchConfig(options, project) {
 }
 
 async function fetchModels(options) {
-  const response = await fetch(httpUrl(options, "/models"), { headers: jsonHeaders(options) });
+  const response = await fetch(httpUrl(options, "/models?claude=bundled"), { headers: jsonHeaders(options) });
   if (!response.ok) throw new Error(await responseError(response));
   return response.json();
+}
+
+async function runModelsCommand(args, options) {
+  let json = false;
+  for (const arg of args) {
+    if (arg === "--json") json = true;
+    else throw new Error(`unknown models option: ${arg}`);
+  }
+  const [registry, config] = await Promise.all([fetchModels(options), fetchConfig(options)]);
+  const models = modelInventory(registry, config);
+  const notes = modelSourceNotes(registry);
+  if (json) {
+    console.log(JSON.stringify({
+      generatedAt: registry.generatedAt ?? registry.at,
+      models,
+      notes,
+      sources: registry.sources ?? []
+    }, null, 2));
+    return;
+  }
+  const tableRows = models.map((model) => [
+    model.model,
+    model.agent,
+    model.efforts.length ? model.efforts.join(",") : "-",
+    model.aliases.length ? model.aliases.join(",") : "-",
+    model.source,
+    model.selected.length ? model.selected.join(",") : "-"
+  ]);
+  printTable(["MODEL", "AGENT", "EFFORTS", "ALIASES", "SOURCE", "SELECTED"], tableRows);
+  for (const note of notes) console.error(`Note: ${note}`);
+}
+
+function modelInventory(registry, config) {
+  const selected = {
+    mate: config.mateResolved ?? config.mateDefaults ?? {},
+    dispatch: config.dispatchResolved ?? config.dispatchDefaults ?? {}
+  };
+  const rows = [];
+  for (const provider of registry.providers ?? []) {
+    for (const entry of provider.options ?? []) {
+      if (entry.status === "unknown") continue;
+      const model = entry.runtimeId ?? entry.id;
+      const aliases = modelAliases(entry, model);
+      rows.push({
+        model,
+        agent: provider.provider,
+        efforts: entry.supportedReasoningEfforts ?? [],
+        aliases,
+        source: entry.runtimeSource === "codex-app-server" ? "live" : "bundled",
+        selected: Object.entries(selected)
+          .filter(([, value]) => value?.agent === provider.provider && [model, ...aliases].includes(value?.model))
+          .map(([role]) => role)
+      });
+    }
+  }
+  return rows;
+}
+
+function modelAliases(entry, model = entry.runtimeId ?? entry.id) {
+  return [...new Set([entry.id, entry.runtimeId, entry.nativeProviderId, entry.apiId]
+    .filter((value) => typeof value === "string" && value.length > 0 && value !== model))];
+}
+
+function modelSourceNotes(registry) {
+  const notes = new Map();
+  for (const source of registry.sources ?? []) {
+    if (source.role !== "runtime" || (source.ok && source.status !== "fallback" && source.status !== "failed")) continue;
+    if (!notes.has(source.name)) notes.set(source.name, `${source.name}: ${source.reason ?? source.status ?? "unavailable"}`);
+  }
+  return [...notes.values()];
+}
+
+function printTable(headers, rows) {
+  const widths = headers.map((header, index) => Math.max(header.length, ...rows.map((row) => String(row[index]).length)));
+  console.log(headers.map((header, index) => header.padEnd(widths[index])).join("  "));
+  for (const row of rows) {
+    console.log(row.map((value, index) => String(value).padEnd(widths[index])).join("  "));
+  }
 }
 
 async function runConfigCommand(args, options) {
@@ -663,12 +746,23 @@ async function runConfigCommand(args, options) {
   if ((parsed.action === "set" || parsed.action === "unset") && parsed.effective) {
     throw new Error("--effective is read-only and cannot be used with config mutations");
   }
+  if (parsed.action === "set" && ["mate", "dispatch"].includes(parsed.positionals[0])) {
+    await setRoleModel(parsed, options);
+    return;
+  }
+  if (parsed.agent || parsed.effort) {
+    throw new Error("--agent and --effort are only valid with `perch config set mate|dispatch <model>`");
+  }
   if (parsed.action === "set" || parsed.action === "unset") {
+    if (parsed.action === "set" && /^(mate|dispatch)\.(agent|model|effort)$/.test(parsed.positionals[0])) {
+      const role = parsed.positionals[0].split(".")[0];
+      console.error(`Deprecated: use \`perch config set ${role} <model> [--effort <level>]\` for atomic model selection.`);
+    }
     await mutateConfig(parsed, options);
     return;
   }
   const config = await fetchConfig(options, parsed.project);
-  const entries = redactConfigEntries(config.entries ?? {});
+  let entries = redactConfigEntries(config.entries ?? {});
   if (parsed.action === "validate") {
     validateConfigEntries(entries, parsed);
     if (parsed.json) console.log(JSON.stringify({ valid: true, entries }, null, 2));
@@ -683,6 +777,7 @@ async function runConfigCommand(args, options) {
     else console.log(formatConfigValue(entry.storedValue));
     return;
   }
+  entries = { ...entries, ...await roleResolutionEntries(config, options) };
   let selected = entries;
   if (!parsed.effective && parsed.global) {
     selected = Object.fromEntries(Object.entries(entries).filter(([, entry]) => entry.scope === "global"));
@@ -707,6 +802,8 @@ function parseConfigArgs(args) {
     effective: false,
     json: false,
     yes: false,
+    agent: undefined,
+    effort: undefined,
     positionals: []
   };
   for (let index = args[0] ? 1 : 0; index < args.length; index += 1) {
@@ -719,11 +816,152 @@ function parseConfigArgs(args) {
     } else if (value === "--effective") parsed.effective = true;
     else if (value === "--json") parsed.json = true;
     else if (value === "--yes") parsed.yes = true;
-    else if (value.startsWith("--")) throw new Error(`unknown config option: ${value}`);
+    else if (value === "--agent") {
+      parsed.agent = args[index + 1];
+      if (!parsed.agent) throw new Error("--agent requires claude or codex");
+      index += 1;
+    } else if (value === "--effort") {
+      parsed.effort = args[index + 1];
+      if (!parsed.effort) throw new Error("--effort requires a level");
+      index += 1;
+    } else if (value.startsWith("--")) throw new Error(`unknown config option: ${value}`);
     else parsed.positionals.push(value);
   }
   if (parsed.global && parsed.project) throw new Error("choose exactly one of --global or --project PATH");
   return parsed;
+}
+
+async function setRoleModel(parsed, options) {
+  if (parsed.project) throw new Error("atomic model selection is global-only");
+  if (parsed.agent && !CONFIG_AGENTS.has(parsed.agent)) {
+    throw new Error(`invalid --agent: ${parsed.agent} (expected ${[...CONFIG_AGENTS].join("|")})`);
+  }
+  const [role, requestedModel] = parsed.positionals;
+  const registry = await fetchModels(options);
+  let candidates = modelCandidates(registry, requestedModel, parsed.agent);
+  if (!candidates.length) throw unknownModelError(registry, requestedModel, parsed.agent);
+  const agents = [...new Set(candidates.map((candidate) => candidate.agent))];
+  if (agents.length > 1) {
+    if (!process.stdin.isTTY) {
+      throw new Error(`model "${requestedModel}" is available for multiple agents (${agents.join(", ")}); rerun with --agent <agent>`);
+    }
+    const answer = (await promptLine(`Model "${requestedModel}" is available for ${agents.join(" or ")}. Choose agent: `)).trim();
+    if (!agents.includes(answer)) throw new Error(`invalid agent choice "${answer}" (expected ${agents.join("|")})`);
+    candidates = candidates.filter((candidate) => candidate.agent === answer);
+  }
+  const selected = candidates[0];
+  const efforts = selected.entry.supportedReasoningEfforts ?? [];
+  if (parsed.effort && !efforts.includes(parsed.effort)) {
+    throw new Error(`invalid effort "${parsed.effort}" for model "${selected.model}". Valid efforts: ${efforts.length ? efforts.join(", ") : "none"}`);
+  }
+  const effort = parsed.effort ?? defaultModelEffort(selected.provider, selected.entry);
+  const layer = role === "mate" ? "mateDefaults" : "dispatchDefaults";
+  const response = await fetch(httpUrl(options, "/config"), {
+    method: "PATCH",
+    headers: jsonHeaders(options),
+    body: JSON.stringify({ [layer]: { agent: selected.agent, model: selected.model, effort: effort ?? null } })
+  });
+  if (!response.ok) throw new Error(await responseError(response));
+  if (parsed.json) {
+    console.log(JSON.stringify({ role, agent: selected.agent, model: selected.model, effort: effort ?? null }, null, 2));
+  } else {
+    console.log(`${role} = ${selected.agent}/${selected.model}${effort ? ` (${effort})` : ""}`);
+  }
+}
+
+function modelCandidates(registry, identifier, requestedAgent) {
+  const direct = [];
+  const aliases = [];
+  for (const provider of registry.providers ?? []) {
+    if (requestedAgent && provider.provider !== requestedAgent) continue;
+    for (const entry of provider.options ?? []) {
+      const model = entry.runtimeId ?? entry.id;
+      const candidate = { agent: provider.provider, model, provider, entry };
+      if (identifier === entry.id || identifier === entry.runtimeId) direct.push(candidate);
+      else if (modelAliases(entry, model).includes(identifier)) aliases.push(candidate);
+    }
+  }
+  const agents = new Set([...direct, ...aliases].map((candidate) => candidate.agent));
+  const matches = [...agents].flatMap((agent) => {
+    const agentDirect = direct.filter((candidate) => candidate.agent === agent);
+    return agentDirect.length ? agentDirect : aliases.filter((candidate) => candidate.agent === agent);
+  });
+  return [...new Map(matches.map((candidate) => [`${candidate.agent}:${candidate.model}`, candidate])).values()];
+}
+
+function defaultModelEffort(provider, entry) {
+  if (provider.provider !== "codex") return undefined;
+  if (entry.defaultReasoningEffort) return entry.defaultReasoningEffort;
+  const roleDefault = Object.values(provider.roleDefaults ?? {}).find((value) => value?.model === (entry.runtimeId ?? entry.id));
+  if (roleDefault?.effort) return roleDefault.effort;
+  const efforts = entry.supportedReasoningEfforts ?? [];
+  return efforts.includes("medium") ? "medium" : efforts[0];
+}
+
+function unknownModelError(registry, identifier, requestedAgent) {
+  const choices = [];
+  for (const provider of registry.providers ?? []) {
+    if (requestedAgent && provider.provider !== requestedAgent) continue;
+    for (const entry of provider.options ?? []) {
+      const model = entry.runtimeId ?? entry.id;
+      for (const value of [model, ...modelAliases(entry, model)]) {
+        choices.push({ value, agent: provider.provider, distance: editDistance(identifier, value) });
+      }
+    }
+  }
+  const suggestions = [...new Map(choices.sort((a, b) => a.distance - b.distance || a.value.localeCompare(b.value))
+    .map((choice) => [`${choice.agent}:${choice.value}`, choice])).values()].slice(0, 3);
+  return new Error(`unknown model "${identifier}".${suggestions.length ? ` Closest matches: ${suggestions.map((item) => `${item.value} (${item.agent})`).join(", ")}.` : ""} Run \`perch models\` to list available models.`);
+}
+
+function editDistance(left, right) {
+  const previous = Array.from({ length: right.length + 1 }, (_, index) => index);
+  for (let leftIndex = 1; leftIndex <= left.length; leftIndex += 1) {
+    const current = [leftIndex];
+    for (let rightIndex = 1; rightIndex <= right.length; rightIndex += 1) {
+      current[rightIndex] = left[leftIndex - 1] === right[rightIndex - 1]
+        ? previous[rightIndex - 1]
+        : 1 + Math.min(previous[rightIndex - 1], previous[rightIndex], current[rightIndex - 1]);
+    }
+    previous.splice(0, previous.length, ...current);
+  }
+  return previous[right.length];
+}
+
+async function roleResolutionEntries(config, options) {
+  let registry;
+  try {
+    registry = await fetchModels(options);
+  } catch (error) {
+    const value = `model registry unavailable: ${error instanceof Error ? error.message : String(error)}`;
+    return Object.fromEntries(["dispatch", "mate"].map((role) => [`${role}.warning`, syntheticConfigEntry(value)]));
+  }
+  const result = {};
+  for (const role of ["dispatch", "mate"]) {
+    const defaults = config[role === "mate" ? "mateDefaults" : "dispatchDefaults"] ?? {};
+    const resolved = config[role === "mate" ? "mateResolved" : "dispatchResolved"] ?? defaults;
+    if (resolved.agent) result[`${role}.resolved-agent`] = syntheticConfigEntry(resolved.agent);
+    const configuredModel = defaults.model;
+    if (!configuredModel || configuredModel === "auto" || !defaults.agent) continue;
+    if (!modelCandidates(registry, configuredModel, defaults.agent).length) {
+      const otherAgents = [...new Set(modelCandidates(registry, configuredModel).map((candidate) => candidate.agent))];
+      const detail = otherAgents.length ? `; model resolves to ${otherAgents.join(", ")}` : "";
+      result[`${role}.warning`] = syntheticConfigEntry(`invalid ${defaults.agent}/${configuredModel} tuple${detail}`);
+    }
+  }
+  return result;
+}
+
+function syntheticConfigEntry(value) {
+  return {
+    effectiveValue: value,
+    source: "automatic",
+    scope: "global",
+    storedValue: value,
+    defaultValue: null,
+    overriddenBy: null,
+    readOnly: true
+  };
 }
 
 function requireConfigKey(key, entries) {
@@ -1470,9 +1708,9 @@ function parseArgs(argv) {
       passthrough = true;
       continue;
     }
-    // `project`, `config`, `worktrees`, and `doctor` keep their own flags as positionals; the shared flags above
+    // `project`, `config`, `models`, `worktrees`, and `doctor` keep their own flags as positionals; the shared flags above
     // (--server, --token, ...) are already consumed.
-    if (arg.startsWith("-") && command !== "project" && command !== "config" && command !== "worktrees" && command !== "doctor") {
+    if (arg.startsWith("-") && command !== "project" && command !== "config" && command !== "models" && command !== "worktrees" && command !== "doctor") {
       throw new Error(`unknown option for ${command}: ${arg} (see \`perch --help\`)`);
     }
     args.push(arg);
@@ -1993,10 +2231,12 @@ function printHelp() {
   perch project [list]
   perch project add <path> [--mode direct-PR|no-mistakes|local-only] [--yolo] [--yes]
   perch project remove <path>
+  perch models [--json]
   perch config show [--global|--project PATH] [--effective] [--json]
   perch config get <key> [--global|--project PATH] [--effective] [--json]
   perch config set --global <dispatch.agent|dispatch.model|dispatch.effort|
                               mate.agent|mate.model|mate.effort> <value>
+  perch config set <mate|dispatch> <model> [--effort <level>] [--agent <agent>]
   perch config set --project PATH <task.mode|task.yolo> <value> [--yes]
   perch config unset --global <key>
   perch config unset --project PATH <key>

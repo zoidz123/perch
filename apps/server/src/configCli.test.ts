@@ -25,10 +25,17 @@ type StubState = {
   mateDefaults: Record<string, string>;
   project: { mode?: string; yolo?: boolean };
   patches: unknown[];
+  registry: Record<string, unknown>;
 };
 
 async function withStubServer(run: (serverUrl: string, state: StubState) => Promise<void>): Promise<void> {
-  const state: StubState = { defaults: {}, mateDefaults: {}, project: {}, patches: [] };
+  const state: StubState = {
+    defaults: {},
+    mateDefaults: {},
+    project: {},
+    patches: [],
+    registry: stubRegistry()
+  };
   const server = createServer((request, response) => {
     response.setHeader("content-type", "application/json");
     if (request.url?.startsWith("/health")) {
@@ -37,6 +44,10 @@ async function withStubServer(run: (serverUrl: string, state: StubState) => Prom
     }
     if (request.url?.startsWith("/config") && request.method === "GET") {
       response.end(JSON.stringify(stubConfig(state)));
+      return;
+    }
+    if (request.url?.startsWith("/models") && request.method === "GET") {
+      response.end(JSON.stringify(state.registry));
       return;
     }
     if (request.url?.startsWith("/config") && request.method === "PATCH") {
@@ -85,6 +96,44 @@ async function withStubServer(run: (serverUrl: string, state: StubState) => Prom
     server.closeAllConnections?.();
     await new Promise<void>((resolve) => server.close(() => resolve()));
   }
+}
+
+function stubRegistry() {
+  return {
+    at: "2026-07-20T00:00:00.000Z",
+    sources: [
+      { name: "claude-bundled", role: "runtime", ok: true, status: "ok" },
+      { name: "codex-app-server", role: "runtime", ok: false, status: "fallback", reason: "codex binary not found" }
+    ],
+    providers: [
+      {
+        provider: "claude",
+        options: [
+          { id: "fable", runtimeId: "fable", nativeProviderId: "claude-fable-5", runtimeSource: "bundled" },
+          { id: "shared", runtimeId: "shared", runtimeSource: "bundled" }
+        ]
+      },
+      {
+        provider: "codex",
+        options: [
+          {
+            id: "gpt-5.6-sol",
+            runtimeId: "gpt-5.6-sol",
+            supportedReasoningEfforts: ["low", "medium", "high"],
+            defaultReasoningEffort: "low",
+            runtimeSource: "static-fallback"
+          },
+          {
+            id: "shared",
+            runtimeId: "shared",
+            supportedReasoningEfforts: ["medium"],
+            defaultReasoningEffort: "medium",
+            runtimeSource: "static-fallback"
+          }
+        ]
+      }
+    ]
+  };
 }
 
 function stubConfig(state: StubState) {
@@ -150,8 +199,12 @@ function stubConfig(state: StubState) {
 type CliResult = { code: number; stdout: string; stderr: string };
 
 async function runConfig(serverUrl: string, home: string, args: string[]): Promise<CliResult> {
+  return runCli(serverUrl, home, ["config", ...args]);
+}
+
+async function runCli(serverUrl: string, home: string, args: string[]): Promise<CliResult> {
   try {
-    const { stdout, stderr } = await execFileAsync(process.execPath, [PERCH_BIN, "config", ...args], {
+    const { stdout, stderr } = await execFileAsync(process.execPath, [PERCH_BIN, ...args], {
       timeout: 15000,
       env: { ...process.env, PERCH_HOME: home, PERCH_SERVER_URL: serverUrl, PERCH_TOKEN: "stub-token" }
     });
@@ -169,6 +222,7 @@ test("config set PATCHes the mapped field and get reads it back", async () => {
       const set = await runConfig(serverUrl, home, ["set", "--global", "dispatch.agent", "codex"]);
       assert.equal(set.code, 0, set.stderr);
       assert.match(set.stdout, /dispatch\.agent = codex/);
+      assert.match(set.stderr, /Deprecated: use `perch config set dispatch <model>/);
       assert.deepEqual(state.patches, [{ dispatchDefaults: { agent: "codex" } }]);
 
       const getOne = await runConfig(serverUrl, home, ["get", "--global", "dispatch.agent"]);
@@ -201,6 +255,7 @@ test("config set/get/unset works the same for the mate-* keys, independent of de
       const setModel = await runConfig(serverUrl, home, ["set", "--global", "mate.model", "opus"]);
       assert.equal(setModel.code, 0, setModel.stderr);
       assert.match(setModel.stdout, /mate\.model = opus/);
+      assert.match(setModel.stderr, /Deprecated: use `perch config set mate <model>/);
 
       const getOne = await runConfig(serverUrl, home, ["get", "--global", "mate.agent"]);
       assert.equal(getOne.stdout.trim(), "codex");
@@ -220,6 +275,111 @@ test("config set/get/unset works the same for the mate-* keys, independent of de
       const badAgent = await runConfig(serverUrl, home, ["set", "--global", "mate.agent", "gemini"]);
       assert.equal(badAgent.code, 1);
       assert.match(badAgent.stderr, /invalid mate\.agent: gemini \(expected claude\|codex\)/);
+    });
+  } finally {
+    rmSync(home, { recursive: true, force: true });
+  }
+});
+
+test("atomic role selection resolves aliases and writes one complete tuple", async () => {
+  const home = mkdtempSync(join(tmpdir(), "perch-config-home-"));
+  try {
+    await withStubServer(async (serverUrl, state) => {
+      const alias = await runConfig(serverUrl, home, ["set", "mate", "claude-fable-5"]);
+      assert.equal(alias.code, 0, alias.stderr);
+      assert.match(alias.stdout, /mate = claude\/fable/);
+      assert.deepEqual(state.patches, [{ mateDefaults: { agent: "claude", model: "fable", effort: null } }]);
+
+      state.patches.length = 0;
+      const codex = await runConfig(serverUrl, home, ["set", "dispatch", "gpt-5.6-sol"]);
+      assert.equal(codex.code, 0, codex.stderr);
+      assert.match(codex.stdout, /dispatch = codex\/gpt-5\.6-sol \(low\)/);
+      assert.deepEqual(state.patches, [{
+        dispatchDefaults: { agent: "codex", model: "gpt-5.6-sol", effort: "low" }
+      }]);
+    });
+  } finally {
+    rmSync(home, { recursive: true, force: true });
+  }
+});
+
+test("atomic role selection rejects unknown models, invalid efforts, and non-TTY ambiguity before PATCH", async () => {
+  const home = mkdtempSync(join(tmpdir(), "perch-config-home-"));
+  try {
+    await withStubServer(async (serverUrl, state) => {
+      const unknown = await runConfig(serverUrl, home, ["set", "mate", "fabl"]);
+      assert.equal(unknown.code, 1);
+      assert.match(unknown.stderr, /Closest matches: fable \(claude\)/);
+      assert.match(unknown.stderr, /perch models/);
+
+      const effort = await runConfig(serverUrl, home, ["set", "dispatch", "gpt-5.6-sol", "--effort", "ultra"]);
+      assert.equal(effort.code, 1);
+      assert.match(effort.stderr, /Valid efforts: low, medium, high/);
+
+      const ambiguous = await runConfig(serverUrl, home, ["set", "mate", "shared"]);
+      assert.equal(ambiguous.code, 1);
+      assert.match(ambiguous.stderr, /available for multiple agents.*--agent/);
+      assert.deepEqual(state.patches, []);
+
+      const disambiguated = await runConfig(serverUrl, home, ["set", "mate", "shared", "--agent", "claude"]);
+      assert.equal(disambiguated.code, 0, disambiguated.stderr);
+      assert.deepEqual(state.patches, [{ mateDefaults: { agent: "claude", model: "shared", effort: null } }]);
+    });
+  } finally {
+    rmSync(home, { recursive: true, force: true });
+  }
+});
+
+test("models lists both agents, marks selected roles, emits JSON, and notes an absent provider", async () => {
+  const home = mkdtempSync(join(tmpdir(), "perch-config-home-"));
+  try {
+    await withStubServer(async (serverUrl, state) => {
+      state.mateDefaults = { agent: "claude", model: "fable" };
+      state.defaults = { agent: "codex", model: "gpt-5.6-sol", effort: "low" };
+
+      const table = await runCli(serverUrl, home, ["models"]);
+      assert.equal(table.code, 0, table.stderr);
+      assert.match(table.stdout, /MODEL\s+AGENT\s+EFFORTS\s+ALIASES\s+SOURCE\s+SELECTED/);
+      assert.match(table.stdout, /fable\s+claude\s+-\s+claude-fable-5\s+bundled\s+mate/);
+      assert.match(table.stdout, /gpt-5\.6-sol\s+codex\s+low,medium,high\s+-\s+bundled\s+dispatch/);
+      assert.match(table.stderr, /Note: codex-app-server: codex binary not found/);
+
+      const json = await runCli(serverUrl, home, ["models", "--json"]);
+      assert.equal(json.code, 0, json.stderr);
+      const body = JSON.parse(json.stdout) as {
+        models: Array<{ model: string; source: string; selected: string[] }>;
+        notes: string[];
+      };
+      assert.deepEqual(body.models.find((model) => model.model === "fable")?.selected, ["mate"]);
+      assert.equal(body.models.find((model) => model.model === "fable")?.source, "bundled");
+      assert.deepEqual(body.notes, ["codex-app-server: codex binary not found"]);
+
+      const codexProvider = (state.registry.providers as Array<{
+        provider: string;
+        options: Array<{ runtimeSource?: string }>;
+      }>).find((provider) => provider.provider === "codex");
+      assert.ok(codexProvider);
+      for (const option of codexProvider.options) option.runtimeSource = "codex-app-server";
+      const liveJson = await runCli(serverUrl, home, ["models", "--json"]);
+      assert.equal(liveJson.code, 0, liveJson.stderr);
+      const liveBody = JSON.parse(liveJson.stdout) as { models: Array<{ agent: string; source: string }> };
+      assert.ok(liveBody.models.filter((model) => model.agent === "codex").every((model) => model.source === "live"));
+    });
+  } finally {
+    rmSync(home, { recursive: true, force: true });
+  }
+});
+
+test("config show reports resolved agents and warns without rewriting an invalid tuple", async () => {
+  const home = mkdtempSync(join(tmpdir(), "perch-config-home-"));
+  try {
+    await withStubServer(async (serverUrl, state) => {
+      state.mateDefaults = { agent: "codex", model: "fable", effort: "medium" };
+      const show = await runConfig(serverUrl, home, ["show", "--global"]);
+      assert.equal(show.code, 0, show.stderr);
+      assert.match(show.stdout, /mate\.resolved-agent\s+codex/);
+      assert.match(show.stdout, /mate\.warning\s+invalid codex\/fable tuple; model resolves to claude/);
+      assert.deepEqual(state.patches, []);
     });
   } finally {
     rmSync(home, { recursive: true, force: true });
