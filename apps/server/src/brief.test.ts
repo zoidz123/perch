@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 import type { Task } from "@perch/shared";
 import { dispatchBrief } from "./brief.js";
+import { CHART_CAPABILITY_NOTE } from "./hooks.js";
 
 function task(overrides: Partial<Task> = {}): Task {
   const now = new Date().toISOString();
@@ -88,4 +89,13 @@ test("the brief points chart authoring at the served guide, never a repo path", 
   assert.match(brief, /\$\{PERCH_HOOK_URL%\/hooks\}\/charts\/authoring/);
   // External users have no perch checkout to read.
   assert.ok(!brief.includes("apps/server/assets/charts/AUTHORING.md"));
+});
+
+test("codex worker briefs append the canonical chart note while Claude briefs stay unchanged", () => {
+  const existing = dispatchBrief(task(), "/tmp/wt");
+  const claude = dispatchBrief(task(), "/tmp/wt", {}, "claude");
+  const codex = dispatchBrief(task(), "/tmp/wt", {}, "codex");
+
+  assert.equal(claude, existing);
+  assert.equal(codex, `${claude}\n\n${CHART_CAPABILITY_NOTE}`);
 });

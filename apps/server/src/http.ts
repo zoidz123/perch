@@ -3116,7 +3116,7 @@ async function prepareDispatchLaunch(
     ? { edit: { relativePath: body.planEdit.path, stagedPath: options.tasks.stagePlanEdit(task.id, body.planEdit.content) } }
     : {};
   const prompt = body.prompt?.trim() || task.title;
-  const kickoff = prompt + dispatchBrief(task, lease.path, planBrief);
+  const kickoff = prompt + dispatchBrief(task, lease.path, planBrief, agent);
   const request: StartAgentRequest = {
     command: agent,
     agent,
@@ -4729,9 +4729,9 @@ async function handleHookReport(
     // SessionStart answers with Claude hook output carrying the capability
     // note: the installed SessionStart hook echoes this body to stdout and
     // Claude injects additionalContext, so solo agents learn charts exist
-    // with zero setup. Append-only on the wire: older installed hooks (and
-    // all codex hooks - codex gets the note via ~/.codex/AGENTS.md) discard
-    // the body, so gaining one is harmless.
+    // with zero setup. Append-only on the wire: older installed hooks and all
+    // codex hooks discard the body, so gaining one is harmless. Codex task
+    // workers receive the same note in their dispatch brief.
     if (eventName === "SessionStart") {
       writeJson(response, 200, {
         hookSpecificOutput: { hookEventName: "SessionStart", additionalContext: CHART_CAPABILITY_NOTE }

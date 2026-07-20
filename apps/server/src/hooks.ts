@@ -75,12 +75,11 @@ const CLAUDE_QUESTION_HOOK_COMMAND =
 const CLAUDE_PLAN_HOOK_COMMAND = CLAUDE_QUESTION_HOOK_COMMAND.replaceAll("question", "plan decision");
 const CLAUDE_ELICITATION_HOOK_COMMAND = CLAUDE_QUESTION_HOOK_COMMAND.replaceAll("question", "MCP interaction");
 
-// The capability note delivered to every solo perch session (mate and crew get
-// richer chart briefings elsewhere): Claude receives it as SessionStart
-// additionalContext through the hook above; codex reads it from the perch-
-// managed block in ~/.codex/AGENTS.md. Lives server-side so it versions with
-// the server, and points at the served authoring guide - external users have
-// no perch repo checkout to read.
+// The capability note delivered to every perch session that needs it: Claude
+// receives it as SessionStart additionalContext through the hook above; codex
+// task workers receive it in their dispatch brief. Lives server-side so it
+// versions with the server, and points at the served authoring guide - external
+// users have no perch repo checkout to read.
 export const CHART_CAPABILITY_NOTE = [
   "You are running under perch: the boss watches and steers this session from a phone or another desktop.",
   "When a deliverable is easier reviewed visually than as prose - a plan, a comparison, findings - you can draw a chart: one HTML file the boss reviews and annotates on phone or desktop.",
@@ -347,8 +346,8 @@ export function installCodexHooks(env: NodeJS.ProcessEnv = process.env): boolean
     const entries = [...(hooks[event] ?? [])];
     const withoutPerch = entries.filter((entry) => !isPerchEntry(entry));
     // Codex hooks keep discarding output (including the SessionStart response
-    // body meant for Claude); codex gets the capability note through the
-    // perch-managed ~/.codex/AGENTS.md block instead.
+    // body meant for Claude); codex task workers get the capability note in
+    // their dispatch brief instead.
     const perchEntry: HookEntry = {
       hooks: [{ type: "command", command: HOOK_COMMAND, timeout: CODEX_HOOK_TIMEOUT_SEC }]
     };
@@ -363,57 +362,46 @@ export function installCodexHooks(env: NodeJS.ProcessEnv = process.env): boolean
     writeFileAtomic(hooksPath, `${JSON.stringify({ ...file, hooks }, null, 2)}\n`);
   }
 
-  // Refresh the instructions block alongside the hooks: best-effort (a failed
-  // note write must never block hook installation or trust persistence).
-  writeCodexAgentsNote(home);
+  // Clean up the instructions block installed by older perch versions. This is
+  // best-effort: a failed migration must never block hook installation or
+  // trust persistence.
+  removeCodexAgentsNote(home);
 
   return writeCodexTrust(home, hooksPath, hooks);
 }
 
-// Maintains the perch-managed block in ~/.codex/AGENTS.md - codex prepends
-// that file to any project AGENTS.md, so this is how solo codex sessions learn
-// the chart capability. Marker-based like the trust block: replace only
-// between the markers, never touch user text outside them, create the file if
-// absent. No trust hash needed (instructions, not a hook). The block's first
-// line self-gates on PERCH_SESSION_ID so it is inert outside perch terminals.
-function writeCodexAgentsNote(home: string): void {
+// Removes blocks installed by older perch versions from ~/.codex/AGENTS.md.
+// Text outside complete marker pairs remains byte-identical. A file without a
+// complete perch block is never written.
+function removeCodexAgentsNote(home: string): void {
   const path = join(home, "AGENTS.md");
-  let current = "";
-  if (existsSync(path)) {
-    try {
-      current = readFileSync(path, "utf8");
-    } catch {
-      return;
-    }
+  if (!existsSync(path)) {
+    return;
   }
 
-  const block = [
-    CODEX_AGENTS_BEGIN,
-    "This perch-managed block applies ONLY when PERCH_SESSION_ID is set in your environment; if it is not set, ignore everything up to the perch end marker.",
-    CHART_CAPABILITY_NOTE,
-    CODEX_AGENTS_END
-  ].join("\n");
-
-  let next: string;
-  const begin = current.indexOf(CODEX_AGENTS_BEGIN);
-  const end = begin >= 0 ? current.indexOf(CODEX_AGENTS_END, begin + CODEX_AGENTS_BEGIN.length) : -1;
-  if (begin >= 0 && end >= 0) {
-    next = current.slice(0, begin) + block + current.slice(end + CODEX_AGENTS_END.length);
-  } else if (begin >= 0) {
-    // Best-effort: an orphaned begin marker means appending a second block could
-    // make a later run replace user text between the old begin and new end.
+  let current: string;
+  try {
+    current = readFileSync(path, "utf8");
+  } catch {
     return;
-  } else if (current.length > 0) {
-    next = `${current.replace(/\n*$/, "\n\n")}${block}\n`;
-  } else {
-    next = `${block}\n`;
+  }
+
+  let next = current;
+  let begin = next.indexOf(CODEX_AGENTS_BEGIN);
+  while (begin >= 0) {
+    const end = next.indexOf(CODEX_AGENTS_END, begin + CODEX_AGENTS_BEGIN.length);
+    if (end < 0) {
+      break;
+    }
+    next = next.slice(0, begin) + next.slice(end + CODEX_AGENTS_END.length);
+    begin = next.indexOf(CODEX_AGENTS_BEGIN, begin);
   }
 
   if (next !== current) {
     try {
       writeFileAtomic(path, next);
     } catch {
-      // AGENTS.md is advisory. Hook installation and trust persistence must
+      // Migration is advisory. Hook installation and trust persistence must
       // continue even if this write fails.
     }
   }
