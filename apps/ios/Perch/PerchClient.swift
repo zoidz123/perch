@@ -63,7 +63,14 @@ final class PerchStore: ObservableObject {
     }
     // Bumped when lastSeen changes so attention dots re-derive.
     @Published private(set) var seenVersion = 0
-    @Published var connectionState = "Disconnected"
+    // Raw socket state changes can arrive several times per second when a
+    // relay registration flaps. Do not publish those changes through the
+    // shared store: doing so invalidates the entire home screen. Only the
+    // hysteresis-filtered availability below is UI state.
+    private(set) var connectionState = "Disconnected" {
+        didSet { observeConnectionState() }
+    }
+    @Published private(set) var presentedServerAvailability: PresentedServerAvailability = .online
     @Published var errorMessage: String?
     @Published var isLoading = false
     // Local usage/credit snapshot (Claude + Codex), read on the Mac.
@@ -105,6 +112,8 @@ final class PerchStore: ObservableObject {
     private var reconnectTask: Task<Void, Never>?
     private var reconnectAttempts = 0
     private var keepaliveTask: Task<Void, Never>?
+    private var connectionPresentationTask: Task<Void, Never>?
+    private var connectionStatusHysteresis = ConnectionStatusHysteresis()
     private var selectionToken: UUID?
     // Encrypted transport state (nil on the legacy plaintext path). The channel
     // is recreated per socket; e2eeRetryTask re-sends e2ee_hello until the
@@ -134,7 +143,29 @@ final class PerchStore: ObservableObject {
     }
 
     var isServerLive: Bool {
-        connectionState == "Live"
+        presentedServerAvailability == .online
+    }
+
+    private func observeConnectionState() {
+        let now = ProcessInfo.processInfo.systemUptime
+        if connectionStatusHysteresis.observe(isLive: connectionState == "Live", at: now) {
+            presentedServerAvailability = connectionStatusHysteresis.presentedAvailability
+        }
+
+        connectionPresentationTask?.cancel()
+        guard let deadline = connectionStatusHysteresis.offlineDeadline else {
+            connectionPresentationTask = nil
+            return
+        }
+        let delay = max(0, deadline - now)
+        connectionPresentationTask = Task { [weak self] in
+            try? await Task.sleep(for: .seconds(delay))
+            guard let self, !Task.isCancelled else { return }
+            if self.connectionStatusHysteresis.advance(to: ProcessInfo.processInfo.systemUptime) {
+                self.presentedServerAvailability = self.connectionStatusHysteresis.presentedAvailability
+            }
+            self.connectionPresentationTask = nil
+        }
     }
 
     private var activeEndpoint: SavedEndpoint? {

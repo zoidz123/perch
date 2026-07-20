@@ -477,8 +477,7 @@ const relayClient = config.relayUrl
     })
   : undefined;
 if (relayClient) {
-  console.log(`relay: dialing ${config.relayUrl} for off-LAN reach`);
-  relayClient.start();
+  console.log(`relay: ready to dial ${config.relayUrl} after the local port is owned`);
 } else {
   console.log("relay: disabled (LAN-only; unset PERCH_RELAY_URL to use the default relay)");
 }
@@ -489,6 +488,13 @@ if (relayClient) {
 
 server.listen(config.port, "0.0.0.0", () => {
   writePidFile();
+  // Owning the HTTP port is the process-level single-instance guard. Start
+  // relay traffic only after the bind succeeds so a duplicate process that
+  // loses EADDRINUSE cannot register the same Mac remotely while it exits.
+  if (relayClient) {
+    console.log(`relay: dialing ${config.relayUrl} for off-LAN reach`);
+    relayClient.start();
+  }
   // Retire daemons orphaned by a non-graceful previous exit before any launch
   // can acquire new ones (acquires only happen via HTTP handlers, so post-bind
   // is still pre-first-acquire): their session-scoped hook credentials are

@@ -586,7 +586,7 @@ struct HomeView: View {
                 .controlSize(.small)
                 .tint(Style.warningText)
             VStack(alignment: .leading, spacing: 1) {
-                Text(store.connectionState.hasPrefix("Reconnecting") ? "Reconnecting" : "Mac offline")
+                Text("Mac offline")
                     .font(.system(size: 13, weight: .semibold))
                     .foregroundStyle(Style.textPrimary)
                 Text("Showing the last server snapshot")
