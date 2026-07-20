@@ -786,6 +786,19 @@ test("POST /hooks answers SessionStart and Claude Stop records turn completion e
     assert.match(note, /\.charts\/<slug>\.html/);
     assert.match(note, /\[perch chart\]/);
 
+    adapter.sessions = [liveSession("pty:worker", { agent: "codex", title: "codex" })];
+    const codexStart = await report({
+      session_id: "codex-agent-1",
+      cwd: "/tmp/repo",
+      hook_event_name: "SessionStart",
+      source: "startup"
+    });
+    assert.equal(codexStart.status, 200);
+    assert.deepEqual(await codexStart.json(), {
+      hookSpecificOutput: { hookEventName: "SessionStart", additionalContext: note }
+    });
+    adapter.sessions = [liveSession("pty:worker")];
+
     const turnStart = await report({ hook_event_name: "UserPromptSubmit" });
     assert.deepEqual((await turnStart.json()) as object, { ok: true });
     tasks.recordEvent(task.id, { kind: "working", source: "worker", message: "still working" });

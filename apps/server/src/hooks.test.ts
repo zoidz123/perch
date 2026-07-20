@@ -7,7 +7,6 @@ import { test } from "node:test";
 import { createHash } from "node:crypto";
 import {
   applyPerchUninstall,
-  claudeHookShimContent,
   claudeSettingsPath,
   codexHookHash,
   findCodexRollout,
@@ -16,6 +15,7 @@ import {
   installCodexHooks,
   isAllowedTranscriptPath,
   normalizeHookEvent,
+  perchHookShimContent,
   perchHookPath,
   planPerchUninstall
 } from "./hooks.js";
@@ -26,6 +26,10 @@ function makeEnv(settings?: object): NodeJS.ProcessEnv {
     writeFileSync(join(dir, "settings.json"), JSON.stringify(settings, null, 2));
   }
   return { CLAUDE_CONFIG_DIR: dir, PERCH_HOME: join(dir, ".perch") };
+}
+
+function makeCodexEnv(home: string): NodeJS.ProcessEnv {
+  return { CODEX_HOME: home, PERCH_HOME: join(home, "perch-home") };
 }
 
 test("installs hook entries for every event, idempotently, preserving user hooks", () => {
@@ -122,7 +126,7 @@ test("migrates inline commands to a shim that preserves event semantics", () => 
   }
 
   const shim = readFileSync(perchHookPath(env), "utf8");
-  assert.equal(shim, claudeHookShimContent());
+  assert.equal(shim, perchHookShimContent());
   assert.equal(statSync(perchHookPath(env)).mode & 0o777, 0o700);
   assert.match(shim, /--max-time 3/);
   assert.match(shim, /--max-time 570/);
@@ -158,7 +162,7 @@ test("updating only shim logic does not rewrite Claude settings", () => {
 
   assert.equal(installClaudeHooks(env), true);
   assert.equal(readFileSync(claudeSettingsPath(env), "utf8"), settings);
-  assert.equal(readFileSync(perchHookPath(env), "utf8"), claudeHookShimContent());
+  assert.equal(readFileSync(perchHookPath(env), "utf8"), perchHookShimContent());
 
   rmSync(env.CLAUDE_CONFIG_DIR as string, { recursive: true, force: true });
 });
@@ -414,9 +418,9 @@ test("codex hook hash matches the codex-rs fingerprint formula", () => {
   assert.equal(hash, `sha256:${expected}`);
 });
 
-test("codex hook installer is idempotent and writes trust hashes", () => {
+test("codex SessionStart uses the echo shim and writes its matching trust hash", () => {
   const home = mkdtempSync(join(tmpdir(), "perch-codex-"));
-  const env = { CODEX_HOME: home } as NodeJS.ProcessEnv;
+  const env = makeCodexEnv(home);
   writeFileSync(join(home, "config.toml"), "[features]\nmemories = true\n");
 
   assert.equal(installCodexHooks(env), true);
@@ -426,6 +430,16 @@ test("codex hook installer is idempotent and writes trust hashes", () => {
   assert.match(config, /perch-codex-trust begin/);
   assert.match(config, /hooks\.state\."[^"]+:session_start:0:0"/);
   assert.match(config, /trusted_hash = "sha256:[0-9a-f]{64}"/);
+
+  const installed = JSON.parse(first);
+  const sessionStartCommand = installed.hooks.SessionStart[0].hooks[0].command as string;
+  const telemetryCommand = installed.hooks.UserPromptSubmit[0].hooks[0].command as string;
+  assert.equal(sessionStartCommand, `'${perchHookPath(env)}' session-start`);
+  assert.match(telemetryCommand, />\/dev\/null 2>&1/);
+  assert.notEqual(sessionStartCommand, telemetryCommand);
+  assert.equal(readFileSync(perchHookPath(env), "utf8"), perchHookShimContent());
+  const sessionStartHash = codexHookHash("session_start", sessionStartCommand, 10);
+  assert.match(config, new RegExp(`session_start:0:0"\\]\\ntrusted_hash = "${sessionStartHash}"`));
 
   // Re-run: no drift.
   assert.equal(installCodexHooks(env), true);
@@ -444,7 +458,7 @@ test("codex hook installer is idempotent and writes trust hashes", () => {
 
 test("codex installer does not create ~/.codex/AGENTS.md", () => {
   const home = mkdtempSync(join(tmpdir(), "perch-codex-agents-"));
-  const env = { CODEX_HOME: home } as NodeJS.ProcessEnv;
+  const env = makeCodexEnv(home);
 
   assert.equal(installCodexHooks(env), true);
   assert.equal(existsSync(join(home, "AGENTS.md")), false);
@@ -454,7 +468,7 @@ test("codex installer does not create ~/.codex/AGENTS.md", () => {
 
 test("codex installer removes existing perch blocks and preserves every other byte", () => {
   const home = mkdtempSync(join(tmpdir(), "perch-codex-agents-up-"));
-  const env = { CODEX_HOME: home } as NodeJS.ProcessEnv;
+  const env = makeCodexEnv(home);
   const prefix = "# My global rules\r\n\r\n";
   const suffix = "\n\nTrailing user text.\n";
   writeFileSync(join(home, "AGENTS.md"), `${prefix}<!-- perch begin -->\nan old perch note\n<!-- perch end -->${suffix}`);
@@ -468,7 +482,7 @@ test("codex installer removes existing perch blocks and preserves every other by
 
 test("codex installer leaves an AGENTS.md without perch markers untouched", () => {
   const home = mkdtempSync(join(tmpdir(), "perch-codex-agents-user-"));
-  const env = { CODEX_HOME: home } as NodeJS.ProcessEnv;
+  const env = makeCodexEnv(home);
   const original = "# My global rules\r\n\r\nKeep my exact bytes.\n";
   writeFileSync(join(home, "AGENTS.md"), original);
   // A write would collide with this sentinel, proving the no-marker path does
@@ -483,7 +497,7 @@ test("codex installer leaves an AGENTS.md without perch markers untouched", () =
 
 test("codex AGENTS.md block leaves an orphaned begin marker untouched", () => {
   const home = mkdtempSync(join(tmpdir(), "perch-codex-agents-orphan-"));
-  const env = { CODEX_HOME: home } as NodeJS.ProcessEnv;
+  const env = makeCodexEnv(home);
   const original = "# My global rules\n\n<!-- perch begin -->\nUser text after an orphaned marker.\n";
   writeFileSync(join(home, "AGENTS.md"), original);
 
@@ -497,7 +511,7 @@ test("codex AGENTS.md block leaves an orphaned begin marker untouched", () => {
 
 test("codex AGENTS.md migration failure does not block trust persistence", () => {
   const home = mkdtempSync(join(tmpdir(), "perch-codex-agents-fail-"));
-  const env = { CODEX_HOME: home } as NodeJS.ProcessEnv;
+  const env = makeCodexEnv(home);
   const original = "# My global rules\n<!-- perch begin -->\nold note\n<!-- perch end -->\n";
   writeFileSync(join(home, "AGENTS.md"), original);
   mkdirSync(join(home, "AGENTS.md.perch-tmp"));
@@ -512,7 +526,7 @@ test("codex AGENTS.md migration failure does not block trust persistence", () =>
 
 test("codex hook installer reuses a [features] header with a trailing comment", () => {
   const home = mkdtempSync(join(tmpdir(), "perch-codex-cmt-"));
-  const env = { CODEX_HOME: home } as NodeJS.ProcessEnv;
+  const env = makeCodexEnv(home);
   writeFileSync(join(home, "config.toml"), "[ features ] # user notes\nmemories = true\n");
 
   assert.equal(installCodexHooks(env), true);
@@ -526,7 +540,7 @@ test("codex hook installer reuses a [features] header with a trailing comment", 
 test("codex hook installer respects hooks = false", () => {
   const home = mkdtempSync(join(tmpdir(), "perch-codex-off-"));
   writeFileSync(join(home, "config.toml"), "[features]\nhooks = false\n");
-  assert.equal(installCodexHooks({ CODEX_HOME: home } as NodeJS.ProcessEnv), false);
+  assert.equal(installCodexHooks(makeCodexEnv(home)), false);
   rmSync(home, { recursive: true, force: true });
 });
 
@@ -561,7 +575,7 @@ test("findCodexRollout locates rollouts by session id in date dirs", () => {
   mkdirSync(day, { recursive: true });
   const file = join(day, "rollout-2026-07-02T10-00-00-0199ffff-aaaa-bbbb.jsonl");
   writeFileSync(file, "");
-  const env = { CODEX_HOME: home } as NodeJS.ProcessEnv;
+  const env = makeCodexEnv(home);
   assert.equal(findCodexRollout("0199ffff-aaaa-bbbb", env), file);
   assert.equal(findCodexRollout("missing", env), undefined);
   rmSync(home, { recursive: true, force: true });
@@ -580,7 +594,7 @@ test("findCodexRollout searches days back for older sessions", () => {
   mkdirSync(day, { recursive: true });
   const file = join(day, "rollout-2026-06-30T10-00-00-0199ffff-cccc-dddd.jsonl");
   writeFileSync(file, "");
-  const env = { CODEX_HOME: home } as NodeJS.ProcessEnv;
+  const env = makeCodexEnv(home);
   assert.equal(findCodexRollout("0199ffff-cccc-dddd", env), file);
   rmSync(home, { recursive: true, force: true });
 });

@@ -4726,12 +4726,10 @@ async function handleHookReport(
       return;
     }
 
-    // SessionStart answers with Claude hook output carrying the capability
-    // note: the installed SessionStart hook echoes this body to stdout and
-    // Claude injects additionalContext, so solo agents learn charts exist
-    // with zero setup. Append-only on the wire: older installed hooks and all
-    // codex hooks discard the body, so gaining one is harmless. Codex task
-    // workers receive the same note in their dispatch brief.
+    // SessionStart answers with the Claude-compatible shape that current Codex
+    // also documents. Both installed SessionStart hooks echo this body to
+    // stdout, so solo agents receive the note as developer context. Codex task
+    // workers keep the same note in their dispatch brief.
     if (eventName === "SessionStart") {
       writeJson(response, 200, {
         hookSpecificOutput: { hookEventName: "SessionStart", additionalContext: CHART_CAPABILITY_NOTE }
