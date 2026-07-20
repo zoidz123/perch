@@ -185,6 +185,10 @@ export type HttpServerOptions = {
   // Codex `--remote` control plane. Absent (or with no acquirable daemon) means
   // every Codex session runs on the plain PTY path and the model chip is off.
   codexControl?: CodexControlPlane;
+  // Launch-time hook reinstaller (see ManagedAgentLauncherOptions.installHooks).
+  // Wired to the real installers by the entrypoint; absent in test fixtures so
+  // tests never rewrite real provider config.
+  installHooks?: (agent: AgentKind) => void;
   taskCompletion?: TaskCompletionReconciler;
   // Charts (artifact review): registry + watchers behind the /charts routes.
   charts?: ChartRegistry;

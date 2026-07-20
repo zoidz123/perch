@@ -444,6 +444,17 @@ const server = createControlServer({
   prPoller,
   claudeStateFile: claudeStateFilePath(),
   codexControl,
+  // Re-assert perch's hook entries at every launch: an external rewrite of
+  // ~/.claude/settings.json (any tool persisting from a stale snapshot) would
+  // otherwise silence hooks for all sessions launched after it until the next
+  // server boot.
+  installHooks: (agent) => {
+    if (agent === "claude") {
+      installClaudeHooks();
+    } else if (agent === "codex") {
+      installCodexHooks();
+    }
+  },
   taskCompletion,
   metrics,
   charts,

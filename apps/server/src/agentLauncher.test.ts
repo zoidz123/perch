@@ -2,17 +2,18 @@ import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { EventEmitter } from "node:events";
-import { existsSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import type { AddressInfo } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
-import type { AgentSession, FleetEvent, PendingServerRequest, RecentEventsResult, ServerRequestResponse, StartAgentRequest } from "@perch/shared";
+import type { AgentKind, AgentSession, FleetEvent, PendingServerRequest, RecentEventsResult, ServerRequestResponse, StartAgentRequest } from "@perch/shared";
 import type { AgentAdapter } from "./adapters/types.js";
 import type { CodexControlPlane } from "./codexControl.js";
 import { AuditLog } from "./audit.js";
 import { FleetMonitor } from "./fleetMonitor.js";
-import { HookRegistry } from "./hooks.js";
+import { HookRegistry, installClaudeHooks, perchHookPath } from "./hooks.js";
+import { RuntimeManager } from "./runtimeManager.js";
 import { createControlServer, handleWebSocketRpcRequest } from "./http.js";
 import { DeviceRegistry } from "./pairing.js";
 import { PrPoller } from "./prPoller.js";
@@ -231,6 +232,10 @@ function fixture(durableBoundary?: "afterLaunch" | "durable") {
     settings: new FleetSettings(env),
     codexControl: control as unknown as CodexControlPlane,
     codexOnPath: () => true,
+    // Individual tests opt in by assigning these; absent means no runtime
+    // ledger and no hook reinstall side effects.
+    runtimeManager: undefined as RuntimeManager | undefined,
+    installHooks: undefined as ((agent: AgentKind) => void) | undefined,
     ...(taskScheduler ? { taskScheduler } : {})
   };
   const server = createControlServer(options);
@@ -732,6 +737,179 @@ test("dispatching a Codex worker never touches the Claude state file", async () 
     assert.equal(response.status, 201, await response.text());
     assert.ok(fx.adapter.requests[0]?.cwd, "codex worker launched into a pool worktree");
     assert.equal(existsSync(join(fx.home, ".claude.json")), false);
+  } finally {
+    await fx.cleanup(repo);
+  }
+});
+
+// The production outage this guards against: hook delivery silently died (an
+// external rewrite of ~/.claude/settings.json dropped perch's entries), so no
+// SessionStart ever correlated a transcript and the timelines of two workers
+// dispatched in the same second stayed empty while both were productive. The
+// launcher now pre-mints the Claude session id (--session-id) and attaches the
+// tailer to the derived transcript path at launch, so every timeline populates
+// - including rows written before the file even existed at attach time - with
+// zero hook events delivered.
+test("concurrent Claude dispatches attach every timeline without any hook event", async () => {
+  const fx = fixture();
+  const repo = makeRepo();
+  const claudeDir = mkdtempSync(join(tmpdir(), "perch-claude-config-"));
+  const priorConfigDir = process.env.CLAUDE_CONFIG_DIR;
+  process.env.CLAUDE_CONFIG_DIR = claudeDir;
+  fx.options.runtimeManager = new RuntimeManager(fx.options.tasks);
+  const baseUrl = await listen(fx.server, fx.options);
+
+  try {
+    const responses = await Promise.all(
+      [1, 2, 3].map((n) =>
+        fetch(`${baseUrl}/tasks`, {
+          ...authed,
+          method: "POST",
+          body: JSON.stringify({ title: `worker ${n}`, project: repo, dispatch: true, agent: "claude", prompt: `go ${n}` })
+        })
+      )
+    );
+    for (const response of responses) {
+      assert.equal(response.status, 201, await response.clone().text());
+    }
+    assert.equal(fx.adapter.requests.length, 3);
+
+    const launches = fx.adapter.requests.map((request, index) => {
+      const flagIndex = request.args?.indexOf("--session-id") ?? -1;
+      assert.ok(flagIndex >= 0, "every fresh Claude launch pre-mints --session-id");
+      const uuid = request.args![flagIndex + 1]!;
+      assert.equal(`pty:${uuid}`, request.sessionId, "provider id and PTY id share the minted uuid");
+      // The runtime knows its provider session from launch, not only after a
+      // SessionStart hook - so recovery never reports provider_session_unknown.
+      const runtime = fx.options.tasks.stateDb.runtimes.findBySession(request.sessionId!);
+      assert.equal(runtime?.providerSessionId, uuid);
+      // Claude creates the transcript only after the process starts; write it
+      // AFTER dispatch returned to prove late attachment plus backfill.
+      const projectDir = join(claudeDir, "projects", realpathSync(request.cwd!).replace(/[^a-zA-Z0-9]/g, "-"));
+      mkdirSync(projectDir, { recursive: true });
+      const at = new Date().toISOString();
+      writeFileSync(
+        join(projectDir, `${uuid}.jsonl`),
+        [
+          JSON.stringify({ type: "user", uuid: `u-${index}`, timestamp: at, message: { role: "user", content: `kickoff ${index}` } }),
+          JSON.stringify({
+            type: "assistant",
+            uuid: `a-${index}`,
+            timestamp: at,
+            message: { role: "assistant", model: "claude-fable-5", content: [{ type: "text", text: `progress ${index}` }] }
+          })
+        ].join("\n") + "\n"
+      );
+      return { sessionId: request.sessionId!, index };
+    });
+
+    // The tailer discovers the late-created files on its poll cadence (1s).
+    const deadline = Date.now() + 10_000;
+    for (const launch of launches) {
+      let items: Array<{ kind: string; text?: string }> = [];
+      while (Date.now() < deadline) {
+        const timeline = await fetch(`${baseUrl}/sessions/${encodeURIComponent(launch.sessionId)}/timeline`, authed);
+        assert.equal(timeline.status, 200);
+        items = ((await timeline.json()) as { items: Array<{ kind: string; text?: string }> }).items;
+        if (items.length >= 2) break;
+        await tick(100);
+      }
+      assert.ok(
+        items.some((item) => item.kind === "user" && item.text === `kickoff ${launch.index}`),
+        `session ${launch.sessionId} backfilled its pre-attach kickoff row`
+      );
+      assert.ok(
+        items.some((item) => item.kind === "assistant" && item.text === `progress ${launch.index}`),
+        `session ${launch.sessionId} tailed its assistant row`
+      );
+      // The watchdog's idle detection reads the same feed; a populated
+      // timeline is exactly what stops the false "no activity since launch".
+      assert.ok(fx.options.timeline.lastActivityAt(launch.sessionId), "activity feed sees the tailed rows");
+    }
+  } finally {
+    if (priorConfigDir === undefined) delete process.env.CLAUDE_CONFIG_DIR;
+    else process.env.CLAUDE_CONFIG_DIR = priorConfigDir;
+    await fx.cleanup(repo, claudeDir);
+  }
+});
+
+test("a Claude launch reinstalls perch hook entries clobbered by an external settings rewrite", async () => {
+  const fx = fixture();
+  const repo = makeRepo();
+  const claudeDir = mkdtempSync(join(tmpdir(), "perch-claude-config-"));
+  const priorConfigDir = process.env.CLAUDE_CONFIG_DIR;
+  const priorHome = process.env.PERCH_HOME;
+  process.env.CLAUDE_CONFIG_DIR = claudeDir;
+  process.env.PERCH_HOME = fx.home;
+  fx.options.installHooks = (agent) => {
+    if (agent === "claude") installClaudeHooks();
+  };
+  const baseUrl = await listen(fx.server, fx.options);
+  // An external tool rewrote settings.json from a stale snapshot: user entries
+  // survive, perch's are gone. Boot-time installation cannot heal this.
+  writeFileSync(
+    join(claudeDir, "settings.json"),
+    JSON.stringify({
+      hooks: { SessionStart: [{ matcher: "", hooks: [{ type: "command", command: "user-tool", timeout: 10 }] }] }
+    })
+  );
+
+  try {
+    const response = await fetch(`${baseUrl}/tasks`, {
+      ...authed,
+      method: "POST",
+      body: JSON.stringify({ title: "healed", project: repo, dispatch: true, agent: "claude", prompt: "go" })
+    });
+    assert.equal(response.status, 201, await response.text());
+    const settings = JSON.parse(readFileSync(join(claudeDir, "settings.json"), "utf8")) as {
+      hooks: Record<string, Array<{ hooks: Array<{ command: string }> }>>;
+    };
+    const sessionStart = settings.hooks.SessionStart ?? [];
+    assert.ok(
+      sessionStart.some((entry) => entry.hooks.some((hook) => hook.command === "user-tool")),
+      "the user's own hook entry survives the reinstall"
+    );
+    assert.ok(
+      sessionStart.some((entry) => entry.hooks.some((hook) => hook.command.includes(perchHookPath()))),
+      "perch's SessionStart entry is restored before the worker spawns"
+    );
+    assert.ok(settings.hooks.Stop, "the full perch hook set is restored");
+  } finally {
+    if (priorConfigDir === undefined) delete process.env.CLAUDE_CONFIG_DIR;
+    else process.env.CLAUDE_CONFIG_DIR = priorConfigDir;
+    if (priorHome === undefined) delete process.env.PERCH_HOME;
+    else process.env.PERCH_HOME = priorHome;
+    await fx.cleanup(repo, claudeDir);
+  }
+});
+
+test("resumed Claude launches keep their provider identity (no --session-id)", async () => {
+  const fx = fixture();
+  const repo = makeRepo();
+  const baseUrl = await listen(fx.server, fx.options);
+
+  try {
+    const resumed = await fetch(`${baseUrl}/agents/pty`, {
+      ...authed,
+      method: "POST",
+      body: JSON.stringify({ command: "claude", agent: "claude", cwd: repo, args: ["--resume", "abc-123"] })
+    });
+    assert.equal(resumed.status, 201, await resumed.text());
+    assert.ok(
+      !fx.adapter.requests[0]?.args?.includes("--session-id"),
+      "a resume keeps the provider-owned session id"
+    );
+
+    const fresh = await fetch(`${baseUrl}/agents/pty`, {
+      ...authed,
+      method: "POST",
+      body: JSON.stringify({ command: "claude", agent: "claude", cwd: repo })
+    });
+    assert.equal(fresh.status, 201, await fresh.text());
+    const args = fx.adapter.requests[1]?.args ?? [];
+    const flagIndex = args.indexOf("--session-id");
+    assert.ok(flagIndex >= 0, "a plain solo launch still pre-mints its session id");
+    assert.equal(`pty:${args[flagIndex + 1]}`, fx.adapter.sessions[1]?.id);
   } finally {
     await fx.cleanup(repo);
   }

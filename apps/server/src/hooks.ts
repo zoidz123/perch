@@ -706,6 +706,30 @@ function writeCodexTrust(
   return true;
 }
 
+// The transcript Claude Code will write for a session launched with
+// `--session-id <uuid>` in `cwd`: <config>/projects/<munged cwd>/<uuid>.jsonl,
+// where the project dir is the session's working directory with every
+// non-alphanumeric byte replaced by "-". Claude munges its own process cwd,
+// which the kernel resolves to the physical path, so symlinked launch dirs
+// (e.g. /tmp on macOS) must be realpathed before munging. Knowing this path at
+// launch is what makes timeline tailing hook-independent: the tailer polls for
+// the file's creation and backfills it from the start, so attachment survives
+// lost or uninstalled hooks entirely.
+export function claudeTranscriptPath(
+  cwd: string,
+  claudeSessionId: string,
+  env: NodeJS.ProcessEnv = process.env
+): string {
+  const configDir = env.CLAUDE_CONFIG_DIR ?? join(homedir(), ".claude");
+  let physical: string;
+  try {
+    physical = realpathSync(resolve(cwd));
+  } catch {
+    physical = resolve(cwd);
+  }
+  return join(configDir, "projects", physical.replace(/[^a-zA-Z0-9]/g, "-"), `${claudeSessionId}.jsonl`);
+}
+
 // Locates the rollout transcript for a codex session id. The filename embeds
 // the id (rollout-<timestamp>-<session_id>.jsonl) under date-sharded dirs, so
 // this scans the most recent date directories only.
