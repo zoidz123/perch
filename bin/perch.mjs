@@ -648,7 +648,7 @@ async function fetchConfig(options, project) {
 }
 
 async function fetchModels(options) {
-  const response = await fetch(httpUrl(options, "/models"), { headers: jsonHeaders(options) });
+  const response = await fetch(httpUrl(options, "/models?claude=bundled"), { headers: jsonHeaders(options) });
   if (!response.ok) throw new Error(await responseError(response));
   return response.json();
 }
@@ -676,9 +676,10 @@ async function runModelsCommand(args, options) {
     model.agent,
     model.efforts.length ? model.efforts.join(",") : "-",
     model.aliases.length ? model.aliases.join(",") : "-",
+    model.source,
     model.selected.length ? model.selected.join(",") : "-"
   ]);
-  printTable(["MODEL", "AGENT", "EFFORTS", "ALIASES", "SELECTED"], tableRows);
+  printTable(["MODEL", "AGENT", "EFFORTS", "ALIASES", "SOURCE", "SELECTED"], tableRows);
   for (const note of notes) console.error(`Note: ${note}`);
 }
 
@@ -690,6 +691,7 @@ function modelInventory(registry, config) {
   const rows = [];
   for (const provider of registry.providers ?? []) {
     for (const entry of provider.options ?? []) {
+      if (entry.status === "unknown") continue;
       const model = entry.runtimeId ?? entry.id;
       const aliases = modelAliases(entry, model);
       rows.push({
@@ -697,6 +699,7 @@ function modelInventory(registry, config) {
         agent: provider.provider,
         efforts: entry.supportedReasoningEfforts ?? [],
         aliases,
+        source: entry.runtimeSource === "codex-app-server" ? "live" : "bundled",
         selected: Object.entries(selected)
           .filter(([, value]) => value?.agent === provider.provider && [model, ...aliases].includes(value?.model))
           .map(([role]) => role)

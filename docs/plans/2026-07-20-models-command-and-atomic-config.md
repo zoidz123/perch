@@ -11,9 +11,11 @@ Keep existing configuration files and dotted-key commands compatible while makin
 
 ## Model inventory
 
-`perch models` combines Perch's existing model registry with live discovery from installed provider CLIs where supported.
-Provider discovery failures never fail the command and instead produce a note identifying the missing or unsupported source.
-The default table shows model id, agent, supported effort levels, aliases, and the current mate or dispatch selection.
+`perch models` combines the bundled Claude `CLAUDE_ALIAS_CATALOG` with Codex live app-server discovery and its existing static fallback.
+Claude model listing never invokes the Claude CLI, an external API, or a gateway.
+Codex discovery failures never fail the command and instead produce a note identifying the missing or unsupported source.
+The default table shows model id, agent, supported effort levels, aliases, source, and the current mate or dispatch selection.
+Each row labels its source as live or bundled.
 `perch models --json` returns the same inventory and source notes as structured data for scripts.
 
 ## Atomic role selection
@@ -42,6 +44,6 @@ Run the focused CLI and model tests, the full server suite, relevant build and l
 
 ## Risks and open questions
 
-Live provider output can change shape, so discovery must remain isolated behind the existing registry parsers and preserve fallback source notes.
+Live Codex output can change shape, so discovery must remain isolated behind the existing registry parser and preserve fallback source notes.
 Aliases shared across agents require deterministic ambiguity handling without guessing in non-interactive use.
 Compatibility reporting must diagnose invalid historical tuples without mutating user-owned configuration.

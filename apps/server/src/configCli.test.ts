@@ -102,15 +102,15 @@ function stubRegistry() {
   return {
     at: "2026-07-20T00:00:00.000Z",
     sources: [
-      { name: "claude-cli", role: "runtime", ok: true, status: "ok" },
+      { name: "claude-bundled", role: "runtime", ok: true, status: "ok" },
       { name: "codex-app-server", role: "runtime", ok: false, status: "fallback", reason: "codex binary not found" }
     ],
     providers: [
       {
         provider: "claude",
         options: [
-          { id: "fable", runtimeId: "fable", nativeProviderId: "claude-fable-5" },
-          { id: "shared", runtimeId: "shared" }
+          { id: "fable", runtimeId: "fable", nativeProviderId: "claude-fable-5", runtimeSource: "bundled" },
+          { id: "shared", runtimeId: "shared", runtimeSource: "bundled" }
         ]
       },
       {
@@ -120,13 +120,15 @@ function stubRegistry() {
             id: "gpt-5.6-sol",
             runtimeId: "gpt-5.6-sol",
             supportedReasoningEfforts: ["low", "medium", "high"],
-            defaultReasoningEffort: "low"
+            defaultReasoningEffort: "low",
+            runtimeSource: "static-fallback"
           },
           {
             id: "shared",
             runtimeId: "shared",
             supportedReasoningEfforts: ["medium"],
-            defaultReasoningEffort: "medium"
+            defaultReasoningEffort: "medium",
+            runtimeSource: "static-fallback"
           }
         ]
       }
@@ -337,16 +339,31 @@ test("models lists both agents, marks selected roles, emits JSON, and notes an a
 
       const table = await runCli(serverUrl, home, ["models"]);
       assert.equal(table.code, 0, table.stderr);
-      assert.match(table.stdout, /MODEL\s+AGENT\s+EFFORTS\s+ALIASES\s+SELECTED/);
-      assert.match(table.stdout, /fable\s+claude\s+-\s+claude-fable-5\s+mate/);
-      assert.match(table.stdout, /gpt-5\.6-sol\s+codex\s+low,medium,high\s+-\s+dispatch/);
+      assert.match(table.stdout, /MODEL\s+AGENT\s+EFFORTS\s+ALIASES\s+SOURCE\s+SELECTED/);
+      assert.match(table.stdout, /fable\s+claude\s+-\s+claude-fable-5\s+bundled\s+mate/);
+      assert.match(table.stdout, /gpt-5\.6-sol\s+codex\s+low,medium,high\s+-\s+bundled\s+dispatch/);
       assert.match(table.stderr, /Note: codex-app-server: codex binary not found/);
 
       const json = await runCli(serverUrl, home, ["models", "--json"]);
       assert.equal(json.code, 0, json.stderr);
-      const body = JSON.parse(json.stdout) as { models: Array<{ model: string; selected: string[] }>; notes: string[] };
+      const body = JSON.parse(json.stdout) as {
+        models: Array<{ model: string; source: string; selected: string[] }>;
+        notes: string[];
+      };
       assert.deepEqual(body.models.find((model) => model.model === "fable")?.selected, ["mate"]);
+      assert.equal(body.models.find((model) => model.model === "fable")?.source, "bundled");
       assert.deepEqual(body.notes, ["codex-app-server: codex binary not found"]);
+
+      const codexProvider = (state.registry.providers as Array<{
+        provider: string;
+        options: Array<{ runtimeSource?: string }>;
+      }>).find((provider) => provider.provider === "codex");
+      assert.ok(codexProvider);
+      for (const option of codexProvider.options) option.runtimeSource = "codex-app-server";
+      const liveJson = await runCli(serverUrl, home, ["models", "--json"]);
+      assert.equal(liveJson.code, 0, liveJson.stderr);
+      const liveBody = JSON.parse(liveJson.stdout) as { models: Array<{ agent: string; source: string }> };
+      assert.ok(liveBody.models.filter((model) => model.agent === "codex").every((model) => model.source === "live"));
     });
   } finally {
     rmSync(home, { recursive: true, force: true });

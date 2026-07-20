@@ -80,9 +80,11 @@ perch models
 perch models --json
 ```
 
-`perch models` lists every model Perch can launch across Claude and Codex using the centralized registry and live provider discovery when the installed CLIs support it.
-The table shows model id, agent, supported effort levels, aliases, and whether the model is selected for mate or dispatch.
-If a provider binary is missing or its listing mechanism is unavailable, the command retains registry fallback models, prints a source note, and still succeeds.
+`perch models` lists Claude models from Perch's bundled `CLAUDE_ALIAS_CATALOG` and Codex models from the live app-server catalog with its existing static fallback.
+Claude listing does not invoke the Claude CLI, an external API, or a gateway.
+The table shows model id, agent, supported effort levels, aliases, source, and whether the model is selected for mate or dispatch.
+Every row identifies its source as live or bundled.
+If Codex is missing or its listing mechanism is unavailable, the command retains the bundled fallback models, prints a source note, and still succeeds.
 `--json` returns the model rows, source notes, and raw source statuses for scripts.
 
 ## Pairing, server, and diagnostics

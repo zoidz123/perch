@@ -55,16 +55,17 @@ const execFile = promisify(execFileCallback);
 // full model ID.") on 2026-07-18. Update this table when the CLI's alias set or
 // versioned names change; it is label/order metadata, not a source of truth for
 // which models exist.
-// Perch-central Claude enrichment. The installed Claude CLI is the sole
-// authority for WHICH aliases are selectable (parsed from `/model`); this table
-// only supplies the versioned label, recency rank, and context detail the CLI
-// does not report. The current frontier models carry a 1M context window as
-// their model context, so base `fable`/`opus`/`sonnet` accurately read "1M
-// context" - they are already 1M, not a smaller window that only the `[1m]`
-// alias upgrades. Haiku 4.5 is 200K. The `[1m]` aliases are the CLI's explicit
-// 1M opt-in; they rank after the base entries and so never enter the compact
-// three-row picker (no redundant duplicate rows), keeping a distinct "X (1M)"
-// label only for the edge case of a saved `[1m]` selection.
+// Perch-central Claude catalog. The installed Claude CLI remains the authority
+// for the app picker's live aliases, while this table is the only Claude source
+// for `perch models`. It also supplies the versioned label, recency rank, and
+// context detail the CLI does not report.
+// The current frontier models carry a 1M context window as their model context,
+// so base `fable`/`opus`/`sonnet` accurately read "1M context" - they are already
+// 1M, not a smaller window that only the `[1m]` alias upgrades.
+// Haiku 4.5 is 200K.
+// The `[1m]` aliases are the CLI's explicit 1M opt-in; they rank after the base
+// entries and so never enter the compact three-row picker, keeping a distinct
+// "X (1M)" label only for the edge case of a saved `[1m]` selection.
 type ClaudeAliasMeta = { label: string; detail?: string; rank: number; nativeProviderId?: string };
 const CLAUDE_ALIAS_CATALOG: Record<string, ClaudeAliasMeta> = {
   fable: { label: "Fable 5", detail: "1M context", rank: 0, nativeProviderId: "claude-fable-5" },
@@ -94,6 +95,17 @@ const CLAUDE_MODELS: ModelCatalogEntry[] = CLAUDE_FALLBACK_ALIASES.map((alias) =
     status: "fallback"
   };
 });
+
+const CLAUDE_BUNDLED_MODELS: ModelCatalogEntry[] = Object.entries(CLAUDE_ALIAS_CATALOG).map(([alias, meta]) => ({
+  id: alias,
+  runtimeId: alias,
+  label: meta.label,
+  ...(meta.detail ? { detail: meta.detail } : {}),
+  ...(meta.nativeProviderId ? { nativeProviderId: meta.nativeProviderId } : {}),
+  runtimeSource: "bundled",
+  source: ["bundled"],
+  status: "available"
+}));
 
 // The model a fresh Claude MATE launches with when neither the start request
 // nor the configured mate defaults (settings mateDefaults / PERCH_MATE_MODEL)
@@ -320,6 +332,38 @@ export async function collectModelRegistry(deps: ModelRegistryDeps = {}): Promis
       sources: [failure, ...(fallback.sources ?? [])]
     };
   }
+}
+
+export async function collectCliModelRegistry(deps: ModelRegistryDeps = {}): Promise<ModelsResponse> {
+  const response = await collectModelRegistry({
+    ...deps,
+    readClaudeSettings: () => null,
+    listClaudeModels: undefined,
+    claudeModelList: undefined
+  });
+  const claude: ProviderModelCatalog = {
+    provider: "claude",
+    label: "Claude",
+    options: CLAUDE_BUNDLED_MODELS,
+    roleDefaults: roleDefaultsFor("claude", CLAUDE_BUNDLED_MODELS),
+    runtimeSource: "bundled",
+    source: ["bundled"],
+    status: "available"
+  };
+  return {
+    ...response,
+    sources: [
+      ...(response.sources ?? []).filter((source) => source.name === "codex-app-server" || source.role === "cache"),
+      {
+        name: "claude-bundled",
+        role: "runtime",
+        ok: true,
+        status: "ok",
+        reason: "bundled CLAUDE_ALIAS_CATALOG"
+      }
+    ],
+    providers: response.providers.map((provider) => provider.provider === "claude" ? claude : provider)
+  };
 }
 
 function claudeCatalog(deps: ModelsDeps): { catalog: ProviderModelCatalog; sourceStatuses: ModelRegistrySourceStatus[] } {

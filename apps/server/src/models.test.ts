@@ -5,6 +5,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
   collectModelRegistry,
+  collectCliModelRegistry,
   collectModels,
   labelForClaudeModelId,
   MATE_CLAUDE_FALLBACK_MODEL,
@@ -119,6 +120,33 @@ test("model identifiers resolve ids and aliases to their owning agent", () => {
   });
   assert.equal(resolveModelIdentifier(liveRegistry, "claude-fable-5")[0]?.model, "fable");
   assert.equal(resolveModelIdentifier(liveRegistry, "claude-fable-5[1m]")[0]?.model, "fable[1m]");
+});
+
+test("CLI model registry uses bundled Claude rows and live Codex without Claude discovery", async () => {
+  let claudeDiscoveryCalls = 0;
+  let claudeSettingsReads = 0;
+  const registry = await collectCliModelRegistry({
+    readClaudeSettings: () => {
+      claudeSettingsReads += 1;
+      return JSON.stringify({ model: "some-external-claude-model" });
+    },
+    readCodexConfig: () => null,
+    listCodexModels: async () => LIVE_CODEX_MODELS,
+    listClaudeModels: async () => {
+      claudeDiscoveryCalls += 1;
+      throw new Error("must not be called");
+    }
+  });
+  assert.equal(claudeDiscoveryCalls, 0);
+  assert.equal(claudeSettingsReads, 0);
+  const claude = providerOf(registry, "claude");
+  assert.equal(claude.runtimeSource, "bundled");
+  assert.deepEqual(claude.options.map((option) => option.id), ["fable", "opus", "sonnet", "haiku", "best", "opusplan"]);
+  assert.ok(claude.options.every((option) => option.runtimeSource === "bundled"));
+  const codex = providerOf(registry, "codex");
+  assert.equal(codex.runtimeSource, "codex-app-server");
+  assert.ok(codex.options.every((option) => option.runtimeSource === "codex-app-server"));
+  assert.deepEqual(registry.sources?.map((source) => source.name), ["codex-app-server", "claude-bundled"]);
 });
 
 test("mate fallback uses Claude's frontier-tracking best alias (bin/perch.mjs mirrors it)", () => {
