@@ -2836,6 +2836,24 @@ async function handleCreateTask(
     return;
   }
 
+  // Crew parentage defaults to the calling session: a request that also
+  // carries its session hook credentials (x-perch-session/x-perch-token, the
+  // same pair the task-verb endpoints verify) gets that session as `parent`
+  // when the body omits it, so a mate that forgets the field still groups its
+  // crew. An explicit `parent` always wins; plain bearer calls without the
+  // headers stay ungrouped as before. Presented-but-invalid credentials are
+  // rejected rather than ignored - silently dropping them would recreate the
+  // ungrouped dispatch this defaulting exists to prevent.
+  const hookSessionId = String(request.headers["x-perch-session"] ?? "");
+  const hookToken = String(request.headers["x-perch-token"] ?? "");
+  if (hookSessionId || hookToken) {
+    if (!options.hooks.verify(hookSessionId, hookToken)) {
+      writeJson(response, 401, { error: "Unauthorized" });
+      return;
+    }
+    if (!body.parent) body.parent = hookSessionId;
+  }
+
   if (body.planEdit) {
     const err = planEditError(body.planEdit);
     if (err) {
