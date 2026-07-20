@@ -55,6 +55,8 @@ The verbs:
 - `POST /tasks` - dispatch work: `{"title", "project", "kind": "ship"|"scout", "prompt", "dispatch": true, "parent": "$PERCH_SESSION_ID"}`.
   The server acquires an isolated worktree, starts the worker with your prompt plus the standard reporting brief, and links everything.
   Always pass `parent` so the crew groups under you.
+  Safety net: also send your hook headers (`-H "x-perch-session: $PERCH_SESSION_ID" -H "x-perch-token: $PERCH_HOOK_TOKEN"`) alongside the bearer token; when the body omits `parent`, the server defaults it to that verified session, so a forgotten field can never dispatch an ungrouped task.
+  An explicit `parent` in the body always wins; callers without session headers are unchanged.
   Mode defaults from the project registry; override with `"mode"` only when the boss says so.
   Omit `agent`, `model`, and `effort` so the boss's configured dispatch defaults decide the launch.
   Pass them only when the boss explicitly overrides that task ("use claude for this one", "run this on gpt-5.5 xhigh"); the override is for that dispatch only, never config and never a new habit.

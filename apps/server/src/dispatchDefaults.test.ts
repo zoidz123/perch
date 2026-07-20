@@ -74,6 +74,7 @@ execFileSync("git", ["-c", "user.email=t@t", "-c", "user.name=t", "commit", "-qm
 
 const env = { PERCH_HOME: home } as NodeJS.ProcessEnv;
 const adapter = new CapturingAdapter();
+const hooks = new HookRegistry();
 const tasks = new TaskStore(env);
 const timeline = new TimelineStore();
 const settings = new FleetSettings(env);
@@ -86,7 +87,7 @@ const serverOptions = {
   monitor: new FleetMonitor(adapter, { broadcastMs: 5 }),
   devices: new DeviceRegistry(env),
   port: 0,
-  hooks: new HookRegistry(),
+  hooks,
   timeline,
   projects: new ProjectRegistry(env),
   worktrees: new WorktreePool({ env }),
@@ -349,6 +350,65 @@ test("PATCH /config refuses values outside the whitelist with a 400", async () =
     });
     assert.equal(invalidShape.status, 400, JSON.stringify(body));
   }
+});
+
+// Crew parentage defaulting: a POST /tasks that also carries verified session
+// hook headers gets that session as `parent` when the body omits it; an
+// explicit `parent` always wins, plain bearer callers stay ungrouped, and
+// presented-but-invalid hook credentials are rejected outright.
+async function dispatchRaw(
+  body: Record<string, unknown>,
+  headers: Record<string, string>
+): Promise<{ status: number; text: string }> {
+  const response = await fetch(`${baseUrl}/tasks`, {
+    method: "POST",
+    headers: { ...authed.headers, ...headers },
+    body: JSON.stringify({ project: repo, dispatch: true, prompt: "go", ...body })
+  });
+  return { status: response.status, text: await response.text() };
+}
+
+function taskOf(text: string): { parentSessionId?: string } {
+  return (JSON.parse(text) as { task: { parentSessionId?: string } }).task;
+}
+
+test("dispatch without parent from a session context defaults parent to that session", async () => {
+  const { token } = hooks.register("pty:mate-a");
+  const response = await dispatchRaw(
+    { title: "t-parent-defaulted" },
+    { "x-perch-session": "pty:mate-a", "x-perch-token": token }
+  );
+  assert.equal(response.status, 201, response.text);
+  assert.equal(taskOf(response.text).parentSessionId, "pty:mate-a");
+  assert.equal(adapter.startRequests.at(-1)?.labels?.parent, "pty:mate-a");
+});
+
+test("explicit parent wins over the session-context default", async () => {
+  const { token } = hooks.register("pty:mate-b");
+  const response = await dispatchRaw(
+    { title: "t-parent-explicit", parent: "pty:other-mate" },
+    { "x-perch-session": "pty:mate-b", "x-perch-token": token }
+  );
+  assert.equal(response.status, 201, response.text);
+  assert.equal(taskOf(response.text).parentSessionId, "pty:other-mate");
+  assert.equal(adapter.startRequests.at(-1)?.labels?.parent, "pty:other-mate");
+});
+
+test("plain bearer dispatch without parent stays ungrouped", async () => {
+  const response = await dispatchRaw({ title: "t-parent-ungrouped" }, {});
+  assert.equal(response.status, 201, response.text);
+  assert.equal(taskOf(response.text).parentSessionId, undefined);
+  assert.equal(adapter.startRequests.at(-1)?.labels?.parent, undefined);
+});
+
+test("invalid session hook credentials on dispatch are rejected, not silently ignored", async () => {
+  const launchesBefore = adapter.startRequests.length;
+  const response = await dispatchRaw(
+    { title: "t-parent-bad-creds" },
+    { "x-perch-session": "pty:mate-a", "x-perch-token": "not-the-token" }
+  );
+  assert.equal(response.status, 401);
+  assert.equal(adapter.startRequests.length, launchesBefore);
 });
 
 test("default worktree capacity supports more than eight dispatched tasks", () => {
