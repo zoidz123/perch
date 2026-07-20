@@ -456,10 +456,11 @@ struct HomeView: View {
     // tasks nest as rows; known-but-idle projects (GET /projects, recency
     // order) render as bare headers - no counts, no roll-ups, no placeholder
     // copy; the list is the information.
-    private var projectGroups: [WorkspaceProjectGroup<AgentTask>] {
-        guard store.mateSession != nil else { return [] }
-        return WorkspaceGrouping.scopedProjectGroups(
-            liveTasks,
+    private var projectSections: [WorkspaceProjectSectionModel] {
+        WorkspaceGrouping.projectSections(
+            tasks: liveTasks,
+            sessions: store.agentSessions,
+            mateSessionId: store.mateSession?.id,
             knownProjects: store.projects.map(\.rootPath)
         )
     }
@@ -493,10 +494,10 @@ struct HomeView: View {
                         }
                     }
 
-                    ForEach(projectGroups, id: \.project) { group in
-                        projectHeader(group)
-                        ForEach(group.tasks) { task in
-                            nestedTaskRow(task)
+                    ForEach(projectSections) { section in
+                        projectHeader(name: section.name, project: section.project)
+                        ForEach(section.rows) { row in
+                            nestedCrewRow(row)
                         }
                     }
                 }
@@ -531,17 +532,19 @@ struct HomeView: View {
 
     // Project sub-header: name + dim home-relative path. Nothing derived - no
     // task counts, no "N need you" chips (boss's constraint).
-    private func projectHeader(_ group: WorkspaceProjectGroup<AgentTask>) -> some View {
+    private func projectHeader(name: String, project: String) -> some View {
         HStack(alignment: .firstTextBaseline, spacing: 8) {
-            Text(group.name.uppercased())
+            Text(name.uppercased())
                 .font(.system(size: 12, weight: .semibold))
                 .foregroundStyle(Style.textSecondary)
                 .kerning(0.5)
-            Text(WorkspaceGrouping.homeRelative(group.project))
-                .font(.system(size: 11.5))
-                .foregroundStyle(Style.textFaint)
-                .lineLimit(1)
-                .truncationMode(.middle)
+            if project.hasPrefix("/") {
+                Text(WorkspaceGrouping.homeRelative(project))
+                    .font(.system(size: 11.5))
+                    .foregroundStyle(Style.textFaint)
+                    .lineLimit(1)
+                    .truncationMode(.middle)
+            }
             Spacer(minLength: 0)
         }
         .padding(.leading, 16)
@@ -550,11 +553,39 @@ struct HomeView: View {
         .padding(.bottom, 4)
         .contentShape(Rectangle())
         .contextMenu {
-            Button(role: .destructive) {
-                removeCandidate = RemoveProjectCandidate(name: group.name, path: group.project)
-                showRemoveConfirm = true
-            } label: {
-                Label("Remove project", systemImage: "folder.badge.minus")
+            if project.hasPrefix("/") {
+                Button(role: .destructive) {
+                    removeCandidate = RemoveProjectCandidate(name: name, path: project)
+                    showRemoveConfirm = true
+                } label: {
+                    Label("Remove project", systemImage: "folder.badge.minus")
+                }
+            }
+        }
+    }
+
+    @ViewBuilder
+    private func nestedCrewRow(_ row: WorkspaceCrewRowModel) -> some View {
+        switch row.source {
+        case let .task(taskId):
+            if let task = liveTasks.first(where: { $0.id == taskId }) {
+                nestedTaskRow(task)
+            }
+        case let .session(sessionId):
+            if let session = store.sessionsById[sessionId] {
+                Button {
+                    store.openSessionRef = SessionRef(id: sessionId)
+                } label: {
+                    CrewSessionRow(row: row, session: session)
+                }
+                .buttonStyle(RowButtonStyle())
+                .padding(.leading, 22)
+                .overlay(alignment: .leading) {
+                    TaskThreadLine()
+                        .stroke(Style.hairline, lineWidth: 1.5)
+                        .frame(width: 13)
+                        .padding(.leading, 16)
+                }
             }
         }
     }

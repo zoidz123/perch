@@ -551,6 +551,65 @@ test("live Claude catalog surfaces Fable 5 first with versioned labels (real CLI
   assert.equal(claude.options.find((o) => o.id === "opusplan")?.label, "Opus Plan");
 });
 
+test("only the hardcoded visible trio is selectable; hidden entries keep resolving", async () => {
+  const baseDeps = { readClaudeSettings: () => null, readCodexConfig: () => null };
+
+  // Live Claude catalog: everything beyond fable/opus/sonnet ([1m] opt-ins,
+  // haiku, best, opusplan) is hidden, not removed.
+  const claude = providerOf(
+    collectModels({ ...baseDeps, claudeModelList: { result: REAL_CLAUDE_MODEL_RESULT } }),
+    "claude"
+  );
+  assert.deepEqual(
+    claude.options.filter((o) => o.hidden !== true).map((o) => o.id),
+    ["fable", "opus", "sonnet"]
+  );
+  // Internal role defaults still resolve through the hidden `best` alias.
+  assert.equal(claude.roleDefaults?.orchestrator?.model, "best");
+
+  // Static Claude fallback: haiku stays resolvable but hidden.
+  const fallbackClaude = providerOf(collectModels(baseDeps), "claude");
+  assert.deepEqual(
+    fallbackClaude.options.filter((o) => o.hidden !== true).map((o) => o.id),
+    ["fable", "opus", "sonnet"]
+  );
+
+  // Bundled catalog (the `perch models` Claude source): same visible trio.
+  const bundled = providerOf(await collectCliModelRegistry(baseDeps), "claude");
+  assert.deepEqual(
+    bundled.options.filter((o) => o.hidden !== true).map((o) => o.id),
+    ["fable", "opus", "sonnet"]
+  );
+  assert.equal(bundled.options.find((o) => o.id === "best")?.hidden, true);
+
+  // Codex static fallback: only the gpt-5.6 trio is visible; older families
+  // (gpt-5.5, gpt-5.4, gpt-5.4-mini, gpt-5.3-codex-spark) stay hidden.
+  const codex = providerOf(collectModels(baseDeps), "codex");
+  assert.deepEqual(
+    codex.options.filter((o) => o.hidden !== true).map((o) => o.id),
+    ["gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"]
+  );
+
+  // Codex live catalog: a runtime model outside the trio is forced hidden.
+  const liveCodex = providerOf(
+    collectModels({
+      ...baseDeps,
+      codexModelList: { data: [...LIVE_CODEX_MODELS.data, { id: "gpt-5.5", model: "gpt-5.5", displayName: "GPT 5.5" }] }
+    }),
+    "codex"
+  );
+  assert.equal(liveCodex.options.find((o) => o.id === "gpt-5.5")?.hidden, true);
+  assert.deepEqual(
+    liveCodex.options.filter((o) => o.hidden !== true).map((o) => o.id),
+    ["gpt-5.6-sol", "gpt-5.6-terra"]
+  );
+
+  // A session running on a hidden meta-alias still reads as a mapped label,
+  // never the raw internal value ("best").
+  assert.equal(resolveSessionModel("claude", { model: "best" }, baseDeps).modelLabel, "Best available");
+  assert.equal(resolveSessionModel("claude", { model: "opusplan" }, baseDeps).modelLabel, "Opus Plan");
+});
+
 test("live Claude catalog dedupes repeated aliases and drops sentinels", () => {
   const claude = providerOf(
     collectModels({
@@ -578,11 +637,13 @@ test("live Claude catalog keeps unknown aliases, labeled and sorted after known 
     "claude"
   );
   // Known aliases lead frontier-first; the unrecognized alias trails in CLI
-  // order and is never hidden.
+  // order. It stays resolvable but hidden: only the hardcoded visible trio is
+  // ever offered for selection.
   assert.deepEqual(claude.options.map((o) => o.id), ["fable", "sonnet", "aurora-9"]);
   const aurora = claude.options.find((o) => o.id === "aurora-9");
   assert.equal(aurora?.label, "Aurora 9");
   assert.equal(aurora?.status, "available");
+  assert.equal(aurora?.hidden, true);
 });
 
 test("malformed Claude CLI output falls back to the static catalog, not an empty picker", () => {

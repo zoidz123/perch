@@ -1,5 +1,69 @@
 import SwiftUI
 
+// Session-first fallback for a crew worker whose durable task snapshot has
+// not reached the phone yet. It keeps the same identity, description,
+// project, and status vocabulary as the task-backed row.
+struct CrewSessionRow: View {
+    let row: WorkspaceCrewRowModel
+    let session: AgentSession
+
+    var body: some View {
+        HStack(spacing: 12) {
+            AgentGlyph(agent: session.agent)
+
+            VStack(alignment: .leading, spacing: 3) {
+                Text(row.workerName)
+                    .font(.system(size: 16, weight: .medium))
+                    .foregroundStyle(Style.textPrimary)
+                    .lineLimit(1)
+                if row.workerName != row.taskTitle {
+                    Text(row.taskTitle)
+                        .font(.system(size: 13))
+                        .foregroundStyle(Style.textSecondary)
+                        .lineLimit(1)
+                }
+            }
+
+            Spacer(minLength: 8)
+
+            Text(statusLabel)
+                .font(.system(size: 11, weight: .semibold))
+                .foregroundStyle(statusColor)
+                .padding(.horizontal, 7)
+                .padding(.vertical, 3)
+                .background(statusColor.opacity(0.14), in: Capsule())
+
+            WorkerStatusDot(status: session.status)
+
+            Image(systemName: "chevron.right")
+                .font(.system(size: 14, weight: .semibold))
+                .foregroundStyle(Style.textFaint)
+        }
+        .padding(.horizontal, 12)
+        .padding(.vertical, 15)
+        .contentShape(Rectangle())
+    }
+
+    private var statusLabel: String {
+        switch row.state {
+        case "needs_you": "Needs approval"
+        case "blocked", "failed": "Blocked"
+        case "done", "landed": "Done"
+        case "working": "Working"
+        default: "Waiting"
+        }
+    }
+
+    private var statusColor: Color {
+        switch row.state {
+        case "needs_you", "blocked", "failed": Style.warningText
+        case "done", "landed": Style.successText
+        case "working": Style.accent
+        default: Style.textSecondary
+        }
+    }
+}
+
 // A crew row: one tracked task joined with its worker session. The task
 // carries the meaning (verb state, PR progress); the session carries the
 // liveness (running / needs approval). Tap opens the worker's chat; the

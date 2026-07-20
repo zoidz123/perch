@@ -2,27 +2,29 @@ import XCTest
 @testable import PerchComposer
 
 // Mirrors the server's live Claude catalog (frontier-first, versioned labels).
-// The `[1m]` opt-in variants rank after the base entries, so the compact
-// three-row picker never surfaces them.
+// Only the hardcoded fable/opus/sonnet trio is visible; the meta-aliases
+// (`best`/`opusplan`), haiku, and the `[1m]` opt-ins arrive marked hidden so
+// they stay resolvable but are never offered for selection.
 private let liveClaudeCatalog: [PickerCatalogOption] = [
     PickerCatalogOption(id: "fable", label: "Fable 5", detail: "1M context"),
     PickerCatalogOption(id: "opus", label: "Opus 4.8", detail: "1M context"),
     PickerCatalogOption(id: "sonnet", label: "Sonnet 5", detail: "1M context"),
-    PickerCatalogOption(id: "haiku", label: "Haiku 4.5", detail: "200K context"),
-    PickerCatalogOption(id: "best", label: "Best available", detail: "Latest highest-capability Claude model"),
-    PickerCatalogOption(id: "opusplan", label: "Opus Plan", detail: "Uses Opus in plan mode, Sonnet otherwise"),
-    PickerCatalogOption(id: "fable[1m]", label: "Fable 5 (1M)", detail: "1M context"),
-    PickerCatalogOption(id: "opus[1m]", label: "Opus 4.8 (1M)", detail: "1M context"),
-    PickerCatalogOption(id: "sonnet[1m]", label: "Sonnet 5 (1M)", detail: "1M context")
+    PickerCatalogOption(id: "haiku", label: "Haiku 4.5", detail: "200K context", hidden: true),
+    PickerCatalogOption(id: "best", label: "Best available", detail: "Latest highest-capability Claude model", hidden: true),
+    PickerCatalogOption(id: "opusplan", label: "Opus Plan", detail: "Uses Opus in plan mode, Sonnet otherwise", hidden: true),
+    PickerCatalogOption(id: "fable[1m]", label: "Fable 5 (1M)", detail: "1M context", hidden: true),
+    PickerCatalogOption(id: "opus[1m]", label: "Opus 4.8 (1M)", detail: "1M context", hidden: true),
+    PickerCatalogOption(id: "sonnet[1m]", label: "Sonnet 5 (1M)", detail: "1M context", hidden: true)
 ]
 
-// Codex fixture: frontier-first, more than three models.
+// Codex fixture: frontier-first; models outside the visible gpt-5.6 trio
+// arrive hidden, mirroring the server's hardcoded visible set.
 private let liveCodexCatalog: [PickerCatalogOption] = [
     PickerCatalogOption(id: "gpt-5.6-sol", label: "GPT 5.6 Sol"),
     PickerCatalogOption(id: "gpt-5.6-terra", label: "GPT 5.6 Terra"),
     PickerCatalogOption(id: "gpt-5.6-luna", label: "GPT 5.6 Luna"),
-    PickerCatalogOption(id: "gpt-5.5", label: "GPT 5.5"),
-    PickerCatalogOption(id: "gpt-5.4", label: "GPT 5.4")
+    PickerCatalogOption(id: "gpt-5.5", label: "GPT 5.5", hidden: true),
+    PickerCatalogOption(id: "gpt-5.4", label: "GPT 5.4", hidden: true)
 ]
 
 private func offeredIds(_ options: [PickerCatalogOption]) -> Set<String> {
