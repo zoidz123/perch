@@ -101,6 +101,10 @@ An optional `planId` query filters tasks linked to one finalized plan.
 }
 ```
 
+Each returned task also carries a server-derived `presentation` with a single `state`:
+`working`, `needs_you`, `blocked`, `awaiting_verification`, `ready_to_merge`, `ready_to_apply`, `failed`, or `closed`.
+It is derived from the durable lifecycle, PR, and verification facts, never persisted as task state, and clients render the primary task status from it instead of inferring readiness from PR checks or mergeability.
+
 Mate uses this detail endpoint before acting on a wake notification.
 The event `seq` is the stable identifier used for completion decisions and turn-boundary evidence.
 
@@ -239,6 +243,10 @@ An idempotency key may be retried with the same decision, but reusing it for dif
 
 Accept records `completion_accepted` and moves the task to `done`.
 If the attached PR merged during review, the server then records the merge and advances the task to `landed`.
+
+Every completion request is bound to the exact deliverable it claims: the current PR head SHA for PR modes, or the current checkout revision for `local-only`.
+The derived `ready_to_merge` presentation holds only while the mate's acceptance of the latest completion request still matches the current PR head and that head has passing checks and GitHub mergeability; `ready_to_apply` likewise holds only while the accepted local revision is still current.
+A rejection, resumed work, or a changed PR head therefore withdraws readiness instead of leaving a stale ready badge.
 
 Reject requires non-empty `feedback`, records `completion_rejected`, and moves the task back to `working`.
 The server best-effort delivers `[perch] Completion rejected: <feedback>` to a live worker session.

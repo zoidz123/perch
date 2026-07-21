@@ -52,7 +52,7 @@ Composer messages queue while a permission prompt is open so ordinary text canno
 
 ## Durable task state
 
-SQLite stores the current task projection, immutable task events, runtime generations, Mate ownership, leased operations, and notification outbox.
+SQLite stores the current task projection, immutable task events, separately persisted PR and completion-verification facts, runtime generations, Mate ownership, leased operations, and notification outbox.
 The task lifecycle describes work meaning, while runtime state describes the replaceable process executing it.
 
 ```text
@@ -62,7 +62,8 @@ runtime:  starting -> live -> recoverable -> recovering -> live generation + 1
 
 A provider turn ending does not complete a task.
 Each worker turn must append a task outcome, and worker `done` is translated to `completion_requested` until Mate verifies the deliverable.
-See [Worker task API and turn lifecycle](worker-task-api.md) for the endpoint contracts and exact completion flow.
+The server also derives a non-persisted per-task presentation state from the lifecycle plus the persisted PR and verification facts, and clients render the primary task badge from it instead of inferring readiness from raw PR checks.
+See [Worker task API and turn lifecycle](worker-task-api.md) for the endpoint contracts, the presentation states, and the exact completion flow.
 
 Losing a runtime records `runtime_interrupted` without changing the task's semantic state.
 Dispatch and recovery operations use durable leases and idempotency keys so a server restart can resume work without intentionally launching duplicates.
