@@ -23,6 +23,9 @@ export type TaskPresentationFacts = {
 // (done -> failed -> working) surrenders it.
 export function deriveTaskPresentation(task: Task, facts: TaskPresentationFacts = {}): TaskPresentation {
   if (task.state === "closed") return { state: "closed" };
+  // Merged work is finished work: it leaves the active list immediately
+  // instead of wearing a badge until teardown closes the record.
+  if (task.state === "landed") return { state: "closed" };
   if (task.state === "failed") return { state: "failed" };
   if (task.state === "needs_you") return { state: "needs_you" };
   if (task.state === "blocked") return { state: "blocked" };
@@ -38,7 +41,7 @@ export function deriveTaskPresentation(task: Task, facts: TaskPresentationFacts 
     if (
       deliverable?.kind === "local" &&
       Boolean(deliverable.revision) &&
-      (verification?.acceptedRevision === undefined || verification.acceptedRevision === deliverable.revision)
+      verification?.acceptedRevision === deliverable.revision
     ) return { state: "ready_to_apply" };
     return { state: "working" };
   }

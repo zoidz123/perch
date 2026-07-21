@@ -65,11 +65,31 @@ test("local-only acceptance binds to the exact accepted checkout revision", () =
     deliverable: { kind: "local", revision: "abc123" },
     accepted: true
   };
-  assert.equal(deriveTaskPresentation(local, { verification: facts }).state, "ready_to_apply");
   assert.equal(deriveTaskPresentation(local, { verification: { ...facts, acceptedRevision: "abc123" } }).state, "ready_to_apply");
   assert.equal(deriveTaskPresentation(local, { verification: { ...facts, acceptedRevision: "def456" } }).state, "working");
-  assert.equal(deriveTaskPresentation(local, { verification: { ...facts, deliverable: { kind: "local" } } }).state, "working");
   assert.equal(deriveTaskPresentation(local, { verification: { ...facts, accepted: false } }).state, "working");
+});
+
+test("local-only readiness stays absent without an exact commit SHA on both sides", () => {
+  const local = task({ mode: "local-only", pr: undefined });
+  const requested: TaskVerificationFacts = {
+    requestSeq: 1,
+    deliverable: { kind: "local", revision: "abc123" },
+    accepted: true
+  };
+  // The request pinned no revision (checkout HEAD was unreadable).
+  assert.equal(
+    deriveTaskPresentation(local, { verification: { ...requested, deliverable: { kind: "local" }, acceptedRevision: "abc123" } }).state,
+    "working"
+  );
+  // The acceptance recorded no revision (checkout HEAD was unreadable).
+  assert.equal(deriveTaskPresentation(local, { verification: requested }).state, "working");
+});
+
+test("landed tasks leave the active presentation without a merged badge", () => {
+  assert.equal(deriveTaskPresentation(task({ state: "landed" })).state, "closed");
+  assert.equal(deriveTaskPresentation(task({ mode: "local-only", state: "landed", pr: undefined })).state, "closed");
+  assert.equal(deriveTaskPresentation(task({ mode: "no-mistakes", state: "landed" })).state, "closed");
 });
 
 test("ordinary lifecycle states and closed tasks retain truthful presentation", () => {

@@ -318,16 +318,26 @@ export class TaskStore {
       };
     });
     this.stateDb.tasks.recordMany(withoutDerived(task), persisted);
+    // Same listener contract as recordEvent: every notification snapshot
+    // carries a derived presentation, computed from the committed facts once
+    // for the whole batch.
+    const facts: TaskPresentationFacts = {
+      pr: this.stateDb.tasks.prFacts(task.id),
+      verification: this.stateDb.tasks.verificationFacts(task.id)
+    };
     for (const notification of notifications) {
       for (const listener of this.listeners) {
         try {
-          listener(notification.task, { ...notification.event, previousState: notification.previousState });
+          listener(this.withPresentation(notification.task, facts), {
+            ...notification.event,
+            previousState: notification.previousState
+          });
         } catch {
           // Observers never disturb the ledger.
         }
       }
     }
-    return this.withPresentation({ ...task });
+    return this.withPresentation({ ...task }, facts);
   }
 
   private withRuntime(task: Task): Task {
@@ -374,16 +384,20 @@ export class TaskStore {
     return undefined;
   }
 
-  // Writers mutate and persist this snapshot; the derived presentation is
-  // stripped so it can never leak into the durable projection or stale into
-  // notification payloads.
+  // Writers mutate and persist this snapshot. It reads the raw projection
+  // (which never stores a presentation) so write paths do not spend fact
+  // queries deriving a presentation they immediately discard.
   private mustFind(id: string): Task {
-    const task = this.find(id);
+    let task: Task | undefined;
+    try {
+      task = this.stateDb.tasks.find(safeId(id));
+    } catch {
+      task = undefined;
+    }
     if (!task) {
       throw new Error(`Unknown task: ${id}`);
     }
-    const { presentation: _presentation, ...current } = task;
-    return current;
+    return this.withRuntime(task);
   }
 }
 

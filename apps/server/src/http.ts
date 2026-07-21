@@ -3483,6 +3483,17 @@ async function completionDecisionRpc(
     if (revision) {
       acceptedDeliverable = { kind: "local", revision };
     }
+    // The git call yielded the event loop, so the validated state may be gone:
+    // a concurrent decision or worker retry must invalidate this one instead
+    // of racing it into the ledger.
+    const current = options.tasks.find(taskId);
+    if (current?.state !== "completion_requested") {
+      return rpcError(409, `Task is ${current?.state ?? "unknown"}, not waiting for completion verification`);
+    }
+    const latestNow = [...options.tasks.events(taskId)].reverse().find((event) => event.kind === "completion_requested");
+    if (latestNow?.seq !== body.requestSeq) {
+      return rpcError(409, "completion request is stale or unknown; re-read the task evidence");
+    }
   }
   const decisionData = {
     completionDecision: {
@@ -3493,12 +3504,17 @@ async function completionDecisionRpc(
       ...(acceptedDeliverable ? { deliverable: acceptedDeliverable } : {})
     }
   };
-  let updated = options.tasks.recordEvent(taskId, {
-    kind: body.action === "accept" ? "completion_accepted" : "completion_rejected",
-    source: "system",
-    message: body.action === "accept" ? "mate verified the requested deliverable" : feedback,
-    data: decisionData
-  });
+  let updated: Task;
+  try {
+    updated = options.tasks.recordEvent(taskId, {
+      kind: body.action === "accept" ? "completion_accepted" : "completion_rejected",
+      source: "system",
+      message: body.action === "accept" ? "mate verified the requested deliverable" : feedback,
+      data: decisionData
+    });
+  } catch (error) {
+    return rpcError(409, error instanceof Error ? error.message : String(error));
+  }
 
   // A PR can merge while the mate is reviewing it. Preserve the landed and
   // auto-return semantics, but only publish merged after verification makes
@@ -3929,8 +3945,12 @@ async function handleTaskEvent(
     let eventData = data;
     if (kind === "completion_requested") {
       const attachedPr = pr ? { ...current.pr, ...pr } : current.pr;
+      const revision = current.mode === "local-only" ? await options.prPoller.checkoutHead(current) : undefined;
+      // A local deliverable pins an exact commit or nothing: an unreadable
+      // checkout HEAD leaves the revision absent, and readiness derivation
+      // stays conservatively withheld rather than trusting a branch name.
       const deliverable = current.mode === "local-only"
-        ? { kind: "local", revision: (await options.prPoller.checkoutHead(current)) ?? current.branch }
+        ? { kind: "local", ...(revision ? { revision } : {}) }
         : { kind: "pr", headOid: attachedPr?.headOid };
       eventData = { ...(data ?? {}), deliverable };
     }
