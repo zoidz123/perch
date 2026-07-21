@@ -574,10 +574,11 @@ function resolveCodexServerRequest(
   if (last?.data?.reason !== "codex_server_request") return;
   const remaining = options.monitor.pendingServerRequest(sessionId);
   if (remaining) {
-    // Another request is still open: the task stays needs_you. When the
-    // ledger's needs_decision moment no longer names an open request, re-point
-    // it at the surviving queue head so the durable evidence stays answerable.
-    if (last.data.requestId === remaining.requestId) return;
+    // Another request is still open: the task stays needs_you. Only when the
+    // ledger's needs_decision moment named the request that just resolved does
+    // it re-point at the surviving queue head; otherwise it still names an
+    // open request and re-pointing would duplicate that request's event.
+    if (last.data.requestId !== request.requestId) return;
     options.tasks.recordEvent(task.id, {
       kind: "needs_decision",
       source: "system",

@@ -777,6 +777,67 @@ test("E2E overlapping Codex approvals resolve in order and the queued request is
   }
 });
 
+test("E2E three overlapping Codex approvals: the ledger re-points only when the last-named request resolves", async () => {
+  const fx = fixture();
+  const repo = makeRepo();
+  const baseUrl = await listen(fx.server, fx.options);
+  try {
+    const dispatched = await fetch(`${baseUrl}/tasks`, {
+      ...authed,
+      method: "POST",
+      body: JSON.stringify({ title: "triple approvals", project: repo, dispatch: true, agent: "codex", prompt: "go" })
+    });
+    const { task } = (await dispatched.json()) as { task: { id: string; sessionId: string } };
+    const callback = fx.control.callbacks.get(task.sessionId);
+    assert.ok(callback?.onServerRequest);
+    const requestA = structuredRequest("rpc-a", "Run: rm -rf build");
+    const requestB = structuredRequest("rpc-b", "Run: npm install");
+    const requestC = structuredRequest("rpc-c", "Apply file changes");
+    callback!.onServerRequest!(requestA);
+    callback!.onServerRequest!(requestB);
+    callback!.onServerRequest!(requestC);
+
+    let sessions = (await (await fetch(`${baseUrl}/sessions`, authed)).json()) as { sessions: AgentSession[] };
+    assert.equal(sessions.sessions[0]?.pendingServerRequest?.requestId, "rpc-a", "the oldest open request is the card");
+    assert.equal(fx.options.tasks.find(task.id)?.state, "needs_you");
+    assert.equal(fx.options.tasks.events(task.id).filter((event) => event.kind === "needs_decision").length, 3);
+
+    // B resolves: it is neither the queue head nor the request the ledger last
+    // named (C), so the ledger stays untouched instead of duplicating B or A.
+    callback!.onServerRequestResolved!(requestB);
+    sessions = (await (await fetch(`${baseUrl}/sessions`, authed)).json()) as { sessions: AgentSession[] };
+    assert.equal(sessions.sessions[0]?.pendingServerRequest?.requestId, "rpc-a", "the head is unchanged");
+    assert.equal(fx.options.tasks.find(task.id)?.state, "needs_you");
+    assert.equal(
+      fx.options.tasks.events(task.id).filter((event) => event.kind === "needs_decision").length,
+      3,
+      "resolving a request the ledger does not name records no duplicate needs_decision"
+    );
+
+    // C resolves: it is the request the ledger last named, so the ledger
+    // re-points at the surviving queue head A with exactly one new event.
+    callback!.onServerRequestResolved!(requestC);
+    sessions = (await (await fetch(`${baseUrl}/sessions`, authed)).json()) as { sessions: AgentSession[] };
+    assert.equal(sessions.sessions[0]?.pendingServerRequest?.requestId, "rpc-a");
+    assert.equal(fx.options.tasks.find(task.id)?.state, "needs_you");
+    const decisions = fx.options.tasks.events(task.id).filter((event) => event.kind === "needs_decision");
+    assert.equal(decisions.length, 4, "the re-point records exactly one new needs_decision");
+    assert.equal(decisions.at(-1)?.data?.requestId, "rpc-a", "the ledger re-points at the surviving queue head");
+
+    // Only resolving the final open request clears the gate.
+    callback!.onServerRequestResolved!(requestA);
+    sessions = (await (await fetch(`${baseUrl}/sessions`, authed)).json()) as { sessions: AgentSession[] };
+    assert.equal(sessions.sessions[0]?.pendingServerRequest, undefined);
+    assert.equal(fx.options.tasks.find(task.id)?.state, "working");
+    assert.equal(
+      fx.options.tasks.events(task.id).filter((event) => event.data?.reason === "codex_server_request_resolved").length,
+      1
+    );
+  } finally {
+    await fx.cleanup(repo);
+  }
+});
+
 test("a failed spawn unwinds Codex control, pre-minted identity, and the worktree lease in reverse order", async () => {
   const fx = fixture();
   const repo = makeRepo();
