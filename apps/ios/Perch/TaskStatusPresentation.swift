@@ -80,11 +80,18 @@ public enum TaskStatusPresentation {
         [primaryChip(taskState: taskState, pr: pr)]
     }
 
-    public static func primaryChip(taskState: String, pr: TaskStatusPr?) -> TaskStatusChip {
-        if taskState == "completion_requested" {
-            return stateChip(taskState)
+    public static func primaryChip(taskState: String, pr: TaskStatusPr?, presentationState: String? = nil, mode: String? = nil) -> TaskStatusChip {
+        let state = presentationState ?? taskState
+        if state == "completion_requested" || state == "awaiting_verification" {
+            return stateChip(state)
         }
-        guard let pr else { return stateChip(taskState) }
+        if state == "ready_to_merge" {
+            return TaskStatusChip(kind: .agent, label: "Ready to merge", tone: .success)
+        }
+        if state == "ready_to_apply" {
+            return TaskStatusChip(kind: .agent, label: "Ready to apply", tone: .success)
+        }
+        guard let pr, presentationState == nil else { return stateChip(state) }
         if taskState == "closed" {
             return prStatusChip(pr, suffix: "closed", tone: .neutral)
         }
@@ -98,6 +105,11 @@ public enum TaskStatusPresentation {
             return prStatusChip(pr, suffix: "checks passed", tone: .success, kind: .checks)
         }
         return prStatusChip(pr, suffix: nil, tone: .neutral)
+    }
+
+    public static func prChip(_ pr: TaskStatusPr?) -> TaskStatusChip? {
+        guard let pr else { return nil }
+        return TaskStatusChip(kind: .pullRequest, label: prLabel(pr), tone: .neutral, isLink: true)
     }
 
     public static func metadata(taskState: String, pr: TaskStatusPr?) -> [String] {
@@ -115,6 +127,8 @@ public enum TaskStatusPresentation {
         case "blocked":
             return TaskStatusChip(kind: .agent, label: "Blocked", tone: .error)
         case "completion_requested":
+            return TaskStatusChip(kind: .agent, label: "Awaiting verification", tone: .attention)
+        case "awaiting_verification":
             return TaskStatusChip(kind: .agent, label: "Awaiting verification", tone: .attention)
         case "done":
             return TaskStatusChip(kind: .agent, label: "Done", tone: .neutral)

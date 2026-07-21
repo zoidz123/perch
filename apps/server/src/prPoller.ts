@@ -396,7 +396,9 @@ export class PrPoller {
       pr.head = view.headRefName;
       changed = true;
     }
-    if (identity.ok && view.headRefOid && !pr.headOid) {
+    // `headOid` is the current observed head. Acceptance is bound to the
+    // immutable completion request, so a head change invalidates readiness.
+    if (identity.ok && view.headRefOid && pr.headOid !== view.headRefOid) {
       pr.headOid = view.headRefOid;
       changed = true;
     }

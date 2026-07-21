@@ -22,7 +22,7 @@ test("fresh startup creates the versioned WAL database with foreign keys enabled
 
   assert.equal(state.path, join(root, "state.sqlite"));
   assert.equal(existsSync(state.path), true);
-  assert.equal(state.schemaVersion(), 9);
+  assert.equal(state.schemaVersion(), 10);
   assert.equal(state.journalMode(), "wal");
   assert.equal(state.foreignKeysEnabled(), true);
 
@@ -36,7 +36,8 @@ test("fresh startup creates the versioned WAL database with foreign keys enabled
     { version: 6, name: "durable-claude-questions" },
     { version: 7, name: "typed-claude-approval-kinds" },
     { version: 8, name: "durable-claude-blocking-interactions" },
-    { version: 9, name: "claude-inbox-correlation-and-deltas" }
+    { version: 9, name: "claude-inbox-correlation-and-deltas" },
+    { version: 10, name: "separate-task-pr-and-verification-facts" }
   ]);
   assert.deepEqual(
     inspect
@@ -58,6 +59,8 @@ test("fresh startup creates the versioned WAL database with foreign keys enabled
       "runtimes",
       "schema_migrations",
       "task_events",
+      "task_pr_facts",
+      "task_verification_facts",
       "tasks"
     ]
   );
@@ -104,7 +107,7 @@ test("legacy JSON and JSONL import idempotently at each startup without modifyin
   writeFileSync(join(dir, "events.jsonl"), eventSource);
 
   const first = new TaskStore(env(root));
-  assert.deepEqual(first.find(task.id), task);
+  assert.deepEqual(first.find(task.id), { ...task, presentation: { state: "working" } });
   assert.deepEqual(first.events(task.id), events);
   assert.equal(first.stateDb.outbox.pending().length, 0, "historical events are not replayed as notifications");
   assert.equal(readFileSync(join(dir, "task.json"), "utf8"), taskSource);
@@ -131,7 +134,7 @@ test("legacy JSON and JSONL import idempotently at each startup without modifyin
 
   const third = new TaskStore(env(root));
   assert.equal(third.list().length, 2);
-  assert.deepEqual(third.find(late.id), late);
+  assert.deepEqual(third.find(late.id), { ...late, presentation: { state: "working" } });
   assert.deepEqual(third.events(task.id), events);
 
   third.close();
@@ -173,7 +176,7 @@ test("malformed legacy records are skipped without aborting the import", () => {
   writeFileSync(join(unparseableDir, "task.json"), "{ definitely not json");
 
   const first = new TaskStore(env(root));
-  assert.deepEqual(first.find(good.id), good);
+  assert.deepEqual(first.find(good.id), { ...good, presentation: { state: "working" } });
   assert.deepEqual(
     first.events(good.id).map((event) => event.seq),
     [1, 3]

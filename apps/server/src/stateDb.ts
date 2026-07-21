@@ -5,7 +5,7 @@ import { join } from "node:path";
 import type { Task, TaskEvent, TaskEventKind, TaskEventSource } from "@perch/shared";
 import Database from "better-sqlite3";
 
-const LATEST_SCHEMA_VERSION = 9;
+const LATEST_SCHEMA_VERSION = 10;
 const LEGACY_TASK_IMPORT = "tasks-json-v1";
 
 const MIGRATIONS = [
@@ -363,6 +363,25 @@ const MIGRATIONS = [
         INSERT INTO claude_inbox_deltas(request_type, request_id, state, snapshot_json, at)
         VALUES ('interaction', NEW.id, NEW.state, json_object('id', NEW.id, 'version', NEW.version, 'state', NEW.state, 'kind', NEW.kind, 'sessionId', NEW.perch_session_id, 'runtimeGeneration', NEW.runtime_generation, 'taskId', NEW.task_id), NEW.updated_at);
       END;
+    `
+  },
+  {
+    version: 10,
+    name: "separate-task-pr-and-verification-facts",
+    sql: `
+      CREATE TABLE task_pr_facts (
+        task_id TEXT PRIMARY KEY REFERENCES tasks(id) ON DELETE RESTRICT,
+        facts_json TEXT NOT NULL,
+        observed_at TEXT NOT NULL
+      ) STRICT;
+      CREATE TABLE task_verification_facts (
+        task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE RESTRICT,
+        request_seq INTEGER NOT NULL,
+        decision TEXT NOT NULL CHECK (decision IN ('requested', 'accepted', 'rejected', 'invalidated')),
+        deliverable_json TEXT,
+        recorded_at TEXT NOT NULL,
+        PRIMARY KEY(task_id, request_seq, decision)
+      ) STRICT;
     `
   }
 ] as const;
@@ -780,6 +799,7 @@ export class TaskRepository {
     if (result.changes !== 1) {
       throw new Error(`Unknown task: ${task.id}`);
     }
+    this.savePrFacts(task);
   }
 
   create(task: Task, event: TaskEventInput): TaskEvent {
@@ -849,6 +869,7 @@ export class TaskRepository {
     this.db
       .prepare("INSERT INTO tasks(id, state, updated_at, projection_json) VALUES (?, ?, ?, ?)")
       .run(task.id, task.state, task.updatedAt, JSON.stringify(task));
+    this.savePrFacts(task);
   }
 
   private appendEvent(taskId: string, event: TaskEventInput, intents: NotificationIntentInput[]): TaskEvent {
@@ -885,7 +906,7 @@ export class TaskRepository {
         at
       );
     }
-    return {
+    const persisted = {
       seq: next.seq,
       at,
       kind: event.kind,
@@ -893,6 +914,35 @@ export class TaskRepository {
       ...(event.message ? { message: event.message } : {}),
       ...(event.data ? { data: event.data } : {})
     };
+    this.saveVerificationFacts(taskId, persisted);
+    return persisted;
+  }
+
+  private savePrFacts(task: Task): void {
+    if (!task.pr) return;
+    this.db.prepare(
+      `INSERT INTO task_pr_facts(task_id, facts_json, observed_at) VALUES (?, ?, ?)
+       ON CONFLICT(task_id) DO UPDATE SET facts_json = excluded.facts_json, observed_at = excluded.observed_at`
+    ).run(task.id, JSON.stringify(task.pr), task.updatedAt);
+  }
+
+  private saveVerificationFacts(taskId: string, event: TaskEvent): void {
+    if (event.kind === "completion_requested") {
+      const deliverable = event.data?.deliverable;
+      this.db.prepare(
+        `INSERT OR REPLACE INTO task_verification_facts(task_id, request_seq, decision, deliverable_json, recorded_at)
+         VALUES (?, ?, 'requested', ?, ?)`
+      ).run(taskId, event.seq, deliverable ? JSON.stringify(deliverable) : null, event.at);
+      return;
+    }
+    if (event.kind !== "completion_accepted" && event.kind !== "completion_rejected") return;
+    const requestSeq = (event.data as { completionDecision?: { requestSeq?: unknown } } | undefined)
+      ?.completionDecision?.requestSeq;
+    if (!Number.isInteger(requestSeq)) return;
+    this.db.prepare(
+      `INSERT OR REPLACE INTO task_verification_facts(task_id, request_seq, decision, recorded_at)
+       VALUES (?, ?, ?, ?)`
+    ).run(taskId, requestSeq, event.kind === "completion_accepted" ? "accepted" : "rejected", event.at);
   }
 }
 

@@ -466,6 +466,20 @@ export type TaskPrCheck = {
   state: "pending" | "passing" | "failing" | "unknown";
 };
 
+// Server-derived from durable lifecycle, PR, and verification facts. It is
+// intentionally distinct from live worker or FleetMonitor status.
+export type TaskPresentationState =
+  | "working"
+  | "needs_you"
+  | "blocked"
+  | "awaiting_verification"
+  | "ready_to_merge"
+  | "ready_to_apply"
+  | "failed"
+  | "closed";
+
+export type TaskPresentation = { state: TaskPresentationState };
+
 export type RuntimeState = "starting" | "live" | "recoverable" | "recovering" | "ended";
 
 export type RuntimeSnapshot = {
@@ -511,6 +525,7 @@ export type Task = {
   worktreeId?: string; // the pool lease
   branch?: string;
   pr?: TaskPr;
+  presentation?: TaskPresentation;
   // The finalized plan this task builds from, stamped at dispatch. An opaque
   // key (the plan doc's repo-relative path, e.g. "docs/plans/2026-07-08-foo.md",
   // or the finalizing chart's id) so a plan edit can look up its affected

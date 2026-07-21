@@ -3910,7 +3910,21 @@ async function handleTaskEvent(
     // report as a completion claim. Trusted done is created only by the mate's
     // explicit /completion accept action.
     const kind = body.kind === "done" ? "completion_requested" : body.kind;
-    updated = options.tasks.recordEvent(taskId, { kind, message, source, ...(data ? { data } : {}) });
+    // Bind the completion claim to the exact deliverable before appending it.
+    // A later PR head observation cannot inherit this acceptance.
+    if (pr) {
+      options.tasks.update(taskId, { pr: { ...task.pr, ...pr } });
+    }
+    const current = options.tasks.find(taskId) ?? task;
+    const eventData = kind === "completion_requested"
+      ? {
+          ...(data ?? {}),
+          deliverable: current.mode === "local-only"
+            ? { kind: "local", revision: current.branch }
+            : { kind: "pr", headOid: current.pr?.headOid }
+        }
+      : data;
+    updated = options.tasks.recordEvent(taskId, { kind, message, source, ...(eventData ? { data: eventData } : {}) });
   } catch (error) {
     writeJson(response, 409, { error: error instanceof Error ? error.message : String(error) });
     return;
@@ -3919,7 +3933,6 @@ async function handleTaskEvent(
   // A finished worker naming its PR arms the reconcile loop: one eager poll
   // now, plus a fast window while the fresh PR's checks are expected to move.
   if (pr && !updated.pr?.merged) {
-    updated = options.tasks.update(taskId, { pr: { ...updated.pr, ...pr } });
     options.prPoller.armFast(taskId);
     void options.prPoller.tick().catch(() => {});
   }

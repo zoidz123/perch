@@ -688,11 +688,16 @@ struct AgentTask: Codable, Identifiable, Equatable {
     let worktreeId: String?
     let branch: String?
     let pr: TaskPrModel?
+    let presentation: TaskPresentationModel?
     // Derived by the server from its authoritative runtime ledger. Optional
     // keeps older task records and servers wire-compatible.
     let runtime: RuntimeSnapshotModel?
     let createdAt: String
     let updatedAt: String
+}
+
+struct TaskPresentationModel: Codable, Equatable {
+    let state: String
 }
 
 struct TaskPrModel: Codable, Equatable {

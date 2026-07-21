@@ -7,6 +7,7 @@ import { BOSS_EVENT_KINDS } from "./mateWake.js";
 import { PUSH_EVENT_KINDS } from "./pushRouter.js";
 import { StateDb, type NotificationIntentInput } from "./stateDb.js";
 import { runtimeSnapshot } from "./runtimeManager.js";
+import { deriveTaskPresentation } from "./taskPresentation.js";
 
 // Ledger 1: tasks - "what work is happening". Dumb CRUD plus a server-enforced
 // state machine; all policy (dispatch composition, absorb/escalate, teardown
@@ -164,14 +165,14 @@ export class TaskStore {
     const runtimes = this.stateDb.runtimes.latestByTask();
     return this.stateDb.tasks.list().map((task) => {
       const runtime = runtimes.get(task.id);
-      return runtime ? { ...task, runtime: runtimeSnapshot(runtime) } : task;
+      return this.withPresentation(runtime ? { ...task, runtime: runtimeSnapshot(runtime) } : task);
     });
   }
 
   find(id: string): Task | undefined {
     try {
       const task = this.stateDb.tasks.find(safeId(id));
-      return task ? this.withRuntime(task) : undefined;
+      return task ? this.withPresentation(this.withRuntime(task)) : undefined;
     } catch {
       return undefined;
     }
@@ -194,7 +195,7 @@ export class TaskStore {
     task.workerName = WORKER_NAMES.find((name) => !reserved.has(name)) ?? numberedWorkerName(reserved);
     task.updatedAt = nextTimestamp(task.updatedAt);
     this.stateDb.tasks.save(withoutRuntime(task));
-    return { ...task };
+    return this.withPresentation({ ...task });
   }
 
   // Upgrade only old, still-open records that already own a worker session.
@@ -240,7 +241,7 @@ export class TaskStore {
     Object.assign(task, fields);
     task.updatedAt = nextTimestamp(task.updatedAt);
     this.stateDb.tasks.save(withoutRuntime(task));
-    return { ...task };
+    return this.withPresentation({ ...task });
   }
 
   // Append an event; when the event kind implies a state, the transition is
@@ -273,7 +274,7 @@ export class TaskStore {
         // Observers never disturb the ledger.
       }
     }
-    return { ...task };
+    return this.withPresentation({ ...task });
   }
 
   // Append a causally-linked event group in one SQLite transaction. Used when
@@ -318,12 +319,17 @@ export class TaskStore {
         }
       }
     }
-    return { ...task };
+    return this.withPresentation({ ...task });
   }
 
   private withRuntime(task: Task): Task {
     const runtime = this.stateDb.runtimes.latestForTask(task.id);
     return runtime ? { ...task, runtime: runtimeSnapshot(runtime) } : task;
+  }
+
+  private withPresentation(task: Task): Task {
+    const { presentation: _presentation, ...persisted } = task;
+    return { ...persisted, presentation: deriveTaskPresentation(persisted, this.events(task.id)) };
   }
 
   events(id: string): TaskEvent[] {
