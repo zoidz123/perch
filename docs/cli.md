@@ -160,32 +160,8 @@ Provider installation and sign-in remain separate user actions.
 
 ## Complete command index
 
-```text
-perch --help | perch help [command]
-perch --version
-perch claude [options] [claude args...]
-perch codex [options] [codex args...]
-perch run [options] -- <command> [args...]
-perch mate [options] [claude|codex]
-perch recover task <task-id>
-perch attach [options] <session-id>
-perch stop <session-id>
-perch ls
-perch pair [--title <device-name>]
-perch devices [ls|revoke <id>]
-perch project [list|ls]
-perch project add <path> [--mode direct-PR|no-mistakes|local-only] [--yolo] [--yes]
-perch project show <path>
-perch project set <path> [--mode direct-PR|no-mistakes|local-only] [--yolo|--no-yolo] [--yes]
-perch project remove|rm <path>
-perch runtime [show|validate] [--json]
-perch models [--json]
-perch config <show|get|set|unset|validate> ...
-perch worktrees [release <id> [--force]]
-perch doctor [--json] [--fix [--yes]]
-perch uninstall [--dry-run] [--purge-data] [--force]
-perch server [status|start|stop|logs]
-```
+`perch --help` prints the canonical, complete command list, and `perch <command> --help` prints each command's usage.
+The sections above cover the same commands with their behavior notes.
 
 ## Contributor checks
 
