@@ -234,6 +234,13 @@ test("a phone-composer turn routes over the real transport as a turn/start RPC o
   await tick();
   assert.deepEqual(shared, ["thr_shared"]);
 
+  // The shared daemon can later broadcast another thread (for example, an
+  // internal Codex thread opened while the Mate keeps running). That must not
+  // replace the root thread Perch persists for crash recovery.
+  daemon.push("thread/started", { thread: { id: "thr_unrelated" } });
+  await tick();
+  assert.deepEqual(shared, ["thr_shared"]);
+
   // Now a composer turn routes over the wire as turn/start on that thread.
   assert.equal(await plane.submitTurn("cx-1", "hello codex", "human"), true);
   await tick();

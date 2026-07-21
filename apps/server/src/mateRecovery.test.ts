@@ -31,11 +31,12 @@ class MateRecoveryAdapter implements AgentAdapter {
   readonly name = "mate-recovery-test";
   readonly sessions: AgentSession[] = [];
   readonly requests: StartAgentRequest[] = [];
+  recentEvents: RecentEventsResult = { events: [], terminal: true };
   onStart?: (request: StartAgentRequest, session: AgentSession) => void;
 
   async getTopology() { return { windows: [], generatedAt: new Date().toISOString() }; }
   async listSessions() { return this.sessions.map((session) => ({ ...session })); }
-  async readRecentEvents(): Promise<RecentEventsResult> { return { events: [], terminal: true }; }
+  async readRecentEvents(): Promise<RecentEventsResult> { return this.recentEvents; }
   async sendInput() {}
   async sendEnter() {}
   async interrupt() {}
@@ -333,7 +334,7 @@ test("a child recovery that failed is retried by the next mate fleet reconcile",
   }
 });
 
-test("a mate recovery failing in prepare returns the claim to recoverable and stays retryable", async () => {
+test("a mate recovery failure is shell-safe, returns the claim to recoverable, and stays retryable", async () => {
   const home = mkdtempSync(join(tmpdir(), "perch-mate-prepare-fail-"));
   const tasks = new TaskStore({ PERCH_HOME: home } as NodeJS.ProcessEnv);
   const ownerManager = new OwnerManager(tasks);
@@ -376,6 +377,10 @@ test("a mate recovery failing in prepare returns the claim to recoverable and st
     }),
     verifyIdentity: async ({ providerSessionId }) => providerSessionId
   };
+  const identityFailingDriver: RecoveryProviderDriver = {
+    ...workingDriver,
+    verifyIdentity: async () => { throw new Error("identity failed"); }
+  };
 
   try {
     const starting = ownerManager.beginMateLaunch({
@@ -391,6 +396,23 @@ test("a mate recovery failing in prepare returns the claim to recoverable and st
 
     const failing = new MateRecoveryCoordinator({ ...base, mateProviders: [throwingDriver] });
     await assert.rejects(failing.recover(recoverable), /codex CLI does not support resume/);
+    assert.equal(ownerManager.latestMate()?.state, "recoverable");
+
+    adapter.recentEvents = {
+      events: [{
+        type: "terminal_output",
+        sessionId: "pty:failed-recovery",
+        text: "\x1b[6nresume failed\x1b]10;?\x1b\\",
+        at: new Date().toISOString()
+      }],
+      terminal: true
+    };
+    const identityFailing = new MateRecoveryCoordinator({ ...base, mateProviders: [identityFailingDriver] });
+    await assert.rejects(identityFailing.recover(ownerManager.latestMate()!), (error: Error) => {
+      assert.equal(error.message, "identity failed; terminal: resume failed");
+      assert.doesNotMatch(error.message, /\x1b/);
+      return true;
+    });
     assert.equal(ownerManager.latestMate()?.state, "recoverable");
 
     const retry = new MateRecoveryCoordinator({ ...base, mateProviders: [workingDriver] });
