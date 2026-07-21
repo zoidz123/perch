@@ -52,6 +52,8 @@ export type AgentSession = {
   pendingApproval?: PendingApproval;
   // Authoritative Codex app-server request. Unlike `pendingApproval`, this is
   // resolved through the matching JSON-RPC request id, never PTY keystrokes.
+  // Several requests can be open at once; this is the oldest still-open one,
+  // and later requests surface here as earlier ones resolve.
   pendingServerRequest?: PendingServerRequest;
   // Set while the agent is blocked on an interactive question (Claude's
   // AskUserQuestion widget); cleared when it resolves. Drives the native
