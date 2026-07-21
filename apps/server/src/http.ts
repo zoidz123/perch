@@ -500,7 +500,7 @@ type RpcResult = { status: number; body: unknown };
 
 // POST /mate/start body. Every field is optional and overrides the fleet's
 // configured mate default for this launch; the app posts `{}` and gets the
-// mate the boss configured with `perch config mate-*`.
+// mate the boss configured with `mate.*` via `perch config`.
 type MateStartRequest = {
   agent?: MateDefaults["agent"];
   model?: string;
@@ -3320,7 +3320,7 @@ async function startMateRpc(
       return rpcError(409, error instanceof Error ? error.message : String(error));
     }
   }
-  // Fleet mate defaults (`perch config mate-*`) shape a fresh mate here just
+  // Fleet mate defaults (`mate.*` via `perch config`) shape a fresh mate here just
   // as they do in `perch mate`, so starting one from the phone lands on the
   // same agent/model. Precedence mirrors dispatch: an explicit request field
   // wins, and a configured model/effort describes the DEFAULT agent's launch

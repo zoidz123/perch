@@ -9,14 +9,14 @@ import { DISPATCH_CODEX_FALLBACK, MATE_CODEX_FALLBACK, MATE_MODEL_AUTO } from ".
 // persisted file (mirroring PERCH_TOKEN vs the token file), the file is
 // mtime-cached and written atomically (mirroring the project registry).
 //
-// Two things live here: the dispatch defaults (`perch config default-*`) -
+// Two things live here: the dispatch defaults (`dispatch.*` via `perch config`) -
 // the agent/model/effort POST /tasks falls back to when a dispatch omits
-// them - and the mate defaults (`perch config mate-*`) - the model/effort
+// them - and the mate defaults (`mate.*` via `perch config`) - the model/effort
 // `perch mate` launches with. An explicit per-call value always wins;
 // nothing configured means the built-in behavior (claude, CLI-default model)
 // is unchanged.
 
-// Agents a dispatch can spawn; the whitelist for `default-agent`. "shell" and
+// Agents a dispatch can spawn; the whitelist for `dispatch.agent`. "shell" and
 // "unknown" are session classifications, never dispatch targets.
 export const DISPATCH_AGENTS = new Set(["claude", "codex"]);
 

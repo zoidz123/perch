@@ -216,6 +216,44 @@ async function runCli(serverUrl: string, home: string, args: string[]): Promise<
   }
 }
 
+test("wrapper help covers top-level and nested commands without starting the server or a provider", async () => {
+  const home = mkdtempSync(join(tmpdir(), "perch-config-home-"));
+  try {
+    const unreachable = "http://127.0.0.1:1";
+    const cases: Array<[string[], RegExp]> = [
+      [["claude", "--help"], /Starts and attaches a Perch-managed claude session/],
+      [["codex", "--help"], /To forward provider help/],
+      [["run", "--help"], /perch run \[options\] -- <command>/],
+      [["mate", "--help"], /durable Mate orchestrator/],
+      [["recover", "task", "--help"], /perch recover task <task-id>/],
+      [["attach", "--help"], /Attaches this terminal/],
+      [["stop", "--help"], /Stops a live Perch session/],
+      [["ls", "--help"], /Lists Perch sessions/],
+      [["pair", "--help"], /Creates a device pairing offer/],
+      [["devices", "revoke", "--help"], /perch devices revoke <id>/],
+      [["project", "add", "--help"], /project remove\|rm <path>/],
+      [["models", "--help"], /selectable Mate and dispatch models/],
+      [["config", "set", "--help"], /Global defaults: dispatch\.\* for workers and mate\.\* for Mate/],
+      [["worktrees", "release", "--help"], /worktrees release <id> \[--force\]/],
+      [["doctor", "--help"], /immutable bundled no-mistakes runtime/],
+      [["uninstall", "--help"], /Removes Perch-managed agent configuration/],
+      [["server", "logs", "--help"], /Controls the local Perch server/]
+    ];
+    for (const [args, expected] of cases) {
+      const result = await runCli(unreachable, home, args);
+      assert.equal(result.code, 0, `${args.join(" ")}: ${result.stderr}`);
+      assert.match(result.stdout, expected);
+      assert.equal(result.stderr, "");
+    }
+
+    const alias = await runCli(unreachable, home, ["help", "config"]);
+    assert.equal(alias.code, 0, alias.stderr);
+    assert.match(alias.stdout, /Runtime keys are read-only provenance/);
+  } finally {
+    rmSync(home, { recursive: true, force: true });
+  }
+});
+
 test("config set PATCHes the mapped field and get reads it back", async () => {
   const home = mkdtempSync(join(tmpdir(), "perch-config-home-"));
   try {
@@ -433,34 +471,44 @@ test("config set validates client-side: bad agent and unknown key never reach th
   }
 });
 
-test("project config requires explicit scope, supports transactional activation flags, and reports provenance", async () => {
+test("config rejects project policy keys after they move to perch project", async () => {
   const home = mkdtempSync(join(tmpdir(), "perch-config-home-"));
   try {
     await withStubServer(async (serverUrl, state) => {
-      const missingScope = await runConfig(serverUrl, home, ["set", "task.mode", "direct-PR"]);
-      assert.equal(missingScope.code, 1);
-      assert.match(missingScope.stderr, /require explicit --global or --project PATH/);
+      const moved = await runConfig(serverUrl, home, ["set", "--project", "/repo", "task.mode", "no-mistakes"]);
+      assert.equal(moved.code, 1);
+      assert.match(moved.stderr, /task\.mode moved to the project registry; use `perch project set \/repo --mode no-mistakes`/);
 
-      const setMode = await runConfig(serverUrl, home, [
-        "set", "--project", "/repo", "--yes", "task.mode", "no-mistakes"
-      ]);
-      assert.equal(setMode.code, 0, setMode.stderr);
-      assert.equal(state.project.mode, "no-mistakes");
-      assert.deepEqual(state.patches.at(-1), { rootPath: "/repo", mode: "no-mistakes" });
+      const yolo = await runConfig(serverUrl, home, ["set", "--project", "/repo", "task.yolo", "true"]);
+      assert.equal(yolo.code, 1);
+      assert.match(yolo.stderr, /task\.yolo moved to the project registry; use `perch project set \/repo --yolo`/);
+      assert.deepEqual(state.patches, []);
+    });
+  } finally {
+    rmSync(home, { recursive: true, force: true });
+  }
+});
 
-      const setYolo = await runConfig(serverUrl, home, ["set", "--project", "/repo", "task.yolo", "false"]);
-      assert.equal(setYolo.code, 0, setYolo.stderr);
-      assert.equal(state.project.yolo, false);
+test("config validate passes on the global view and runtime owns bundled provenance", async () => {
+  const home = mkdtempSync(join(tmpdir(), "perch-config-home-"));
+  try {
+    await withStubServer(async (serverUrl) => {
+      const validate = await runConfig(serverUrl, home, ["validate"]);
+      assert.equal(validate.code, 0, validate.stderr);
+      assert.match(validate.stdout, /configuration valid/);
 
-      const effective = await runConfig(serverUrl, home, [
-        "get", "--project", "/repo", "--effective", "--json", "task.mode"
-      ]);
-      assert.equal(effective.code, 0, effective.stderr);
-      const parsed = JSON.parse(effective.stdout) as { effectiveValue: string; source: string; scope: string };
-      assert.deepEqual(
-        { value: parsed.effectiveValue, source: parsed.source, scope: parsed.scope },
-        { value: "no-mistakes", source: "project", scope: "project" }
-      );
+      const show = await runConfig(serverUrl, home, ["show"]);
+      assert.equal(show.code, 0, show.stderr);
+      assert.doesNotMatch(show.stdout, /runtime\.no-mistakes|task\.mode|task\.yolo/);
+
+      const runtime = await runCli(serverUrl, home, ["runtime", "validate"]);
+      assert.equal(runtime.code, 0, runtime.stderr);
+      assert.match(runtime.stdout, /bundled no-mistakes runtime valid/);
+
+      const runtimeJson = await runCli(serverUrl, home, ["runtime", "--json"]);
+      assert.equal(runtimeJson.code, 0, runtimeJson.stderr);
+      const body = JSON.parse(runtimeJson.stdout) as Record<string, { effectiveValue: unknown }>;
+      assert.equal(body["runtime.no-mistakes.source"]?.effectiveValue, "bundled");
     });
   } finally {
     rmSync(home, { recursive: true, force: true });

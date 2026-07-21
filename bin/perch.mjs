@@ -71,7 +71,7 @@ async function main() {
   }
 
   if (parsed.help || parsed.command === "help" || !parsed.command) {
-    printHelp();
+    printHelp(parsed.command === "help" ? parsed.args[0] : parsed.command);
     return;
   }
 
@@ -109,6 +109,11 @@ async function main() {
 
   if (parsed.command === "config") {
     await runConfigCommand(parsed.args, parsed.options);
+    return;
+  }
+
+  if (parsed.command === "runtime") {
+    await runRuntimeCommand(parsed.args, parsed.options);
     return;
   }
 
@@ -512,8 +517,8 @@ async function runProjectCommand(args, options) {
     }
     const rows = projects.map((project) => ({
       name: project.name,
-      mode: project.mode ?? "-",
-      yolo: project.yolo ? "yes" : "-",
+      mode: project.mode ?? "direct-PR (default)",
+      yolo: project.yolo ? "true" : "false (default)",
       used: humanizeSince(project.lastUsedAt),
       path: prettyPath(project.rootPath)
     }));
@@ -586,7 +591,40 @@ async function runProjectCommand(args, options) {
     return;
   }
 
-  throw new Error(`unknown project action: ${action} (expected list|add|remove)`);
+  if (action === "show") {
+    const { path } = parseProjectArgs(args.slice(1), "show");
+    const root = resolve(path);
+    const response = await fetch(httpUrl(options, "/projects"), { headers: jsonHeaders(options) });
+    if (!response.ok) throw new Error(await responseError(response));
+    const project = (await response.json()).projects?.find((entry) => resolve(entry.rootPath) === root);
+    if (!project) throw new Error(`unknown project: ${root}`);
+    console.log(`PROJECT  ${project.name}\nPATH     ${prettyPath(project.rootPath)}\nMODE     ${project.mode ?? "direct-PR (built-in default)"}\nYOLO     ${project.yolo ? "true" : "false (built-in default)"}`);
+    return;
+  }
+
+  if (action === "set") {
+    const { path, mode, yolo, yes } = parseProjectArgs(args.slice(1), "set");
+    if (mode === undefined && yolo === undefined) throw new Error("project set requires --mode or --yolo");
+    const root = resolve(path);
+    if (mode === "no-mistakes") {
+      const config = await fetchConfig(options);
+      validateBundledRuntimeEntries(config.entries ?? {});
+      if (!yes) {
+        if (!process.stdin.isTTY) throw new Error("setting project mode=no-mistakes requires confirmation; rerun with --yes");
+        const answer = await promptLine(`initialize the no-mistakes gate in ${prettyPath(root)} now? [Y/n] `);
+        if (/^n/i.test(answer.trim())) {
+          console.log("aborted - setting the mode runs `no-mistakes init`; prior mode preserved");
+          return;
+        }
+      }
+    }
+    const response = await fetch(httpUrl(options, "/projects"), { method: "PATCH", headers: jsonHeaders(options), body: JSON.stringify({ rootPath: root, ...(mode !== undefined ? { mode } : {}), ...(yolo !== undefined ? { yolo } : {}) }) });
+    if (!response.ok) throw new Error(await responseError(response));
+    console.log(`updated ${prettyPath(root)}`);
+    return;
+  }
+
+  throw new Error(`unknown project action: ${action} (expected list|add|show|set|remove)`);
 }
 
 function parseProjectArgs(args, action) {
@@ -602,6 +640,8 @@ function parseProjectArgs(args, action) {
       mode = arg.slice("--mode=".length);
     } else if (arg === "--yolo") {
       yolo = true;
+    } else if (arg === "--no-yolo") {
+      yolo = false;
     } else if (arg === "--yes" || arg === "-y") {
       yes = true;
     } else if (arg.startsWith("-")) {
@@ -626,21 +666,17 @@ function parseProjectArgs(args, action) {
 // ---------------------------------------------------------------------------
 
 const CONFIG_KEYS = {
-  "dispatch.agent": { scope: "global", layer: "dispatchDefaults", field: "agent" },
-  "dispatch.model": { scope: "global", layer: "dispatchDefaults", field: "model" },
-  "dispatch.effort": { scope: "global", layer: "dispatchDefaults", field: "effort" },
-  "mate.agent": { scope: "global", layer: "mateDefaults", field: "agent" },
-  "mate.model": { scope: "global", layer: "mateDefaults", field: "model" },
-  "mate.effort": { scope: "global", layer: "mateDefaults", field: "effort" },
-  "task.mode": { scope: "project", field: "mode" },
-  "task.yolo": { scope: "project", field: "yolo" }
+  "dispatch.agent": { layer: "dispatchDefaults", field: "agent" },
+  "dispatch.model": { layer: "dispatchDefaults", field: "model" },
+  "dispatch.effort": { layer: "dispatchDefaults", field: "effort" },
+  "mate.agent": { layer: "mateDefaults", field: "agent" },
+  "mate.model": { layer: "mateDefaults", field: "model" },
+  "mate.effort": { layer: "mateDefaults", field: "effort" }
 };
 const CONFIG_AGENTS = new Set(["claude", "codex"]);
-const CONFIG_MODES = new Set(["direct-PR", "no-mistakes", "local-only"]);
 
-async function fetchConfig(options, project) {
-  const query = `?effective=1${project ? `&project=${encodeURIComponent(project)}` : ""}`;
-  const response = await fetch(httpUrl(options, `/config${query}`), { headers: jsonHeaders(options) });
+async function fetchConfig(options) {
+  const response = await fetch(httpUrl(options, "/config?effective=1"), { headers: jsonHeaders(options) });
   if (!response.ok) {
     throw new Error(await responseError(response));
   }
@@ -765,10 +801,12 @@ async function runConfigCommand(args, options) {
     await mutateConfig(parsed, options);
     return;
   }
-  const config = await fetchConfig(options, parsed.project);
+  if (parsed.project) throw new Error("project settings moved to `perch project show|set <path>`");
+  const config = await fetchConfig(options);
   let entries = redactConfigEntries(config.entries ?? {});
+  entries = Object.fromEntries(Object.entries(entries).filter(([, entry]) => entry.scope === "global"));
   if (parsed.action === "validate") {
-    validateConfigEntries(entries, parsed);
+    validateConfigEntries(entries);
     if (parsed.json) console.log(JSON.stringify({ valid: true, entries }, null, 2));
     else console.log("configuration valid");
     return;
@@ -782,12 +820,7 @@ async function runConfigCommand(args, options) {
     return;
   }
   entries = { ...entries, ...await roleResolutionEntries(config, options) };
-  let selected = entries;
-  if (!parsed.effective && parsed.global) {
-    selected = Object.fromEntries(Object.entries(entries).filter(([, entry]) => entry.scope === "global"));
-  } else if (!parsed.effective && parsed.project) {
-    selected = Object.fromEntries(Object.entries(entries).filter(([, entry]) => entry.scope === "project"));
-  }
+  const selected = entries;
   if (parsed.json) {
     console.log(JSON.stringify(selected, null, 2));
     return;
@@ -805,7 +838,6 @@ function parseConfigArgs(args) {
     project: undefined,
     effective: false,
     json: false,
-    yes: false,
     agent: undefined,
     effort: undefined,
     positionals: []
@@ -819,7 +851,6 @@ function parseConfigArgs(args) {
       index += 1;
     } else if (value === "--effective") parsed.effective = true;
     else if (value === "--json") parsed.json = true;
-    else if (value === "--yes") parsed.yes = true;
     else if (value === "--agent") {
       parsed.agent = args[index + 1];
       if (!parsed.agent) throw new Error("--agent requires claude or codex");
@@ -976,57 +1007,45 @@ function requireConfigKey(key, entries) {
 }
 
 async function mutateConfig(parsed, options) {
-  if (!parsed.global && !parsed.project) {
-    throw new Error("config mutations require explicit --global or --project PATH");
-  }
   const key = parsed.positionals[0];
   const spec = CONFIG_KEYS[key];
   if (!spec) {
+    if (key === "task.mode" || key === "task.yolo") {
+      throw new Error(`${key} moved to the project registry; use \`${projectSetHint(key, parsed)}\``);
+    }
     if (key?.startsWith("runtime.no-mistakes.")) {
       throw new Error(`${key} is read-only and managed by perchctl; update Perch to change it`);
     }
     throw new Error(`unknown config key: ${key ?? "(none)"}`);
   }
-  const requestedScope = parsed.global ? "global" : "project";
-  if (spec.scope !== requestedScope) throw new Error(`${key} is ${spec.scope}-only`);
-  let value = parsed.action === "unset" ? null : parsed.positionals[1];
+  if (!parsed.global) {
+    throw new Error(parsed.project ? `${key} is global-only` : "config mutations require explicit --global");
+  }
+  const value = parsed.action === "unset" ? null : parsed.positionals[1];
   if (parsed.action === "set" && value === undefined) throw new Error(`config set ${key} requires a value`);
   if (spec.field === "agent" && value !== null && !CONFIG_AGENTS.has(value)) {
     throw new Error(`invalid ${key}: ${value} (expected ${[...CONFIG_AGENTS].join("|")})`);
   }
-  if (key === "task.mode" && value !== null && !CONFIG_MODES.has(value)) {
-    throw new Error(`invalid task.mode: ${value} (expected ${[...CONFIG_MODES].join("|")})`);
-  }
-  if (key === "task.yolo" && value !== null) {
-    if (value !== "true" && value !== "false") throw new Error("task.yolo must be true or false");
-    value = value === "true";
-  }
-  if (key === "task.mode" && value === "no-mistakes") {
-    const before = await fetchConfig(options, parsed.project);
-    validateBundledRuntimeEntries(before.entries ?? {});
-    if (!parsed.yes) {
-      if (!process.stdin.isTTY) throw new Error("setting task.mode=no-mistakes requires confirmation; rerun with --yes");
-      const answer = await promptLine(`initialize and verify the bundled no-mistakes gate in ${prettyPath(parsed.project)}? [y/N] `);
-      if (answer.trim().toLowerCase() !== "y" && answer.trim().toLowerCase() !== "yes") {
-        console.log("aborted; prior project mode preserved");
-        return;
-      }
-    }
-  }
-  const path = spec.scope === "global" ? "/config" : "/projects";
-  const body = spec.scope === "global"
-    ? { [spec.layer]: { [spec.field]: value } }
-    : { rootPath: parsed.project, [spec.field]: value };
-  const response = await fetch(httpUrl(options, path), {
+  const response = await fetch(httpUrl(options, "/config"), {
     method: "PATCH",
     headers: jsonHeaders(options),
-    body: JSON.stringify(body)
+    body: JSON.stringify({ [spec.layer]: { [spec.field]: value } })
   });
   if (!response.ok) throw new Error(await responseError(response));
-  const config = await fetchConfig(options, parsed.project);
+  const config = await fetchConfig(options);
   const entry = redactConfigEntries(config.entries ?? {})[key];
   if (parsed.json) console.log(JSON.stringify({ key, ...entry }, null, 2));
   else console.log(`${key} = ${formatConfigValue(entry?.storedValue)}`);
+}
+
+function projectSetHint(key, parsed) {
+  const path = parsed.project ?? "<path>";
+  const value = parsed.action === "set" ? parsed.positionals[1] : undefined;
+  if (key === "task.mode") {
+    return `perch project set ${path} --mode ${value ?? "<direct-PR|no-mistakes|local-only>"}`;
+  }
+  const flag = value === "true" ? "--yolo" : value === "false" ? "--no-yolo" : "--yolo|--no-yolo";
+  return `perch project set ${path} ${flag}`;
 }
 
 function redactConfigEntries(entries) {
@@ -1042,11 +1061,9 @@ function redactConfigEntries(entries) {
   }));
 }
 
-function validateConfigEntries(entries, parsed) {
-  if (parsed.project && !Object.hasOwn(entries, "task.mode")) throw new Error("project configuration is unavailable");
-  validateBundledRuntimeEntries(entries);
+function validateConfigEntries(entries) {
   for (const [key, entry] of Object.entries(entries)) {
-    if (!entry || !["global", "project", "runtime"].includes(entry.scope)) throw new Error(`invalid config entry: ${key}`);
+    if (!entry || entry.scope !== "global") throw new Error(`invalid config entry: ${key}`);
   }
 }
 
@@ -1064,6 +1081,24 @@ function validateBundledRuntimeEntries(entries) {
   if (!entries["runtime.no-mistakes.path"]?.effectiveValue || !entries["runtime.no-mistakes.SHA-256"]?.effectiveValue) {
     throw new Error("bundled no-mistakes runtime path or SHA-256 is unavailable");
   }
+}
+
+async function runRuntimeCommand(args, options) {
+  const action = args[0] && !args[0].startsWith("--") ? args[0] : "show";
+  const json = args.includes("--json");
+  if (!["show", "validate"].includes(action) || args.some((arg) => arg !== action && arg !== "--json")) {
+    throw new Error("runtime expects `perch runtime [show|validate] [--json]`");
+  }
+  const entries = redactConfigEntries((await fetchConfig(options)).entries ?? {});
+  const runtime = Object.fromEntries(Object.entries(entries).filter(([key]) => key.startsWith("runtime.no-mistakes.")));
+  if (action === "validate") {
+    validateBundledRuntimeEntries(runtime);
+    if (json) console.log(JSON.stringify({ valid: true, runtime }, null, 2));
+    else console.log("bundled no-mistakes runtime valid");
+    return;
+  }
+  if (json) console.log(JSON.stringify(runtime, null, 2));
+  else for (const [key, entry] of Object.entries(runtime)) console.log(`${key.padEnd(34)} ${formatConfigValue(entry.effectiveValue)}`);
 }
 
 function formatConfigValue(value) {
@@ -1272,7 +1307,7 @@ function renderDoctorReport(report) {
         : project.note ??
           (project.initialized
             ? "initialized (reinstall this perchctl version if its bundled runtime is unavailable)"
-            : "not initialized - set project task.mode=no-mistakes to initialize transactionally");
+            : `not initialized - run \`perch project set ${prettyPath(project.rootPath)} --mode no-mistakes\` to initialize transactionally`);
       console.log(
         `${project.ready ? "✓" : "-"} ${project.name.padEnd(nameWidth)}  ${prettyPath(project.rootPath).padEnd(pathWidth)}  ${state}`.trimEnd()
       );
@@ -1707,14 +1742,20 @@ function parseArgs(argv) {
       command = arg;
       continue;
     }
+    // Wrapper help must never start a provider session. Put `--` before a
+    // provider's own help flag when the intent is to forward it instead.
+    if (arg === "-h" || arg === "--help") {
+      help = true;
+      continue;
+    }
     if (AGENT_COMMANDS.has(command)) {
       args.push(arg);
       passthrough = true;
       continue;
     }
-    // `project`, `config`, `models`, `worktrees`, and `doctor` keep their own flags as positionals; the shared flags above
+    // `project`, `config`, `runtime`, `models`, `worktrees`, and `doctor` keep their own flags as positionals; the shared flags above
     // (--server, --token, ...) are already consumed.
-    if (arg.startsWith("-") && command !== "project" && command !== "config" && command !== "models" && command !== "worktrees" && command !== "doctor") {
+    if (arg.startsWith("-") && command !== "project" && command !== "config" && command !== "runtime" && command !== "models" && command !== "worktrees" && command !== "doctor") {
       throw new Error(`unknown option for ${command}: ${arg} (see \`perch --help\`)`);
     }
     args.push(arg);
@@ -2220,7 +2261,12 @@ function printStarted(session) {
   console.log(`Workspace: Perch agents`);
 }
 
-function printHelp() {
+function printHelp(command) {
+  const usage = commandHelp(command);
+  if (usage) {
+    console.log(usage);
+    return;
+  }
   console.log(`Usage:
   perch codex [options] [codex args...]
   perch claude [options] [claude args...]
@@ -2234,17 +2280,18 @@ function printHelp() {
   perch devices [ls|revoke <id>]
   perch project [list]
   perch project add <path> [--mode direct-PR|no-mistakes|local-only] [--yolo] [--yes]
+  perch project show <path>
+  perch project set <path> [--mode direct-PR|no-mistakes|local-only] [--yolo|--no-yolo] [--yes]
   perch project remove <path>
+  perch runtime [show|validate] [--json]
   perch models [--json]
-  perch config show [--global|--project PATH] [--effective] [--json]
-  perch config get <key> [--global|--project PATH] [--effective] [--json]
+  perch config show [--global] [--effective] [--json]
+  perch config get <key> [--global] [--effective] [--json]
   perch config set --global <dispatch.agent|dispatch.model|dispatch.effort|
                               mate.agent|mate.model|mate.effort> <value>
   perch config set <mate|dispatch> <model> [--effort <level>] [--agent <agent>]
-  perch config set --project PATH <task.mode|task.yolo> <value> [--yes]
   perch config unset --global <key>
-  perch config unset --project PATH <key>
-  perch config validate [--global|--project PATH] [--effective] [--json]
+  perch config validate [--global] [--effective] [--json]
   perch worktrees
   perch worktrees release <id> [--force]
   perch doctor [--json] [--fix [--yes]]
@@ -2268,9 +2315,8 @@ Session ids can be shortened: \`perch attach e1b4\` works if unambiguous.
 \`perch doctor\` validates the immutable no-mistakes runtime bundled with this
 perchctl package. It never downloads or repairs that runtime from PATH; reinstall
 this exact perchctl version if the bundled bytes are missing or corrupt.
-\`perch config\` manages fleet dispatch and Mate defaults plus project task mode
-and yolo settings. An explicit per-task mode wins over the project value, then
-the built-in direct-PR default applies.
+\`perch config\` shows global Mate and dispatch defaults only. Use \`perch project\`
+for delivery mode and yolo, and \`perch runtime\` for bundled-runtime provenance.
 
 Examples:
   perch claude
@@ -2278,4 +2324,33 @@ Examples:
   perch run -- /bin/zsh -lc 'for i in 1 2 3; do echo $i; sleep 1; done'
 
 While attached, press Ctrl-] to detach without stopping the Perch session.`);
+}
+
+function commandHelp(command) {
+  const common = `Global options: --server <url>, --token <token>. Launch commands also accept --cwd <path>, --title <title>, and --no-attach.`;
+  if (["claude", "codex", "run"].includes(command)) {
+    const usage = command === "run"
+      ? "perch run [options] -- <command> [args...]"
+      : `perch ${command} [options] [${command} args...]`;
+    const forwardHelp = command === "run"
+      ? "To view a wrapped command's help instead of this wrapper help, run:\n  perch run -- <command> --help"
+      : `To forward provider help instead of viewing this wrapper help, run:\n  perch ${command} -- --help`;
+    return `Usage: ${usage}\n\nStarts and attaches a Perch-managed ${command === "run" ? "command" : command} session.\n${common}\n\n${forwardHelp}`;
+  }
+  if (command === "mate") return `Usage: perch mate [options] [claude|codex]\n\nStarts or attaches to the durable Mate orchestrator.\n  --new  intentionally start a fresh Mate conversation\n${common}`;
+  if (command === "recover") return "Usage: perch recover task <task-id>\n\nRecovers a task when its persisted runtime supports recovery.";
+  if (command === "attach") return `Usage: perch attach [options] <session-id>\n\nAttaches this terminal to a live Perch session. Session ids may be shortened when unambiguous.\n${common}`;
+  if (command === "stop") return "Usage: perch stop <session-id>\n\nStops a live Perch session. Session ids may be shortened when unambiguous.";
+  if (command === "ls") return "Usage: perch ls\n\nLists Perch sessions.";
+  if (command === "pair") return "Usage: perch pair [--title <device-name>]\n\nCreates a device pairing offer. Treat the printed URL and QR code as credentials.";
+  if (command === "devices") return "Usage:\n  perch devices [ls]\n  perch devices revoke <id>\n\nLists paired devices or revokes one device token.";
+  if (command === "project") return `Usage:\n  perch project [list|ls]\n  perch project add <path> [--mode direct-PR|no-mistakes|local-only] [--yolo] [--yes]\n  perch project show <path>\n  perch project set <path> [--mode direct-PR|no-mistakes|local-only] [--yolo|--no-yolo] [--yes]\n  perch project remove|rm <path>\n\nThe project registry is live server state. Use \`perch project list\` to inspect it.\n\`--mode no-mistakes\` initializes and verifies the bundled gate before persisting the mode; it asks once unless --yes is present.`;
+  if (command === "models") return "Usage: perch models [--json]\n\nLists selectable Mate and dispatch models, aliases, supported effort levels, and sources.";
+  if (command === "runtime") return "Usage: perch runtime [show|validate] [--json]\n\nShows or validates the read-only bundled no-mistakes runtime provenance shipped with this perchctl package.";
+  if (command === "config") return `Usage:\n  perch config show [--global] [--effective] [--json]\n  perch config get <key> [--global] [--effective] [--json]\n  perch config set <mate|dispatch> <model> [--effort <level>] [--agent <agent>]\n  perch config set --global <key> <value>\n  perch config unset --global <key>\n  perch config validate [--global] [--effective] [--json]\n\nGlobal defaults: dispatch.* for workers and mate.* for Mate.\nProject settings (delivery mode and yolo) moved to \`perch project show|set <path>\`.\nRuntime keys are read-only provenance for this perchctl package; view them with \`perch runtime [show|validate]\`.\nUse \`perch project list\` for the live project registry.`;
+  if (command === "worktrees") return "Usage:\n  perch worktrees\n  perch worktrees release <id> [--force]\n\nLists isolated task worktrees or releases an orphaned lease.";
+  if (command === "doctor") return "Usage: perch doctor [--json] [--fix [--yes]]\n\nChecks the server environment and validates the immutable bundled no-mistakes runtime. It does not download or PATH-repair that runtime.";
+  if (command === "uninstall") return "Usage: perch uninstall [--dry-run] [--purge-data] [--force]\n\nRemoves Perch-managed agent configuration. It preserves ~/.perch state unless --purge-data is supplied.";
+  if (command === "server") return "Usage: perch server [status|start|stop|logs]\n\nControls the local Perch server.";
+  return undefined;
 }
