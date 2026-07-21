@@ -532,6 +532,20 @@ export function resolveApprovalForTask(
   });
 }
 
+function codexServerRequestEventData(request: PendingServerRequest): Record<string, unknown> {
+  return {
+    reason: "codex_server_request",
+    requestId: request.requestId,
+    threadId: request.threadId,
+    turnId: request.turnId,
+    itemId: request.itemId,
+    callId: request.callId,
+    family: request.family,
+    decisions: request.decisions,
+    persistence: request.persistence
+  };
+}
+
 function surfaceCodexServerRequest(
   options: ManagedAgentLauncherOptions,
   sessionId: string,
@@ -544,17 +558,7 @@ function surfaceCodexServerRequest(
     kind: "needs_decision",
     source: "system",
     message: request.summary,
-    data: {
-      reason: "codex_server_request",
-      requestId: request.requestId,
-      threadId: request.threadId,
-      turnId: request.turnId,
-      itemId: request.itemId,
-      callId: request.callId,
-      family: request.family,
-      decisions: request.decisions,
-      persistence: request.persistence
-    }
+    data: codexServerRequestEventData(request)
   });
 }
 
@@ -567,7 +571,23 @@ function resolveCodexServerRequest(
   const task = taskForSession(options, sessionId);
   if (!task || task.state !== "needs_you") return;
   const last = options.tasks.events(task.id).at(-1);
-  if (last?.data?.reason !== "codex_server_request" || last.data.requestId !== request.requestId) return;
+  if (last?.data?.reason !== "codex_server_request") return;
+  const remaining = options.monitor.pendingServerRequest(sessionId);
+  if (remaining) {
+    // Another request is still open: the task stays needs_you. Only when the
+    // ledger's needs_decision moment named the request that just resolved does
+    // it re-point at the surviving queue head; otherwise it still names an
+    // open request and re-pointing would duplicate that request's event.
+    if (last.data.requestId !== request.requestId) return;
+    options.tasks.recordEvent(task.id, {
+      kind: "needs_decision",
+      source: "system",
+      message: remaining.summary,
+      data: codexServerRequestEventData(remaining)
+    });
+    return;
+  }
+  if (last.data.requestId !== request.requestId) return;
   options.tasks.recordEvent(task.id, {
     kind: "working",
     source: "system",
