@@ -112,6 +112,11 @@ async function main() {
     return;
   }
 
+  if (parsed.command === "runtime") {
+    await runRuntimeCommand(parsed.args, parsed.options);
+    return;
+  }
+
   if (parsed.command === "models") {
     await runModelsCommand(parsed.args, parsed.options);
     return;
@@ -512,8 +517,8 @@ async function runProjectCommand(args, options) {
     }
     const rows = projects.map((project) => ({
       name: project.name,
-      mode: project.mode ?? "-",
-      yolo: project.yolo ? "yes" : "-",
+      mode: project.mode ?? "direct-PR (default)",
+      yolo: project.yolo ? "true" : "false (default)",
       used: humanizeSince(project.lastUsedAt),
       path: prettyPath(project.rootPath)
     }));
@@ -586,7 +591,33 @@ async function runProjectCommand(args, options) {
     return;
   }
 
-  throw new Error(`unknown project action: ${action} (expected list|add|remove)`);
+  if (action === "show") {
+    const { path } = parseProjectArgs(args.slice(1), "show");
+    const root = resolve(path);
+    const response = await fetch(httpUrl(options, "/projects"), { headers: jsonHeaders(options) });
+    if (!response.ok) throw new Error(await responseError(response));
+    const project = (await response.json()).projects?.find((entry) => resolve(entry.rootPath) === root);
+    if (!project) throw new Error(`unknown project: ${root}`);
+    console.log(`PROJECT  ${project.name}\nPATH     ${prettyPath(project.rootPath)}\nMODE     ${project.mode ?? "direct-PR (built-in default)"}\nYOLO     ${project.yolo ? "true" : "false (built-in default)"}`);
+    return;
+  }
+
+  if (action === "set") {
+    const { path, mode, yolo, yes } = parseProjectArgs(args.slice(1), "set");
+    if (mode === undefined && yolo === undefined) throw new Error("project set requires --mode or --yolo");
+    const root = resolve(path);
+    if (mode === "no-mistakes") {
+      const config = await fetchConfig(options);
+      validateBundledRuntimeEntries(config.entries ?? {});
+      if (!yes && !process.stdin.isTTY) throw new Error("setting project mode=no-mistakes requires confirmation; rerun with --yes");
+    }
+    const response = await fetch(httpUrl(options, "/projects"), { method: "PATCH", headers: jsonHeaders(options), body: JSON.stringify({ rootPath: root, ...(mode !== undefined ? { mode } : {}), ...(yolo !== undefined ? { yolo } : {}) }) });
+    if (!response.ok) throw new Error(await responseError(response));
+    console.log(`updated ${prettyPath(root)}`);
+    return;
+  }
+
+  throw new Error(`unknown project action: ${action} (expected list|add|show|set|remove)`);
 }
 
 function parseProjectArgs(args, action) {
@@ -602,6 +633,8 @@ function parseProjectArgs(args, action) {
       mode = arg.slice("--mode=".length);
     } else if (arg === "--yolo") {
       yolo = true;
+    } else if (arg === "--no-yolo") {
+      yolo = false;
     } else if (arg === "--yes" || arg === "-y") {
       yes = true;
     } else if (arg.startsWith("-")) {
@@ -631,9 +664,7 @@ const CONFIG_KEYS = {
   "dispatch.effort": { scope: "global", layer: "dispatchDefaults", field: "effort" },
   "mate.agent": { scope: "global", layer: "mateDefaults", field: "agent" },
   "mate.model": { scope: "global", layer: "mateDefaults", field: "model" },
-  "mate.effort": { scope: "global", layer: "mateDefaults", field: "effort" },
-  "task.mode": { scope: "project", field: "mode" },
-  "task.yolo": { scope: "project", field: "yolo" }
+  "mate.effort": { scope: "global", layer: "mateDefaults", field: "effort" }
 };
 const CONFIG_AGENTS = new Set(["claude", "codex"]);
 const CONFIG_MODES = new Set(["direct-PR", "no-mistakes", "local-only"]);
@@ -765,8 +796,10 @@ async function runConfigCommand(args, options) {
     await mutateConfig(parsed, options);
     return;
   }
-  const config = await fetchConfig(options, parsed.project);
+  if (parsed.project) throw new Error("project settings moved to `perch project show|set <path>`");
+  const config = await fetchConfig(options);
   let entries = redactConfigEntries(config.entries ?? {});
+  entries = Object.fromEntries(Object.entries(entries).filter(([, entry]) => entry.scope === "global"));
   if (parsed.action === "validate") {
     validateConfigEntries(entries, parsed);
     if (parsed.json) console.log(JSON.stringify({ valid: true, entries }, null, 2));
@@ -782,12 +815,7 @@ async function runConfigCommand(args, options) {
     return;
   }
   entries = { ...entries, ...await roleResolutionEntries(config, options) };
-  let selected = entries;
-  if (!parsed.effective && parsed.global) {
-    selected = Object.fromEntries(Object.entries(entries).filter(([, entry]) => entry.scope === "global"));
-  } else if (!parsed.effective && parsed.project) {
-    selected = Object.fromEntries(Object.entries(entries).filter(([, entry]) => entry.scope === "project"));
-  }
+  const selected = entries;
   if (parsed.json) {
     console.log(JSON.stringify(selected, null, 2));
     return;
@@ -1064,6 +1092,24 @@ function validateBundledRuntimeEntries(entries) {
   if (!entries["runtime.no-mistakes.path"]?.effectiveValue || !entries["runtime.no-mistakes.SHA-256"]?.effectiveValue) {
     throw new Error("bundled no-mistakes runtime path or SHA-256 is unavailable");
   }
+}
+
+async function runRuntimeCommand(args, options) {
+  const action = args[0] ?? "show";
+  const json = args.includes("--json");
+  if (![("show"), ("validate")].includes(action) || args.some((arg) => arg !== action && arg !== "--json")) {
+    throw new Error("runtime expects `perch runtime [show|validate] [--json]`");
+  }
+  const entries = redactConfigEntries((await fetchConfig(options)).entries ?? {});
+  const runtime = Object.fromEntries(Object.entries(entries).filter(([key]) => key.startsWith("runtime.no-mistakes.")));
+  if (action === "validate") {
+    validateBundledRuntimeEntries(runtime);
+    if (json) console.log(JSON.stringify({ valid: true, runtime }, null, 2));
+    else console.log("bundled no-mistakes runtime valid");
+    return;
+  }
+  if (json) console.log(JSON.stringify(runtime, null, 2));
+  else for (const [key, entry] of Object.entries(runtime)) console.log(`${key.padEnd(34)} ${formatConfigValue(entry.effectiveValue)}`);
 }
 
 function formatConfigValue(value) {
@@ -2245,17 +2291,18 @@ function printHelp(command) {
   perch devices [ls|revoke <id>]
   perch project [list]
   perch project add <path> [--mode direct-PR|no-mistakes|local-only] [--yolo] [--yes]
+  perch project show <path>
+  perch project set <path> [--mode direct-PR|no-mistakes|local-only] [--yolo|--no-yolo] [--yes]
   perch project remove <path>
+  perch runtime [show|validate] [--json]
   perch models [--json]
-  perch config show [--global|--project PATH] [--effective] [--json]
+  perch config show [--global] [--effective] [--json]
   perch config get <key> [--global|--project PATH] [--effective] [--json]
   perch config set --global <dispatch.agent|dispatch.model|dispatch.effort|
                               mate.agent|mate.model|mate.effort> <value>
   perch config set <mate|dispatch> <model> [--effort <level>] [--agent <agent>]
-  perch config set --project PATH <task.mode|task.yolo> <value> [--yes]
   perch config unset --global <key>
-  perch config unset --project PATH <key>
-  perch config validate [--global|--project PATH] [--effective] [--json]
+  perch config validate [--global] [--effective] [--json]
   perch worktrees
   perch worktrees release <id> [--force]
   perch doctor [--json] [--fix [--yes]]
@@ -2279,10 +2326,8 @@ Session ids can be shortened: \`perch attach e1b4\` works if unambiguous.
 \`perch doctor\` validates the immutable no-mistakes runtime bundled with this
 perchctl package. It never downloads or repairs that runtime from PATH; reinstall
 this exact perchctl version if the bundled bytes are missing or corrupt.
-\`perch config\` shows local/global configuration and bundled runtime provenance.
-It does not list live project-registry state unless you pass \`--project PATH\`.
-Use \`perch project list\` to inspect registered projects. An explicit per-task
-mode wins over the project value, then the built-in direct-PR default applies.
+\`perch config\` shows global Mate and dispatch defaults only. Use \`perch project\`
+for delivery mode and yolo, and \`perch runtime\` for bundled-runtime provenance.
 
 Examples:
   perch claude

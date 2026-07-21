@@ -26,9 +26,11 @@ Press `Ctrl+]` to detach from an attached terminal without stopping its process.
 ## Projects
 
 ```text
-perch project [list]
+perch project [list|ls]
 perch project ls
 perch project add <path> [--mode direct-PR|no-mistakes|local-only] [--yolo] [--yes]
+perch project show <path>
+perch project set <path> [--mode direct-PR|no-mistakes|local-only] [--yolo|--no-yolo] [--yes]
 perch project remove <path>
 perch project rm <path>
 ```
@@ -58,16 +60,12 @@ An omitted effort uses the selected model's registry default.
 Unknown models report closest matches, unsupported efforts report the valid levels, and ambiguous cross-agent ids require an interactive choice or `--agent`.
 Global keys are `dispatch.agent`, `dispatch.model`, `dispatch.effort`, `mate.agent`, `mate.model`, and `mate.effort`.
 Setting those dotted global keys remains supported for compatibility and prints a deprecation notice recommending the atomic role command.
-Project-only keys are `task.mode` and `task.yolo`.
-Agent values are `claude` or `codex`, task mode is `direct-PR`, `no-mistakes`, or `local-only`, and yolo is a strict boolean.
+Agent values are `claude` or `codex`.
 
 ### Configuration layers
 
-`perch config` is a view of local/global defaults, an optionally selected project's task settings, and immutable package runtime facts.
-It is not a dump of the live project registry.
-Use `perch project list` to inspect registered projects and their current `MODE` and `YOLO` values.
-Pass `--project /path/to/project` to read or mutate the task settings for that registered project.
-Without `--project`, `task.mode` and `task.yolo` show their built-in values because no project was selected.
+`perch config` is a view of global Mate and dispatch defaults only.
+It never presents project registry or bundled-runtime state.
 
 Copy these commands to inspect and change the global Mate default:
 
@@ -94,14 +92,13 @@ Copy these commands to inspect and change delivery settings for one project:
 
 ```sh
 perch project list
-perch config show --project /path/to/project --effective
-perch config set --project /path/to/project task.mode no-mistakes --yes
-perch config set --project /path/to/project task.yolo true
+perch project show /path/to/project
+perch project set /path/to/project --mode no-mistakes --yolo --yes
 ```
 
 Task mode precedence is explicit task mode, then the project registry value, then built-in `direct-PR`.
-`task.yolo` is a project registry value and defaults to `false` when it is unset.
-Setting `task.mode` to `no-mistakes` is transactional: Perch validates the bundled runtime, initializes the repository gate, and preserves the prior mode if any step fails.
+Project yolo is an orthogonal boolean and defaults to `false`.
+`perch project set ... --mode no-mistakes` validates the bundled runtime and preserves the prior mode if activation fails.
 
 Effective output includes `effectiveValue`, `source`, `scope`, `storedValue`, `defaultValue`, and `overriddenBy` for every key.
 Configuration listings also report each role's resolved agent and warn about a saved agent and model tuple that the current registry cannot validate.
@@ -110,7 +107,7 @@ Text and JSON redact secret-shaped keys identically.
 Environment overrides have higher precedence than stored global launch defaults.
 Task mode precedence is explicit task, project, then built-in `direct-PR`.
 
-Read-only runtime keys are:
+`perch runtime` shows these read-only provenance fields:
 
 - `runtime.no-mistakes.version`
 - `runtime.no-mistakes.path`
@@ -132,7 +129,7 @@ These fields identify the signed runtime shipped inside the installed `perchctl`
 
 An `(unset)` value with source `bundled` in a non-effective `perch config` listing means the field is not user-stored configuration.
 It does not mean no runtime is installed or that a project is not configured for `no-mistakes`.
-Run `perch config show --effective`, `perch config validate`, or `perch doctor` to inspect and validate the effective bundled runtime.
+Run `perch runtime validate` or `perch doctor` to inspect and validate the effective bundled runtime.
 
 ## Models
 
@@ -180,7 +177,10 @@ perch pair [--title <device-name>]
 perch devices [ls|revoke <id>]
 perch project [list|ls]
 perch project add <path> [--mode direct-PR|no-mistakes|local-only] [--yolo] [--yes]
+perch project show <path>
+perch project set <path> [--mode direct-PR|no-mistakes|local-only] [--yolo|--no-yolo] [--yes]
 perch project remove|rm <path>
+perch runtime [show|validate] [--json]
 perch models [--json]
 perch config <show|get|set|unset|validate> ...
 perch worktrees [release <id> [--force]]

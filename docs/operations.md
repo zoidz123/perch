@@ -91,16 +91,14 @@ perch config show --effective
 perch models
 perch config set dispatch <model-id> --agent codex --effort high
 perch config set mate <model-id> --agent claude
-perch config set --project /path/to/project task.mode no-mistakes
-perch config set --project /path/to/project task.yolo true
+perch project set /path/to/project --mode no-mistakes --yolo --yes
 ```
 
 The role commands set a complete global agent, model, and effort tuple atomically.
 The server validates model and effort combinations against its current provider catalog.
 An explicit task or launch agent, model, or effort value wins over the matching persisted default.
 Environment variables win over persisted settings.
-`perch config` does not list the live project registry unless a project path is supplied.
-Use `perch project list` to inspect the registry, and see the [CLI guide](cli.md#configuration-layers) for precedence and runtime provenance.
+Use `perch project show` for delivery mode and yolo, and `perch runtime` for bundled-runtime provenance.
 
 | Setting | Environment override |
 | --- | --- |

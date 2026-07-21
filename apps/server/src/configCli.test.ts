@@ -471,34 +471,14 @@ test("config set validates client-side: bad agent and unknown key never reach th
   }
 });
 
-test("project config requires explicit scope, supports transactional activation flags, and reports provenance", async () => {
+test("config rejects project policy keys after they move to perch project", async () => {
   const home = mkdtempSync(join(tmpdir(), "perch-config-home-"));
   try {
     await withStubServer(async (serverUrl, state) => {
-      const missingScope = await runConfig(serverUrl, home, ["set", "task.mode", "direct-PR"]);
-      assert.equal(missingScope.code, 1);
-      assert.match(missingScope.stderr, /require explicit --global or --project PATH/);
-
-      const setMode = await runConfig(serverUrl, home, [
-        "set", "--project", "/repo", "--yes", "task.mode", "no-mistakes"
-      ]);
-      assert.equal(setMode.code, 0, setMode.stderr);
-      assert.equal(state.project.mode, "no-mistakes");
-      assert.deepEqual(state.patches.at(-1), { rootPath: "/repo", mode: "no-mistakes" });
-
-      const setYolo = await runConfig(serverUrl, home, ["set", "--project", "/repo", "task.yolo", "false"]);
-      assert.equal(setYolo.code, 0, setYolo.stderr);
-      assert.equal(state.project.yolo, false);
-
-      const effective = await runConfig(serverUrl, home, [
-        "get", "--project", "/repo", "--effective", "--json", "task.mode"
-      ]);
-      assert.equal(effective.code, 0, effective.stderr);
-      const parsed = JSON.parse(effective.stdout) as { effectiveValue: string; source: string; scope: string };
-      assert.deepEqual(
-        { value: parsed.effectiveValue, source: parsed.source, scope: parsed.scope },
-        { value: "no-mistakes", source: "project", scope: "project" }
-      );
+      const moved = await runConfig(serverUrl, home, ["set", "--project", "/repo", "task.mode", "no-mistakes"]);
+      assert.equal(moved.code, 1);
+      assert.match(moved.stderr, /unknown config key: task\.mode/);
+      assert.deepEqual(state.patches, []);
     });
   } finally {
     rmSync(home, { recursive: true, force: true });
