@@ -74,7 +74,8 @@ Remote approval is state-bound:
 - Claude PermissionDenied is visible failure evidence, not an approval request.
 - Claude startup, authentication, and directory-trust prompts happen before hooks are available.
   Perch surfaces those detected PTY gates as desktop-only manual actions and never treats a keystroke or notification as proof of remote approval.
-- Codex approvals use the structured app-server request only while its request ID is still current.
+- Codex approvals use the structured app-server request and are answered by exact JSON-RPC request ID.
+  Several requests can be open at once; each stays answerable only until that exact ID resolves.
 - Codex attention without an authoritative structured request remains desktop-only.
 - Stale, missing, changed, or ambiguous prompts return a conflict instead of sending guessed input.
 

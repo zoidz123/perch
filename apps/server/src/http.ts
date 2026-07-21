@@ -1999,13 +1999,15 @@ async function route(
       if (typeof body.requestId !== "string" && typeof body.requestId !== "number") {
         throw new Error("requestId must be a string or number");
       }
-      const pending = options.monitor.pendingServerRequest(canonicalSessionId);
+      // Several requests can be open at once; answer exactly the id named,
+      // whether or not it is the queue head the overview currently shows.
+      const pending = options.monitor.pendingServerRequestById(canonicalSessionId, body.requestId);
       if (!pending) {
-        writeJson(response, 409, { error: "No structured server request for this session" });
-        return;
-      }
-      if (pending.requestId !== body.requestId) {
-        writeJson(response, 409, { error: "The structured server request has changed" });
+        if (options.monitor.pendingServerRequest(canonicalSessionId)) {
+          writeJson(response, 409, { error: "The structured server request has changed" });
+        } else {
+          writeJson(response, 409, { error: "No structured server request for this session" });
+        }
         return;
       }
       if (!options.codexControl?.respondToServerRequest(canonicalSessionId, body)) {
