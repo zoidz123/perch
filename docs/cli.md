@@ -151,7 +151,7 @@ If Codex is missing or its listing mechanism is unavailable, the command retains
 ## Pairing, server, and diagnostics
 
 ```text
-perch pair
+perch pair [--title <device-name>]
 perch devices [ls|revoke <id>]
 perch server [status|start|stop|logs]
 perch doctor [--json] [--fix [--yes]]
@@ -176,7 +176,7 @@ perch recover task <task-id>
 perch attach [options] <session-id>
 perch stop <session-id>
 perch ls
-perch pair
+perch pair [--title <device-name>]
 perch devices [ls|revoke <id>]
 perch project [list|ls]
 perch project add <path> [--mode direct-PR|no-mistakes|local-only] [--yolo] [--yes]
