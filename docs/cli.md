@@ -43,18 +43,17 @@ Any failure preserves the previous mode.
 ## Configuration
 
 ```text
-perch config show [--global|--project PATH] [--effective] [--json]
-perch config get <key> [--global|--project PATH] [--effective] [--json]
+perch config show [--global] [--effective] [--json]
+perch config get <key> [--global] [--effective] [--json]
 perch config set mate <model> [--effort <level>] [--agent claude|codex]
 perch config set dispatch <model> [--effort <level>] [--agent claude|codex]
 perch config set --global <key> <value>
-perch config set --project PATH <key> <value> [--yes]
 perch config unset --global <key>
-perch config unset --project PATH <key>
-perch config validate [--global|--project PATH] [--effective] [--json]
+perch config validate [--global] [--effective] [--json]
 ```
 
-Mutations always require an explicit scope.
+Dotted-key mutations require explicit `--global`.
+Project delivery settings moved to `perch project show|set <path>`; a `task.mode` or `task.yolo` mutation fails with the equivalent `perch project set` command.
 The mate and dispatch model commands are global by definition and resolve the model to one agent before writing the complete agent, model, and effort tuple atomically.
 An omitted effort uses the selected model's registry default.
 Unknown models report closest matches, unsupported efforts report the valid levels, and ambiguous cross-agent ids require an interactive choice or `--agent`.
@@ -127,8 +126,7 @@ These fields identify the signed runtime shipped inside the installed `perchctl`
 - `architecture` is the platform slice selected for this Mac.
 - `protocol` is the authorization protocol version Perch requires from the runtime.
 
-An `(unset)` value with source `bundled` in a non-effective `perch config` listing means the field is not user-stored configuration.
-It does not mean no runtime is installed or that a project is not configured for `no-mistakes`.
+These fields are not user-stored configuration, and they never appear in `perch config` listings.
 Run `perch runtime validate` or `perch doctor` to inspect and validate the effective bundled runtime.
 
 ## Models

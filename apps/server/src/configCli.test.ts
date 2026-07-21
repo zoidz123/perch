@@ -477,8 +477,38 @@ test("config rejects project policy keys after they move to perch project", asyn
     await withStubServer(async (serverUrl, state) => {
       const moved = await runConfig(serverUrl, home, ["set", "--project", "/repo", "task.mode", "no-mistakes"]);
       assert.equal(moved.code, 1);
-      assert.match(moved.stderr, /unknown config key: task\.mode/);
+      assert.match(moved.stderr, /task\.mode moved to the project registry; use `perch project set \/repo --mode no-mistakes`/);
+
+      const yolo = await runConfig(serverUrl, home, ["set", "--project", "/repo", "task.yolo", "true"]);
+      assert.equal(yolo.code, 1);
+      assert.match(yolo.stderr, /task\.yolo moved to the project registry; use `perch project set \/repo --yolo`/);
       assert.deepEqual(state.patches, []);
+    });
+  } finally {
+    rmSync(home, { recursive: true, force: true });
+  }
+});
+
+test("config validate passes on the global view and runtime owns bundled provenance", async () => {
+  const home = mkdtempSync(join(tmpdir(), "perch-config-home-"));
+  try {
+    await withStubServer(async (serverUrl) => {
+      const validate = await runConfig(serverUrl, home, ["validate"]);
+      assert.equal(validate.code, 0, validate.stderr);
+      assert.match(validate.stdout, /configuration valid/);
+
+      const show = await runConfig(serverUrl, home, ["show"]);
+      assert.equal(show.code, 0, show.stderr);
+      assert.doesNotMatch(show.stdout, /runtime\.no-mistakes|task\.mode|task\.yolo/);
+
+      const runtime = await runCli(serverUrl, home, ["runtime", "validate"]);
+      assert.equal(runtime.code, 0, runtime.stderr);
+      assert.match(runtime.stdout, /bundled no-mistakes runtime valid/);
+
+      const runtimeJson = await runCli(serverUrl, home, ["runtime", "--json"]);
+      assert.equal(runtimeJson.code, 0, runtimeJson.stderr);
+      const body = JSON.parse(runtimeJson.stdout) as Record<string, { effectiveValue: unknown }>;
+      assert.equal(body["runtime.no-mistakes.source"]?.effectiveValue, "bundled");
     });
   } finally {
     rmSync(home, { recursive: true, force: true });
