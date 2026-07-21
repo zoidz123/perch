@@ -1381,7 +1381,7 @@ export type DispatchDefaults = {
   effort?: CodexReasoningEffort;
 };
 
-// Fleet-level mate defaults (`perch config mate-*`): applied by `perch mate`
+// Fleet-level mate defaults (`mate.*` via `perch config`): applied by `perch mate`
 // when it spawns the mate's StartAgentRequest. `agent` picks which CLI the
 // mate launches as (claude|codex) - LAUNCH-TIME ONLY, choosing a fresh
 // mate's agent at start; there is no mid-conversation agent switch or
