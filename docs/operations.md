@@ -88,18 +88,19 @@ Fleet defaults are split between workers and Mate:
 
 ```sh
 perch config show --effective
-perch config set --global dispatch.agent codex
-perch config set --global dispatch.model <model-id>
-perch config set --global dispatch.effort high
-perch config set --global mate.agent claude
-perch config set --global mate.model <model-id>
-perch config unset --global dispatch.model
+perch models
+perch config set dispatch <model-id> --agent codex --effort high
+perch config set mate <model-id> --agent claude
 perch config set --project /path/to/project task.mode no-mistakes
+perch config set --project /path/to/project task.yolo true
 ```
 
+The role commands set a complete global agent, model, and effort tuple atomically.
 The server validates model and effort combinations against its current provider catalog.
-An explicit task or launch value wins over a persisted default.
+An explicit task or launch agent, model, or effort value wins over the matching persisted default.
 Environment variables win over persisted settings.
+`perch config` does not list the live project registry unless a project path is supplied.
+Use `perch project list` to inspect the registry, and see the [CLI guide](cli.md#configuration-layers) for precedence and runtime provenance.
 
 | Setting | Environment override |
 | --- | --- |

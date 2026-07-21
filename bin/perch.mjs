@@ -71,7 +71,7 @@ async function main() {
   }
 
   if (parsed.help || parsed.command === "help" || !parsed.command) {
-    printHelp();
+    printHelp(parsed.command === "help" ? parsed.args[0] : parsed.command, parsed.command === "help" ? parsed.args.slice(1) : parsed.args);
     return;
   }
 
@@ -1707,6 +1707,12 @@ function parseArgs(argv) {
       command = arg;
       continue;
     }
+    // Wrapper help must never start a provider session. Put `--` before a
+    // provider's own help flag when the intent is to forward it instead.
+    if (arg === "-h" || arg === "--help") {
+      help = true;
+      continue;
+    }
     if (AGENT_COMMANDS.has(command)) {
       args.push(arg);
       passthrough = true;
@@ -2220,7 +2226,13 @@ function printStarted(session) {
   console.log(`Workspace: Perch agents`);
 }
 
-function printHelp() {
+function printHelp(command, args = []) {
+  const action = args[0];
+  const usage = commandHelp(command, action);
+  if (usage) {
+    console.log(usage);
+    return;
+  }
   console.log(`Usage:
   perch codex [options] [codex args...]
   perch claude [options] [claude args...]
@@ -2268,9 +2280,10 @@ Session ids can be shortened: \`perch attach e1b4\` works if unambiguous.
 \`perch doctor\` validates the immutable no-mistakes runtime bundled with this
 perchctl package. It never downloads or repairs that runtime from PATH; reinstall
 this exact perchctl version if the bundled bytes are missing or corrupt.
-\`perch config\` manages fleet dispatch and Mate defaults plus project task mode
-and yolo settings. An explicit per-task mode wins over the project value, then
-the built-in direct-PR default applies.
+\`perch config\` shows local/global configuration and bundled runtime provenance.
+It does not list live project-registry state unless you pass \`--project PATH\`.
+Use \`perch project list\` to inspect registered projects. An explicit per-task
+mode wins over the project value, then the built-in direct-PR default applies.
 
 Examples:
   perch claude
@@ -2278,4 +2291,29 @@ Examples:
   perch run -- /bin/zsh -lc 'for i in 1 2 3; do echo $i; sleep 1; done'
 
 While attached, press Ctrl-] to detach without stopping the Perch session.`);
+}
+
+function commandHelp(command, action) {
+  const common = `Global options: --server <url>, --token <token>. Launch commands also accept --cwd <path>, --title <title>, and --no-attach.`;
+  if (["claude", "codex", "run"].includes(command)) {
+    const usage = command === "run"
+      ? "perch run [options] -- <command> [args...]"
+      : `perch ${command} [options] [${command} args...]`;
+    return `Usage: ${usage}\n\nStarts and attaches a Perch-managed ${command === "run" ? "command" : command} session.\n${common}\n\nTo forward provider help instead of viewing this wrapper help, run:\n  perch ${command} -- --help`;
+  }
+  if (command === "mate") return `Usage: perch mate [options] [claude|codex]\n\nStarts or attaches to the durable Mate orchestrator.\n  --new  intentionally start a fresh Mate conversation\n${common}`;
+  if (command === "recover") return "Usage: perch recover task <task-id>\n\nRecovers a task when its persisted runtime supports recovery.";
+  if (command === "attach") return `Usage: perch attach [options] <session-id>\n\nAttaches this terminal to a live Perch session. Session ids may be shortened when unambiguous.\n${common}`;
+  if (command === "stop") return "Usage: perch stop <session-id>\n\nStops a live Perch session. Session ids may be shortened when unambiguous.";
+  if (command === "ls") return "Usage: perch ls\n\nLists Perch sessions.";
+  if (command === "pair") return "Usage: perch pair [--title <device-name>]\n\nCreates a device pairing offer. Treat the printed URL and QR code as credentials.";
+  if (command === "devices") return "Usage:\n  perch devices [ls]\n  perch devices revoke <id>\n\nLists paired devices or revokes one device token.";
+  if (command === "project") return `Usage:\n  perch project [list|ls]\n  perch project add <path> [--mode direct-PR|no-mistakes|local-only] [--yolo] [--yes]\n  perch project remove|rm <path>\n\nThe project registry is live server state. Use \`perch project list\` to inspect it.\n\`--mode no-mistakes\` initializes and verifies the bundled gate before persisting the mode.`;
+  if (command === "models") return "Usage: perch models [--json]\n\nLists selectable Mate and dispatch models, aliases, supported effort levels, and sources.";
+  if (command === "config") return `Usage:\n  perch config show [--global|--project PATH] [--effective] [--json]\n  perch config get <key> [--global|--project PATH] [--effective] [--json]\n  perch config set <mate|dispatch> <model> [--effort <level>] [--agent <agent>]\n  perch config set --global <key> <value>\n  perch config set --project PATH <task.mode|task.yolo> <value> [--yes]\n  perch config unset --global <key>\n  perch config unset --project PATH <key>\n  perch config validate [--global|--project PATH] [--effective] [--json]\n\nGlobal defaults: dispatch.* for workers and mate.* for Mate.\nProject settings: task.mode and task.yolo. Use \`--project PATH\` to inspect a registered project's settings.\nRuntime keys are read-only provenance for this perchctl package, not project registry state.\nUse \`perch project list\` for the live project registry.`;
+  if (command === "worktrees") return "Usage:\n  perch worktrees\n  perch worktrees release <id> [--force]\n\nLists isolated task worktrees or releases an orphaned lease.";
+  if (command === "doctor") return "Usage: perch doctor [--json] [--fix [--yes]]\n\nChecks the server environment and validates the immutable bundled no-mistakes runtime. It does not download or PATH-repair that runtime.";
+  if (command === "uninstall") return "Usage: perch uninstall [--dry-run] [--purge-data] [--force]\n\nRemoves Perch-managed agent configuration. It preserves ~/.perch state unless --purge-data is supplied.";
+  if (command === "server") return "Usage: perch server [status|start|stop|logs]\n\nControls the local Perch server.";
+  return undefined;
 }

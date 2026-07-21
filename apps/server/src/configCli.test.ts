@@ -216,6 +216,44 @@ async function runCli(serverUrl: string, home: string, args: string[]): Promise<
   }
 }
 
+test("wrapper help covers top-level and nested commands without starting the server or a provider", async () => {
+  const home = mkdtempSync(join(tmpdir(), "perch-config-home-"));
+  try {
+    const unreachable = "http://127.0.0.1:1";
+    const cases: Array<[string[], RegExp]> = [
+      [["claude", "--help"], /Starts and attaches a Perch-managed claude session/],
+      [["codex", "--help"], /To forward provider help/],
+      [["run", "--help"], /perch run \[options\] -- <command>/],
+      [["mate", "--help"], /durable Mate orchestrator/],
+      [["recover", "task", "--help"], /perch recover task <task-id>/],
+      [["attach", "--help"], /Attaches this terminal/],
+      [["stop", "--help"], /Stops a live Perch session/],
+      [["ls", "--help"], /Lists Perch sessions/],
+      [["pair", "--help"], /Creates a device pairing offer/],
+      [["devices", "revoke", "--help"], /perch devices revoke <id>/],
+      [["project", "add", "--help"], /project remove\|rm <path>/],
+      [["models", "--help"], /selectable Mate and dispatch models/],
+      [["config", "set", "--help"], /Global defaults: dispatch\.\* for workers and mate\.\* for Mate/],
+      [["worktrees", "release", "--help"], /worktrees release <id> \[--force\]/],
+      [["doctor", "--help"], /immutable bundled no-mistakes runtime/],
+      [["uninstall", "--help"], /Removes Perch-managed agent configuration/],
+      [["server", "logs", "--help"], /Controls the local Perch server/]
+    ];
+    for (const [args, expected] of cases) {
+      const result = await runCli(unreachable, home, args);
+      assert.equal(result.code, 0, `${args.join(" ")}: ${result.stderr}`);
+      assert.match(result.stdout, expected);
+      assert.equal(result.stderr, "");
+    }
+
+    const alias = await runCli(unreachable, home, ["help", "config"]);
+    assert.equal(alias.code, 0, alias.stderr);
+    assert.match(alias.stdout, /Runtime keys are read-only provenance/);
+  } finally {
+    rmSync(home, { recursive: true, force: true });
+  }
+});
+
 test("config set PATCHes the mapped field and get reads it back", async () => {
   const home = mkdtempSync(join(tmpdir(), "perch-config-home-"));
   try {
