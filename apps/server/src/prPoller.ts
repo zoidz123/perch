@@ -167,6 +167,18 @@ export class PrPoller {
     await this.poll((task) => this.fastUntil.has(task.id), "fast");
   }
 
+  // The exact commit currently checked out for this task's work, resolved
+  // through the same worktree mapping the poller binds PRs with. Completion
+  // requests and mate acceptances use it to pin local-only deliverables to a
+  // concrete revision rather than a branch name.
+  async checkoutHead(task: Task): Promise<string | undefined> {
+    try {
+      return await this.resolveHead(this.resolveCheckout(task));
+    } catch {
+      return undefined;
+    }
+  }
+
   // Bind a worker-named PR to a task at the done gate. Identity (repo + head
   // repo) must match the task's repo, and the PR must provably carry the
   // worker's delivered commits. That proof is the PR head commit equalling the
@@ -347,7 +359,11 @@ export class PrPoller {
         kind: "completion_requested",
         source: "system",
         message: `pull request discovered independently for mate verification: ${task.pr!.url}`,
-        data: { evidence: "independent_pr_discovery", head: task.pr?.headOid }
+        data: {
+          evidence: "independent_pr_discovery",
+          head: task.pr?.headOid,
+          deliverable: { kind: "pr", headOid: task.pr?.headOid }
+        }
       });
       this.armFast(task.id);
       return updated;
@@ -396,7 +412,9 @@ export class PrPoller {
       pr.head = view.headRefName;
       changed = true;
     }
-    if (identity.ok && view.headRefOid && !pr.headOid) {
+    // `headOid` is the current observed head. Acceptance is bound to the
+    // immutable completion request, so a head change invalidates readiness.
+    if (identity.ok && view.headRefOid && pr.headOid !== view.headRefOid) {
       pr.headOid = view.headRefOid;
       changed = true;
     }

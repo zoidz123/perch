@@ -3474,20 +3474,47 @@ async function completionDecisionRpc(
     return rpcError(409, `Task is ${task.state}, not waiting for completion verification`);
   }
 
+  // For local-only work the acceptance additionally records the checkout HEAD
+  // the mate observed, so readiness derivation can refuse a deliverable that
+  // moved between the request and the decision.
+  let acceptedDeliverable: { kind: "local"; revision: string } | undefined;
+  if (body.action === "accept" && task.mode === "local-only") {
+    const revision = await options.prPoller.checkoutHead(task);
+    if (revision) {
+      acceptedDeliverable = { kind: "local", revision };
+    }
+    // The git call yielded the event loop, so the validated state may be gone:
+    // a concurrent decision or worker retry must invalidate this one instead
+    // of racing it into the ledger.
+    const current = options.tasks.find(taskId);
+    if (current?.state !== "completion_requested") {
+      return rpcError(409, `Task is ${current?.state ?? "unknown"}, not waiting for completion verification`);
+    }
+    const latestNow = [...options.tasks.events(taskId)].reverse().find((event) => event.kind === "completion_requested");
+    if (latestNow?.seq !== body.requestSeq) {
+      return rpcError(409, "completion request is stale or unknown; re-read the task evidence");
+    }
+  }
   const decisionData = {
     completionDecision: {
       action: body.action,
       requestSeq: body.requestSeq,
       idempotencyKey: key,
-      ...(feedback ? { feedback } : {})
+      ...(feedback ? { feedback } : {}),
+      ...(acceptedDeliverable ? { deliverable: acceptedDeliverable } : {})
     }
   };
-  let updated = options.tasks.recordEvent(taskId, {
-    kind: body.action === "accept" ? "completion_accepted" : "completion_rejected",
-    source: "system",
-    message: body.action === "accept" ? "mate verified the requested deliverable" : feedback,
-    data: decisionData
-  });
+  let updated: Task;
+  try {
+    updated = options.tasks.recordEvent(taskId, {
+      kind: body.action === "accept" ? "completion_accepted" : "completion_rejected",
+      source: "system",
+      message: body.action === "accept" ? "mate verified the requested deliverable" : feedback,
+      data: decisionData
+    });
+  } catch (error) {
+    return rpcError(409, error instanceof Error ? error.message : String(error));
+  }
 
   // A PR can merge while the mate is reviewing it. Preserve the landed and
   // auto-return semantics, but only publish merged after verification makes
@@ -3910,7 +3937,24 @@ async function handleTaskEvent(
     // report as a completion claim. Trusted done is created only by the mate's
     // explicit /completion accept action.
     const kind = body.kind === "done" ? "completion_requested" : body.kind;
-    updated = options.tasks.recordEvent(taskId, { kind, message, source, ...(data ? { data } : {}) });
+    // Bind the completion claim to the exact deliverable inside the event
+    // itself. A later PR head observation cannot inherit this acceptance. The
+    // task is re-read after the awaits above so the deliverable reflects
+    // current facts, not the handler-entry snapshot.
+    const current = options.tasks.find(taskId) ?? task;
+    let eventData = data;
+    if (kind === "completion_requested") {
+      const attachedPr = pr ? { ...current.pr, ...pr } : current.pr;
+      const revision = current.mode === "local-only" ? await options.prPoller.checkoutHead(current) : undefined;
+      // A local deliverable pins an exact commit or nothing: an unreadable
+      // checkout HEAD leaves the revision absent, and readiness derivation
+      // stays conservatively withheld rather than trusting a branch name.
+      const deliverable = current.mode === "local-only"
+        ? { kind: "local", ...(revision ? { revision } : {}) }
+        : { kind: "pr", headOid: attachedPr?.headOid };
+      eventData = { ...(data ?? {}), deliverable };
+    }
+    updated = options.tasks.recordEvent(taskId, { kind, message, source, ...(eventData ? { data: eventData } : {}) });
   } catch (error) {
     writeJson(response, 409, { error: error instanceof Error ? error.message : String(error) });
     return;
@@ -3918,6 +3962,8 @@ async function handleTaskEvent(
 
   // A finished worker naming its PR arms the reconcile loop: one eager poll
   // now, plus a fast window while the fresh PR's checks are expected to move.
+  // The attachment lands only after the event proved a legal transition, so a
+  // rejected report leaves the task untouched.
   if (pr && !updated.pr?.merged) {
     updated = options.tasks.update(taskId, { pr: { ...updated.pr, ...pr } });
     options.prPoller.armFast(taskId);

@@ -2,115 +2,38 @@ import XCTest
 @testable import PerchTaskStatus
 
 final class TaskStatusPresentationTests: XCTestCase {
-    func testQueuedAndWorkingBeforePrUsePlainState() {
-        XCTAssertEqual(TaskStatusPresentation.chips(taskState: "queued", pr: nil).map(\.label), ["Queued"])
-        XCTAssertEqual(TaskStatusPresentation.chips(taskState: "working", pr: nil).map(\.label), ["Working"])
-    }
-
-    func testCompletionRequestStaysVisibleEvenWhenPrExists() {
-        let chips = TaskStatusPresentation.chips(
-            taskState: "completion_requested",
-            pr: TaskStatusPr(url: "https://github.com/o/r/pull/77", checks: "passing")
-        )
-
-        XCTAssertEqual(chips.map(\.label), ["Awaiting verification"])
-        XCTAssertEqual(chips.map(\.tone), [.attention])
-    }
-
-    func testPrNumberIsThePrimaryStatusOncePrExists() {
-        let chips = TaskStatusPresentation.chips(
-            taskState: "done",
-            pr: TaskStatusPr(url: "https://github.com/o/r/pull/77")
-        )
-
-        XCTAssertEqual(chips.map(\.label), ["PR #77"])
-        XCTAssertTrue(chips[0].isLink)
-        XCTAssertEqual(TaskStatusPresentation.metadata(taskState: "done", pr: TaskStatusPr(url: "https://github.com/o/r/pull/77")), [])
-    }
-
-    func testPassingChecksKeepPrNumberInPrimaryStatus() {
-        let chips = TaskStatusPresentation.chips(
+    func testGreenPrFactsDoNotPromoteWorkingTask() {
+        let chip = TaskStatusPresentation.primaryChip(
             taskState: "working",
-            pr: TaskStatusPr(url: "https://github.com/o/r/pull/12", checks: "passing")
+            pr: TaskStatusPr(url: "https://github.com/o/r/pull/12", checks: "passing", mergeReady: true),
+            presentationState: "working",
+            mode: "direct-PR"
         )
-
-        XCTAssertEqual(chips.map(\.label), ["PR #12 checks passed"])
-        XCTAssertEqual(chips.map(\.tone), [.success])
+        XCTAssertEqual(chip.label, "Working")
+        XCTAssertNotEqual(chip.tone, .success)
     }
 
-    func testMergeReadyWinsOverChecksAsThePrimaryStatus() {
-        let chips = TaskStatusPresentation.chips(
-            taskState: "done",
-            pr: TaskStatusPr(
-                url: "https://github.com/o/r/pull/27",
-                checks: "passing",
-                mergeReady: true
-            )
-        )
-
-        XCTAssertEqual(chips.map(\.label), ["PR #27 ready to merge"])
-        XCTAssertEqual(chips.last?.tone, .success)
+    func testDerivedStatesHaveOnlyApprovedPrimaryBadges() {
+        XCTAssertEqual(TaskStatusPresentation.primaryChip(taskState: "working", pr: nil, presentationState: "reviewing", mode: "no-mistakes").label, "Reviewing")
+        XCTAssertEqual(TaskStatusPresentation.primaryChip(taskState: "done", pr: nil, presentationState: "ready_to_merge").label, "Ready to merge")
+        XCTAssertEqual(TaskStatusPresentation.primaryChip(taskState: "done", pr: nil, presentationState: "ready_to_apply", mode: "local-only").label, "Ready to apply")
+        XCTAssertEqual(TaskStatusPresentation.primaryChip(taskState: "completion_requested", pr: nil, presentationState: "awaiting_verification").label, "Awaiting verification")
+        XCTAssertEqual(TaskStatusPresentation.primaryChip(taskState: "needs_you", pr: nil, presentationState: "needs_you").label, "Needs you")
+        XCTAssertEqual(TaskStatusPresentation.primaryChip(taskState: "blocked", pr: nil, presentationState: "blocked").label, "Blocked")
+        XCTAssertEqual(TaskStatusPresentation.primaryChip(taskState: "failed", pr: nil, presentationState: "failed").label, "Failed")
     }
 
-    func testMergedAndClosedStayLinear() {
-        XCTAssertEqual(
-            TaskStatusPresentation.chips(
-                taskState: "landed",
-                pr: TaskStatusPr(url: "https://github.com/o/r/pull/155", checks: "passing", merged: true)
-            ).map(\.label),
-            ["PR #155 merged"]
-        )
-
-        XCTAssertEqual(
-            TaskStatusPresentation.chips(
-                taskState: "closed",
-                pr: TaskStatusPr(url: "https://github.com/o/r/pull/155", checks: "passing", merged: true)
-            ).map(\.label),
-            ["PR #155 closed"]
-        )
+    func testOtherModesStayWorkingUntilVerification() {
+        XCTAssertEqual(TaskStatusPresentation.primaryChip(taskState: "working", pr: nil, presentationState: "working", mode: "direct-PR").label, "Working")
+        XCTAssertEqual(TaskStatusPresentation.primaryChip(taskState: "working", pr: nil, presentationState: "working", mode: "local-only").label, "Working")
+        XCTAssertEqual(TaskStatusPresentation.primaryChip(taskState: "completion_requested", pr: nil, presentationState: "awaiting_verification", mode: "no-mistakes").label, "Awaiting verification")
     }
 
-    func testNamedDocsGateFailureUsesDocsGateCopy() {
-        let chips = TaskStatusPresentation.chips(
-            taskState: "done",
-            pr: TaskStatusPr(
-                url: "https://github.com/o/r/pull/9",
-                checks: "failing",
-                checkDetails: [TaskStatusCheck(name: "docs-gate", state: "failing")]
-            )
-        )
-
-        XCTAssertEqual(chips.map(\.label), ["PR #9 docs gate failed"])
-        XCTAssertEqual(chips.last?.tone, .error)
-    }
-
-    func testPassingChecksCanStillShowMergeBlockers() {
-        let chips = TaskStatusPresentation.chips(
-            taskState: "done",
-            pr: TaskStatusPr(
-                url: "https://github.com/o/r/pull/21",
-                checks: "passing",
-                mergeReady: false,
-                reviewDecision: "REVIEW_REQUIRED"
-            )
-        )
-
-        XCTAssertEqual(chips.map(\.label), ["PR #21 review required"])
-        XCTAssertEqual(chips.last?.tone, .attention)
-    }
-
-    func testUnknownMergeabilityReadsAsUnknownNotBlocked() {
-        let chips = TaskStatusPresentation.chips(
-            taskState: "done",
-            pr: TaskStatusPr(
-                url: "https://github.com/o/r/pull/33",
-                checks: "passing",
-                mergeReady: false,
-                mergeable: "UNKNOWN"
-            )
-        )
-
-        XCTAssertEqual(chips.map(\.label), ["PR #33 merge unknown"])
-        XCTAssertEqual(chips.last?.tone, .attention)
+    func testPrChipIsNeutralAndSeparateFromPrimaryState() {
+        let pr = TaskStatusPr(url: "https://github.com/o/r/pull/77", checks: "passing", mergeReady: true)
+        XCTAssertEqual(TaskStatusPresentation.prChip(pr)?.label, "PR #77")
+        XCTAssertEqual(TaskStatusPresentation.prChip(pr)?.tone, .neutral)
+        XCTAssertTrue(TaskStatusPresentation.prChip(pr)?.isLink == true)
+        XCTAssertEqual(TaskStatusPresentation.primaryChip(taskState: "working", pr: pr, presentationState: "working").label, "Working")
     }
 }

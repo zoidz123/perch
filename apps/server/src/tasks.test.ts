@@ -322,3 +322,46 @@ test("workerParkedAt speaks only for the latest state-moving event", () => {
 
   rmSync(home, { recursive: true, force: true });
 });
+
+test("derived readiness follows verification and PR facts, and never persists", () => {
+  const { store: tasks, home } = store();
+  const task = tasks.create({ title: "ship truthful badges", project: "/tmp/repo" });
+  tasks.update(task.id, {
+    pr: { url: "https://github.com/o/r/pull/12", headOid: "head-a", checks: "passing", mergeable: "MERGEABLE", mergeReady: true }
+  });
+
+  const requested = tasks.recordEvent(task.id, {
+    kind: "completion_requested",
+    source: "worker",
+    data: { deliverable: { kind: "pr", headOid: "head-a" } }
+  });
+  assert.equal(requested.presentation?.state, "awaiting_verification");
+
+  const requestSeq = tasks.events(task.id).at(-1)!.seq;
+  const accepted = tasks.recordEvent(task.id, {
+    kind: "completion_accepted",
+    source: "system",
+    data: { completionDecision: { requestSeq } }
+  });
+  assert.equal(accepted.presentation?.state, "ready_to_merge");
+  assert.equal(tasks.list().find((candidate) => candidate.id === task.id)?.presentation?.state, "ready_to_merge");
+
+  // A new observed head invalidates readiness; the accepted head restores it.
+  const moved = tasks.update(task.id, { pr: { ...accepted.pr!, headOid: "head-b" } });
+  assert.equal(moved.presentation?.state, "working");
+  const restored = tasks.update(task.id, { pr: { ...accepted.pr!, headOid: "head-a" } });
+  assert.equal(restored.presentation?.state, "ready_to_merge");
+
+  // Resumed work surrenders readiness even though the acceptance still stands.
+  tasks.recordEvent(task.id, { kind: "failed", source: "worker" });
+  const resumed = tasks.recordEvent(task.id, { kind: "working", source: "worker" });
+  assert.equal(resumed.presentation?.state, "working");
+
+  // The durable projection stores facts only, never the derived presentation.
+  const raw = tasks.stateDb.tasks.find(task.id);
+  assert.ok(raw);
+  assert.equal("presentation" in raw, false);
+
+  tasks.close();
+  rmSync(home, { recursive: true, force: true });
+});

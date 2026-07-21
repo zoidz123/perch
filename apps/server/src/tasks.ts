@@ -7,6 +7,7 @@ import { BOSS_EVENT_KINDS } from "./mateWake.js";
 import { PUSH_EVENT_KINDS } from "./pushRouter.js";
 import { StateDb, type NotificationIntentInput } from "./stateDb.js";
 import { runtimeSnapshot } from "./runtimeManager.js";
+import { deriveTaskPresentation, type TaskPresentationFacts } from "./taskPresentation.js";
 
 // Ledger 1: tasks - "what work is happening". Dumb CRUD plus a server-enforced
 // state machine; all policy (dispatch composition, absorb/escalate, teardown
@@ -162,16 +163,21 @@ export class TaskStore {
 
   list(): Task[] {
     const runtimes = this.stateDb.runtimes.latestByTask();
+    const prFacts = this.stateDb.tasks.prFactsByTask();
+    const verifications = this.stateDb.tasks.verificationFactsByTask();
     return this.stateDb.tasks.list().map((task) => {
       const runtime = runtimes.get(task.id);
-      return runtime ? { ...task, runtime: runtimeSnapshot(runtime) } : task;
+      return this.withPresentation(runtime ? { ...task, runtime: runtimeSnapshot(runtime) } : task, {
+        pr: prFacts.get(task.id),
+        verification: verifications.get(task.id)
+      });
     });
   }
 
   find(id: string): Task | undefined {
     try {
       const task = this.stateDb.tasks.find(safeId(id));
-      return task ? this.withRuntime(task) : undefined;
+      return task ? this.withPresentation(this.withRuntime(task)) : undefined;
     } catch {
       return undefined;
     }
@@ -193,8 +199,8 @@ export class TaskStore {
     );
     task.workerName = WORKER_NAMES.find((name) => !reserved.has(name)) ?? numberedWorkerName(reserved);
     task.updatedAt = nextTimestamp(task.updatedAt);
-    this.stateDb.tasks.save(withoutRuntime(task));
-    return { ...task };
+    this.stateDb.tasks.save(withoutDerived(task));
+    return this.withPresentation({ ...task });
   }
 
   // Upgrade only old, still-open records that already own a worker session.
@@ -239,8 +245,8 @@ export class TaskStore {
     const task = this.mustFind(id);
     Object.assign(task, fields);
     task.updatedAt = nextTimestamp(task.updatedAt);
-    this.stateDb.tasks.save(withoutRuntime(task));
-    return { ...task };
+    this.stateDb.tasks.save(withoutDerived(task));
+    return this.withPresentation({ ...task });
   }
 
   // Append an event; when the event kind implies a state, the transition is
@@ -265,15 +271,18 @@ export class TaskStore {
     }
     task.updatedAt = nextTimestamp(task.updatedAt);
     const notificationIntents = options.notificationIntents ?? taskEventNotificationIntents(task, event);
-    this.stateDb.tasks.record(withoutRuntime(task), event, notificationIntents);
+    this.stateDb.tasks.record(withoutDerived(task), event, notificationIntents);
+    // Derive after the append so listeners observe the presentation this event
+    // produced, never the one it replaced.
+    const updated = this.withPresentation({ ...task });
     for (const listener of this.listeners) {
       try {
-        listener({ ...task }, { ...event, previousState });
+        listener({ ...updated }, { ...event, previousState });
       } catch {
         // Observers never disturb the ledger.
       }
     }
-    return { ...task };
+    return updated;
   }
 
   // Append a causally-linked event group in one SQLite transaction. Used when
@@ -286,7 +295,7 @@ export class TaskStore {
       notificationIntents?: NotificationIntentInput[];
     }>
   ): Task {
-    if (entries.length === 0) return this.mustFind(id);
+    if (entries.length === 0) return this.withPresentation(this.mustFind(id));
     const task = this.mustFind(id);
     const notifications: Array<{ task: Task; event: (typeof entries)[number]["event"]; previousState: TaskState }> = [];
     const persisted = entries.map(({ event, notificationIntents }) => {
@@ -308,22 +317,41 @@ export class TaskStore {
         intents: notificationIntents ?? taskEventNotificationIntents(task, event)
       };
     });
-    this.stateDb.tasks.recordMany(withoutRuntime(task), persisted);
+    this.stateDb.tasks.recordMany(withoutDerived(task), persisted);
+    // Same listener contract as recordEvent: every notification snapshot
+    // carries a derived presentation, computed from the committed facts once
+    // for the whole batch.
+    const facts: TaskPresentationFacts = {
+      pr: this.stateDb.tasks.prFacts(task.id),
+      verification: this.stateDb.tasks.verificationFacts(task.id)
+    };
     for (const notification of notifications) {
       for (const listener of this.listeners) {
         try {
-          listener(notification.task, { ...notification.event, previousState: notification.previousState });
+          listener(this.withPresentation(notification.task, facts), {
+            ...notification.event,
+            previousState: notification.previousState
+          });
         } catch {
           // Observers never disturb the ledger.
         }
       }
     }
-    return { ...task };
+    return this.withPresentation({ ...task }, facts);
   }
 
   private withRuntime(task: Task): Task {
     const runtime = this.stateDb.runtimes.latestForTask(task.id);
     return runtime ? { ...task, runtime: runtimeSnapshot(runtime) } : task;
+  }
+
+  private withPresentation(task: Task, facts?: TaskPresentationFacts): Task {
+    const { presentation: _presentation, ...persisted } = task;
+    const resolved = facts ?? {
+      pr: this.stateDb.tasks.prFacts(task.id),
+      verification: this.stateDb.tasks.verificationFacts(task.id)
+    };
+    return { ...persisted, presentation: deriveTaskPresentation(persisted, resolved) };
   }
 
   events(id: string): TaskEvent[] {
@@ -356,12 +384,20 @@ export class TaskStore {
     return undefined;
   }
 
+  // Writers mutate and persist this snapshot. It reads the raw projection
+  // (which never stores a presentation) so write paths do not spend fact
+  // queries deriving a presentation they immediately discard.
   private mustFind(id: string): Task {
-    const task = this.find(id);
+    let task: Task | undefined;
+    try {
+      task = this.stateDb.tasks.find(safeId(id));
+    } catch {
+      task = undefined;
+    }
     if (!task) {
       throw new Error(`Unknown task: ${id}`);
     }
-    return task;
+    return this.withRuntime(task);
   }
 }
 
@@ -427,7 +463,7 @@ function nextTimestamp(previous: string): string {
   return new Date(Number.isNaN(prior) ? now : Math.max(now, prior + 1)).toISOString();
 }
 
-function withoutRuntime(task: Task): Task {
-  const { runtime: _runtime, ...persisted } = task;
+function withoutDerived(task: Task): Task {
+  const { runtime: _runtime, presentation: _presentation, ...persisted } = task;
   return persisted;
 }

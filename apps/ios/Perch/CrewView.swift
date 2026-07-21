@@ -130,10 +130,15 @@ struct TaskRow: View {
             AgentGlyph(agent: workerAgent)
 
             VStack(alignment: .leading, spacing: 3) {
-                Text(workerIdentity)
-                    .font(.system(size: 16, weight: .medium))
-                    .foregroundStyle(Style.textPrimary)
-                    .lineLimit(1)
+                HStack(spacing: 6) {
+                    Text(workerIdentity)
+                        .font(.system(size: 16, weight: .medium))
+                        .foregroundStyle(Style.textPrimary)
+                        .lineLimit(1)
+                    if let prChip = TaskStatusPresentation.prChip(task.pr.map(presentationPr)) {
+                        taskChip(prChip)
+                    }
+                }
 
                 if workerIdentity != task.title {
                     Text(task.title)
@@ -248,7 +253,12 @@ struct TaskRow: View {
     }
 
     private var primaryStatusChip: TaskStatusChip {
-        TaskStatusPresentation.primaryChip(taskState: task.state, pr: task.pr.map(presentationPr))
+        TaskStatusPresentation.primaryChip(
+            taskState: task.state,
+            pr: task.pr.map(presentationPr),
+            presentationState: task.presentation?.state,
+            mode: task.mode
+        )
     }
 
     private var statusMetadata: [String] {

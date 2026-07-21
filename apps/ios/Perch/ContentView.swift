@@ -436,9 +436,11 @@ struct HomeView: View {
         store.isServerLive
     }
 
-    // The crew: live tasks (ledger 1) joined with their worker sessions.
+    // The crew: live tasks (ledger 1) joined with their worker sessions. The
+    // server-derived presentation folds landed into closed, so merged work
+    // leaves the list immediately; the raw state keeps older servers working.
     private var liveTasks: [AgentTask] {
-        store.tasks.filter { $0.state != "closed" }
+        store.tasks.filter { ($0.presentation?.state ?? $0.state) != "closed" }
     }
 
     // Sessions not owned by a live task keep their plain rows; the mate is
