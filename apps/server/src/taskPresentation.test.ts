@@ -32,6 +32,14 @@ test("green and mergeable PR needs mate acceptance for Ready to Merge", () => {
   assert.equal(deriveTaskPresentation(task(), { verification: verification() }).state, "ready_to_merge");
 });
 
+test("only a durably working no-mistakes task presents Reviewing", () => {
+  assert.equal(deriveTaskPresentation(task({ mode: "no-mistakes", state: "working" })).state, "reviewing");
+  assert.equal(deriveTaskPresentation(task({ mode: "no-mistakes", state: "queued" })).state, "working");
+  assert.equal(deriveTaskPresentation(task({ mode: "no-mistakes", state: "completion_requested" })).state, "awaiting_verification");
+  assert.equal(deriveTaskPresentation(task({ mode: "direct-PR", state: "working" })).state, "working");
+  assert.equal(deriveTaskPresentation(task({ mode: "local-only", state: "working" })).state, "working");
+});
+
 test("rejection, resumption, new head, and changed checks invalidate readiness", () => {
   assert.equal(deriveTaskPresentation(task({ state: "working" }), { verification: verification({ accepted: false }) }).state, "working");
   assert.equal(deriveTaskPresentation(task({ state: "working" }), { verification: verification() }).state, "working");

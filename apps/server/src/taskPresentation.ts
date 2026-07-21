@@ -27,6 +27,10 @@ export function deriveTaskPresentation(task: Task, facts: TaskPresentationFacts 
   if (task.state === "needs_you") return { state: "needs_you" };
   if (task.state === "blocked") return { state: "blocked" };
   if (task.state === "completion_requested") return { state: "awaiting_verification" };
+  // A no-mistakes task is Reviewing only while its durable lifecycle says the
+  // worker is actively working. A parked gate and a completion request take
+  // their normal primary states above; other modes never promote Working.
+  if (task.mode === "no-mistakes" && task.state === "working") return { state: "reviewing" };
   if (task.state !== "done") return { state: "working" };
   const verification = facts.verification;
   const deliverable = verification?.accepted ? verification.deliverable : undefined;

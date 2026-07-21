@@ -122,6 +122,8 @@ public enum TaskStatusPresentation {
             return TaskStatusChip(kind: .agent, label: "Queued", tone: .attention)
         case "working":
             return TaskStatusChip(kind: .agent, label: "Working", tone: .attention)
+        case "reviewing":
+            return TaskStatusChip(kind: .agent, label: "Reviewing", tone: .attention)
         case "needs_you":
             return TaskStatusChip(kind: .agent, label: "Needs you", tone: .attention)
         case "blocked":

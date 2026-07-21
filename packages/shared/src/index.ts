@@ -470,6 +470,7 @@ export type TaskPrCheck = {
 // intentionally distinct from live worker or FleetMonitor status.
 export type TaskPresentationState =
   | "working"
+  | "reviewing"
   | "needs_you"
   | "blocked"
   | "awaiting_verification"
