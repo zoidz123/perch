@@ -7,7 +7,7 @@ import type { AddressInfo } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
-import type { AgentKind, AgentSession, FleetEvent, PendingServerRequest, RecentEventsResult, ServerRequestResponse, StartAgentRequest } from "@perch/shared";
+import type { AgentKind, AgentSession, AgentSessionStatus, FleetEvent, PendingServerRequest, RecentEventsResult, ServerRequestResponse, StartAgentRequest } from "@perch/shared";
 import type { AgentAdapter } from "./adapters/types.js";
 import type { CodexControlPlane } from "./codexControl.js";
 import { AuditLog } from "./audit.js";
@@ -35,6 +35,7 @@ class FakeCodexControl {
   transferred: Array<{ from: string; to: string }> = [];
   private readonly live = new Set<string>();
   callbacks = new Map<string, {
+    onStatus?: (status: AgentSessionStatus) => void;
     onServerRequest?: (request: PendingServerRequest) => void;
     onServerRequestResolved?: (request: PendingServerRequest) => void;
   }>();
@@ -53,6 +54,7 @@ class FakeCodexControl {
   async attach(sessionId: string, args: {
     socketPath: string;
     cwd: string;
+    onStatus?: (status: AgentSessionStatus) => void;
     onServerRequest?: (request: PendingServerRequest) => void;
     onServerRequestResolved?: (request: PendingServerRequest) => void;
   }): Promise<boolean> {
@@ -620,6 +622,156 @@ test("E2E structured approval reaches API, gates input, resolves by request id, 
       body: JSON.stringify({ requestId: "rpc-47", decision: "accept" })
     });
     assert.equal(stale.status, 409);
+  } finally {
+    await fx.cleanup(repo);
+  }
+});
+
+// Codex can open several JSON-RPC approvals in one session (parallel tool
+// calls). Each stays pending until Codex confirms that exact request id
+// resolved; the overview presents them as a deterministic queue, oldest first.
+function structuredRequest(requestId: string | number, summary: string): PendingServerRequest {
+  return {
+    requestId,
+    threadId: "thr-1",
+    turnId: "turn-1",
+    family: "command_execution",
+    summary,
+    content: { command: summary },
+    decisions: [
+      { id: "accept", label: "Allow" },
+      { id: "decline", label: "Deny", destructive: true }
+    ],
+    at: new Date().toISOString()
+  };
+}
+
+test("E2E overlapping Codex approvals: resolving B first keeps A pending, gated, and answerable", async () => {
+  const fx = fixture();
+  const repo = makeRepo();
+  const baseUrl = await listen(fx.server, fx.options);
+  try {
+    const dispatched = await fetch(`${baseUrl}/tasks`, {
+      ...authed,
+      method: "POST",
+      body: JSON.stringify({ title: "overlapping approvals", project: repo, dispatch: true, agent: "codex", prompt: "go" })
+    });
+    const { task } = (await dispatched.json()) as { task: { id: string; sessionId: string } };
+    const callback = fx.control.callbacks.get(task.sessionId);
+    assert.ok(callback?.onServerRequest);
+    const requestA = structuredRequest("rpc-a", "Run: rm -rf build");
+    const requestB = structuredRequest("rpc-b", "Run: npm install");
+    callback!.onServerRequest!(requestA);
+    callback!.onServerRequest!(requestB);
+
+    let sessions = (await (await fetch(`${baseUrl}/sessions`, authed)).json()) as { sessions: AgentSession[] };
+    assert.equal(sessions.sessions[0]?.status, "needs_approval");
+    assert.equal(sessions.sessions[0]?.pendingServerRequest?.requestId, "rpc-a", "the oldest open request is the card");
+    assert.equal(fx.options.tasks.find(task.id)?.state, "needs_you");
+    assert.equal(fx.options.tasks.events(task.id).filter((event) => event.kind === "needs_decision").length, 2);
+
+    // Codex resolves B first (answered on the desktop TUI). A must survive.
+    callback!.onServerRequestResolved!(requestB);
+
+    sessions = (await (await fetch(`${baseUrl}/sessions`, authed)).json()) as { sessions: AgentSession[] };
+    assert.equal(sessions.sessions[0]?.pendingServerRequest?.requestId, "rpc-a", "resolving B must not drop A");
+    assert.equal(sessions.sessions[0]?.status, "needs_approval", "A is still open");
+    assert.equal(fx.options.tasks.find(task.id)?.state, "needs_you", "the durable task still needs the boss");
+    const lastEvent = fx.options.tasks.events(task.id).at(-1);
+    assert.equal(lastEvent?.kind, "needs_decision");
+    assert.equal(lastEvent?.data?.requestId, "rpc-a", "the ledger re-points at the still-open request");
+
+    // Generic composer input stays gated while A is open.
+    const input = await fetch(`${baseUrl}/sessions/${encodeURIComponent(task.sessionId)}/input`, {
+      ...authed,
+      method: "POST",
+      body: JSON.stringify({ text: "1" })
+    });
+    assert.deepEqual(await input.json(), { ok: true, queued: true });
+
+    // A remains answerable by its exact request id.
+    const answer = await fetch(`${baseUrl}/sessions/${encodeURIComponent(task.sessionId)}/server-request`, {
+      ...authed,
+      method: "POST",
+      body: JSON.stringify({ requestId: "rpc-a", decision: "accept" })
+    });
+    assert.equal(answer.status, 202, await answer.text());
+    assert.equal(fx.control.responses.at(-1)?.response.requestId, "rpc-a");
+
+    // Codex confirms A resolved; a duplicate notification stays one event.
+    callback!.onServerRequestResolved!(requestA);
+    callback!.onServerRequestResolved!(requestA);
+    callback!.onStatus!("running");
+    await tick(20);
+
+    sessions = (await (await fetch(`${baseUrl}/sessions`, authed)).json()) as { sessions: AgentSession[] };
+    assert.equal(sessions.sessions[0]?.pendingServerRequest, undefined);
+    assert.equal(sessions.sessions[0]?.status, "running");
+    assert.equal(sessions.sessions[0]?.queuedCount, undefined, "the final resolution releases queued composer input");
+    assert.equal(fx.options.tasks.find(task.id)?.state, "working");
+    assert.equal(
+      fx.options.tasks.events(task.id).filter((event) => event.data?.reason === "codex_server_request_resolved").length,
+      1
+    );
+
+    const stale = await fetch(`${baseUrl}/sessions/${encodeURIComponent(task.sessionId)}/server-request`, {
+      ...authed,
+      method: "POST",
+      body: JSON.stringify({ requestId: "rpc-a", decision: "accept" })
+    });
+    assert.equal(stale.status, 409);
+  } finally {
+    await fx.cleanup(repo);
+  }
+});
+
+test("E2E overlapping Codex approvals resolve in order and the queued request is answerable before it surfaces", async () => {
+  const fx = fixture();
+  const repo = makeRepo();
+  const baseUrl = await listen(fx.server, fx.options);
+  try {
+    const dispatched = await fetch(`${baseUrl}/tasks`, {
+      ...authed,
+      method: "POST",
+      body: JSON.stringify({ title: "queued approvals", project: repo, dispatch: true, agent: "codex", prompt: "go" })
+    });
+    const { task } = (await dispatched.json()) as { task: { id: string; sessionId: string } };
+    const callback = fx.control.callbacks.get(task.sessionId);
+    assert.ok(callback?.onServerRequest);
+    const requestA = structuredRequest("rpc-a", "Run: rm -rf build");
+    // A numeric JSON-RPC id must be preserved end to end, never coerced.
+    const requestB = structuredRequest(48, "Apply file changes");
+    callback!.onServerRequest!(requestA);
+    callback!.onServerRequest!(requestB);
+
+    // B is queued behind A on the card, but already answerable by exact id.
+    let sessions = (await (await fetch(`${baseUrl}/sessions`, authed)).json()) as { sessions: AgentSession[] };
+    assert.equal(sessions.sessions[0]?.pendingServerRequest?.requestId, "rpc-a");
+    const answerB = await fetch(`${baseUrl}/sessions/${encodeURIComponent(task.sessionId)}/server-request`, {
+      ...authed,
+      method: "POST",
+      body: JSON.stringify({ requestId: 48, decision: "accept" })
+    });
+    assert.equal(answerB.status, 202, await answerB.text());
+    assert.equal(fx.control.responses.at(-1)?.response.requestId, 48);
+
+    // A resolves first: B surfaces as the next card and the task stays gated.
+    callback!.onServerRequestResolved!(requestA);
+    sessions = (await (await fetch(`${baseUrl}/sessions`, authed)).json()) as { sessions: AgentSession[] };
+    assert.equal(sessions.sessions[0]?.pendingServerRequest?.requestId, 48, "the next open request surfaces");
+    assert.equal(sessions.sessions[0]?.status, "needs_approval");
+    assert.equal(fx.options.tasks.find(task.id)?.state, "needs_you");
+    assert.equal(
+      fx.options.tasks.events(task.id).filter((event) => event.kind === "needs_decision").length,
+      2,
+      "the ledger already names the surviving request; no duplicate needs_decision"
+    );
+
+    // Only resolving the final open request clears the gate.
+    callback!.onServerRequestResolved!(requestB);
+    sessions = (await (await fetch(`${baseUrl}/sessions`, authed)).json()) as { sessions: AgentSession[] };
+    assert.equal(sessions.sessions[0]?.pendingServerRequest, undefined);
+    assert.equal(fx.options.tasks.find(task.id)?.state, "working");
   } finally {
     await fx.cleanup(repo);
   }

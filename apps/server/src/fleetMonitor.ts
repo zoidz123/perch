@@ -156,7 +156,12 @@ export class FleetMonitor {
   // Open permission prompts and composer messages held until the session can
   // take input again. Both surface in the fleet overview.
   private readonly pendingApprovals = new Map<string, PendingApproval>();
-  private readonly pendingServerRequests = new Map<string, PendingServerRequest>();
+  // Codex app-server requests, per session keyed by exact JSON-RPC request id:
+  // the protocol allows several to be open at once, and each stays pending
+  // until Codex confirms that exact id resolved. Insertion order is the
+  // deterministic queue the overview presents, oldest first. A session's entry
+  // exists only while at least one request is open, so `has()` is the gate.
+  private readonly pendingServerRequests = new Map<string, Map<string, PendingServerRequest>>();
   // Open AskUserQuestion prompts, alongside approvals in the overview. Both
   // gate the composer so typed text never lands in the focused widget.
   private readonly pendingQuestions = new Map<string, PendingQuestion>();
@@ -478,14 +483,17 @@ export class FleetMonitor {
 
   setPendingServerRequest(sessionId: string, request: PendingServerRequest): boolean {
     const canonical = this.canonicalSessionId(sessionId);
-    const existing = this.pendingServerRequests.get(canonical);
-    if (existing && existing.requestId === request.requestId && existing.threadId === request.threadId) {
+    const open = this.pendingServerRequests.get(canonical) ?? new Map<string, PendingServerRequest>();
+    const key = serverRequestKey(request.requestId);
+    const existing = open.get(key);
+    if (existing && existing.threadId === request.threadId) {
       return false;
     }
-    this.pendingServerRequests.set(canonical, request);
+    open.set(key, request);
+    this.pendingServerRequests.set(canonical, open);
     this.applyExternalStatus(canonical, "needs_approval", "codex", "adapter");
     this.pushRouter?.approvalNeeded(canonical, this.findSession(canonical), {
-      id: `${typeof request.requestId}:${request.requestId}`,
+      id: key,
       summary: request.summary,
       command: typeof request.content.command === "string" ? request.content.command : undefined,
       at: request.at
@@ -494,15 +502,28 @@ export class FleetMonitor {
     return true;
   }
 
+  // The oldest open request: the queue head the phone card, the generic
+  // approve barrier, and the task ledger read. Later requests surface as
+  // earlier ones resolve.
   pendingServerRequest(sessionId: string): PendingServerRequest | undefined {
-    return this.pendingServerRequests.get(this.canonicalSessionId(sessionId));
+    const open = this.pendingServerRequests.get(this.canonicalSessionId(sessionId));
+    return open?.values().next().value;
+  }
+
+  // Exact-id lookup so every open request stays answerable, not just the head.
+  pendingServerRequestById(sessionId: string, requestId: string | number): PendingServerRequest | undefined {
+    const open = this.pendingServerRequests.get(this.canonicalSessionId(sessionId));
+    return open?.get(serverRequestKey(requestId));
   }
 
   resolveServerRequest(sessionId: string, requestId: string | number): PendingServerRequest | undefined {
     const canonical = this.canonicalSessionId(sessionId);
-    const pending = this.pendingServerRequests.get(canonical);
-    if (!pending || pending.requestId !== requestId) return undefined;
-    this.pendingServerRequests.delete(canonical);
+    const open = this.pendingServerRequests.get(canonical);
+    const key = serverRequestKey(requestId);
+    const pending = open?.get(key);
+    if (!open || !pending) return undefined;
+    open.delete(key);
+    if (open.size === 0) this.pendingServerRequests.delete(canonical);
     this.scheduleBroadcast();
     return pending;
   }
@@ -1178,7 +1199,7 @@ export class FleetMonitor {
       if (!ended) {
         // A question and a generic approval are mutually exclusive surfaces;
         // the question is the more specific/actionable one, so it wins.
-        const serverRequest = this.pendingServerRequests.get(session.id);
+        const serverRequest = this.pendingServerRequests.get(session.id)?.values().next().value;
         const question = this.pendingQuestions.get(session.id);
         const claudeInteraction = this.pendingClaudeInteractions.get(session.id);
         if (serverRequest) {
@@ -1433,6 +1454,12 @@ export class FleetMonitor {
     }
     client.socket.send(JSON.stringify(message));
   }
+}
+
+// Mirrors the Codex adapter's requestKey: JSON-RPC ids are string | number,
+// and "48" must never collide with 48.
+function serverRequestKey(requestId: string | number): string {
+  return `${typeof requestId}:${requestId}`;
 }
 
 function captureText(events: AgentEvent[]): string {
