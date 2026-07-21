@@ -71,7 +71,7 @@ async function main() {
   }
 
   if (parsed.help || parsed.command === "help" || !parsed.command) {
-    printHelp(parsed.command === "help" ? parsed.args[0] : parsed.command, parsed.command === "help" ? parsed.args.slice(1) : parsed.args);
+    printHelp(parsed.command === "help" ? parsed.args[0] : parsed.command);
     return;
   }
 
@@ -2226,9 +2226,8 @@ function printStarted(session) {
   console.log(`Workspace: Perch agents`);
 }
 
-function printHelp(command, args = []) {
-  const action = args[0];
-  const usage = commandHelp(command, action);
+function printHelp(command) {
+  const usage = commandHelp(command);
   if (usage) {
     console.log(usage);
     return;
@@ -2293,13 +2292,16 @@ Examples:
 While attached, press Ctrl-] to detach without stopping the Perch session.`);
 }
 
-function commandHelp(command, action) {
+function commandHelp(command) {
   const common = `Global options: --server <url>, --token <token>. Launch commands also accept --cwd <path>, --title <title>, and --no-attach.`;
   if (["claude", "codex", "run"].includes(command)) {
     const usage = command === "run"
       ? "perch run [options] -- <command> [args...]"
       : `perch ${command} [options] [${command} args...]`;
-    return `Usage: ${usage}\n\nStarts and attaches a Perch-managed ${command === "run" ? "command" : command} session.\n${common}\n\nTo forward provider help instead of viewing this wrapper help, run:\n  perch ${command} -- --help`;
+    const forwardHelp = command === "run"
+      ? "To view a wrapped command's help instead of this wrapper help, run:\n  perch run -- <command> --help"
+      : `To forward provider help instead of viewing this wrapper help, run:\n  perch ${command} -- --help`;
+    return `Usage: ${usage}\n\nStarts and attaches a Perch-managed ${command === "run" ? "command" : command} session.\n${common}\n\n${forwardHelp}`;
   }
   if (command === "mate") return `Usage: perch mate [options] [claude|codex]\n\nStarts or attaches to the durable Mate orchestrator.\n  --new  intentionally start a fresh Mate conversation\n${common}`;
   if (command === "recover") return "Usage: perch recover task <task-id>\n\nRecovers a task when its persisted runtime supports recovery.";
