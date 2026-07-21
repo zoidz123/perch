@@ -201,7 +201,7 @@ Important paths are:
 | `devices.json` | Paired devices and revocable tokens |
 | `settings.json` | Worker and Mate defaults |
 | `projects.json` | Project registry and delivery modes |
-| `state.sqlite` | Tasks, events, runtimes, owners, operations, and notification outbox |
+| `state.sqlite` | Tasks, events, PR and completion-verification facts, runtimes, owners, operations, and notification outbox |
 | `worktrees/` | Isolated git worktree pool |
 | `mate/` | Mate home and managed instructions |
 | `charts/` | Canonical registered charts |

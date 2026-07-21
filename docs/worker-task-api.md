@@ -105,6 +105,7 @@ Each returned task also carries a server-derived `presentation` with a single `s
 `working`, `reviewing`, `needs_you`, `blocked`, `awaiting_verification`, `ready_to_merge`, `ready_to_apply`, `failed`, or `closed`.
 It is derived from the durable lifecycle, PR, and verification facts, never persisted as task state, and clients render the primary task status from it instead of inferring readiness from PR checks or mergeability.
 A `landed` task presents as `closed`, so merged work leaves the active task list immediately instead of wearing a badge until teardown closes the record.
+A `no-mistakes` task in the `working` lifecycle state presents as `reviewing`, making the active no-mistakes review visible; other modes stay `working` until `awaiting_verification`.
 
 Mate uses this detail endpoint before acting on a wake notification.
 The event `seq` is the stable identifier used for completion decisions and turn-boundary evidence.
