@@ -8,6 +8,7 @@ import { codexRecoveryDriver, type RecoveryProviderDriver } from "./recovery.js"
 import { isTrustedProviderIdentity } from "./runtimeManager.js";
 import type { OwnerRuntimeRecord, RuntimeRecord } from "./stateDb.js";
 import type { TaskScheduler } from "./taskScheduler.js";
+import { stripTerminalControls } from "./terminalText.js";
 import { terminateMatchingOrphan } from "./orphanProcess.js";
 
 export type MateFleetRecoveryResult = {
@@ -182,12 +183,13 @@ export class MateRecoveryCoordinator {
       const recent = launched
         ? await this.options.adapter.readRecentEvents(launchedSessionId, 12).catch(() => undefined)
         : undefined;
-      const tail = recent?.events
+      const recentTail = stripTerminalControls((recent?.events
         .map((event) => event.type === "terminal_output" ? event.text ?? "" : "")
         .filter(Boolean)
         .join("\n")
-        .trim()
-        .slice(-1_000) || capturedOutput.join("").trim().slice(-1_000);
+        ?? "")).slice(-1_000);
+      const capturedTail = stripTerminalControls(capturedOutput.join("")).slice(-1_000);
+      const tail = recentTail || capturedTail;
       if (launched) await this.options.adapter.stopSession?.(launchedSessionId).catch(() => {});
       const message = `${error instanceof Error ? error.message : String(error)}${tail ? `; terminal: ${tail}` : ""}`;
       this.options.ownerManager.failRecovery(claimed, message);

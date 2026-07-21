@@ -188,6 +188,10 @@ export class CodexControlPlane {
       sessionId,
       socketPath: args.socketPath,
       onThreadStarted: (threadId) => {
+        // A shared daemon broadcasts every thread it opens, including threads
+        // unrelated to this TUI. The first thread is the root conversation for
+        // this session; replacing it would corrupt durable recovery identity.
+        if (session.sharedThreadId) return;
         session.sharedThreadId = threadId;
         session.onSharedThread?.(threadId);
       },
