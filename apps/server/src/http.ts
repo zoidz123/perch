@@ -3474,12 +3474,23 @@ async function completionDecisionRpc(
     return rpcError(409, `Task is ${task.state}, not waiting for completion verification`);
   }
 
+  // For local-only work the acceptance additionally records the checkout HEAD
+  // the mate observed, so readiness derivation can refuse a deliverable that
+  // moved between the request and the decision.
+  let acceptedDeliverable: { kind: "local"; revision: string } | undefined;
+  if (body.action === "accept" && task.mode === "local-only") {
+    const revision = await options.prPoller.checkoutHead(task);
+    if (revision) {
+      acceptedDeliverable = { kind: "local", revision };
+    }
+  }
   const decisionData = {
     completionDecision: {
       action: body.action,
       requestSeq: body.requestSeq,
       idempotencyKey: key,
-      ...(feedback ? { feedback } : {})
+      ...(feedback ? { feedback } : {}),
+      ...(acceptedDeliverable ? { deliverable: acceptedDeliverable } : {})
     }
   };
   let updated = options.tasks.recordEvent(taskId, {
@@ -3910,20 +3921,19 @@ async function handleTaskEvent(
     // report as a completion claim. Trusted done is created only by the mate's
     // explicit /completion accept action.
     const kind = body.kind === "done" ? "completion_requested" : body.kind;
-    // Bind the completion claim to the exact deliverable before appending it.
-    // A later PR head observation cannot inherit this acceptance.
-    if (pr) {
-      options.tasks.update(taskId, { pr: { ...task.pr, ...pr } });
-    }
+    // Bind the completion claim to the exact deliverable inside the event
+    // itself. A later PR head observation cannot inherit this acceptance. The
+    // task is re-read after the awaits above so the deliverable reflects
+    // current facts, not the handler-entry snapshot.
     const current = options.tasks.find(taskId) ?? task;
-    const eventData = kind === "completion_requested"
-      ? {
-          ...(data ?? {}),
-          deliverable: current.mode === "local-only"
-            ? { kind: "local", revision: current.branch }
-            : { kind: "pr", headOid: current.pr?.headOid }
-        }
-      : data;
+    let eventData = data;
+    if (kind === "completion_requested") {
+      const attachedPr = pr ? { ...current.pr, ...pr } : current.pr;
+      const deliverable = current.mode === "local-only"
+        ? { kind: "local", revision: (await options.prPoller.checkoutHead(current)) ?? current.branch }
+        : { kind: "pr", headOid: attachedPr?.headOid };
+      eventData = { ...(data ?? {}), deliverable };
+    }
     updated = options.tasks.recordEvent(taskId, { kind, message, source, ...(eventData ? { data: eventData } : {}) });
   } catch (error) {
     writeJson(response, 409, { error: error instanceof Error ? error.message : String(error) });
@@ -3932,7 +3942,10 @@ async function handleTaskEvent(
 
   // A finished worker naming its PR arms the reconcile loop: one eager poll
   // now, plus a fast window while the fresh PR's checks are expected to move.
+  // The attachment lands only after the event proved a legal transition, so a
+  // rejected report leaves the task untouched.
   if (pr && !updated.pr?.merged) {
+    updated = options.tasks.update(taskId, { pr: { ...updated.pr, ...pr } });
     options.prPoller.armFast(taskId);
     void options.prPoller.tick().catch(() => {});
   }

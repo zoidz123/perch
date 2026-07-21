@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import type { Task, TaskEvent } from "@perch/shared";
-import { deriveTaskPresentation } from "./taskPresentation.js";
+import type { Task } from "@perch/shared";
+import { deriveTaskPresentation, type TaskVerificationFacts } from "./taskPresentation.js";
 
 function task(overrides: Partial<Task> = {}): Task {
   return {
@@ -18,37 +18,56 @@ function task(overrides: Partial<Task> = {}): Task {
   };
 }
 
-function events(decision: "completion_accepted" | "completion_rejected" = "completion_accepted"): TaskEvent[] {
-  return [
-    { seq: 1, at: "", kind: "completion_requested", source: "worker", data: { deliverable: { kind: "pr", headOid: "head-a" } } },
-    { seq: 2, at: "", kind: decision, source: "system", data: { completionDecision: { requestSeq: 1 } } }
-  ];
+function verification(overrides: Partial<TaskVerificationFacts> = {}): TaskVerificationFacts {
+  return { requestSeq: 1, deliverable: { kind: "pr", headOid: "head-a" }, accepted: true, ...overrides };
 }
 
 test("green and mergeable PR needs mate acceptance for Ready to Merge", () => {
-  assert.equal(deriveTaskPresentation(task({ state: "working" }), []).state, "working");
-  assert.equal(deriveTaskPresentation(task({ state: "completion_requested" }), events()).state, "awaiting_verification");
-  assert.equal(deriveTaskPresentation(task(), events()).state, "ready_to_merge");
+  assert.equal(deriveTaskPresentation(task({ state: "working" })).state, "working");
+  assert.equal(
+    deriveTaskPresentation(task({ state: "completion_requested" }), { verification: verification({ accepted: false }) }).state,
+    "awaiting_verification"
+  );
+  assert.equal(deriveTaskPresentation(task(), { verification: verification({ accepted: false }) }).state, "working");
+  assert.equal(deriveTaskPresentation(task(), { verification: verification() }).state, "ready_to_merge");
 });
 
 test("rejection, resumption, new head, and changed checks invalidate readiness", () => {
-  assert.equal(deriveTaskPresentation(task({ state: "working" }), events("completion_rejected")).state, "working");
-  assert.equal(deriveTaskPresentation(task({ pr: { ...task().pr!, headOid: "head-b" } }), events()).state, "working");
-  assert.equal(deriveTaskPresentation(task({ pr: { ...task().pr!, checks: "failing" } }), events()).state, "working");
+  assert.equal(deriveTaskPresentation(task({ state: "working" }), { verification: verification({ accepted: false }) }).state, "working");
+  assert.equal(deriveTaskPresentation(task({ state: "working" }), { verification: verification() }).state, "working");
+  assert.equal(deriveTaskPresentation(task({ state: "failed" }), { verification: verification() }).state, "failed");
+  assert.equal(
+    deriveTaskPresentation(task({ pr: { ...task().pr!, headOid: "head-b" } }), { verification: verification() }).state,
+    "working"
+  );
+  assert.equal(
+    deriveTaskPresentation(task(), { pr: { ...task().pr!, headOid: "head-b" }, verification: verification() }).state,
+    "working"
+  );
+  assert.equal(
+    deriveTaskPresentation(task({ pr: { ...task().pr!, checks: "failing" } }), { verification: verification() }).state,
+    "working"
+  );
 });
 
-test("local-only acceptance derives Ready to Apply without PR language", () => {
+test("local-only acceptance binds to the exact accepted checkout revision", () => {
   const local = task({ mode: "local-only", pr: undefined });
-  const localEvents: TaskEvent[] = [
-    { seq: 1, at: "", kind: "completion_requested", source: "worker", data: { deliverable: { kind: "local", revision: "abc" } } },
-    { seq: 2, at: "", kind: "completion_accepted", source: "system", data: { completionDecision: { requestSeq: 1 } } }
-  ];
-  assert.equal(deriveTaskPresentation(local, localEvents).state, "ready_to_apply");
+  const facts: TaskVerificationFacts = {
+    requestSeq: 1,
+    deliverable: { kind: "local", revision: "abc123" },
+    accepted: true
+  };
+  assert.equal(deriveTaskPresentation(local, { verification: facts }).state, "ready_to_apply");
+  assert.equal(deriveTaskPresentation(local, { verification: { ...facts, acceptedRevision: "abc123" } }).state, "ready_to_apply");
+  assert.equal(deriveTaskPresentation(local, { verification: { ...facts, acceptedRevision: "def456" } }).state, "working");
+  assert.equal(deriveTaskPresentation(local, { verification: { ...facts, deliverable: { kind: "local" } } }).state, "working");
+  assert.equal(deriveTaskPresentation(local, { verification: { ...facts, accepted: false } }).state, "working");
 });
 
 test("ordinary lifecycle states and closed tasks retain truthful presentation", () => {
-  assert.equal(deriveTaskPresentation(task({ state: "needs_you" }), []).state, "needs_you");
-  assert.equal(deriveTaskPresentation(task({ state: "blocked" }), []).state, "blocked");
-  assert.equal(deriveTaskPresentation(task({ state: "failed" }), []).state, "failed");
-  assert.equal(deriveTaskPresentation(task({ state: "closed" }), []).state, "closed");
+  assert.equal(deriveTaskPresentation(task({ state: "needs_you" })).state, "needs_you");
+  assert.equal(deriveTaskPresentation(task({ state: "blocked" })).state, "blocked");
+  assert.equal(deriveTaskPresentation(task({ state: "failed" })).state, "failed");
+  assert.equal(deriveTaskPresentation(task({ state: "closed" })).state, "closed");
+  assert.equal(deriveTaskPresentation(task({ state: "queued" })).state, "working");
 });

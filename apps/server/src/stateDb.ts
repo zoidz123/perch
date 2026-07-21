@@ -2,8 +2,9 @@ import { randomUUID } from "node:crypto";
 import { chmodSync, existsSync, mkdirSync, readFileSync, readdirSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
-import type { Task, TaskEvent, TaskEventKind, TaskEventSource } from "@perch/shared";
+import type { Task, TaskEvent, TaskEventKind, TaskEventSource, TaskPr } from "@perch/shared";
 import Database from "better-sqlite3";
+import type { TaskDeliverable, TaskVerificationFacts } from "./taskPresentation.js";
 
 const LATEST_SCHEMA_VERSION = 10;
 const LEGACY_TASK_IMPORT = "tasks-json-v1";
@@ -382,6 +383,22 @@ const MIGRATIONS = [
         recorded_at TEXT NOT NULL,
         PRIMARY KEY(task_id, request_seq, decision)
       ) STRICT;
+
+      INSERT OR IGNORE INTO task_pr_facts(task_id, facts_json, observed_at)
+      SELECT id, json_extract(projection_json, '$.pr'), updated_at
+      FROM tasks WHERE json_extract(projection_json, '$.pr') IS NOT NULL;
+
+      INSERT OR IGNORE INTO task_verification_facts(task_id, request_seq, decision, deliverable_json, recorded_at)
+      SELECT task_id, seq, 'requested', json_extract(data_json, '$.deliverable'), at
+      FROM task_events WHERE kind = 'completion_requested';
+
+      INSERT OR IGNORE INTO task_verification_facts(task_id, request_seq, decision, deliverable_json, recorded_at)
+      SELECT task_id, json_extract(data_json, '$.completionDecision.requestSeq'),
+             CASE kind WHEN 'completion_accepted' THEN 'accepted' ELSE 'rejected' END,
+             json_extract(data_json, '$.completionDecision.deliverable'), at
+      FROM task_events
+      WHERE kind IN ('completion_accepted', 'completion_rejected')
+        AND typeof(json_extract(data_json, '$.completionDecision.requestSeq')) = 'integer';
     `
   }
 ] as const;
@@ -627,6 +644,12 @@ type TaskEventInput = {
 };
 
 type TaskRow = { projection_json: string };
+type VerificationFactsRow = {
+  request_seq: number;
+  deliverable_json: string | null;
+  accepted: number;
+  accepted_deliverable_json: string | null;
+};
 type TaskEventRow = {
   id: number;
   seq: number;
@@ -838,6 +861,64 @@ export class TaskRepository {
     return rows.map(taskEventFromRow);
   }
 
+  // The durable GitHub observations for a task's PR, written in the same
+  // transaction as every projection save. Presentation derives from these
+  // facts, not from the stored projection snapshot.
+  prFacts(taskId: string): TaskPr | undefined {
+    const row = this.db
+      .prepare("SELECT facts_json FROM task_pr_facts WHERE task_id = ?")
+      .get(taskId) as { facts_json: string } | undefined;
+    return row ? (JSON.parse(row.facts_json) as TaskPr) : undefined;
+  }
+
+  prFactsByTask(): Map<string, TaskPr> {
+    const rows = this.db
+      .prepare("SELECT task_id, facts_json FROM task_pr_facts")
+      .all() as Array<{ task_id: string; facts_json: string }>;
+    return new Map(rows.map((row) => [row.task_id, JSON.parse(row.facts_json) as TaskPr]));
+  }
+
+  // The latest completion request and its mate decision, without loading the
+  // task's whole event ledger. Task listing sits on hot paths and must not
+  // fan out a full-history query per task.
+  verificationFacts(taskId: string): TaskVerificationFacts | undefined {
+    const row = this.db
+      .prepare(
+        `SELECT requested.request_seq, requested.deliverable_json,
+                accepted.task_id IS NOT NULL AS accepted, accepted.deliverable_json AS accepted_deliverable_json
+         FROM task_verification_facts requested
+         LEFT JOIN task_verification_facts accepted
+           ON accepted.task_id = requested.task_id
+          AND accepted.request_seq = requested.request_seq
+          AND accepted.decision = 'accepted'
+         WHERE requested.task_id = ? AND requested.decision = 'requested'
+         ORDER BY requested.request_seq DESC LIMIT 1`
+      )
+      .get(taskId) as VerificationFactsRow | undefined;
+    return row ? verificationFactsFromRow(row) : undefined;
+  }
+
+  verificationFactsByTask(): Map<string, TaskVerificationFacts> {
+    const rows = this.db
+      .prepare(
+        `SELECT requested.task_id, requested.request_seq, requested.deliverable_json,
+                accepted.task_id IS NOT NULL AS accepted, accepted.deliverable_json AS accepted_deliverable_json
+         FROM task_verification_facts requested
+         JOIN (
+           SELECT task_id, max(request_seq) AS request_seq
+           FROM task_verification_facts WHERE decision = 'requested' GROUP BY task_id
+         ) latest
+           ON latest.task_id = requested.task_id AND latest.request_seq = requested.request_seq
+         LEFT JOIN task_verification_facts accepted
+           ON accepted.task_id = requested.task_id
+          AND accepted.request_seq = requested.request_seq
+          AND accepted.decision = 'accepted'
+         WHERE requested.decision = 'requested'`
+      )
+      .all() as Array<VerificationFactsRow & { task_id: string }>;
+    return new Map(rows.map((row) => [row.task_id, verificationFactsFromRow(row)]));
+  }
+
   insertImported(task: Task, events: TaskEvent[]): { task: number; events: number } {
     const taskResult = this.db
       .prepare("INSERT OR IGNORE INTO tasks(id, state, updated_at, projection_json) VALUES (?, ?, ?, ?)")
@@ -845,6 +926,7 @@ export class TaskRepository {
     if (taskResult.changes === 0) {
       return { task: 0, events: 0 };
     }
+    this.savePrFacts(task);
     let eventCount = 0;
     const insert = this.db.prepare(
       `INSERT OR IGNORE INTO task_events(task_id, seq, at, kind, source, message, data_json)
@@ -861,6 +943,9 @@ export class TaskRepository {
         event.data ? JSON.stringify(event.data) : null
       );
       eventCount += result.changes;
+      if (result.changes > 0) {
+        this.saveVerificationFacts(task.id, event);
+      }
     }
     return { task: taskResult.changes, events: eventCount };
   }
@@ -936,13 +1021,20 @@ export class TaskRepository {
       return;
     }
     if (event.kind !== "completion_accepted" && event.kind !== "completion_rejected") return;
-    const requestSeq = (event.data as { completionDecision?: { requestSeq?: unknown } } | undefined)
-      ?.completionDecision?.requestSeq;
+    const decision = (event.data as { completionDecision?: { requestSeq?: unknown; deliverable?: unknown } } | undefined)
+      ?.completionDecision;
+    const requestSeq = decision?.requestSeq;
     if (!Number.isInteger(requestSeq)) return;
     this.db.prepare(
-      `INSERT OR REPLACE INTO task_verification_facts(task_id, request_seq, decision, recorded_at)
-       VALUES (?, ?, ?, ?)`
-    ).run(taskId, requestSeq, event.kind === "completion_accepted" ? "accepted" : "rejected", event.at);
+      `INSERT OR REPLACE INTO task_verification_facts(task_id, request_seq, decision, deliverable_json, recorded_at)
+       VALUES (?, ?, ?, ?, ?)`
+    ).run(
+      taskId,
+      requestSeq,
+      event.kind === "completion_accepted" ? "accepted" : "rejected",
+      decision?.deliverable ? JSON.stringify(decision.deliverable) : null,
+      event.at
+    );
   }
 }
 
@@ -2044,6 +2136,21 @@ function taskEventFromRow(row: TaskEventRow): TaskEvent {
     source: row.source,
     ...(row.message ? { message: row.message } : {}),
     ...(row.data_json ? { data: JSON.parse(row.data_json) as Record<string, unknown> } : {})
+  };
+}
+
+function verificationFactsFromRow(row: VerificationFactsRow): TaskVerificationFacts {
+  const deliverable = row.deliverable_json
+    ? (JSON.parse(row.deliverable_json) as TaskDeliverable)
+    : undefined;
+  const acceptedDeliverable = row.accepted_deliverable_json
+    ? (JSON.parse(row.accepted_deliverable_json) as { revision?: string })
+    : undefined;
+  return {
+    requestSeq: row.request_seq,
+    accepted: row.accepted === 1,
+    ...(deliverable ? { deliverable } : {}),
+    ...(acceptedDeliverable?.revision ? { acceptedRevision: acceptedDeliverable.revision } : {})
   };
 }
 
