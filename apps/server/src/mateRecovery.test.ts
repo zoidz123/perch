@@ -438,8 +438,11 @@ test("Codex mate recovery uses native resume syntax and binds only the verified 
   const monitor = new FleetMonitor(adapter);
   const timeline = new TimelineStore();
   const scheduler = new TaskScheduler({ stateDb: tasks.stateDb, operationKinds: ["recovery"] });
+  const recoveryOrder: string[] = [];
+  adapter.onStart = () => { recoveryOrder.push("launch"); };
   const codexDriver: RecoveryProviderDriver = {
     provider: "codex",
+    verifyBeforeLaunch: true,
     prepare: (runtime) => ({
       expectedProviderSessionId: runtime.providerSessionId!,
       request: {
@@ -451,7 +454,10 @@ test("Codex mate recovery uses native resume syntax and binds only the verified 
         title: "mate"
       }
     }),
-    verifyIdentity: async ({ providerSessionId }) => providerSessionId
+    verifyIdentity: async ({ providerSessionId }) => {
+      recoveryOrder.push("verify");
+      return providerSessionId;
+    }
   };
   const recovery = new MateRecoveryCoordinator({
     adapter,
@@ -484,6 +490,7 @@ test("Codex mate recovery uses native resume syntax and binds only the verified 
 
     const result = await recovery.recover(recoverable);
     assert.equal(result.recoveredMate, true);
+    assert.deepEqual(recoveryOrder, ["verify", "launch"]);
     assert.deepEqual(adapter.requests[0]?.args, ["resume", MATE_CONVERSATION]);
     assert.equal(ownerManager.snapshot()?.provider, "codex");
     assert.equal(ownerManager.snapshot()?.providerSessionId, MATE_CONVERSATION);

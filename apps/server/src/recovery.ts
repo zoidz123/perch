@@ -24,6 +24,7 @@ export type PreparedProviderRecovery = {
 
 export type RecoveryProviderDriver = {
   provider: string;
+  verifyBeforeLaunch?: boolean;
   prepare(runtime: RuntimeRecord, task: Task): Promise<PreparedProviderRecovery> | PreparedProviderRecovery;
   verifySessionStart?(expectedProviderSessionId: string, payload: HookEventPayload): boolean;
   verifyIdentity?(input: {
@@ -186,6 +187,9 @@ export class RecoveryCoordinator {
     let launchedSessionId = sessionId;
     let launched = false;
     try {
+      if (driver.verifyBeforeLaunch) {
+        await this.verifyIdentity(driver, sessionId, providerSessionId, request.cwd ?? task.project);
+      }
       await context.boundary("beforeLaunch");
       context.checkpoint({
         ...payload,
@@ -213,18 +217,9 @@ export class RecoveryCoordinator {
         }
       }
       await context.boundary("afterLaunch");
-      const verified = await driver.verifyIdentity?.({
-        sessionId: result.session.id,
-        providerSessionId,
-        cwd: request.cwd ?? task.project,
-        codexControl: this.options.codexControl
-      });
-      if (verified && verified !== providerSessionId) {
-        throw new Error(
-          `recovery provider identity mismatch: expected ${driver.provider}/${providerSessionId}, got ${driver.provider}/${verified ?? "unknown"}`
-        );
+      if (!driver.verifyBeforeLaunch) {
+        await this.verifyIdentity(driver, result.session.id, providerSessionId, request.cwd ?? task.project);
       }
-      if (verified) this.observeSessionStart(result.session.id, driver.provider, verified);
       try {
         await identity;
         // Identity evidence can arrive out-of-band (the codex driver resumes
@@ -317,6 +312,26 @@ export class RecoveryCoordinator {
     return identity;
   }
 
+  private async verifyIdentity(
+    driver: RecoveryProviderDriver,
+    sessionId: string,
+    providerSessionId: string,
+    cwd: string
+  ): Promise<void> {
+    const verified = await driver.verifyIdentity?.({
+      sessionId,
+      providerSessionId,
+      cwd,
+      codexControl: this.options.codexControl
+    });
+    if (verified && verified !== providerSessionId) {
+      throw new Error(
+        `recovery provider identity mismatch: expected ${driver.provider}/${providerSessionId}, got ${driver.provider}/${verified}`
+      );
+    }
+    if (verified) this.observeSessionStart(sessionId, driver.provider, verified);
+  }
+
   // A resumed operation may only compensate its own stale claim. A recovering
   // row held by a different owner belongs to a later recovery in flight;
   // revoking it would let two workers resume the same provider conversation.
@@ -361,13 +376,13 @@ let codexResumeSyntax: Promise<void> | undefined;
 
 export const codexRecoveryDriver: RecoveryProviderDriver = {
   provider: "codex",
+  verifyBeforeLaunch: true,
   // A resumed codex TUI emits no SessionStart hook and touches no rollout at
   // startup (evidence only appears at its first turn), so recovery cannot wait
-  // on the hook path the way Claude does. The shared-daemon check applies only
-  // when the recovered session runs the remote topology; today recovery
-  // launches PTY-only, so this falls through to an out-of-band resume that
-  // proves the persisted thread is resumable in Codex's store. The coordinator
-  // additionally requires the launched PTY to still be alive before binding.
+  // on the hook path the way Claude does. Prove the persisted thread is
+  // resumable before launching the PTY: a second app-server resume can block
+  // once the TUI already owns that thread. The coordinator then launches the
+  // exact thread id and requires the PTY to remain alive before binding.
   async verifyIdentity({ sessionId, providerSessionId, cwd, codexControl }) {
     const shared = await codexControl?.verifyResumedThread(sessionId, providerSessionId);
     if (shared) return shared;

@@ -141,6 +141,10 @@ export class MateRecoveryCoordinator {
           if (text) capturedOutput.push(text);
         }
       });
+      const driver = this.providers.get(claimed.provider);
+      if (driver?.verifyBeforeLaunch) {
+        await this.verifyIdentity(driver, sessionId, providerSessionId, claimed.cwd);
+      }
       const result = await startManagedAgent(this.options, {
         request: prepared.request,
         trackRuntime: false,
@@ -157,15 +161,8 @@ export class MateRecoveryCoordinator {
           this.expectations.delete(sessionId);
         }
       }
-      const driver = this.providers.get(claimed.provider);
-      if (driver?.verifyIdentity) {
-        const verified = await driver.verifyIdentity({
-          sessionId: launchedSessionId,
-          providerSessionId,
-          cwd: claimed.cwd,
-          codexControl: this.options.codexControl
-        });
-        if (verified) this.observeSessionStart(launchedSessionId, "codex", verified);
+      if (driver && !driver.verifyBeforeLaunch) {
+        await this.verifyIdentity(driver, launchedSessionId, providerSessionId, claimed.cwd);
       }
       await identity;
       const alive = (await this.options.adapter.listSessions()).some(
@@ -215,6 +212,26 @@ export class MateRecoveryCoordinator {
     const driver = this.providers.get(runtime.provider);
     if (!driver) throw new Error(`mate recovery provider is not supported: ${runtime.provider}`);
     return driver.prepare(transientRuntime, transientTask);
+  }
+
+  private async verifyIdentity(
+    driver: RecoveryProviderDriver,
+    sessionId: string,
+    providerSessionId: string,
+    cwd: string
+  ): Promise<void> {
+    const verified = await driver.verifyIdentity?.({
+      sessionId,
+      providerSessionId,
+      cwd,
+      codexControl: this.options.codexControl
+    });
+    if (verified && verified !== providerSessionId) {
+      throw new Error(
+        `mate recovery provider identity mismatch: expected ${driver.provider}/${providerSessionId}, got ${driver.provider}/${verified}`
+      );
+    }
+    if (verified) this.observeSessionStart(sessionId, driver.provider, verified);
   }
 
   private async restoreChildren(mate: OwnerRuntimeRecord, previousSessionId?: string) {
