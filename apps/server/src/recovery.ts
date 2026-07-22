@@ -424,6 +424,18 @@ export const codexRecoveryDriver: RecoveryProviderDriver = {
   }
 };
 
+// The codex app-server rejects thread/resume for a recorded thread whose
+// rollout JSONL was never written (the file only appears at the thread's first
+// turn) with exactly this -32600 message. That condition is permanent - the
+// rollout will never appear - unlike transient daemon/socket/timeout failures,
+// which must stay recoverable. Match both the code marker and the message text
+// (the client formats errors as `<method>: <message> (code=<code>)`), so other
+// -32600 shapes (e.g. a malformed thread id) never classify as permanent.
+export function isCodexMissingRolloutResumeError(error: unknown): boolean {
+  const message = error instanceof Error ? error.message : String(error);
+  return message.includes("(code=-32600)") && message.includes("no rollout found for thread id");
+}
+
 async function verifyCodexResumeSyntax(): Promise<void> {
   const { stdout, stderr } = await execFileAsync("codex", ["resume", "--help"], { timeout: 5_000 });
   const help = `${stdout}\n${stderr}`;

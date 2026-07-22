@@ -16,7 +16,7 @@ import { OwnerManager } from "./ownerManager.js";
 import { ProjectRegistry } from "./projects.js";
 import { DeviceRegistry } from "./pairing.js";
 import { PrPoller } from "./prPoller.js";
-import { RecoveryCoordinator, type RecoveryProviderDriver } from "./recovery.js";
+import { isCodexMissingRolloutResumeError, RecoveryCoordinator, type RecoveryProviderDriver } from "./recovery.js";
 import { RuntimeManager } from "./runtimeManager.js";
 import { TaskScheduler } from "./taskScheduler.js";
 import { TaskStore } from "./tasks.js";
@@ -425,6 +425,229 @@ test("a mate recovery failure is shell-safe, returns the claim to recoverable, a
     monitor.stop();
     timeline.stop();
     tasks.close();
+    rmSync(home, { recursive: true, force: true });
+  }
+});
+
+// The permanent -32600 no-rollout condition: codex recorded the thread id at
+// thread/started but was killed before its first turn ever wrote the rollout
+// file, so thread/resume can never succeed. A plain `perch mate` must retire
+// that stale generation and launch a fresh mate in the same request instead of
+// re-arming the identical failure on every start.
+test("a codex mate resume hitting the permanent no-rollout condition retires the generation and starts fresh in the same request", async () => {
+  const home = mkdtempSync(join(tmpdir(), "perch-mate-no-rollout-"));
+  const priorHome = process.env.PERCH_HOME;
+  // seedMateHome inside the fresh-launch route reads process.env.
+  process.env.PERCH_HOME = home;
+  const tasks = new TaskStore({ PERCH_HOME: home } as NodeJS.ProcessEnv);
+  const ownerManager = new OwnerManager(tasks);
+  const runtimeManager = new RuntimeManager(tasks);
+  const adapter = new MateRecoveryAdapter();
+  const monitor = new FleetMonitor(adapter);
+  const timeline = new TimelineStore();
+  const scheduler = new TaskScheduler({ stateDb: tasks.stateDb, operationKinds: ["recovery"] });
+  const options = {
+    adapter,
+    auditLog: new AuditLog(join(home, "audit.jsonl")),
+    monitor,
+    projects: new ProjectRegistry({ PERCH_HOME: home } as NodeJS.ProcessEnv),
+    worktrees: new WorktreePool({ env: { PERCH_HOME: home } as NodeJS.ProcessEnv }),
+    hooks: new HookRegistry(),
+    timeline,
+    tasks,
+    port: 8787,
+    runtimeManager,
+    ownerManager
+  };
+  // The exact wrapped shape a real `codex app-server` produces for a recorded
+  // thread with no rollout file (verified against codex-cli 0.144.6).
+  const permanentMessage = `thread/resume: no rollout found for thread id ${MATE_CONVERSATION} (code=-32600)`;
+  const missingRolloutDriver: RecoveryProviderDriver = {
+    provider: "codex",
+    verifyBeforeLaunch: true,
+    prepare: (runtime) => ({
+      expectedProviderSessionId: runtime.providerSessionId!,
+      request: {
+        command: "codex",
+        agent: "codex",
+        args: ["resume", runtime.providerSessionId!],
+        sessionId: `pty:${randomUUID()}`,
+        cwd: home,
+        title: "mate"
+      }
+    }),
+    verifyIdentity: async () => { throw new Error(permanentMessage); }
+  };
+  const mateRecovery = new MateRecoveryCoordinator({
+    ...options,
+    taskScheduler: scheduler,
+    mateProviders: [missingRolloutDriver],
+    identityTimeoutMs: 500
+  });
+  const server = createControlServer({
+    ...options,
+    authToken: "test-token",
+    boxSecretKey: new Uint8Array(32),
+    devices: new DeviceRegistry({ PERCH_HOME: home } as NodeJS.ProcessEnv),
+    prPoller: new PrPoller(tasks, async () => { throw new Error("gh disabled in tests"); }),
+    settings: new FleetSettings({ PERCH_HOME: home } as NodeJS.ProcessEnv),
+    taskScheduler: scheduler,
+    mateRecoveryCoordinator: mateRecovery
+  });
+
+  try {
+    assert.equal(isCodexMissingRolloutResumeError(new Error(permanentMessage)), true);
+
+    const starting = ownerManager.beginMateLaunch({
+      command: "codex",
+      agent: "codex",
+      sessionId: "pty:old-codex-mate",
+      cwd: home,
+      labels: { role: "mate" }
+    });
+    ownerManager.markLive(starting, "pty:old-codex-mate");
+    ownerManager.recordProviderSession("pty:old-codex-mate", "codex", MATE_CONVERSATION);
+    ownerManager.interruptSession("pty:old-codex-mate");
+
+    await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+    const port = (server.address() as AddressInfo).port;
+    const started = await fetch(`http://127.0.0.1:${port}/mate/start`, {
+      method: "POST",
+      headers: { authorization: "Bearer test-token", "content-type": "application/json" },
+      body: "{}"
+    });
+    assert.equal(started.status, 201, await started.clone().text());
+    const body = await started.json() as { fresh?: boolean; session: AgentSession };
+    assert.equal(body.fresh, true);
+
+    // The stale generation is retired with the permanent reason on record.
+    const stale = tasks.stateDb.ownerRuntimes.findBySession("pty:old-codex-mate");
+    assert.equal(stale?.generation, 0);
+    assert.equal(stale?.state, "ended");
+    assert.equal(stale?.metadata?.endedReason, "unrecoverable-provider-conversation");
+    assert.match(String(stale?.metadata?.endedError), /no rollout found/);
+
+    // The fresh mate is a new launch (never a resume) on the next generation.
+    assert.equal(ownerManager.snapshot()?.generation, 1);
+    assert.equal(ownerManager.snapshot()?.state, "live");
+    const fresh = adapter.requests.at(-1)!;
+    assert.equal(adapter.requests.length, 1);
+    assert.equal(fresh.labels?.role, "mate");
+    assert.ok(!(fresh.args ?? []).includes("resume"), `fresh mate must not resume: ${JSON.stringify(fresh.args)}`);
+  } finally {
+    server.closeAllConnections?.();
+    if (server.listening) await new Promise<void>((resolve) => server.close(() => resolve()));
+    await scheduler.stop();
+    monitor.stop();
+    timeline.stop();
+    tasks.close();
+    if (priorHome === undefined) delete process.env.PERCH_HOME;
+    else process.env.PERCH_HOME = priorHome;
+    rmSync(home, { recursive: true, force: true });
+  }
+});
+
+test("transient codex mate resume failures still answer 409 and keep the generation recoverable", async () => {
+  const home = mkdtempSync(join(tmpdir(), "perch-mate-transient-"));
+  const priorHome = process.env.PERCH_HOME;
+  process.env.PERCH_HOME = home;
+  const tasks = new TaskStore({ PERCH_HOME: home } as NodeJS.ProcessEnv);
+  const ownerManager = new OwnerManager(tasks);
+  const runtimeManager = new RuntimeManager(tasks);
+  const adapter = new MateRecoveryAdapter();
+  const monitor = new FleetMonitor(adapter);
+  const timeline = new TimelineStore();
+  const scheduler = new TaskScheduler({ stateDb: tasks.stateDb, operationKinds: ["recovery"] });
+  const options = {
+    adapter,
+    auditLog: new AuditLog(join(home, "audit.jsonl")),
+    monitor,
+    projects: new ProjectRegistry({ PERCH_HOME: home } as NodeJS.ProcessEnv),
+    worktrees: new WorktreePool({ env: { PERCH_HOME: home } as NodeJS.ProcessEnv }),
+    hooks: new HookRegistry(),
+    timeline,
+    tasks,
+    port: 8787,
+    runtimeManager,
+    ownerManager
+  };
+  // Transient shapes that must never classify as permanent: a resume timeout,
+  // and the app-server's other -32600 (malformed thread id, verified against
+  // codex-cli 0.144.6) which is not the missing-rollout condition.
+  const transientMessages = [
+    "thread/resume timed out after 20000ms (id=3)",
+    "thread/resume: invalid session id: invalid character: expected an optional prefix of `urn:uuid:` followed by [0-9a-fA-F-], found `n` at 1 (code=-32600)"
+  ];
+  let failure = transientMessages[0]!;
+  const failingDriver: RecoveryProviderDriver = {
+    provider: "codex",
+    verifyBeforeLaunch: true,
+    prepare: (runtime) => ({
+      expectedProviderSessionId: runtime.providerSessionId!,
+      request: {
+        command: "codex",
+        agent: "codex",
+        args: ["resume", runtime.providerSessionId!],
+        sessionId: `pty:${randomUUID()}`,
+        cwd: home,
+        title: "mate"
+      }
+    }),
+    verifyIdentity: async () => { throw new Error(failure); }
+  };
+  const mateRecovery = new MateRecoveryCoordinator({
+    ...options,
+    taskScheduler: scheduler,
+    mateProviders: [failingDriver],
+    identityTimeoutMs: 500
+  });
+  const server = createControlServer({
+    ...options,
+    authToken: "test-token",
+    boxSecretKey: new Uint8Array(32),
+    devices: new DeviceRegistry({ PERCH_HOME: home } as NodeJS.ProcessEnv),
+    prPoller: new PrPoller(tasks, async () => { throw new Error("gh disabled in tests"); }),
+    settings: new FleetSettings({ PERCH_HOME: home } as NodeJS.ProcessEnv),
+    taskScheduler: scheduler,
+    mateRecoveryCoordinator: mateRecovery
+  });
+
+  try {
+    const starting = ownerManager.beginMateLaunch({
+      command: "codex",
+      agent: "codex",
+      sessionId: "pty:old-codex-mate",
+      cwd: home,
+      labels: { role: "mate" }
+    });
+    ownerManager.markLive(starting, "pty:old-codex-mate");
+    ownerManager.recordProviderSession("pty:old-codex-mate", "codex", MATE_CONVERSATION);
+    ownerManager.interruptSession("pty:old-codex-mate");
+
+    await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+    const port = (server.address() as AddressInfo).port;
+    for (const message of transientMessages) {
+      failure = message;
+      assert.equal(isCodexMissingRolloutResumeError(new Error(message)), false);
+      const response = await fetch(`http://127.0.0.1:${port}/mate/start`, {
+        method: "POST",
+        headers: { authorization: "Bearer test-token", "content-type": "application/json" },
+        body: "{}"
+      });
+      assert.equal(response.status, 409);
+      assert.equal(ownerManager.latestMate()?.generation, 0);
+      assert.equal(ownerManager.latestMate()?.state, "recoverable");
+    }
+    assert.equal(adapter.requests.length, 0);
+  } finally {
+    server.closeAllConnections?.();
+    if (server.listening) await new Promise<void>((resolve) => server.close(() => resolve()));
+    await scheduler.stop();
+    monitor.stop();
+    timeline.stop();
+    tasks.close();
+    if (priorHome === undefined) delete process.env.PERCH_HOME;
+    else process.env.PERCH_HOME = priorHome;
     rmSync(home, { recursive: true, force: true });
   }
 });
