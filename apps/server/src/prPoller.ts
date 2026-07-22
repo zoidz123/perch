@@ -102,6 +102,7 @@ export class PrPoller {
   private readonly resolveCheckout: CheckoutResolver;
   // Task id -> epoch until which it rides the fast cadence.
   private readonly fastUntil = new Map<string, number>();
+  private readonly awaitingMerge = new Set<string>();
   private timer?: NodeJS.Timeout;
   private fastTimer?: NodeJS.Timeout;
   private inFlight = false;
@@ -152,19 +153,32 @@ export class PrPoller {
     await this.poll(() => true, "baseline");
   }
 
-  // The fast lane: tasks inside their fast window plus done PRs that are ready
-  // to merge. Ready PRs stay fast until GitHub reports merged or closed, so a
-  // merge just after the original window does not wait for the slow baseline.
+  // The fast lane: tasks inside their fast window plus done PRs that have
+  // become ready to merge. They stay fast until GitHub reports merged or
+  // closed, so a later readiness regression cannot restore the slow baseline.
   async fastTick(): Promise<void> {
     const now = this.now();
+    const tasks = this.tasks.list();
+    const tasksById = new Map(tasks.map((task) => [task.id, task]));
+    for (const task of tasks) {
+      if (task.state === "done" && task.pr?.mergeReady === true && !task.pr.merged) {
+        this.awaitingMerge.add(task.id);
+      }
+    }
     for (const [taskId, until] of this.fastUntil) {
       if (until <= now) {
         this.fastUntil.delete(taskId);
       }
     }
+    for (const taskId of this.awaitingMerge) {
+      const task = tasksById.get(taskId);
+      if (!task || task.state === "closed" || task.pr?.merged) {
+        this.awaitingMerge.delete(taskId);
+      }
+    }
     const include = (task: Task): boolean =>
-      this.fastUntil.has(task.id) || isAwaitingMerge(task);
-    if (this.fastUntil.size === 0 && !this.tasks.list().some(isAwaitingMerge)) {
+      this.fastUntil.has(task.id) || (task.state === "done" && this.awaitingMerge.has(task.id));
+    if (this.fastUntil.size === 0 && !tasks.some(include)) {
       return;
     }
     await this.poll(include, "fast");
@@ -429,6 +443,9 @@ export class PrPoller {
       }
     }
     const mergeReady = isMergeReady(task, view, checks, expectedRepo) && (identity.ok || !view.headRepository);
+    if (mergeReady && task.state === "done") {
+      this.awaitingMerge.add(task.id);
+    }
     if (pr.mergeReady !== mergeReady) {
       pr.mergeReady = mergeReady;
       changed = true;
@@ -438,6 +455,9 @@ export class PrPoller {
       pr.merged = true;
       changed = true;
       justMerged = true;
+    }
+    if (identity.ok && (view.state === "MERGED" || view.state === "CLOSED" || !!view.mergedAt)) {
+      this.awaitingMerge.delete(task.id);
     }
 
     // Persist the new PR state before emitting events, so a listener reacting to
@@ -478,10 +498,6 @@ function shouldPoll(task: Task): boolean {
     !!task.pr?.url &&
     !task.pr.merged
   );
-}
-
-function isAwaitingMerge(task: Task): boolean {
-  return task.state === "done" && task.pr?.mergeReady === true && !task.pr.merged;
 }
 
 function shouldDiscover(task: Task): boolean {

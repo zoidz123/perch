@@ -169,7 +169,7 @@ test("auto-return: a merged PR returns the worktree within the poll cycle", asyn
   h.cleanup();
 });
 
-test("auto-return: a ready done PR stays fast-polled after its window and returns on merge", async () => {
+test("auto-return: transient readiness regression stays fast-polled until merge", async () => {
   const h = harness();
   const task = h.tasks.create({ title: "merge after settled checks", project: h.repo });
   h.tasks.recordEvent(task.id, { kind: "working", source: "worker" });
@@ -185,7 +185,7 @@ test("auto-return: a ready done PR stays fast-polled after its window and return
   });
 
   let clock = 1_000_000;
-  let merged = false;
+  let phase: "ready" | "regressed" | "merged" = "ready";
   let polls = 0;
   const { pending } = autoReturn(h);
   const poller = new PrPoller(
@@ -193,14 +193,14 @@ test("auto-return: a ready done PR stays fast-polled after its window and return
     async () => {
       polls += 1;
       return {
-        state: merged ? "MERGED" : "OPEN",
-        mergedAt: merged ? "2026-07-22T00:00:00Z" : null,
+        state: phase === "merged" ? "MERGED" : "OPEN",
+        mergedAt: phase === "merged" ? "2026-07-22T00:00:00Z" : null,
         headRefName: "perch/late-merge",
         headRepository: { nameWithOwner: "o/r" },
         statusCheckRollup: [{ conclusion: "SUCCESS" }],
         isDraft: false,
-        mergeable: "MERGEABLE",
-        mergeStateStatus: "CLEAN",
+        mergeable: phase === "regressed" ? "UNKNOWN" : "MERGEABLE",
+        mergeStateStatus: phase === "regressed" ? "UNKNOWN" : "CLEAN",
         reviewDecision: "APPROVED"
       };
     },
@@ -211,15 +211,17 @@ test("auto-return: a ready done PR stays fast-polled after its window and return
   await poller.fastTick();
   assert.equal(h.tasks.find(task.id)?.pr?.mergeReady, true);
 
-  // Checks settled before the original fast window expired. GitHub merges
-  // just afterward, so the next fast tick must still observe it rather than
-  // waiting for the five-minute baseline.
   clock += 60_001;
-  merged = true;
+  phase = "regressed";
+  await poller.fastTick();
+  assert.equal(polls, 2);
+  assert.equal(h.tasks.find(task.id)?.pr?.mergeReady, false);
+
+  phase = "merged";
   await poller.fastTick();
   await Promise.all(pending);
 
-  assert.equal(polls, 2, "the later fast tick observes the merge");
+  assert.equal(polls, 3, "the later fast tick observes the merge");
   assert.equal(h.tasks.find(task.id)?.state, "closed");
   assert.equal(h.pool.find(lease.id)?.leasedBy, undefined, "the worker slot auto-returns");
   assert.deepEqual(h.stopped, [sessionId]);
@@ -229,7 +231,7 @@ test("auto-return: a ready done PR stays fast-polled after its window and return
   const kinds = h.tasks.events(task.id).map((event) => event.kind);
   assert.equal(kinds.filter((kind) => kind === "merged").length, 1);
   assert.equal(kinds.filter((kind) => kind === "closed").length, 1);
-  assert.equal(polls, 2, "closed tasks stop fast polling");
+  assert.equal(polls, 3, "closed tasks stop fast polling");
 
   h.cleanup();
 });
