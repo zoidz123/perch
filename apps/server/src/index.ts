@@ -189,7 +189,21 @@ void adapter
   .listSessions()
   .then((sessions) => {
     const live = new Set(sessions.map((session) => session.id));
-    hooks.prune(live);
+    // A surviving codex daemon's environment still authenticates with the
+    // session identity it was spawned with; keep those durable credentials
+    // until the runtime either rebinds (aliasing them to the live session) or
+    // ends. Pruning them here would strand every tool shell of a daemon the
+    // sweep below deliberately keeps alive.
+    const keepCredentials = new Set(live);
+    for (const runtime of [...tasks.stateDb.runtimes.active(), ...tasks.stateDb.ownerRuntimes.active()]) {
+      if (typeof runtime.metadata?.appServerSocketPath !== "string") continue;
+      const daemonSessionId =
+        typeof runtime.metadata.appServerDaemonSessionId === "string"
+          ? runtime.metadata.appServerDaemonSessionId
+          : runtime.ptySessionId;
+      if (daemonSessionId) keepCredentials.add(daemonSessionId);
+    }
+    hooks.prune(keepCredentials);
     runtimeManager.reconcile(live, (sessionId) => Boolean(adapter.runtimeProcess?.(sessionId)));
     ownerManager.reconcile(live, (sessionId) => Boolean(adapter.runtimeProcess?.(sessionId)));
   })
@@ -581,7 +595,7 @@ server.listen(config.port, "0.0.0.0", () => {
   // second server racing against a live one dies on EADDRINUSE without
   // SIGTERMing its live daemons.
   const keepSockets = new Set<string>();
-  for (const runtime of tasks.stateDb.runtimes.active()) {
+  for (const runtime of [...tasks.stateDb.runtimes.active(), ...tasks.stateDb.ownerRuntimes.active()]) {
     const socketPath = runtime.metadata?.appServerSocketPath;
     if (typeof socketPath === "string" && socketPath.length > 0) keepSockets.add(socketPath);
   }
@@ -629,8 +643,14 @@ async function shutdown(): Promise<void> {
   }
   // Leave live owned sessions' daemons running: they hold the in-memory
   // thread state the next server life rebinds to (runtime rows just flipped
-  // recoverable above). Everything else is torn down.
+  // recoverable above). Sockets recorded on still-active worker and mate
+  // runtimes survive too, so a daemon awaiting a not-yet-run recovery is
+  // never torn down by a second graceful restart. Everything else goes.
   const surviving = codexOwned.liveSocketPaths();
+  for (const runtime of [...tasks.stateDb.runtimes.active(), ...tasks.stateDb.ownerRuntimes.active()]) {
+    const socketPath = runtime.metadata?.appServerSocketPath;
+    if (typeof socketPath === "string" && socketPath.length > 0) surviving.add(socketPath);
+  }
   codexOwned.stop({ keepDaemons: true });
   codexDaemons.stopAll(surviving);
   // server.close() waits for open connections; drop WebSocket clients so a

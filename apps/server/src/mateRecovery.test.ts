@@ -20,7 +20,7 @@ import { OwnerManager } from "./ownerManager.js";
 import { ProjectRegistry } from "./projects.js";
 import { DeviceRegistry } from "./pairing.js";
 import { PrPoller } from "./prPoller.js";
-import { isCodexMissingRolloutResumeError, RecoveryCoordinator, type RecoveryProviderDriver } from "./recovery.js";
+import { codexRecoveryDriver, isCodexMissingRolloutResumeError, RecoveryCoordinator, type RecoveryProviderDriver } from "./recovery.js";
 import { RuntimeManager } from "./runtimeManager.js";
 import { TaskScheduler } from "./taskScheduler.js";
 import { TaskStore } from "./tasks.js";
@@ -738,6 +738,83 @@ test("Codex mate recovery resumes the exact thread over the app-server and binds
     assert.equal(ownerManager.snapshot()?.provider, "codex");
     assert.equal(ownerManager.snapshot()?.providerSessionId, MATE_CONVERSATION);
     assert.equal(ownerManager.snapshot()?.generation, 1);
+  } finally {
+    await scheduler.stop();
+    monitor.stop();
+    timeline.stop();
+    tasks.close();
+    rmSync(home, { recursive: true, force: true });
+  }
+});
+
+test("Codex mate recovery rebinds to the launch-recorded daemon socket and aliases the stale identity", async () => {
+  const home = mkdtempSync(join(tmpdir(), "perch-codex-mate-rebind-"));
+  const tasks = new TaskStore({ PERCH_HOME: home } as NodeJS.ProcessEnv);
+  const ownerManager = new OwnerManager(tasks);
+  const runtimeManager = new RuntimeManager(tasks);
+  const adapter = new MateRecoveryAdapter();
+  const codexOwned = new FakeCodexOwnedAdapter();
+  const routing = new RoutingAgentAdapter(
+    adapter as unknown as PtyAgentAdapter,
+    codexOwned as unknown as CodexAppServerAdapter
+  );
+  const monitor = new FleetMonitor(routing);
+  const timeline = new TimelineStore();
+  const scheduler = new TaskScheduler({ stateDb: tasks.stateDb, operationKinds: ["recovery"] });
+  const mateSocket = "/fake/daemons/mate-surviving.sock";
+  const recoveryOptions = {
+    adapter: routing,
+    codexOwned: codexOwned as unknown as CodexAppServerAdapter,
+    auditLog: new AuditLog(join(home, "audit.jsonl")),
+    monitor,
+    projects: new ProjectRegistry({ PERCH_HOME: home } as NodeJS.ProcessEnv),
+    worktrees: new WorktreePool({ env: { PERCH_HOME: home } as NodeJS.ProcessEnv }),
+    hooks: new HookRegistry(),
+    timeline,
+    tasks,
+    port: 8787,
+    runtimeManager,
+    ownerManager,
+    taskScheduler: scheduler,
+    // The production codex driver: the recorded socket must flow from the
+    // owner runtime's launch metadata into codexOwnedResume.
+    mateProviders: [codexRecoveryDriver],
+    identityTimeoutMs: 500
+  };
+  const recovery = new MateRecoveryCoordinator(recoveryOptions);
+  (recoveryOptions as { mateRecoveryCoordinator?: MateRecoveryCoordinator }).mateRecoveryCoordinator = recovery;
+
+  try {
+    const starting = ownerManager.beginMateLaunch({
+      command: "codex",
+      agent: "codex",
+      sessionId: "pty:old-codex-mate",
+      cwd: home,
+      labels: { role: "mate" }
+    });
+    ownerManager.markLive(starting, "pty:old-codex-mate", undefined, {
+      metadata: {
+        source: "mate-launch",
+        codexDriver: "app-server-owned",
+        appServerSocketPath: mateSocket
+      }
+    });
+    ownerManager.recordProviderSession("pty:old-codex-mate", "codex", MATE_CONVERSATION);
+    const recoverable = ownerManager.interruptSession("pty:old-codex-mate")!;
+    assert.equal(recoverable.metadata?.appServerSocketPath, mateSocket, "launch metadata survives interruption");
+
+    const result = await recovery.recover(recoverable);
+    assert.equal(result.recoveredMate, true);
+    assert.deepEqual(codexOwned.launches[0]?.resume, { threadId: MATE_CONVERSATION, socketPath: mateSocket });
+
+    const bound = ownerManager.latestMate()!;
+    assert.equal(bound.generation, 1);
+    assert.equal(bound.state, "live");
+    assert.equal(bound.metadata?.codexDriver, "app-server-owned");
+    assert.equal(bound.metadata?.appServerSocketPath, mateSocket);
+    assert.equal(bound.metadata?.appServerDaemonSessionId, "pty:old-codex-mate");
+    assert.equal(bound.metadata?.appServerDaemonGeneration, 0);
+    assert.equal(recoveryOptions.hooks.resolveAlias("pty:old-codex-mate"), bound.ptySessionId);
   } finally {
     await scheduler.stop();
     monitor.stop();

@@ -2852,7 +2852,9 @@ async function handleCreateTask(
       writeJson(response, 401, { error: "Unauthorized" });
       return;
     }
-    if (!body.parent) body.parent = hookSessionId;
+    // A rebound codex daemon's env still names its spawn-time session; the
+    // alias resolves that identity to the live session so crew still groups.
+    if (!body.parent) body.parent = options.hooks.resolveAlias(hookSessionId);
   }
 
   if (body.planEdit) {
@@ -3855,11 +3857,15 @@ async function handleTaskEvent(
   const bearer = authenticate(request, options);
   let source: "worker" | "system" = "system";
   if (!bearer) {
-    const sessionId = String(request.headers["x-perch-session"] ?? "");
+    const presentedSessionId = String(request.headers["x-perch-session"] ?? "");
     const token = String(request.headers["x-perch-token"] ?? "");
-    const reason = !sessionId || !token
+    // Verification is against the presented (possibly spawn-time) identity;
+    // the alias maps a rebound daemon's stale env credentials to the live
+    // session the task now runs under.
+    const sessionId = options.hooks.resolveAlias(presentedSessionId);
+    const reason = !presentedSessionId || !token
       ? "missing_credentials"
-      : !options.hooks.verify(sessionId, token)
+      : !options.hooks.verify(presentedSessionId, token)
         ? "invalid_credentials"
         : task.sessionId !== sessionId
           ? "task_session_mismatch"
@@ -3868,7 +3874,7 @@ async function handleTaskEvent(
       // curl -f intentionally hides the response body from workers. Keep the
       // rejection visible in server.log without ever printing the hook token.
       console.warn(
-        `task-event: rejected status=401 task=${taskId} session=${sessionId ? sessionId.slice(0, 16) : "missing"} reason=${reason}`
+        `task-event: rejected status=401 task=${taskId} session=${presentedSessionId ? presentedSessionId.slice(0, 16) : "missing"} reason=${reason}`
       );
       writeJson(response, 401, { error: "Unauthorized" });
       return;
@@ -3983,12 +3989,16 @@ async function handleNoMistakesAuthorization(
   response: ServerResponse,
   options: HttpServerOptions
 ): Promise<void> {
-  const sessionId = String(request.headers["x-perch-session"] ?? "");
+  const presentedSessionId = String(request.headers["x-perch-session"] ?? "");
   const token = String(request.headers["x-perch-token"] ?? "");
-  if (!sessionId || !token || !options.hooks.verify(sessionId, token)) {
+  if (!presentedSessionId || !token || !options.hooks.verify(presentedSessionId, token)) {
     writeJson(response, 401, { error: "Unauthorized" });
     return;
   }
+  // A rebound codex daemon authenticates with the identity baked into its env
+  // at spawn; the alias (registered only while the recovered generation is
+  // live) resolves it to the live session and runtime.
+  const sessionId = options.hooks.resolveAlias(presentedSessionId);
 
   // Runtime ownership is authoritative and is bound before the kickoff prompt
   // can run. Task projection linkage follows immediately after launch, so
@@ -4015,6 +4025,14 @@ async function handleNoMistakesAuthorization(
   const durableMode = boundedPolicyString(body.durableMode, 32);
   const requestGeneration = Number.isSafeInteger(body.runtimeGeneration) ? body.runtimeGeneration : -1;
   const runtime = sessionRuntime ?? options.tasks.stateDb.runtimes.latestForTask(task.id);
+  // Env cannot change in a surviving daemon: an aliased caller truthfully
+  // echoes the generation recorded at daemon spawn, which the recovery bind
+  // persisted on the live runtime. Anything else must match the live
+  // generation exactly.
+  const daemonEnvGeneration =
+    presentedSessionId !== sessionId && typeof runtime?.metadata?.appServerDaemonGeneration === "number"
+      ? (runtime.metadata.appServerDaemonGeneration as number)
+      : undefined;
   const expectedWorktree = runtime?.worktreePath ??
     (task.worktreeId ? options.worktrees.find(task.worktreeId)?.path : undefined);
   const expectedBranch = task.branch ?? `perch/${task.id}`;
@@ -4049,7 +4067,7 @@ async function handleNoMistakesAuthorization(
     reason = "request_replayed";
   } else if (taskId !== task.id) {
     reason = "task_mismatch";
-  } else if (requestSessionId !== sessionId) {
+  } else if (requestSessionId !== presentedSessionId) {
     reason = "session_mismatch";
   } else if (canonicalPolicyPath(projectPath) !== canonicalPolicyPath(task.project)) {
     reason = "project_mismatch";
@@ -4057,7 +4075,7 @@ async function handleNoMistakesAuthorization(
     reason = "repository_mismatch";
   } else if (!runtime) {
     reason = "runtime_missing";
-  } else if (requestGeneration !== runtime.generation) {
+  } else if (requestGeneration !== runtime.generation && requestGeneration !== daemonEnvGeneration) {
     reason = "runtime_generation_mismatch";
   } else if (runtime.ptySessionId !== sessionId) {
     reason = "runtime_session_mismatch";
@@ -4171,7 +4189,7 @@ async function handleRegisterChart(
       writeJson(response, 401, { error: "Unauthorized" });
       return;
     }
-    result = await registerChartCore(body.file, sessionId, options, {
+    result = await registerChartCore(body.file, options.hooks.resolveAlias(sessionId), options, {
       remoteAddress: request.socket.remoteAddress
     });
   }
@@ -4552,15 +4570,18 @@ async function handleHookReport(
 ): Promise<void> {
   let synchronousClaudeControl = false;
   try {
-    const sessionId = String(request.headers["x-perch-session"] ?? "");
+    const presentedSessionId = String(request.headers["x-perch-session"] ?? "");
     const token = String(request.headers["x-perch-token"] ?? "");
+    // Hook posts from a rebound codex daemon's shells carry the daemon's
+    // spawn-time identity; attribute them to the live session it aliases to.
+    const sessionId = options.hooks.resolveAlias(presentedSessionId);
     const payload = await readJsonOrEmpty<HookEventPayload>(request);
     const requestedEventName = hookEventName(payload);
     synchronousClaudeControl = requestedEventName === "PermissionRequest" ||
       requestedEventName === "Elicitation" || requestedEventName === "ElicitationResult" ||
       (requestedEventName === "PreToolUse" &&
         (payload.tool_name === ASK_USER_QUESTION_TOOL || payload.tool_name === "ExitPlanMode"));
-    if (!sessionId || !options.hooks.verify(sessionId, token)) {
+    if (!presentedSessionId || !options.hooks.verify(presentedSessionId, token)) {
       // PermissionRequest is synchronous control, so authentication failure
       // must be visible to the bridge and fall back to Claude's local dialog.
       // Telemetry hooks retain their historical fail-open 200 response.

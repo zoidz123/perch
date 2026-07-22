@@ -173,6 +173,10 @@ export class RuntimeManager {
       provider: string;
       providerSessionId: string;
       ownership?: RuntimeProcessOwnership;
+      // Driver facts re-recorded at bind (codexDriver, appServerSocketPath):
+      // the recovered generation must keep protecting its live daemon across
+      // the NEXT restart, not just the first one.
+      metadata?: Record<string, unknown>;
     }
   ): RuntimeRecord {
     if (
@@ -202,7 +206,8 @@ export class RuntimeManager {
         metadata: {
           source: "provider-recovery",
           previousRuntimeId: recovering.id,
-          previousGeneration: recovering.generation
+          previousGeneration: recovering.generation,
+          ...(input.metadata ?? {})
         }
       });
       if (!next) return undefined;
