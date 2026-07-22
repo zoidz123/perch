@@ -222,10 +222,8 @@ const monitor = new FleetMonitor(adapter, {
   onInputSubmitted: (sessionId) =>
     markTaskWorkingFromActivity({ tasks }, sessionId, { newTurn: true }),
   promptDeliveries,
-  promptDeliveryWarning: (sessionId) =>
-    promptDeliverySurface(tasks.stateDb.promptDeliveries.list(sessionId)).promptDeliveryWarning,
-  promptDeliveryResolution: (sessionId) =>
-    promptDeliverySurface(tasks.stateDb.promptDeliveries.list(sessionId)).promptDeliveryResolution,
+  promptDeliverySurface: (sessionId) =>
+    promptDeliverySurface(tasks.stateDb.promptDeliveries.surfaceCandidates(sessionId)),
   onQueuedInputRejected: (sessionId, count, reason) => {
     const task = tasks.list().find((candidate) => candidate.sessionId === sessionId);
     if (!task || task.state === "closed") return;

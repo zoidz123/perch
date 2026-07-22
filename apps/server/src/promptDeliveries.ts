@@ -1,15 +1,17 @@
 import type { AgentSession, TimelineItem } from "@perch/shared";
-import type { PromptDeliveryRecord, StateDb } from "./stateDb.js";
+import type { PromptDeliveryRecord, PromptDeliverySurfaceRecord, StateDb } from "./stateDb.js";
 import { TIMELINE_TEXT_MAX_LENGTH } from "./timeline.js";
 
 const DEFAULT_RECEIPT_TIMEOUT_MS = 15_000;
 
 export type PromptDeliverySource = "human" | "agent";
 
-export function promptDeliverySurface(deliveries: PromptDeliveryRecord[]): {
+export type PromptDeliverySurface = {
   promptDeliveryWarning?: AgentSession["promptDeliveryWarning"];
   promptDeliveryResolution?: AgentSession["promptDeliveryResolution"];
-} {
+};
+
+export function promptDeliverySurface(deliveries: PromptDeliverySurfaceRecord[]): PromptDeliverySurface {
   const unresolved = deliveries
     .filter(
       (delivery) =>

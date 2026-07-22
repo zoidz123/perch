@@ -793,6 +793,18 @@ export type PromptDeliveryRecord = {
   updatedAt: string;
 };
 
+export type PromptDeliverySurfaceRecord = Pick<
+  PromptDeliveryRecord,
+  | "id"
+  | "state"
+  | "failureReason"
+  | "unknownAt"
+  | "unknownNotifiedAt"
+  | "acceptedAt"
+  | "acceptedNotifiedAt"
+  | "updatedAt"
+>;
+
 type TaskEventInput = {
   kind: TaskEventKind;
   message?: string;
@@ -2214,6 +2226,36 @@ export class PromptDeliveryRepository {
     return (rows as PromptDeliveryRow[]).map(promptDeliveryFromRow);
   }
 
+  surfaceCandidates(sessionId: string): PromptDeliverySurfaceRecord[] {
+    const rows = this.db.prepare(
+      `WITH scoped AS (
+         SELECT pd.id, pd.state, pd.failure_reason, pd.unknown_at, pd.unknown_notified_at,
+                pd.accepted_at, pd.accepted_notified_at, pd.updated_at, pd.created_at
+         FROM prompt_deliveries pd
+         WHERE pd.perch_session_id = ?
+            OR pd.task_id IN (SELECT task_id FROM runtimes WHERE pty_session_id = ?)
+            OR pd.perch_session_id IN (
+              SELECT history.pty_session_id
+              FROM owner_runtimes current
+              JOIN owner_runtimes history ON history.owner_id = current.owner_id
+              WHERE current.pty_session_id = ? AND history.pty_session_id IS NOT NULL
+            )
+       ), unresolved AS (
+         SELECT * FROM scoped
+         WHERE state IN ('not_submitted', 'delivery_unknown') AND unknown_notified_at IS NOT NULL
+         ORDER BY created_at DESC, id DESC LIMIT 1
+       ), resolved AS (
+         SELECT * FROM scoped
+         WHERE state = 'accepted' AND unknown_notified_at IS NOT NULL AND accepted_notified_at IS NOT NULL
+         ORDER BY created_at DESC, id DESC LIMIT 1
+       )
+       SELECT * FROM unresolved
+       UNION ALL
+       SELECT * FROM resolved`
+    ).all(sessionId, sessionId, sessionId) as PromptDeliverySurfaceRow[];
+    return rows.map(promptDeliverySurfaceFromRow);
+  }
+
   markTyping(id: string, at?: string): PromptDeliveryRecord | undefined {
     const now = this.nextTimestamp(at);
     const order = this.nextMutationOrder();
@@ -2648,6 +2690,18 @@ type PromptDeliveryRow = {
   updated_at: string;
 };
 
+type PromptDeliverySurfaceRow = Pick<
+  PromptDeliveryRow,
+  | "id"
+  | "state"
+  | "failure_reason"
+  | "unknown_at"
+  | "unknown_notified_at"
+  | "accepted_at"
+  | "accepted_notified_at"
+  | "updated_at"
+>;
+
 function taskEventFromRow(row: TaskEventRow): TaskEvent {
   return {
     seq: row.seq,
@@ -2902,6 +2956,19 @@ function promptDeliveryFromRow(row: PromptDeliveryRow): PromptDeliveryRecord {
     ...(row.unknown_at ? { unknownAt: row.unknown_at } : {}),
     ...(row.unknown_from_state ? { unknownFromState: row.unknown_from_state } : {}),
     ...(row.unknown_notified_at ? { unknownNotifiedAt: row.unknown_notified_at } : {}),
+    ...(row.accepted_notified_at ? { acceptedNotifiedAt: row.accepted_notified_at } : {}),
+    updatedAt: row.updated_at
+  };
+}
+
+function promptDeliverySurfaceFromRow(row: PromptDeliverySurfaceRow): PromptDeliverySurfaceRecord {
+  return {
+    id: row.id,
+    state: row.state,
+    ...(row.failure_reason ? { failureReason: row.failure_reason } : {}),
+    ...(row.unknown_at ? { unknownAt: row.unknown_at } : {}),
+    ...(row.unknown_notified_at ? { unknownNotifiedAt: row.unknown_notified_at } : {}),
+    ...(row.accepted_at ? { acceptedAt: row.accepted_at } : {}),
     ...(row.accepted_notified_at ? { acceptedNotifiedAt: row.accepted_notified_at } : {}),
     updatedAt: row.updated_at
   };

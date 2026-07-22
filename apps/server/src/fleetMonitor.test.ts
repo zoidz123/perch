@@ -129,13 +129,20 @@ test("durable prompt delivery warnings and resolutions replay on every fleet sna
     at: "2026-07-22T00:00:00.000Z"
   };
   let resolution: AgentSession["promptDeliveryResolution"];
+  let surfaceCalls = 0;
   const hub = new FleetMonitor(adapter, {
-    promptDeliveryWarning: () => warning,
-    promptDeliveryResolution: () => resolution
+    promptDeliverySurface: () => {
+      surfaceCalls += 1;
+      return {
+        ...(warning ? { promptDeliveryWarning: warning } : {}),
+        ...(resolution ? { promptDeliveryResolution: resolution } : {})
+      };
+    }
   });
   after(() => hub.stop());
 
   assert.deepEqual(hub.withLiveState(await adapter.listSessions())[0]?.promptDeliveryWarning, warning);
+  assert.equal(surfaceCalls, 1);
   warning = undefined;
   resolution = {
     deliveryId: "delivery-1",
@@ -145,6 +152,7 @@ test("durable prompt delivery warnings and resolutions replay on every fleet sna
   const reconnected = hub.withLiveState(await adapter.listSessions())[0];
   assert.equal(reconnected?.promptDeliveryWarning, undefined);
   assert.deepEqual(reconnected?.promptDeliveryResolution, resolution);
+  assert.equal(surfaceCalls, 2);
 });
 
 test("an adapter-reported session exit closes outstanding prompt deliveries", async () => {

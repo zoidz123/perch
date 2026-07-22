@@ -629,6 +629,63 @@ test("a newer accepted delivery cannot hide an older unresolved warning", async 
   }
 });
 
+test("a recovered mate inherits the prior generation's bounded delivery surface", async () => {
+  const f = fixture();
+  try {
+    f.stateDb.owners.ensure("owner:mate", "mate");
+    f.stateDb.ownerRuntimes.create({
+      ownerId: "owner:mate",
+      generation: 0,
+      state: "live",
+      agent: "claude",
+      provider: "claude",
+      ptySessionId: "pty:old-mate",
+      cwd: "/tmp"
+    });
+    const delivery = f.tracker.create("pty:old-mate", "mate prompt", "human");
+    f.tracker.markTyping(delivery.id);
+    f.tracker.markSubmitted(delivery.id, null);
+    const submittedAt = f.stateDb.promptDeliveries.find(delivery.id)?.submittedAt;
+    assert.ok(submittedAt);
+    await new Promise((resolve) => setTimeout(resolve, 2));
+    f.tracker.markUnknown(delivery.id, "acceptance was not confirmed; not resent");
+
+    assert.ok(f.stateDb.ownerRuntimes.compareAndSwap("owner:mate", 0, "live", "ended"));
+    f.stateDb.ownerRuntimes.create({
+      ownerId: "owner:mate",
+      generation: 1,
+      state: "live",
+      agent: "claude",
+      provider: "claude",
+      ptySessionId: "pty:new-mate",
+      cwd: "/tmp"
+    });
+
+    const warning = promptDeliverySurface(
+      f.stateDb.promptDeliveries.surfaceCandidates("pty:new-mate")
+    );
+    assert.equal(warning.promptDeliveryWarning?.deliveryId, delivery.id);
+    assert.equal(warning.promptDeliveryResolution, undefined);
+
+    f.tracker.acknowledgeTimeline({
+      seq: 19,
+      id: "recovered-mate-authentic-row",
+      sessionId: "pty:old-mate",
+      kind: "user",
+      text: "mate prompt",
+      at: submittedAt!
+    });
+    const resolution = promptDeliverySurface(
+      f.stateDb.promptDeliveries.surfaceCandidates("pty:new-mate")
+    );
+    assert.equal(resolution.promptDeliveryWarning, undefined);
+    assert.equal(resolution.promptDeliveryResolution?.deliveryId, delivery.id);
+    assert.equal(f.stateDb.promptDeliveries.surfaceCandidates("pty:new-mate").length, 1);
+  } finally {
+    f.close();
+  }
+});
+
 test("a much later manual duplicate cannot retroactively accept an unknown delivery", async () => {
   const f = fixture(10);
   try {

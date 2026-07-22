@@ -25,7 +25,7 @@ export type SessionModel = {
 };
 import type { RawData } from "ws";
 import type { AgentAdapter } from "./adapters/types.js";
-import type { PromptDeliverySource, PromptDeliveryTracker } from "./promptDeliveries.js";
+import type { PromptDeliverySource, PromptDeliverySurface, PromptDeliveryTracker } from "./promptDeliveries.js";
 import type { AuditLog } from "./audit.js";
 import { detectPrompt, type DetectedPrompt } from "./promptDetect.js";
 import type { PushRouter } from "./pushRouter.js";
@@ -143,8 +143,7 @@ export type FleetMonitorOptions = {
   // Durable warning text derived from the prompt-delivery ledger. It is
   // recomputed for every fleet snapshot, so disconnected clients see it on
   // reconnect instead of depending on a one-shot WebSocket event.
-  promptDeliveryWarning?: (sessionId: string) => AgentSession["promptDeliveryWarning"];
-  promptDeliveryResolution?: (sessionId: string) => AgentSession["promptDeliveryResolution"];
+  promptDeliverySurface?: (sessionId: string) => PromptDeliverySurface;
   // Durable task policy hook for accepted composer input that later becomes
   // undeliverable because the terminal ended or a queued flush failed.
   onQueuedInputRejected?: (sessionId: string, count: number, reason: string) => void;
@@ -223,8 +222,7 @@ export class FleetMonitor {
   ) => void;
   private readonly onInputSubmitted?: (sessionId: string) => void;
   private readonly promptDeliveries?: PromptDeliveryTracker;
-  private readonly promptDeliveryWarning?: (sessionId: string) => AgentSession["promptDeliveryWarning"];
-  private readonly promptDeliveryResolution?: (sessionId: string) => AgentSession["promptDeliveryResolution"];
+  private readonly promptDeliverySurface?: (sessionId: string) => PromptDeliverySurface;
   private readonly onQueuedInputRejected?: (sessionId: string, count: number, reason: string) => void;
   private readonly onApprovalNeeded?: (sessionId: string, approval: PendingApproval) => void;
   private readonly onApprovalResolved?: (sessionId: string, approval: PendingApproval) => void;
@@ -250,8 +248,7 @@ export class FleetMonitor {
     this.onUsageLimit = options.onUsageLimit;
     this.onInputSubmitted = options.onInputSubmitted;
     this.promptDeliveries = options.promptDeliveries;
-    this.promptDeliveryWarning = options.promptDeliveryWarning;
-    this.promptDeliveryResolution = options.promptDeliveryResolution;
+    this.promptDeliverySurface = options.promptDeliverySurface;
     this.onQueuedInputRejected = options.onQueuedInputRejected;
     this.onApprovalNeeded = options.onApprovalNeeded;
     this.onApprovalResolved = options.onApprovalResolved;
@@ -1235,10 +1232,13 @@ export class FleetMonitor {
       if (tail !== undefined) {
         result.tail = tail;
       }
-      const promptDeliveryWarning = this.promptDeliveryWarning?.(session.id);
-      if (promptDeliveryWarning) result.promptDeliveryWarning = promptDeliveryWarning;
-      const promptDeliveryResolution = this.promptDeliveryResolution?.(session.id);
-      if (promptDeliveryResolution) result.promptDeliveryResolution = promptDeliveryResolution;
+      const deliverySurface = this.promptDeliverySurface?.(session.id);
+      if (deliverySurface?.promptDeliveryWarning) {
+        result.promptDeliveryWarning = deliverySurface.promptDeliveryWarning;
+      }
+      if (deliverySurface?.promptDeliveryResolution) {
+        result.promptDeliveryResolution = deliverySurface.promptDeliveryResolution;
+      }
       const modelInfo = this.sessionModels.get(session.id);
       if (modelInfo) {
         if (modelInfo.model !== undefined) result.model = modelInfo.model;
