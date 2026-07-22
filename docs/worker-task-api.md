@@ -209,6 +209,13 @@ After a restart, a kickoff journaled as submitted but never acknowledged reconci
 Claude's kickoff rides the spawn argv as the CLI's positional query; launches whose brief exceeds the spawn-argument limit are refused rather than truncated.
 Process argv is readable across users for the life of the session (world-readable `/proc/<pid>/cmdline` on default Linux, `ps aux` on macOS), unlike the 0600 same-user transcript files, so on shared machines a sensitive brief is more exposed than it was on the typed-prompt path.
 
+Every server-originated Claude text prompt is journaled in SQLite before submission, including the positional kickoff and later composer or Mate follow-ups.
+Follow-ups still use Claude's native PTY TUI: Perch types the prompt, verifies that distinctive text reached the input line when possible, and sends exactly one Enter.
+The delivery becomes accepted only from a matching verified `UserPromptSubmit` hook or a matching transcript user row with an authentic provider timestamp.
+Receipt IDs, durable ordering, timestamp boundaries, and conservative same-text matching prevent transcript replay or an older identical prompt from accepting a newer delivery.
+A receipt timeout, process loss, or server restart records either `prompt_not_submitted` or `prompt_delivery_unknown`; Perch never blindly resends uncertain input.
+The worker task ledger records the warning and any later authentic resolution, while `GET /sessions` and fleet snapshots expose `promptDeliveryWarning` or `promptDeliveryResolution` so Mate and reconnecting clients see the durable result.
+
 Provider prose is never treated as the outcome.
 Even if the final assistant message says the work is finished, Mate must rely on the durable worker event and verify the deliverable.
 
@@ -302,6 +309,7 @@ Mate sends a concise follow-up with:
 ```
 
 The server either submits the text or queues it behind a provider interaction that must be resolved first.
+For Claude, a successful HTTP response means Perch accepted the text into this durable delivery path; provider acceptance is confirmed separately by the receipt rules above.
 Accepted follow-up input starts a new turn and can return a rejected or parked task to `working` only through the normal activity path.
 
 ### `POST /tasks/:id/recover`

@@ -106,8 +106,9 @@ export class RecoveryCoordinator {
     }
     const task = this.options.tasks.find(operation.taskId);
     if (!task) throw new Error(`Unknown task: ${operation.taskId}`);
-    let runtime = this.options.tasks.stateDb.runtimes.latestForTask(task.id);
-    if (!runtime) throw new Error(`task ${task.id} has no durable runtime`);
+    const currentRuntime = this.options.tasks.stateDb.runtimes.latestForTask(task.id);
+    if (!currentRuntime) throw new Error(`task ${task.id} has no durable runtime`);
+    let runtime = currentRuntime;
 
     if (runtime.state === "live" && runtime.generation === payload.expectedGeneration + 1) return;
     if (runtime.generation !== payload.expectedGeneration) {
