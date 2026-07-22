@@ -730,41 +730,6 @@ export function claudeTranscriptPath(
   return join(configDir, "projects", physical.replace(/[^a-zA-Z0-9]/g, "-"), `${claudeSessionId}.jsonl`);
 }
 
-// Locates the rollout transcript for a codex session id. The filename embeds
-// the id (rollout-<timestamp>-<session_id>.jsonl) under date-sharded dirs, so
-// this scans the most recent date directories only.
-export function findCodexRollout(
-  codexSessionId: string,
-  env: NodeJS.ProcessEnv = process.env
-): string | undefined {
-  const root = join(codexHome(env), "sessions");
-  const suffix = `-${codexSessionId}.jsonl`;
-  const days: string[] = [];
-  for (let offset = -1; offset <= 2; offset += 1) {
-    const d = new Date(Date.now() - offset * 86_400_000);
-    days.push(
-      join(
-        root,
-        String(d.getFullYear()),
-        String(d.getMonth() + 1).padStart(2, "0"),
-        String(d.getDate()).padStart(2, "0")
-      )
-    );
-  }
-  for (const dir of days) {
-    try {
-      for (const name of readdirSync(dir)) {
-        if (name.startsWith("rollout-") && name.endsWith(suffix)) {
-          return join(dir, name);
-        }
-      }
-    } catch {
-      // Date dir absent; keep looking.
-    }
-  }
-  return undefined;
-}
-
 // Maps perch PTY sessions to their hook tokens and, once SessionStart
 // arrives, to the agent's own session id + transcript path.
 export type HookCorrelation = {

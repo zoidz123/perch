@@ -9,7 +9,6 @@ import {
   applyPerchUninstall,
   claudeSettingsPath,
   codexHookHash,
-  findCodexRollout,
   HookRegistry,
   installClaudeHooks,
   installCodexHooks,
@@ -562,39 +561,3 @@ test("codex hook payloads normalize through the nested envelope", () => {
   assert.equal(normalizeHookEvent({ hook_event: { event_type: "stop" } }).status, "idle");
 });
 
-test("findCodexRollout locates rollouts by session id in date dirs", () => {
-  const home = mkdtempSync(join(tmpdir(), "perch-codex-roll-"));
-  const now = new Date();
-  const day = join(
-    home,
-    "sessions",
-    String(now.getFullYear()),
-    String(now.getMonth() + 1).padStart(2, "0"),
-    String(now.getDate()).padStart(2, "0")
-  );
-  mkdirSync(day, { recursive: true });
-  const file = join(day, "rollout-2026-07-02T10-00-00-0199ffff-aaaa-bbbb.jsonl");
-  writeFileSync(file, "");
-  const env = makeCodexEnv(home);
-  assert.equal(findCodexRollout("0199ffff-aaaa-bbbb", env), file);
-  assert.equal(findCodexRollout("missing", env), undefined);
-  rmSync(home, { recursive: true, force: true });
-});
-
-test("findCodexRollout searches days back for older sessions", () => {
-  const home = mkdtempSync(join(tmpdir(), "perch-codex-roll-"));
-  const twoDaysAgo = new Date(Date.now() - 2 * 86_400_000);
-  const day = join(
-    home,
-    "sessions",
-    String(twoDaysAgo.getFullYear()),
-    String(twoDaysAgo.getMonth() + 1).padStart(2, "0"),
-    String(twoDaysAgo.getDate()).padStart(2, "0")
-  );
-  mkdirSync(day, { recursive: true });
-  const file = join(day, "rollout-2026-06-30T10-00-00-0199ffff-cccc-dddd.jsonl");
-  writeFileSync(file, "");
-  const env = makeCodexEnv(home);
-  assert.equal(findCodexRollout("0199ffff-cccc-dddd", env), file);
-  rmSync(home, { recursive: true, force: true });
-});

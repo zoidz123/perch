@@ -195,16 +195,17 @@ The task's semantic state is otherwise unchanged.
 
 Claude and Codex provide the boundaries differently:
 
-- Claude and plain Codex PTY fallback use verified `UserPromptSubmit` and `Stop` hook reports sent to `POST /hooks`.
-- Daemon-controlled Codex uses app-server turn-start and turn-completed notifications internally, avoiding duplicate evidence from compatibility hooks.
+- Claude uses verified `UserPromptSubmit` and `Stop` hook reports sent to `POST /hooks`.
+- Codex is app-server-owned and uses protocol turn-started and turn-completed notifications, avoiding duplicate evidence from compatibility hooks.
 - On Claude's first `Stop` without an outcome, Perch returns additional hook context asking the worker to report one accurate outcome before stopping.
   Claude's `stop_hook_active` loop guard permits only this one continuation.
 - A Codex turn-completed notification is settled and cannot be continued in the same way, so the durable `stalled` event wakes Mate to retry or steer the worker.
 
-A dispatched Codex worker can also fail before any first turn: a TUI that is not ready yet silently swallows the typed kickoff prompt.
-If no first-turn evidence (a turn lifecycle event for that session, a worker event, or the rollout correlation) appears within 45 seconds of launch, the server retries the exact original kickoff at most once, journaled on the task ledger so a server restart inside the window never submits a second retry.
-If a permission gate is open at retry time the retry is skipped, because the approval flow owns that outcome and queued text could later duplicate an accepted kickoff.
-After a second silent window it records a `blocked` event with `source: "system"`, `data.reason: "kickoff_not_accepted"`, and `data.retry` (`"submitted"` or `"gated"`) so Mate adjudicates instead of the worker sitting silently empty.
+A dispatched Codex worker's kickoff is the first acknowledged `turn/start` against the thread the launch established, never a typed prompt.
+The ledger carries the durable contract: a `note` with `data.reason: "kickoff_submitted"` (including the stable `clientUserMessageId`) lands before the send, and `data.reason: "kickoff_accepted"` with the provider `turnId` lands only after a successful response or history reconciliation.
+A rejected `turn/start` parks the task `blocked` with `data.reason: "kickoff_rejected"` and the provider's real error; an outcome that stays unknown after `thread/read` reconciliation parks it `blocked` with `data.reason: "kickoff_unknown"` and is never blindly resent.
+After a restart, a kickoff journaled as submitted but never acknowledged reconciles against authoritative thread history by its `clientUserMessageId`: found means accepted is recorded, verifiably absent means the exact kickoff is resubmitted once with the same id.
+Claude's kickoff rides the spawn argv as the CLI's positional query; launches whose brief exceeds the spawn-argument limit are refused rather than truncated.
 
 Provider prose is never treated as the outcome.
 Even if the final assistant message says the work is finished, Mate must rely on the durable worker event and verify the deliverable.

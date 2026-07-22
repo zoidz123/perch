@@ -58,11 +58,12 @@ const HAS_WORD = /[A-Za-z0-9]/;
 //
 // Claude only, deliberately. The frame (numbered options plus `❯`) and the key
 // that answers it ("1", the same key `/sessions/:id/approve` already sends) are
-// verified against Claude's TUI. Codex answers approvals with "y" and reports
-// its prompts through hooks already, so guessing at its frames would buy a card
-// perch cannot correctly answer. Adding an agent here means verifying both.
+// verified against Claude's TUI. Codex no longer runs in a perch PTY at all
+// (its sessions are app-server-owned, with structured JSON-RPC approvals), so
+// there is no Codex screen to read. Adding an agent here means verifying its
+// frames against the real TUI first.
 export function detectPrompt(screen: string, agent: AgentKind | undefined): DetectedPrompt | undefined {
-  if (agent !== "claude" && agent !== "codex") {
+  if (agent !== "claude") {
     return undefined;
   }
 
@@ -98,11 +99,7 @@ export function detectPrompt(screen: string, agent: AgentKind | undefined): Dete
     }
     lastOptionAt = index;
     cursorSeen ||= cursor;
-    // Codex field prompts append explanatory copy in a second aligned column.
-    // The choice label is the first column; descriptions remain context, not
-    // part of the exact decision identity shown on mobile.
-    const renderedOption = match[2]!.trim();
-    options.push(agent === "codex" ? renderedOption.split(/\s{2,}/, 1)[0]!.trim() : renderedOption);
+    options.push(match[2]!.trim());
   }
 
   if (options.length < 2 || options.length > MAX_OPTIONS || !cursorSeen) {
@@ -110,67 +107,13 @@ export function detectPrompt(screen: string, agent: AgentKind | undefined): Dete
   }
 
   const summary = titleFor(lines.slice(0, firstOptionAt));
-  const app = lines
-    .slice(0, firstOptionAt)
-    .map((line) => /^App:\s*(.+)$/.exec(line)?.[1]?.trim())
-    .find((value): value is string => Boolean(value));
-  const codexComputerUse =
-    agent === "codex" &&
-    /^Allow Computer Use to use .+\?$/.test(summary) &&
-    app !== undefined &&
-    options.length === 4 &&
-    options[0] === "Allow" &&
-    options[1] === "Allow for this session" &&
-    options[2] === "Always allow" &&
-    options[3] === "Cancel";
-  const legacyCodexComputerUse =
-    agent === "codex" &&
-    summary === "Computer Use wants permission" &&
-    options.length === 4 &&
-    options[0] === "Allow" &&
-    options[1] === "Allow for this session" &&
-    options[2] === "Always allow" &&
-    options[3] === "Cancel";
-  if (agent === "codex" && !codexComputerUse && !legacyCodexComputerUse) return undefined;
 
   return {
     // Hashed over the title and the option text only - never the cursor
     // position, which moves as the user arrows through the dialog.
     id: `screen:${hash(`${summary}\n${options.join("\n")}`)}`,
     summary,
-    options,
-    ...(codexComputerUse
-      ? {
-          decisions: [
-            {
-              id: "allow",
-              label: "Allow",
-              persistence: "turn" as const,
-              input: [...Array<string>(4).fill("\x1b[A"), "\r"]
-            },
-            {
-              id: "allow_session",
-              label: "Allow for this session",
-              persistence: "session" as const,
-              input: [...Array<string>(4).fill("\x1b[A"), "\x1b[B", "\r"]
-            },
-            {
-              id: "allow_always",
-              label: "Always allow",
-              persistence: "always" as const,
-              input: [...Array<string>(4).fill("\x1b[A"), "\x1b[B", "\x1b[B", "\r"]
-            },
-            {
-              id: "cancel",
-              label: "Cancel",
-              destructive: true,
-              input: [...Array<string>(4).fill("\x1b[A"), "\x1b[B", "\x1b[B", "\x1b[B", "\r"]
-            }
-          ],
-          context: { app: app.replace(/^"|"$/g, ""), tool: "Computer Use" }
-        }
-      : {}),
-    ...(legacyCodexComputerUse ? { remoteResolutionUnavailable: true } : {})
+    options
   };
 }
 
