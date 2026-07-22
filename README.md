@@ -48,7 +48,7 @@ For one provider session without Mate orchestration, run `perch claude` or `perc
 
 ## How Perch works
 
-A local background server launches real Claude Code and Codex sessions, preserves their native terminal interfaces, and manages their sessions.
+A local background server launches Claude Code under server-owned PTYs and Codex through app-server daemons while preserving each provider's native desktop interface.
 SQLite records every task change and the state of each worker.
 The Task API carries structured updates between Mate and workers, and a worker's completion request becomes done only after Mate verifies and accepts it.
 Every task has an explicit owner, which makes coordination more predictable even though agent execution is not deterministic.

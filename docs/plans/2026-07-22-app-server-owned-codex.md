@@ -5,7 +5,8 @@ Verified against codex-cli 0.144.6 (source tag rust-v0.144.6) with live two-clie
 
 ## Decision
 
-Perch owns every Codex session through a per-worktree `codex app-server` daemon on a private unix socket, and remains the sole standing authoritative client.
+Perch owns every Codex session through a session-isolated `codex app-server` daemon on a private unix socket, and remains the sole standing authoritative client.
+The daemon key includes the workdir, launch overrides, session-scoped hook identity, and Codex runtime fingerprint, so managed workers normally have one daemon and one thread each.
 Perch creates or resumes threads, captures thread IDs from protocol responses, serializes all programmatic input, and persists authoritative thread and turn IDs.
 Protocol notifications own timeline, status, approvals, and catch-up.
 The phone transport is unchanged: LAN, Tailscale, or E2EE relay to Perch, never to the app-server.
@@ -38,6 +39,7 @@ The generic PTY adapter and every Claude behavior are preserved byte-for-byte.
 ## Stage 2: protocol-native behavior
 
 - The initial kickoff is the first acknowledged `turn/start` after `thread/start` returns; never a PTY write.
+- A fresh Codex Mate submits one visible readiness turn, preserves the same lost-response history reconciliation as other programmatic input, and withholds attach metadata until the readiness turn completes successfully.
 - Kickoff intent is journaled durably before send with a stable `clientUserMessageId`, and the returned `turn.id` is journaled on acceptance.
 - Idle input uses `turn/start`; input during an active turn uses `turn/steer` with `expectedTurnId`.
 - Every programmatic input carries a `clientUserMessageId`; ambiguous response loss reconciles against `thread/read` history before any resend; never a blind resend.
@@ -55,7 +57,8 @@ The generic PTY adapter and every Claude behavior are preserved byte-for-byte.
 
 ## Stage 4: native desktop attachment
 
-- Each Codex session surfaces its exact attach command, `codex resume <threadId> --remote unix://<socketPath>`, on the session record.
+- Each attachable Codex session surfaces its exact attach command, `codex resume <threadId> --remote unix://<socketPath>`, on the session record.
+- A fresh Codex Mate does not surface that command while its readiness turn is pending, preventing the native TUI from attempting `thread/resume` before rollout history exists.
 - The attached native TUI replays history, receives live events and approvals, and can steer or interrupt under same-user trust.
 - Perch remains the single programmatic writer; the attached human TUI is controller-capable by design.
 
@@ -79,6 +82,7 @@ The generic PTY adapter and every Claude behavior are preserved byte-for-byte.
 - Perch restart rebind without daemon restart.
 - Daemon death, interrupted-turn history, resume, and continuation recovery.
 - Fresh-thread missing-rollout race and permanently-missing-rollout classification.
+- Fresh Codex Mate readiness completion, attach-command withholding during the turn, and lost-response reconciliation before the command is revealed.
 - Slow-consumer/reconnect behavior and schema shapes against installed codex 0.144.6.
 - Desktop native-TUI attachment smoke coverage without simulators or physical devices.
 - Legacy Codex runtime upgrade: provable thread migration and the truthful-end path.

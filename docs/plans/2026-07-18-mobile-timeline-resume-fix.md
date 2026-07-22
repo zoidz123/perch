@@ -31,7 +31,8 @@ Verified against on-disk transcripts of a live resumed mate (the scout's exact p
 - The fork's first message-row uuid equals the parent's first message-row uuid (the fork replays from the conversation root; the anchor appears at fork line index 4).
 - The fork rewrites the replayed rows' `sessionId` to its own id but **preserves their `uuid`s** (which is why parent and fork share message uuids).
 
-Codex does not have this bug: `agentLauncher.ts` `attachCodexRollout` (~560-582) runs an active loop that re-finds the codex rollout file and calls `timeline.attach()` when it appears. The Claude path has no equivalent re-resolution.
+Historical note: this plan predates app-server-owned Codex sessions.
+Codex now receives timeline history and live events directly from the app-server protocol, so it does not use Claude's transcript-tail or fork-following path.
 
 Note on timing: the fork appears at the **first post-resume turn**, not at launch. For a recovered task worker that is seconds later (the recovery kickoff). For an idle recovered mate it can be **hours** later (whenever the boss next messages it). A short bounded loop is therefore insufficient; the re-resolver must live for the session.
 
@@ -41,9 +42,9 @@ The iOS "Not delivered" is a downstream symptom: the client's only positive deli
 
 ### Server (core): follow the fork
 
-Add an active Claude transcript re-resolver - the Claude analogue of the codex rollout scan - scoped to resumed Claude sessions only (non-resumed sessions do not fork; scout-confirmed).
+Add an active Claude transcript re-resolver scoped to resumed Claude sessions only (non-resumed sessions do not fork; scout-confirmed).
 
-- `startManagedAgent` detects a Claude launch whose args include `--resume` and calls `timeline.followClaudeResume(sessionId, isAllowedTranscriptPath)`. This is the single chokepoint both mate recovery and task-worker recovery already pass through. Codex resume uses `["resume", ...]` (no dashes) so it is never matched.
+- `startManagedAgent` detects a Claude launch whose args include `--resume` and calls `timeline.followClaudeResume(sessionId, isAllowedTranscriptPath)`. This is the single chokepoint both mate recovery and task-worker recovery already pass through, while app-server-owned Codex recovery uses its separate thread-resume path.
 - `TimelineStore.followClaudeResume` starts a long-lived resolver owned by the store (stopped in `detach`/`prune`/`stop`, sharing the tailer's lifecycle). On each tick it:
   1. Reads the currently-attached transcript path (`this.tailers.get(sessionId)?.path`); waits if the first attach has not happened yet.
   2. Establishes a lineage anchor once: the directory of the current transcript, and the transcript's first message-row `uuid`.
