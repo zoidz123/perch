@@ -1,21 +1,13 @@
 import type { AgentKind } from "@perch/shared";
 
-// A provider usage-limit / quota-exhaustion condition read off the rendered
-// screen. A worker CLI that runs out of credits prints its own limit line and
-// then just sits there: no hook fires, no tool call is attempted, the PTY goes
-// quiet, and the session reads as a plain "idle" - so the task ledger keeps it
-// "working" forever and the orchestrator is blind to a dead-on-arrival worker.
-// This is the net for that: recognizing the CLI's own limit line on screen lets
-// perch flip the session out of idle and block the task with an actionable note
-// (which needs the owner to add credits, not the worker to keep trying).
+// A provider usage-limit / quota-exhaustion condition reported by a structured
+// provider event, a hook, or the rendered-terminal fallback below.
 export type UsageLimit = {
   // The provider whose quota is exhausted (openai/codex, anthropic/claude).
   provider: string;
-  // The CLI's limit line, verbatim (clipped), so the block note the owner sees
-  // carries the exact wording the terminal showed.
+  // Provider detail for the block note, clipped before it reaches the ledger.
   message: string;
-  // The retry/reset time the CLI named, when it named one ("3:28 PM", "3pm").
-  // Absent when the CLI printed no time (e.g. a hard "purchase credits" stop).
+  // The retry/reset time reported by the source, when present.
   retryAt?: string;
   // Where Perch learned it. Structured provider events always win over the
   // rendered-terminal safety net.

@@ -126,10 +126,9 @@ export type FleetMonitorOptions = {
   // Centralized launch service. The monitor owns WebSocket client plumbing,
   // but not agent launch policy.
   startAgent?: StartAgentLauncher;
-  // A worker CLI printed its provider usage-limit line and stalled (detected off
-  // the rendered screen). The monitor flips the session's own status to `error`;
-  // this hook is where task-ledger policy lives (block the task, wake the mate).
-  // Fired once per detected condition per session, not on every screen redraw.
+  // A provider integration or terminal fallback reported quota exhaustion.
+  // The monitor flips the session status to `error`; this hook owns task-ledger
+  // policy. Fired once per distinct condition per session.
   onUsageLimit?: (sessionId: string, agent: AgentKind | undefined, limit: UsageLimit) => void;
   // Called only after composer text was actually submitted to the agent. Text
   // held behind an approval/question gate does not fire this until the later
@@ -172,9 +171,8 @@ export class FleetMonitor {
   // the dialog leaves the screen; the id also keeps a redraw from re-raising it.
   private readonly screenPrompts = new Map<string, DetectedPrompt>();
   // Sessions already surfaced as usage-limited, by session -> detection
-  // signature (provider + retry time). Keeps a screen redraw from re-blocking
-  // the task and re-waking the mate every capture; a fresh signature (a new
-  // limit line) fires again.
+  // signature. Keeps repeated provider events or screen redraws from re-blocking
+  // the task; a fresh condition fires again.
   private readonly usageLimits = new Map<string, string>();
   // The exact model + reasoning effort each session is running, resolved
   // server-side at launch and updated on every live switch, overlaid onto the
