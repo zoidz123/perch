@@ -162,20 +162,9 @@ export class PrPoller {
         this.fastUntil.delete(taskId);
       }
     }
-    let hasAwaitingMerge = false;
-    for (let task of this.tasks.list()) {
-      if (task.state === "done" && task.pr?.mergeReady === true && !task.pr.merged) {
-        if (task.pr.awaitingMerge !== true) {
-          task = this.tasks.update(task.id, { pr: { ...task.pr, awaitingMerge: true } });
-        }
-        hasAwaitingMerge = true;
-      } else if (isAwaitingMerge(task)) {
-        hasAwaitingMerge = true;
-      }
-    }
     const include = (task: Task): boolean =>
-      this.fastUntil.has(task.id) || isAwaitingMerge(task);
-    if (this.fastUntil.size === 0 && !hasAwaitingMerge) {
+      this.fastUntil.has(task.id) || isAwaitingMerge(task) || shouldBootstrapAwaitingMerge(task);
+    if (this.fastUntil.size === 0 && !this.tasks.list().some(include)) {
       return;
     }
     await this.poll(include, "fast");
@@ -309,25 +298,38 @@ export class PrPoller {
         if (mode === "baseline" && shouldDiscover(task)) {
           task = await this.discoverAndFinish(task);
         }
+        task = this.bootstrapAwaitingMerge(task);
         if (!shouldPoll(task) || !include(task)) {
           continue;
         }
         this.metrics?.increment(`prPoller.${mode}Polls`);
-        const view = await this.runGh(task.pr!.url);
-        if (!view) {
-          continue;
-        }
         let expectedRepo: string | undefined;
         try {
           expectedRepo = await this.resolveLocalRepo(task.project);
         } catch {
           expectedRepo = undefined;
         }
-        this.apply(task, view, expectedRepo);
+        const prUrl = task.pr!.url;
+        const view = await this.runGh(prUrl);
+        const current = this.tasks.find(task.id);
+        if (!current || !shouldPoll(current) || current.pr?.url !== prUrl) {
+          continue;
+        }
+        task = this.bootstrapAwaitingMerge(current);
+        if (view) {
+          this.apply(task, view, expectedRepo);
+        }
       }
     } finally {
       this.inFlight = false;
     }
+  }
+
+  private bootstrapAwaitingMerge(task: Task): Task {
+    if (!shouldBootstrapAwaitingMerge(task)) {
+      return task;
+    }
+    return this.tasks.update(task.id, { pr: { ...task.pr!, awaitingMerge: true } });
   }
 
   private async discoverAndFinish(task: Task): Promise<Task> {
@@ -502,6 +504,10 @@ function shouldPoll(task: Task): boolean {
 
 function isAwaitingMerge(task: Task): boolean {
   return task.state === "done" && task.pr?.awaitingMerge === true && !task.pr.merged;
+}
+
+function shouldBootstrapAwaitingMerge(task: Task): boolean {
+  return task.state === "done" && task.pr?.mergeReady === true && task.pr.awaitingMerge !== true && !task.pr.merged;
 }
 
 function shouldDiscover(task: Task): boolean {

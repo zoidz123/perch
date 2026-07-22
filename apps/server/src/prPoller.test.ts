@@ -471,6 +471,78 @@ test("readiness before completion acceptance bootstraps awaiting-merge cadence",
   rmSync(home, { recursive: true, force: true });
 });
 
+test("overlapping baseline response preserves acceptance-time awaiting-merge latch", async () => {
+  const home = mkdtempSync(join(tmpdir(), "perch-poller-"));
+  const tasks = new TaskStore({ PERCH_HOME: home } as NodeJS.ProcessEnv);
+  const task = tasks.create({ title: "overlapping poll", project: "/tmp/repo" });
+  tasks.recordEvent(task.id, { kind: "working", source: "worker" });
+  tasks.recordEvent(task.id, { kind: "completion_requested", source: "worker" });
+  tasks.update(task.id, {
+    branch: "perch/overlapping-poll",
+    pr: {
+      url: "https://github.com/o/r/pull/33",
+      repo: "o/r",
+      headRepo: "o/r",
+      head: "perch/overlapping-poll",
+      mergeReady: true
+    }
+  });
+
+  let releaseResponse!: (view: GhPrView) => void;
+  let markStarted!: () => void;
+  const started = new Promise<void>((resolve) => {
+    markStarted = resolve;
+  });
+  const response = new Promise<GhPrView>((resolve) => {
+    releaseResponse = resolve;
+  });
+  let polls = 0;
+  const poller = new PrPoller(
+    tasks,
+    async () => {
+      polls += 1;
+      if (polls === 1) {
+        markStarted();
+        return response;
+      }
+      return view({
+        state: "MERGED",
+        mergedAt: "2026-07-22T00:00:00Z",
+        headRefName: "perch/overlapping-poll"
+      });
+    },
+    { resolveLocalRepo: async () => "o/r" }
+  );
+
+  const baseline = poller.tick();
+  await started;
+  tasks.recordEvent(task.id, { kind: "completion_accepted", source: "system" });
+  await poller.fastTick();
+  assert.equal(tasks.find(task.id)?.pr?.awaitingMerge, undefined);
+
+  releaseResponse(
+    view({
+      headRefName: "perch/overlapping-poll",
+      statusCheckRollup: [{ conclusion: "SUCCESS" }],
+      isDraft: false,
+      mergeable: "UNKNOWN",
+      mergeStateStatus: "UNKNOWN",
+      reviewDecision: "APPROVED"
+    })
+  );
+  await baseline;
+
+  assert.equal(polls, 1);
+  assert.equal(tasks.find(task.id)?.pr?.mergeReady, false);
+  assert.equal(tasks.find(task.id)?.pr?.awaitingMerge, true);
+
+  await poller.fastTick();
+  assert.equal(polls, 2);
+  assert.equal(tasks.find(task.id)?.state, "landed");
+
+  rmSync(home, { recursive: true, force: true });
+});
+
 test("awaiting-merge fast cadence survives restart after readiness regresses", async () => {
   const home = mkdtempSync(join(tmpdir(), "perch-poller-"));
   const tasks = new TaskStore({ PERCH_HOME: home } as NodeJS.ProcessEnv);
