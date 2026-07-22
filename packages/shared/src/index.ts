@@ -519,7 +519,8 @@ export type Task = {
   mode: TaskMode;
   state: TaskState;
   // Original boss/mate brief before the server appends its worker reporting
-  // contract. Optional so historical projections remain readable.
+  // contract. Optional so historical projections remain readable and because
+  // the default `GET /tasks` snapshot strips it (docs/worker-task-api.md).
   prompt?: string;
   sessionId?: string; // the worker session
   parentSessionId?: string; // durable crew parentage for notification routing
