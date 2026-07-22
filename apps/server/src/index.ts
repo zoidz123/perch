@@ -370,7 +370,11 @@ tasks.subscribe((task, event) => {
       source: "system",
       message: `auto-return on merge: ${verdict.reason}`
     });
-    await executeTeardown(task, { tasks, worktrees, adapter, auditLog, runtimeManager });
+    await executeTeardown(
+      task,
+      { tasks, worktrees, adapter, auditLog, runtimeManager },
+      verdict.defaultBranch ? { defaultBranch: verdict.defaultBranch } : {}
+    );
   })().catch(() => {});
 });
 

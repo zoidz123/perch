@@ -15,9 +15,11 @@ const execFileAsync = promisify(execFile);
 // Cadence is adaptive (G5): 5 min is the resting baseline, but a PR that is
 // "expecting change" - just attached, checks unsettled, or a sibling PR in the
 // same repo just merged (merge-train) - rides a fast window and is re-polled
-// every ~25s until it stabilizes, then falls back to the baseline. All gh
-// calls (both cadences) serialize through one single-flighted pass, so the
-// fast lane can never stampede gh or stack onto a slow baseline pass.
+// every ~25s. Stable PRs fall back to the baseline, but a trusted done PR stays
+// fast after it first becomes merge-ready until GitHub reports it merged or
+// closed. All gh calls (both cadences) serialize through one single-flighted
+// pass, so the fast lane can never stampede gh or stack onto a slow baseline
+// pass.
 
 export const POLL_INTERVAL_MS = 5 * 60_000;
 export const FAST_POLL_MS = 25_000;
@@ -152,8 +154,9 @@ export class PrPoller {
     await this.poll(() => true, "baseline");
   }
 
-  // The fast lane: only tasks inside their fast window. A no-op (zero gh
-  // calls) when nothing is expecting change.
+  // The fast lane: tasks inside their fast window plus done PRs that have
+  // become ready to merge. They stay fast until GitHub reports merged or
+  // closed, so a later readiness regression cannot restore the slow baseline.
   async fastTick(): Promise<void> {
     const now = this.now();
     for (const [taskId, until] of this.fastUntil) {
@@ -161,10 +164,12 @@ export class PrPoller {
         this.fastUntil.delete(taskId);
       }
     }
-    if (this.fastUntil.size === 0) {
+    const include = (task: Task): boolean =>
+      this.fastUntil.has(task.id) || isAwaitingMerge(task) || shouldBootstrapAwaitingMerge(task);
+    if (this.fastUntil.size === 0 && !this.tasks.list().some(include)) {
       return;
     }
-    await this.poll((task) => this.fastUntil.has(task.id), "fast");
+    await this.poll(include, "fast");
   }
 
   // The exact commit currently checked out for this task's work, resolved
@@ -295,25 +300,38 @@ export class PrPoller {
         if (mode === "baseline" && shouldDiscover(task)) {
           task = await this.discoverAndFinish(task);
         }
+        task = this.bootstrapAwaitingMerge(task);
         if (!shouldPoll(task) || !include(task)) {
           continue;
         }
         this.metrics?.increment(`prPoller.${mode}Polls`);
-        const view = await this.runGh(task.pr!.url);
-        if (!view) {
-          continue;
-        }
         let expectedRepo: string | undefined;
         try {
           expectedRepo = await this.resolveLocalRepo(task.project);
         } catch {
           expectedRepo = undefined;
         }
-        this.apply(task, view, expectedRepo);
+        const prUrl = task.pr!.url;
+        const view = await this.runGh(prUrl);
+        const current = this.tasks.find(task.id);
+        if (!current || !shouldPoll(current) || current.pr?.url !== prUrl) {
+          continue;
+        }
+        task = this.bootstrapAwaitingMerge(current);
+        if (view) {
+          this.apply(task, view, expectedRepo);
+        }
       }
     } finally {
       this.inFlight = false;
     }
+  }
+
+  private bootstrapAwaitingMerge(task: Task): Task {
+    if (!shouldBootstrapAwaitingMerge(task)) {
+      return task;
+    }
+    return this.tasks.update(task.id, { pr: { ...task.pr!, awaitingMerge: true } });
   }
 
   private async discoverAndFinish(task: Task): Promise<Task> {
@@ -431,6 +449,15 @@ export class PrPoller {
       changed = true;
       mergeReadyTurnedTrue = mergeReady;
     }
+    if (mergeReady && task.state === "done" && pr.awaitingMerge !== true) {
+      pr.awaitingMerge = true;
+      changed = true;
+    }
+    const terminal = view.state === "MERGED" || view.state === "CLOSED" || !!view.mergedAt;
+    if (terminal && pr.awaitingMerge === true) {
+      pr.awaitingMerge = false;
+      changed = true;
+    }
     if ((view.state === "MERGED" || view.mergedAt) && !pr.merged && identity.ok) {
       pr.merged = true;
       changed = true;
@@ -453,9 +480,10 @@ export class PrPoller {
     }
 
     // Adaptive cadence: unsettled checks mean change is coming - keep the PR
-    // in the fast window (sliding, re-armed each pass while pending). A merge
-    // ends this PR's polling and often unblocks siblings in the same repo
-    // (merge-train), so those get a fast window instead.
+    // in the fast window (sliding, re-armed each pass while pending). A done PR
+    // that has become merge-ready stays fast through the durable awaitingMerge
+    // marker above. A merge ends this PR's polling and often unblocks siblings
+    // in the same repo (merge-train), so those get a fast window instead.
     if (justMerged) {
       this.fastUntil.delete(task.id);
       for (const other of this.tasks.list()) {
@@ -475,6 +503,14 @@ function shouldPoll(task: Task): boolean {
     !!task.pr?.url &&
     !task.pr.merged
   );
+}
+
+function isAwaitingMerge(task: Task): boolean {
+  return task.state === "done" && task.pr?.awaitingMerge === true && !task.pr.merged;
+}
+
+function shouldBootstrapAwaitingMerge(task: Task): boolean {
+  return task.state === "done" && task.pr?.mergeReady === true && task.pr.awaitingMerge !== true && !task.pr.merged;
 }
 
 function shouldDiscover(task: Task): boolean {

@@ -1,6 +1,13 @@
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
-import { existsSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import {
+  chmodSync,
+  existsSync,
+  mkdtempSync,
+  readFileSync,
+  rmSync,
+  writeFileSync
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
@@ -23,7 +30,32 @@ function makeRepo(): string {
   writeFileSync(join(dir, "readme.md"), "hello\n");
   run(["add", "."]);
   run(["commit", "-qm", "init"]);
+  run(["config", "remote.origin.uploadpack", "/usr/bin/false"]);
   return dir;
+}
+
+function makeRemoteFixture(): { base: string; seed: string; clone: string } {
+  const base = mkdtempSync(join(tmpdir(), "perch-td-remote-"));
+  const upstream = join(base, "upstream.git");
+  execFileSync("git", ["init", "-q", "--bare", "-b", "main", upstream], { stdio: "pipe" });
+
+  const seed = join(base, "seed");
+  execFileSync("git", ["init", "-q", "-b", "main", seed], { stdio: "pipe" });
+  const seedRun = (args: string[]) => execFileSync("git", ["-C", seed, ...args], { stdio: "pipe" });
+  seedRun(["config", "user.email", "t@t"]);
+  seedRun(["config", "user.name", "t"]);
+  writeFileSync(join(seed, "readme.md"), "hello\n");
+  seedRun(["add", "."]);
+  seedRun(["commit", "-qm", "init"]);
+  seedRun(["remote", "add", "origin", upstream]);
+  seedRun(["push", "-q", "-u", "origin", "main"]);
+
+  const clone = join(base, "clone");
+  execFileSync("git", ["clone", "-q", upstream, clone], { stdio: "pipe" });
+  const cloneRun = (args: string[]) => execFileSync("git", ["-C", clone, ...args], { stdio: "pipe" });
+  cloneRun(["config", "user.email", "t@t"]);
+  cloneRun(["config", "user.name", "t"]);
+  return { base, seed, clone };
 }
 
 function inSlot(path: string, args: string[]): void {
@@ -90,12 +122,16 @@ function autoReturn(h: Harness): { pending: Promise<unknown>[] } {
           source: "system",
           message: `auto-return on merge: ${verdict.reason}`
         });
-        await executeTeardown(task, {
-          tasks: h.tasks,
-          worktrees: h.pool,
-          adapter: h.adapter,
-          auditLog: h.auditLog
-        });
+        await executeTeardown(
+          task,
+          {
+            tasks: h.tasks,
+            worktrees: h.pool,
+            adapter: h.adapter,
+            auditLog: h.auditLog
+          },
+          verdict.defaultBranch ? { defaultBranch: verdict.defaultBranch } : {}
+        );
       })()
     );
   });
@@ -141,6 +177,73 @@ test("auto-return: a merged PR returns the worktree within the poll cycle", asyn
   assert.ok(kinds.includes("note"), "an auto-return trail note is recorded");
   assert.equal(kinds.filter((k) => k === "merged").length, 1);
   assert.equal(kinds.filter((k) => k === "closed").length, 1);
+
+  h.cleanup();
+});
+
+test("auto-return: transient readiness regression stays fast-polled until merge", async () => {
+  const h = harness();
+  const task = h.tasks.create({ title: "merge after settled checks", project: h.repo });
+  h.tasks.recordEvent(task.id, { kind: "working", source: "worker" });
+  h.tasks.recordEvent(task.id, { kind: "done", source: "worker" });
+
+  const sessionId = "pty:late-merge";
+  const lease = await h.pool.acquire(h.repo, sessionId);
+  h.tasks.update(task.id, {
+    sessionId,
+    worktreeId: lease.id,
+    branch: "perch/late-merge",
+    pr: { url: "https://github.com/o/r/pull/41" }
+  });
+
+  let clock = 1_000_000;
+  let phase: "ready" | "regressed" | "merged" = "ready";
+  let polls = 0;
+  const { pending } = autoReturn(h);
+  const poller = new PrPoller(
+    h.tasks,
+    async () => {
+      polls += 1;
+      return {
+        state: phase === "merged" ? "MERGED" : "OPEN",
+        mergedAt: phase === "merged" ? "2026-07-22T00:00:00Z" : null,
+        headRefName: "perch/late-merge",
+        headRepository: { nameWithOwner: "o/r" },
+        statusCheckRollup: [{ conclusion: "SUCCESS" }],
+        isDraft: false,
+        mergeable: phase === "regressed" ? "UNKNOWN" : "MERGEABLE",
+        mergeStateStatus: phase === "regressed" ? "UNKNOWN" : "CLEAN",
+        reviewDecision: "APPROVED"
+      };
+    },
+    { now: () => clock, fastWindowMs: 60_000 }
+  );
+
+  poller.armFast(task.id);
+  await poller.fastTick();
+  assert.equal(h.tasks.find(task.id)?.pr?.mergeReady, true);
+
+  clock += 60_001;
+  phase = "regressed";
+  await poller.fastTick();
+  assert.equal(polls, 2);
+  assert.equal(h.tasks.find(task.id)?.pr?.mergeReady, false);
+
+  phase = "merged";
+  await poller.fastTick();
+  await Promise.all(pending);
+
+  assert.equal(polls, 3, "the later fast tick observes the merge");
+  assert.equal(h.tasks.find(task.id)?.state, "closed");
+  assert.equal(h.pool.find(lease.id)?.leasedBy, undefined, "the worker slot auto-returns");
+  assert.deepEqual(h.stopped, [sessionId]);
+
+  await poller.fastTick();
+  await Promise.all(pending);
+  const kinds = h.tasks.events(task.id).map((event) => event.kind);
+  assert.equal(kinds.filter((kind) => kind === "merged").length, 1);
+  assert.equal(kinds.filter((kind) => kind === "closed").length, 1);
+  assert.equal(polls, 3, "closed tasks stop fast polling");
 
   h.cleanup();
 });
@@ -276,6 +379,161 @@ test("gate refuses committed-but-unlanded work with no merged PR", async () => {
   assert.equal(h.pool.find(lease.id)?.leasedBy, sessionId, "unlanded work stays leased");
 
   h.cleanup();
+});
+
+test("gate resolves and fetches origin/main without a local origin/HEAD", async () => {
+  const { base, seed, clone } = makeRemoteFixture();
+  const home = mkdtempSync(join(tmpdir(), "perch-td-home-"));
+  const tasks = new TaskStore({ PERCH_HOME: home } as NodeJS.ProcessEnv);
+  const task = tasks.create({ title: "merged upstream", project: clone });
+  tasks.recordEvent(task.id, { kind: "working", source: "worker" });
+  tasks.recordEvent(task.id, { kind: "done", source: "worker" });
+
+  const localMain = execFileSync("git", ["-C", clone, "rev-parse", "main"]).toString().trim();
+  execFileSync("git", ["-C", clone, "checkout", "-q", "--detach"], { stdio: "pipe" });
+  writeFileSync(join(clone, "landed.txt"), "landed\n");
+  inSlot(clone, ["add", "."]);
+  inSlot(clone, ["commit", "-qm", "landed work"]);
+  const landedHead = execFileSync("git", ["-C", clone, "rev-parse", "HEAD"]).toString().trim();
+  execFileSync("git", ["-C", clone, "push", "-q", "origin", "HEAD:main"], { stdio: "pipe" });
+  execFileSync("git", ["-C", clone, "update-ref", "refs/remotes/origin/main", localMain], { stdio: "pipe" });
+  execFileSync(
+    "git",
+    ["-C", clone, "symbolic-ref", "--delete", "refs/remotes/origin/HEAD"],
+    { stdio: "pipe" }
+  );
+  const uploadPack = join(base, "counting-upload-pack");
+  writeFileSync(
+    uploadPack,
+    `#!/bin/sh\nprintf '1\\n' >> "$0.count"\nexec git-upload-pack "$@"\n`
+  );
+  chmodSync(uploadPack, 0o755);
+  execFileSync("git", ["-C", clone, "config", "remote.origin.uploadpack", uploadPack]);
+
+  const verdict = await landedGate(tasks.find(task.id)!, clone);
+
+  assert.equal(verdict.landed, true);
+  assert.match(verdict.reason, /origin\/main|remote branch/);
+  assert.equal(
+    execFileSync("git", ["-C", clone, "rev-parse", "origin/main"]).toString().trim(),
+    landedHead,
+    "the targeted fetch refreshes the remote-tracking ref"
+  );
+  assert.equal(
+    execFileSync("git", ["-C", clone, "rev-parse", "main"]).toString().trim(),
+    localMain,
+    "the user's local default branch is untouched"
+  );
+  assert.equal(
+    execFileSync("git", ["-C", seed, "rev-parse", "main"]).toString().trim(),
+    localMain,
+    "the unrelated seed checkout is untouched"
+  );
+  assert.equal(
+    readFileSync(`${uploadPack}.count`, "utf8").trim().split("\n").length,
+    2,
+    "one remote HEAD lookup and one targeted fetch"
+  );
+
+  rmSync(home, { recursive: true, force: true });
+  rmSync(base, { recursive: true, force: true });
+});
+
+test("complete ancestry teardown reuses the gate's default branch", async () => {
+  const { base, clone } = makeRemoteFixture();
+  const poolRoot = mkdtempSync(join(tmpdir(), "perch-td-pool-"));
+  const home = mkdtempSync(join(tmpdir(), "perch-td-home-"));
+  const pool = new WorktreePool({ root: poolRoot, maxSlots: 1 });
+  const tasks = new TaskStore({ PERCH_HOME: home } as NodeJS.ProcessEnv);
+  const auditLog = new AuditLog(join(home, "audit.jsonl"));
+  const task = tasks.create({ title: "merged upstream", project: clone });
+  tasks.recordEvent(task.id, { kind: "working", source: "worker" });
+  tasks.recordEvent(task.id, { kind: "done", source: "worker" });
+  const sessionId = "pty:ancestry";
+  const lease = await pool.acquire(clone, sessionId);
+  tasks.update(task.id, { sessionId, worktreeId: lease.id });
+  const staleTip = execFileSync("git", ["-C", clone, "rev-parse", "origin/main"])
+    .toString()
+    .trim();
+  writeFileSync(join(lease.path, "landed.txt"), "landed\n");
+  inSlot(lease.path, ["add", "."]);
+  inSlot(lease.path, ["commit", "-qm", "landed work"]);
+  inSlot(lease.path, ["push", "-q", "origin", "HEAD:main"]);
+  execFileSync(
+    "git",
+    ["-C", clone, "update-ref", "refs/remotes/origin/main", staleTip],
+    { stdio: "pipe" }
+  );
+  execFileSync(
+    "git",
+    ["-C", clone, "symbolic-ref", "--delete", "refs/remotes/origin/HEAD"],
+    { stdio: "pipe" }
+  );
+  const uploadPack = join(base, "teardown-upload-pack");
+  writeFileSync(
+    uploadPack,
+    `#!/bin/sh\nprintf '1\\n' >> "$0.count"\nexec git-upload-pack "$@"\n`
+  );
+  chmodSync(uploadPack, 0o755);
+  execFileSync("git", ["-C", clone, "config", "remote.origin.uploadpack", uploadPack]);
+
+  const verdict = await landedGate(tasks.find(task.id)!, lease.path);
+  assert.equal(verdict.landed, true);
+  await executeTeardown(
+    tasks.find(task.id)!,
+    {
+      tasks,
+      worktrees: pool,
+      adapter: { name: "test", stopSession: async () => {} } as unknown as AgentAdapter,
+      auditLog
+    },
+    verdict.defaultBranch ? { defaultBranch: verdict.defaultBranch } : {}
+  );
+
+  assert.equal(tasks.find(task.id)?.state, "closed");
+  assert.equal(pool.find(lease.id)?.leasedBy, undefined);
+  assert.equal(
+    readFileSync(`${uploadPack}.count`, "utf8").trim().split("\n").length,
+    2,
+    "gate and forced release share one lookup and fetch"
+  );
+
+  rmSync(poolRoot, { recursive: true, force: true });
+  rmSync(home, { recursive: true, force: true });
+  rmSync(base, { recursive: true, force: true });
+});
+
+test("gate bounds offline default-branch discovery without retrying", async () => {
+  const { base, clone } = makeRemoteFixture();
+  const home = mkdtempSync(join(tmpdir(), "perch-td-home-"));
+  const tasks = new TaskStore({ PERCH_HOME: home } as NodeJS.ProcessEnv);
+  const task = tasks.create({ title: "offline origin", project: clone });
+  tasks.recordEvent(task.id, { kind: "working", source: "worker" });
+  tasks.recordEvent(task.id, { kind: "done", source: "worker" });
+  execFileSync(
+    "git",
+    ["-C", clone, "symbolic-ref", "--delete", "refs/remotes/origin/HEAD"],
+    { stdio: "pipe" }
+  );
+  const uploadPack = join(base, "slow-upload-pack");
+  writeFileSync(uploadPack, `#!/bin/sh\nprintf '1\\n' >> "$0.count"\nread request\nexit 1\n`);
+  chmodSync(uploadPack, 0o755);
+  execFileSync("git", ["-C", clone, "config", "remote.origin.uploadpack", uploadPack]);
+
+  const startedAt = Date.now();
+  const verdict = await landedGate(tasks.find(task.id)!, clone);
+  const elapsed = Date.now() - startedAt;
+
+  assert.equal(verdict.landed, true);
+  assert.equal(
+    readFileSync(`${uploadPack}.count`, "utf8").trim().split("\n").length,
+    1,
+    "offline discovery makes one remote request"
+  );
+  assert.ok(elapsed < 5_000, `offline lookup took ${elapsed}ms`);
+
+  rmSync(home, { recursive: true, force: true });
+  rmSync(base, { recursive: true, force: true });
 });
 
 test("gate refuses a merged PR record whose repo conflicts with the task", async () => {
