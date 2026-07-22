@@ -12,9 +12,17 @@ export type TaskVerificationFacts = {
   acceptedRevision?: string;
 };
 
+// The durable proof that a task's work entered the no-mistakes review
+// pipeline: the seq of the latest allowed runtime authorization (run,
+// gate-push, or agent-launch) not yet superseded by a return to working.
+export type TaskReviewFacts = {
+  enteredSeq: number;
+};
+
 export type TaskPresentationFacts = {
   pr?: TaskPr;
   verification?: TaskVerificationFacts;
+  review?: TaskReviewFacts;
 };
 
 // GitHub facts only satisfy the PR half of readiness. A mate decision bound to
@@ -30,10 +38,11 @@ export function deriveTaskPresentation(task: Task, facts: TaskPresentationFacts 
   if (task.state === "needs_you") return { state: "needs_you" };
   if (task.state === "blocked") return { state: "blocked" };
   if (task.state === "completion_requested") return { state: "awaiting_verification" };
-  // A no-mistakes task is Reviewing only while its durable lifecycle says the
-  // worker is actively working. A parked gate and a completion request take
-  // their normal primary states above; other modes never promote Working.
-  if (task.mode === "no-mistakes" && task.state === "working") return { state: "reviewing" };
+  // A no-mistakes task is Reviewing only while the durable review facts prove
+  // the pipeline is actively engaged: an allowed runtime authorization not yet
+  // superseded by a return to working. Mode alone never promotes Working -
+  // scouting and implementation stay Working until the gate truly starts.
+  if (task.mode === "no-mistakes" && task.state === "working" && facts.review) return { state: "reviewing" };
   if (task.state !== "done") return { state: "working" };
   const verification = facts.verification;
   const deliverable = verification?.accepted ? verification.deliverable : undefined;

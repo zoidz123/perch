@@ -165,11 +165,13 @@ export class TaskStore {
     const runtimes = this.stateDb.runtimes.latestByTask();
     const prFacts = this.stateDb.tasks.prFactsByTask();
     const verifications = this.stateDb.tasks.verificationFactsByTask();
+    const reviews = this.stateDb.tasks.reviewFactsByTask();
     return this.stateDb.tasks.list().map((task) => {
       const runtime = runtimes.get(task.id);
       return this.withPresentation(runtime ? { ...task, runtime: runtimeSnapshot(runtime) } : task, {
         pr: prFacts.get(task.id),
-        verification: verifications.get(task.id)
+        verification: verifications.get(task.id),
+        review: reviews.get(task.id)
       });
     });
   }
@@ -323,7 +325,8 @@ export class TaskStore {
     // for the whole batch.
     const facts: TaskPresentationFacts = {
       pr: this.stateDb.tasks.prFacts(task.id),
-      verification: this.stateDb.tasks.verificationFacts(task.id)
+      verification: this.stateDb.tasks.verificationFacts(task.id),
+      review: this.stateDb.tasks.reviewFacts(task.id)
     };
     for (const notification of notifications) {
       for (const listener of this.listeners) {
@@ -349,7 +352,8 @@ export class TaskStore {
     const { presentation: _presentation, ...persisted } = task;
     const resolved = facts ?? {
       pr: this.stateDb.tasks.prFacts(task.id),
-      verification: this.stateDb.tasks.verificationFacts(task.id)
+      verification: this.stateDb.tasks.verificationFacts(task.id),
+      review: this.stateDb.tasks.reviewFacts(task.id)
     };
     return { ...persisted, presentation: deriveTaskPresentation(persisted, resolved) };
   }

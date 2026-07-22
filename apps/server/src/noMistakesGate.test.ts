@@ -506,7 +506,7 @@ test("direct-PR and local-only authorization is denied despite prompt words and 
 });
 
 test("explicit per-task mode override controls authorization in both directions", async () => {
-  await withServer(async ({ port, bin, home, repo, adapter, hooks, projects }) => {
+  await withServer(async ({ port, bin, home, repo, adapter, hooks, projects, tasks }) => {
     writeInitShim(bin, join(home, "override-init.log"));
     execFileSync("git", ["remote", "add", "no-mistakes", join(home, "ready-gate.git")], { cwd: repo });
     projects.touch(repo, { mode: "direct-PR" });
@@ -521,11 +521,19 @@ test("explicit per-task mode override controls authorization in both directions"
     const allowedTask = (await allowedResponse.json() as {
       task: { id: string; project: string; branch?: string; sessionId?: string };
     }).task;
+
+    // The badge contract: a working no-mistakes task is Working until the
+    // allowed authorization proves the pipeline engaged, then Reviewing.
+    tasks.recordEvent(allowedTask.id, { kind: "working", source: "worker", message: "implementing" });
+    assert.equal(tasks.find(allowedTask.id)?.presentation?.state, "working");
     for (const operation of ["run", "gate-push", "agent-launch"] as const) {
       const allowed = await authorize(port, hooks, allowedTask, adapter.sessions.at(-1)!.cwd!, { operation });
       assert.equal(allowed.status, 200);
       assert.equal(((await allowed.json()) as { allowed: boolean }).allowed, true);
     }
+    assert.equal(tasks.find(allowedTask.id)?.presentation?.state, "reviewing");
+    tasks.recordEvent(allowedTask.id, { kind: "working", source: "worker", message: "resumed after the run" });
+    assert.equal(tasks.find(allowedTask.id)?.presentation?.state, "working");
   });
 
   await withServer(async ({ port, bin, repo, adapter, hooks }) => {

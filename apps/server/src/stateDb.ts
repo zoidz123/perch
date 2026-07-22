@@ -4,9 +4,9 @@ import { homedir } from "node:os";
 import { join } from "node:path";
 import type { Task, TaskEvent, TaskEventKind, TaskEventSource, TaskPr } from "@perch/shared";
 import Database from "better-sqlite3";
-import type { TaskDeliverable, TaskVerificationFacts } from "./taskPresentation.js";
+import type { TaskDeliverable, TaskReviewFacts, TaskVerificationFacts } from "./taskPresentation.js";
 
-const LATEST_SCHEMA_VERSION = 10;
+const LATEST_SCHEMA_VERSION = 11;
 const LEGACY_TASK_IMPORT = "tasks-json-v1";
 
 const MIGRATIONS = [
@@ -399,6 +399,31 @@ const MIGRATIONS = [
       FROM task_events
       WHERE kind IN ('completion_accepted', 'completion_rejected')
         AND typeof(json_extract(data_json, '$.completionDecision.requestSeq')) = 'integer';
+    `
+  },
+  {
+    version: 11,
+    name: "task-review-facts",
+    sql: `
+      CREATE TABLE task_review_facts (
+        task_id TEXT PRIMARY KEY REFERENCES tasks(id) ON DELETE RESTRICT,
+        entered_seq INTEGER NOT NULL,
+        recorded_at TEXT NOT NULL
+      ) STRICT;
+
+      INSERT OR IGNORE INTO task_review_facts(task_id, entered_seq, recorded_at)
+      SELECT e.task_id, e.seq, e.at
+      FROM task_events e
+      WHERE json_extract(e.data_json, '$.noMistakesAuthorization.allowed') = 1
+        AND e.seq = (
+          SELECT max(a.seq) FROM task_events a
+          WHERE a.task_id = e.task_id
+            AND json_extract(a.data_json, '$.noMistakesAuthorization.allowed') = 1
+        )
+        AND e.seq > coalesce((
+          SELECT max(w.seq) FROM task_events w
+          WHERE w.task_id = e.task_id AND w.kind IN ('working', 'completion_rejected')
+        ), 0);
     `
   }
 ] as const;
@@ -919,6 +944,23 @@ export class TaskRepository {
     return new Map(rows.map((row) => [row.task_id, verificationFactsFromRow(row)]));
   }
 
+  // The durable proof of active no-mistakes review: the latest allowed runtime
+  // authorization not yet superseded by a return to working. Maintained per
+  // event append, so presentation never scans the full ledger on hot paths.
+  reviewFacts(taskId: string): TaskReviewFacts | undefined {
+    const row = this.db
+      .prepare("SELECT entered_seq FROM task_review_facts WHERE task_id = ?")
+      .get(taskId) as { entered_seq: number } | undefined;
+    return row ? { enteredSeq: row.entered_seq } : undefined;
+  }
+
+  reviewFactsByTask(): Map<string, TaskReviewFacts> {
+    const rows = this.db
+      .prepare("SELECT task_id, entered_seq FROM task_review_facts")
+      .all() as Array<{ task_id: string; entered_seq: number }>;
+    return new Map(rows.map((row) => [row.task_id, { enteredSeq: row.entered_seq }]));
+  }
+
   insertImported(task: Task, events: TaskEvent[]): { task: number; events: number } {
     const taskResult = this.db
       .prepare("INSERT OR IGNORE INTO tasks(id, state, updated_at, projection_json) VALUES (?, ?, ?, ?)")
@@ -945,6 +987,7 @@ export class TaskRepository {
       eventCount += result.changes;
       if (result.changes > 0) {
         this.saveVerificationFacts(task.id, event);
+        this.saveReviewFacts(task.id, event);
       }
     }
     return { task: taskResult.changes, events: eventCount };
@@ -1000,6 +1043,7 @@ export class TaskRepository {
       ...(event.data ? { data: event.data } : {})
     };
     this.saveVerificationFacts(taskId, persisted);
+    this.saveReviewFacts(taskId, persisted);
     return persisted;
   }
 
@@ -1009,6 +1053,23 @@ export class TaskRepository {
       `INSERT INTO task_pr_facts(task_id, facts_json, observed_at) VALUES (?, ?, ?)
        ON CONFLICT(task_id) DO UPDATE SET facts_json = excluded.facts_json, observed_at = excluded.observed_at`
     ).run(task.id, JSON.stringify(task.pr), task.updatedAt);
+  }
+
+  // An allowed authorization proves the pipeline engaged; the two event kinds
+  // that move durable state back to working (working, completion_rejected)
+  // surrender the proof. Denied authorizations never mark review.
+  private saveReviewFacts(taskId: string, event: TaskEvent): void {
+    if (event.kind === "working" || event.kind === "completion_rejected") {
+      this.db.prepare("DELETE FROM task_review_facts WHERE task_id = ?").run(taskId);
+      return;
+    }
+    const authorization = (event.data as { noMistakesAuthorization?: { allowed?: unknown } } | undefined)
+      ?.noMistakesAuthorization;
+    if (authorization?.allowed !== true) return;
+    this.db.prepare(
+      `INSERT INTO task_review_facts(task_id, entered_seq, recorded_at) VALUES (?, ?, ?)
+       ON CONFLICT(task_id) DO UPDATE SET entered_seq = excluded.entered_seq, recorded_at = excluded.recorded_at`
+    ).run(taskId, event.seq, event.at);
   }
 
   private saveVerificationFacts(taskId: string, event: TaskEvent): void {
