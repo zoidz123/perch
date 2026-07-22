@@ -670,7 +670,7 @@ test("a recovered mate inherits the prior generation's bounded delivery surface"
     f.tracker.acknowledgeTimeline({
       seq: 19,
       id: "recovered-mate-authentic-row",
-      sessionId: "pty:old-mate",
+      sessionId: "pty:new-mate",
       kind: "user",
       text: "mate prompt",
       at: submittedAt!

@@ -805,6 +805,17 @@ export type PromptDeliverySurfaceRecord = Pick<
   | "updatedAt"
 >;
 
+const PROMPT_DELIVERY_LINEAGE_SCOPE_SQL = `(
+  pd.perch_session_id = @sessionId
+  OR pd.task_id IN (SELECT task_id FROM runtimes WHERE pty_session_id = @sessionId)
+  OR pd.perch_session_id IN (
+    SELECT history.pty_session_id
+    FROM owner_runtimes current
+    JOIN owner_runtimes history ON history.owner_id = current.owner_id
+    WHERE current.pty_session_id = @sessionId AND history.pty_session_id IS NOT NULL
+  )
+)`;
+
 type TaskEventInput = {
   kind: TaskEventKind;
   message?: string;
@@ -2232,14 +2243,7 @@ export class PromptDeliveryRepository {
          SELECT pd.id, pd.state, pd.failure_reason, pd.unknown_at, pd.unknown_notified_at,
                 pd.accepted_at, pd.accepted_notified_at, pd.updated_at, pd.created_at
          FROM prompt_deliveries pd
-         WHERE pd.perch_session_id = ?
-            OR pd.task_id IN (SELECT task_id FROM runtimes WHERE pty_session_id = ?)
-            OR pd.perch_session_id IN (
-              SELECT history.pty_session_id
-              FROM owner_runtimes current
-              JOIN owner_runtimes history ON history.owner_id = current.owner_id
-              WHERE current.pty_session_id = ? AND history.pty_session_id IS NOT NULL
-            )
+         WHERE ${PROMPT_DELIVERY_LINEAGE_SCOPE_SQL}
        ), unresolved AS (
          SELECT * FROM scoped
          WHERE state IN ('not_submitted', 'delivery_unknown') AND unknown_notified_at IS NOT NULL
@@ -2252,7 +2256,7 @@ export class PromptDeliveryRepository {
        SELECT * FROM unresolved
        UNION ALL
        SELECT * FROM resolved`
-    ).all(sessionId, sessionId, sessionId) as PromptDeliverySurfaceRow[];
+    ).all({ sessionId }) as PromptDeliverySurfaceRow[];
     return rows.map(promptDeliverySurfaceFromRow);
   }
 
@@ -2331,16 +2335,24 @@ export class PromptDeliveryRepository {
     if (!observed) return undefined;
     const observedAt = input.receiptKind === "transcript" ? Date.parse(input.observedAt ?? "") : undefined;
     if (input.receiptKind === "transcript" && !Number.isFinite(observedAt)) return undefined;
+    const deliveryScope = input.receiptKind === "transcript"
+      ? PROMPT_DELIVERY_LINEAGE_SCOPE_SQL
+      : "pd.perch_session_id = @sessionId";
     const rows = this.db.prepare(
-      `SELECT *, rowid AS delivery_ordinal FROM prompt_deliveries
-       WHERE perch_session_id = ? AND state IN ('typing', 'submitted', 'accepted', 'delivery_unknown')
+      `SELECT pd.*, pd.rowid AS delivery_ordinal FROM prompt_deliveries pd
+       WHERE ${deliveryScope} AND pd.state IN ('typing', 'submitted', 'accepted', 'delivery_unknown')
        ORDER BY rowid`
-    ).all(input.perchSessionId) as PromptDeliveryRow[];
+    ).all({ sessionId: input.perchSessionId }) as PromptDeliveryRow[];
     if (input.receiptKind === "transcript" && input.receiptId) {
       const replayed = rows.find((row) => row.transcript_receipt_id === input.receiptId);
       if (replayed) return { delivery: promptDeliveryFromRow(replayed), newlyAccepted: false };
     }
-    const matches = rows.filter((row) => {
+    const matchableRows = input.receiptKind === "transcript"
+      ? rows.filter(
+          (row) => row.perch_session_id === input.perchSessionId || row.state === "delivery_unknown"
+        )
+      : rows;
+    const matches = matchableRows.filter((row) => {
       if (row.state === "delivery_unknown" && row.unknown_from_state === "queued") return false;
       if (row.state === "delivery_unknown" && input.receiptKind !== "transcript") return false;
       if (input.receiptKind === "transcript") {
