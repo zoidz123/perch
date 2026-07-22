@@ -202,8 +202,9 @@ Claude and Codex provide the boundaries differently:
 - A Codex turn-completed notification is settled and cannot be continued in the same way, so the durable `stalled` event wakes Mate to retry or steer the worker.
 
 A dispatched Codex worker can also fail before any first turn: a TUI that is not ready yet silently swallows the typed kickoff prompt.
-If no first-turn evidence (a turn lifecycle event for that session, a worker event, or the rollout correlation) appears within 45 seconds of launch, the server retries the exact original kickoff once.
-After a second silent window it records a `blocked` event with `source: "system"` and `data.reason: "kickoff_not_accepted"` so Mate adjudicates instead of the worker sitting silently empty.
+If no first-turn evidence (a turn lifecycle event for that session, a worker event, or the rollout correlation) appears within 45 seconds of launch, the server retries the exact original kickoff at most once, journaled on the task ledger so a server restart inside the window never submits a second retry.
+If a permission gate is open at retry time the retry is skipped, because the approval flow owns that outcome and queued text could later duplicate an accepted kickoff.
+After a second silent window it records a `blocked` event with `source: "system"`, `data.reason: "kickoff_not_accepted"`, and `data.retry` (`"submitted"` or `"gated"`) so Mate adjudicates instead of the worker sitting silently empty.
 
 Provider prose is never treated as the outcome.
 Even if the final assistant message says the work is finished, Mate must rely on the durable worker event and verify the deliverable.
