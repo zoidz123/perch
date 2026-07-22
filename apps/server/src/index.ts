@@ -6,6 +6,7 @@ import { codexOnPath, selectCodexDriver } from "./adapters/codexDaemon.js";
 import { AuditLog } from "./audit.js";
 import {
   markTaskWorkingFromActivity,
+  rearmCodexKickoffWatchdogs,
   resolveApprovalForTask,
   taskCapabilityEnvironment,
   surfaceApprovalToTask
@@ -515,6 +516,11 @@ server.listen(config.port, "0.0.0.0", () => {
   codexControl.sweepOrphanDaemons();
   taskScheduler.start();
   outboxWorker.start();
+  // A kickoff watchdog armed by a previous server life is process memory;
+  // rearm from durable dispatch state so a restart inside its window cannot
+  // orphan a silent codex worker. Post-bind only, like the daemon sweep: the
+  // process that loses the port race must never inject into live sessions.
+  void rearmCodexKickoffWatchdogs({ tasks, monitor, hooks, timeline, adapter });
   console.log(`Perch server listening on http://0.0.0.0:${config.port}`);
 });
 

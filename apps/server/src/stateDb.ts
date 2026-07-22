@@ -1439,6 +1439,13 @@ export class OperationRepository {
     return row ? operationFromRow(row) : undefined;
   }
 
+  latestForTask(taskId: string, kind: string): OperationRecord | undefined {
+    const row = this.db
+      .prepare("SELECT * FROM operations WHERE task_id = ? AND kind = ? ORDER BY created_at DESC, rowid DESC LIMIT 1")
+      .get(taskId, kind) as OperationRow | undefined;
+    return row ? operationFromRow(row) : undefined;
+  }
+
   claim(input: {
     id?: string;
     kind?: string;

@@ -8,6 +8,7 @@ import type { AgentAdapter } from "./adapters/types.js";
 import {
   armCodexKickoffWatchdog,
   codexFirstTurnEvidence,
+  rearmCodexKickoffWatchdogs,
   startManagedAgent
 } from "./agentLauncher.js";
 import { AuditLog } from "./audit.js";
@@ -126,8 +127,53 @@ test("a swallowed codex kickoff is retried exactly once and an exhausted retry p
     assert.equal(blocked?.source, "system");
     assert.equal(blocked?.data?.reason, "kickoff_not_accepted");
     assert.equal(blocked?.data?.sessionId, f.sessionId);
+    assert.equal(blocked?.data?.retry, "submitted");
+    // The submitted retry is journaled durably so a restart cannot repeat it.
+    assert.ok(
+      f.tasks
+        .events(f.taskId)
+        .some((event) => event.kind === "note" && event.data?.reason === "kickoff_retried")
+    );
     // Exactly once: the exhausted pass never submits again.
     assert.equal(f.adapter.submitted.length, 1);
+  } finally {
+    f.close();
+  }
+});
+
+test("an open permission gate skips the retry and the blocked outcome says so", async () => {
+  const f = fixture("perch-kickoff-gated-");
+  try {
+    let recorded = 0;
+    const deps = {
+      tasks: f.tasks,
+      monitor: f.monitor,
+      hooks: f.hooks,
+      timeline: {
+        recordSource: () => {
+          recorded += 1;
+        }
+      }
+    };
+    f.monitor.applyExternalStatus(f.sessionId, "needs_approval", "codex", "adapter");
+    armCodexKickoffWatchdog(deps, f.sessionId, f.taskId, "kickoff prompt", 40);
+
+    assert.ok(
+      await until(2_000, () => f.tasks.find(f.taskId)?.state === "blocked"),
+      "a gate-skipped retry still adjudicates"
+    );
+    // Nothing was submitted, so the timeline records no agent-sourced kickoff
+    // and no spent-retry journal entry exists.
+    assert.deepEqual(f.adapter.submitted, []);
+    assert.equal(recorded, 0);
+    assert.ok(
+      !f.tasks
+        .events(f.taskId)
+        .some((event) => event.kind === "note" && event.data?.reason === "kickoff_retried")
+    );
+    const blocked = f.tasks.events(f.taskId).find((event) => event.kind === "blocked");
+    assert.equal(blocked?.data?.retry, "gated");
+    assert.match(blocked?.message ?? "", /skipped by an open permission gate/);
   } finally {
     f.close();
   }
@@ -239,5 +285,117 @@ test("startManagedAgent arms the kickoff watchdog for codex task dispatches only
   } finally {
     f.close();
     claude.close();
+  }
+});
+
+// Simulate a server restart inside the watchdog window: the in-memory arm is
+// gone, but the dispatch operation (holding the exact kickoff) and the task
+// ledger survive in SQLite, and the session is still live in the adapter.
+function recordDispatchOperation(f: Fixture): void {
+  f.tasks.stateDb.operations.create({
+    taskId: f.taskId,
+    kind: "dispatch",
+    idempotencyKey: `dispatch:${f.taskId}`,
+    payload: {
+      prepared: {
+        request: {
+          command: "codex",
+          agent: "codex",
+          sessionId: f.sessionId,
+          cwd: f.home,
+          labels: { task: f.taskId },
+          initialPrompt: "kickoff prompt"
+        },
+        leaseId: "wt-rearm"
+      },
+      launchStarted: true
+    }
+  });
+}
+
+function markSessionLive(f: Fixture): void {
+  f.adapter.sessions.push({
+    id: f.sessionId,
+    title: "codex - kickoff",
+    agent: "codex",
+    cwd: f.home,
+    kind: "terminal",
+    status: "running",
+    lastActivityAt: new Date().toISOString()
+  });
+}
+
+test("a server restart inside the window rearms the watchdog from durable dispatch state", async () => {
+  const f = fixture("perch-kickoff-rearm-");
+  try {
+    recordDispatchOperation(f);
+    markSessionLive(f);
+
+    await rearmCodexKickoffWatchdogs(f, 40);
+    assert.ok(await until(2_000, () => f.adapter.submitted.length === 1), "rearm retried the kickoff");
+    assert.deepEqual(f.adapter.submitted, ["kickoff prompt"]);
+    assert.ok(
+      await until(2_000, () => f.tasks.find(f.taskId)?.state === "blocked"),
+      "a rearmed exhausted retry still parks the task"
+    );
+    assert.equal(f.adapter.submitted.length, 1);
+  } finally {
+    f.close();
+  }
+});
+
+test("a retry journaled before the restart is never submitted a second time", async () => {
+  const f = fixture("perch-kickoff-rearm-spent-");
+  try {
+    recordDispatchOperation(f);
+    markSessionLive(f);
+    f.tasks.recordEvent(f.taskId, {
+      kind: "note",
+      source: "system",
+      message: "codex kickoff retried after a silent launch window",
+      data: { reason: "kickoff_retried", sessionId: f.sessionId }
+    });
+
+    await rearmCodexKickoffWatchdogs(f, 30);
+    assert.ok(
+      await until(2_000, () => f.tasks.find(f.taskId)?.state === "blocked"),
+      "the final adjudication window still runs after the restart"
+    );
+    assert.deepEqual(f.adapter.submitted, []);
+    const blocked = f.tasks.events(f.taskId).find((event) => event.kind === "blocked");
+    assert.equal(blocked?.data?.retry, "submitted");
+    assert.match(blocked?.message ?? "", /one kickoff retry/);
+  } finally {
+    f.close();
+  }
+});
+
+test("rearm skips tasks whose session did not survive the restart", async () => {
+  const f = fixture("perch-kickoff-rearm-dead-");
+  try {
+    recordDispatchOperation(f);
+
+    await rearmCodexKickoffWatchdogs(f, 30);
+    await tick(200);
+    assert.deepEqual(f.adapter.submitted, []);
+    assert.ok(!f.tasks.events(f.taskId).some((event) => event.kind === "blocked"));
+  } finally {
+    f.close();
+  }
+});
+
+test("rearm skips tasks with first-turn evidence", async () => {
+  const f = fixture("perch-kickoff-rearm-evidence-");
+  try {
+    recordDispatchOperation(f);
+    markSessionLive(f);
+    f.tasks.recordEvent(f.taskId, { kind: "working", source: "worker", message: "on it" });
+
+    await rearmCodexKickoffWatchdogs(f, 30);
+    await tick(200);
+    assert.deepEqual(f.adapter.submitted, []);
+    assert.ok(!f.tasks.events(f.taskId).some((event) => event.kind === "blocked"));
+  } finally {
+    f.close();
   }
 });

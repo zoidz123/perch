@@ -744,7 +744,8 @@ export function codexFirstTurnEvidence(
 // adjudicates instead of the worker "working" forever. Evidence is re-checked
 // immediately before the retry, so a first turn that lands in the window
 // suppresses it, and the per-session guard makes the retry exactly-once even
-// when arming races.
+// when arming races. A submitted retry is journaled on the task ledger so a
+// rearm after a server restart never submits a second one.
 export function armCodexKickoffWatchdog(
   deps: CodexKickoffWatchdogDeps,
   sessionId: string,
@@ -755,7 +756,14 @@ export function armCodexKickoffWatchdog(
   if (codexKickoffWatchdogs.has(sessionId)) return;
   codexKickoffWatchdogs.add(sessionId);
   const disarm = () => codexKickoffWatchdogs.delete(sessionId);
-  const finalPass = () => {
+  const retrySpent = () =>
+    deps.tasks
+      .events(taskId)
+      .some(
+        (event) =>
+          event.kind === "note" && event.data?.reason === "kickoff_retried" && event.data?.sessionId === sessionId
+      );
+  const finalPass = (retry: "submitted" | "gated") => {
     try {
       if (codexFirstTurnEvidence(deps, sessionId, taskId)) return;
       const task = deps.tasks.find(taskId);
@@ -766,8 +774,10 @@ export function armCodexKickoffWatchdog(
         kind: "blocked",
         source: "system",
         message:
-          "codex worker shows no first turn after launch and one kickoff retry; the kickoff prompt was never accepted",
-        data: { reason: "kickoff_not_accepted", sessionId }
+          retry === "submitted"
+            ? "codex worker shows no first turn after launch and one kickoff retry; the kickoff prompt was never accepted"
+            : "codex worker shows no first turn after launch and the kickoff retry was skipped by an open permission gate; the kickoff prompt was never accepted",
+        data: { reason: "kickoff_not_accepted", sessionId, retry }
       });
     } catch {
       // Ledger bookkeeping must never disturb the session.
@@ -776,23 +786,75 @@ export function armCodexKickoffWatchdog(
     }
   };
   const retryPass = async () => {
+    let retry: "submitted" | "gated";
     try {
       if (codexFirstTurnEvidence(deps, sessionId, taskId)) return disarm();
-      // Exactly one retry of the exact original kickoff. queueIfGated: false -
-      // an open permission gate means the worker is not silently empty (the
-      // approval flow owns that outcome), and queued text typed later could
-      // land after the gate resolves and duplicate an accepted kickoff.
-      deps.timeline.recordSource(sessionId, kickoff, "agent");
-      await deps.monitor.queueOrSubmit(sessionId, kickoff, { queueIfGated: false });
+      if (retrySpent()) {
+        // A previous server life already spent the one retry; only the final
+        // adjudication window remains.
+        retry = "submitted";
+      } else {
+        // Exactly one retry of the exact original kickoff. queueIfGated: false -
+        // an open permission gate means the worker is not silently empty (the
+        // approval flow owns that outcome), and queued text typed later could
+        // land after the gate resolves and duplicate an accepted kickoff. Only
+        // an actually submitted retry earns a provenance record and the
+        // spent-retry journal entry.
+        const result = await deps.monitor.queueOrSubmit(sessionId, kickoff, { queueIfGated: false });
+        retry = result.gated ? "gated" : "submitted";
+        if (!result.gated) {
+          deps.timeline.recordSource(sessionId, kickoff, "agent");
+          deps.tasks.recordEvent(taskId, {
+            kind: "note",
+            source: "system",
+            message: "codex kickoff retried after a silent launch window",
+            data: { reason: "kickoff_retried", sessionId }
+          });
+        }
+      }
     } catch {
       // The session already ended; exit reporting owns the truthful outcome.
       return disarm();
     }
-    const finalTimer = setTimeout(finalPass, windowMs);
+    const finalTimer = setTimeout(() => finalPass(retry), windowMs);
     finalTimer.unref?.();
   };
   const retryTimer = setTimeout(() => void retryPass(), windowMs);
   retryTimer.unref?.();
+}
+
+// The armed watchdog is process memory; a server restart inside its window
+// would otherwise leave a silent dispatched worker unwatched (the generic
+// launch-stall backstop can be fooled by TUI banner activity). Rearm at boot
+// from durable state alone: still-queued/working codex task dispatches whose
+// session is live and shows no first-turn evidence, with the exact original
+// kickoff read back from the dispatch operation's prepared launch request.
+export async function rearmCodexKickoffWatchdogs(
+  deps: CodexKickoffWatchdogDeps & { adapter: Pick<AgentAdapter, "listSessions"> },
+  windowMs = CODEX_KICKOFF_RETRY_MS
+): Promise<void> {
+  let live: Set<string>;
+  try {
+    live = new Set((await deps.adapter.listSessions()).map((session) => session.id));
+  } catch {
+    return;
+  }
+  for (const task of deps.tasks.list()) {
+    try {
+      if (task.state !== "queued" && task.state !== "working") continue;
+      if (!task.sessionId || !live.has(task.sessionId)) continue;
+      const operation = deps.tasks.stateDb.operations.latestForTask(task.id, "dispatch");
+      const request = (operation?.payload as { prepared?: { request?: StartAgentRequest } } | undefined)?.prepared
+        ?.request;
+      if (!request || typeof request.initialPrompt !== "string" || request.initialPrompt.trim().length === 0) continue;
+      if (request.sessionId !== task.sessionId) continue;
+      if (launchAgentKind(request.command, request.agent) !== "codex") continue;
+      if (codexFirstTurnEvidence(deps, task.sessionId, task.id)) continue;
+      armCodexKickoffWatchdog(deps, task.sessionId, task.id, request.initialPrompt, windowMs);
+    } catch {
+      // One task's bad records must never block the boot rearm sweep.
+    }
+  }
 }
 
 // Resolve the agent kind for a launch, mirroring the PTY adapter's inference so
