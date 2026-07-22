@@ -696,7 +696,7 @@ export class CodexAppServerClient {
     await this.sendInterrupt();
 
     const grace = opts?.gracePeriodMs ?? ABORT_GRACE_MS;
-    const settled = await this.waitForTurnCompletion(grace);
+    const settled = await this.waitForPendingTurnCompletion(grace);
     if (settled) {
       return { hadActiveTurn: true, aborted: true, forcedRestart: false, resumedThread: false };
     }
@@ -726,7 +726,7 @@ export class CodexAppServerClient {
     return this.pendingInterrupt;
   }
 
-  private async waitForTurnCompletion(timeoutMs: number): Promise<boolean> {
+  private async waitForPendingTurnCompletion(timeoutMs: number): Promise<boolean> {
     if (!this.pendingTurnCompletion) return true;
     const deadline = Date.now() + Math.max(0, timeoutMs);
     while (this.pendingTurnCompletion) {
