@@ -119,9 +119,10 @@ export class RuntimeManager {
 
   // Returns the updated record only when this call transitioned the runtime;
   // undefined when it was already settled or the CAS lost. A "recovering"
-  // runtime is excluded: its ptySessionId still names the dead pre-recovery
-  // PTY, so old-session death evidence must not revoke the held recovery
-  // claim - bind, failRecovery, or the startup reconcile own that lifecycle.
+  // runtime is excluded: its legacy-named ptySessionId still identifies the
+  // dead pre-recovery session, so old-session death evidence must not revoke
+  // the held recovery claim - bind, failRecovery, or the startup reconcile own
+  // that lifecycle.
   interruptSession(
     sessionId: string,
     message = "worker runtime interrupted",
@@ -246,7 +247,7 @@ export class RuntimeManager {
     return failed;
   }
 
-  // A candidate PTY that refused to die may still hold the provider
+  // A candidate runtime that refused to die may still hold the provider
   // conversation, so the claim deliberately stays "recovering" rather than
   // reopening recovery against a possibly-live duplicate. There is no
   // same-process retry path from here: POST /tasks/:id/recover answers 409

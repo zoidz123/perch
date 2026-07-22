@@ -488,9 +488,9 @@ taskWatchdog.start();
 // trees stay leased and visible rather than losing work). A holder also counts
 // as live while its task is still open, so a stalled-but-decidable task never
 // loses its slot to the reaper; POST /worktrees/:id/release is the explicit
-// path for everything this skips. Runs once at startup - server-owned PTYs die
-// with the server, so a previous life's expired leases reclaim immediately -
-// and then on an interval.
+// path for everything this skips. Runs once at startup so expired leases from
+// sessions that did not survive can reclaim immediately, and then on an
+// interval.
 const reclaimOrphanedLeases = () =>
   (async () => {
     const live = new Set((await adapter.listSessions()).map((session) => session.id));

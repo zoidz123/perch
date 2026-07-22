@@ -246,10 +246,10 @@ export class TimelineStore {
   // `claude --resume` forks the conversation into a fresh jsonl (new uuid) in
   // the same project dir and abandons the resumed-from file, often only at the
   // first post-resume turn (which for an idle mate can be hours later). No
-  // further SessionStart hook names the fork, so this active re-resolution -
-  // the Claude analogue of the codex rollout scan - is the only way to follow
-  // it. Lineage is confirmed by the shared root message uuid, so a concurrent
-  // unrelated session in the same dir is never adopted. Idempotent per session;
+  // further SessionStart hook names the fork, so this active re-resolution is
+  // the only way to follow it. Lineage is confirmed by the shared root message
+  // uuid, so a concurrent unrelated session in the same dir is never adopted.
+  // Idempotent per session;
   // the resolver reads whatever transcript the SessionStart hook attaches, so
   // calling this before the first attach is safe (it waits).
   followClaudeResume(sessionId: string, isPathAllowed?: (path: string) => boolean): void {

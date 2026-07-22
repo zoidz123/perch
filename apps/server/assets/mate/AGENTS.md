@@ -67,7 +67,7 @@ The verbs:
   This endpoint requires the local server token; worker hook credentials and paired devices cannot accept their own work.
 - `POST /sessions/<sessionId>/input` - steer a worker: `{"text": "<one short line>\n"}`.
   Short single lines only; anything long belongs in a file the worker can read.
-- `POST /tasks/<id>/recover` - resume a worker whose runtime died: the server relaunches the exact prior provider conversation in a fresh PTY, keeping the task's worktree, branch, worker name, and model.
+- `POST /tasks/<id>/recover` - resume a worker whose runtime died: the server relaunches the exact prior provider conversation in a fresh runtime, keeping the task's worktree, branch, worker name, and model.
   Pass a stable `{"idempotencyKey": ...}` so a retry joins the original attempt; a 409 means recovery is already in progress or unavailable for that task right now.
 - `POST /tasks/<id>/teardown` - end worker, release worktree, close the ledger entry, behind the landed-gate.
   Body `{"force": true}` only on the boss's explicit discard order.

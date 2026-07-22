@@ -17,8 +17,8 @@ import { createHash, randomBytes } from "node:crypto";
 import type { AgentSessionStatus, QuestionItem } from "@perch/shared";
 import { ASK_USER_QUESTION_TOOL, extractQuestions, questionId } from "./askQuestion.js";
 
-// Perch recovers agent structure without owning provider SDKs: every
-// perch-spawned PTY carries PERCH_SESSION_ID / PERCH_HOOK_URL /
+// Perch recovers agent structure without owning provider SDKs: every managed
+// provider process carries PERCH_SESSION_ID / PERCH_HOOK_URL /
 // PERCH_HOOK_TOKEN in its environment, and a globally-installed Claude hook
 // (gated on that env, inert everywhere else) POSTs each hook event back to
 // the local server. Fail-open by design: a dead server must never break the
@@ -730,8 +730,8 @@ export function claudeTranscriptPath(
   return join(configDir, "projects", physical.replace(/[^a-zA-Z0-9]/g, "-"), `${claudeSessionId}.jsonl`);
 }
 
-// Maps perch PTY sessions to their hook tokens and, once SessionStart
-// arrives, to the agent's own session id + transcript path.
+// Maps Perch sessions to their hook tokens and, once SessionStart arrives, to
+// the agent's own session id + transcript path.
 export type HookCorrelation = {
   sessionId: string;
   agentSessionId?: string;
@@ -765,9 +765,8 @@ export class HookRegistry {
   }
 
   // Deliberate credential rotation: mints a fresh token and revokes any prior
-  // token for the session. Launch paths must use ensure() instead - a codex
-  // `--remote` launch registers the same session twice (daemon env, then PTY
-  // env), and re-minting here silently invalidated the daemon's copy.
+  // token for the session. Launch paths must use ensure() instead because
+  // multiple setup paths can request credentials for the same live session.
   register(sessionId: string): { token: string } {
     for (const [token, registered] of this.tokens) {
       if (registered === sessionId) this.tokens.delete(token);
@@ -780,8 +779,8 @@ export class HookRegistry {
   }
 
   // Idempotent registration: returns the session's live token when one exists,
-  // minting only for a new session. Every registration path for the same live
-  // session (codex daemon env + PTY env) shares one credential this way.
+  // minting only for a new session. Every setup path for the same live session
+  // shares one credential this way.
   ensure(sessionId: string): { token: string } {
     for (const [token, registered] of this.tokens) {
       if (registered === sessionId) {

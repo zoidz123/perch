@@ -4641,8 +4641,8 @@ async function handleHookReport(
     const codexOwnedTurnBoundary = format === "codex" && options.codexOwned?.has(sessionId) === true;
 
     // Snapshot the immutable task-event sequence before the automatic
-    // new-turn working event. Native Codex control owns this boundary when
-    // attached; plain Codex PTY fallback uses its verified hooks like Claude.
+    // new-turn working event. App-server-owned Codex control owns this
+    // boundary; hook-driven providers use their verified hooks.
     if (eventName === "UserPromptSubmit" && !codexOwnedTurnBoundary) {
       options.taskCompletion?.onTurnStarted(sessionId, format);
     }

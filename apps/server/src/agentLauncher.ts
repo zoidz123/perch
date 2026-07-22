@@ -382,9 +382,9 @@ export async function startManagedAgent(
 
     // A resumed Claude session forks its transcript into a fresh jsonl (new
     // uuid) and abandons the resumed-from file the SessionStart hook names, so
-    // the tailer must actively re-resolve to the live fork - the Claude
-    // analogue of the codex rollout scan. Scoped to `--resume` launches only;
-    // fresh sessions do not fork, and codex resume uses `resume` (no dashes).
+    // the tailer must actively re-resolve to the live fork. This is scoped to
+    // `--resume` launches only; fresh sessions do not fork, and app-server-owned
+    // Codex sessions use protocol events instead of transcript tailing.
     if (isClaudeResumeLaunch(request)) {
       options.timeline.followClaudeResume(session.id, isAllowedTranscriptPath);
     }

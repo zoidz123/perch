@@ -224,10 +224,10 @@ export class RecoveryCoordinator {
       }
       try {
         await identity;
-        // Identity evidence can arrive out-of-band (the codex driver resumes
+        // Identity evidence can arrive out-of-band (the Codex driver resumes
         // the thread against its own app-server), which proves the persisted
-        // conversation is resumable but not that the freshly spawned TUI
-        // survived startup. Never bind a live generation to a PTY that has
+        // conversation is resumable but not that the replacement session
+        // survived startup. Never bind a live generation to a session that
         // already exited.
         const alive = (await this.options.adapter.listSessions()).some(
           (session) => session.id === launchedSessionId && session.status !== "done" && session.status !== "error"
