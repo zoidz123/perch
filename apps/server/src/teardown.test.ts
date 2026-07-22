@@ -26,6 +26,30 @@ function makeRepo(): string {
   return dir;
 }
 
+function makeRemoteFixture(): { base: string; seed: string; clone: string } {
+  const base = mkdtempSync(join(tmpdir(), "perch-td-remote-"));
+  const upstream = join(base, "upstream.git");
+  execFileSync("git", ["init", "-q", "--bare", "-b", "main", upstream], { stdio: "pipe" });
+
+  const seed = join(base, "seed");
+  execFileSync("git", ["init", "-q", "-b", "main", seed], { stdio: "pipe" });
+  const seedRun = (args: string[]) => execFileSync("git", ["-C", seed, ...args], { stdio: "pipe" });
+  seedRun(["config", "user.email", "t@t"]);
+  seedRun(["config", "user.name", "t"]);
+  writeFileSync(join(seed, "readme.md"), "hello\n");
+  seedRun(["add", "."]);
+  seedRun(["commit", "-qm", "init"]);
+  seedRun(["remote", "add", "origin", upstream]);
+  seedRun(["push", "-q", "-u", "origin", "main"]);
+
+  const clone = join(base, "clone");
+  execFileSync("git", ["clone", "-q", upstream, clone], { stdio: "pipe" });
+  const cloneRun = (args: string[]) => execFileSync("git", ["-C", clone, ...args], { stdio: "pipe" });
+  cloneRun(["config", "user.email", "t@t"]);
+  cloneRun(["config", "user.name", "t"]);
+  return { base, seed, clone };
+}
+
 function inSlot(path: string, args: string[]): void {
   execFileSync("git", ["-C", path, ...args], { stdio: "pipe" });
 }
@@ -141,6 +165,71 @@ test("auto-return: a merged PR returns the worktree within the poll cycle", asyn
   assert.ok(kinds.includes("note"), "an auto-return trail note is recorded");
   assert.equal(kinds.filter((k) => k === "merged").length, 1);
   assert.equal(kinds.filter((k) => k === "closed").length, 1);
+
+  h.cleanup();
+});
+
+test("auto-return: a ready done PR stays fast-polled after its window and returns on merge", async () => {
+  const h = harness();
+  const task = h.tasks.create({ title: "merge after settled checks", project: h.repo });
+  h.tasks.recordEvent(task.id, { kind: "working", source: "worker" });
+  h.tasks.recordEvent(task.id, { kind: "done", source: "worker" });
+
+  const sessionId = "pty:late-merge";
+  const lease = await h.pool.acquire(h.repo, sessionId);
+  h.tasks.update(task.id, {
+    sessionId,
+    worktreeId: lease.id,
+    branch: "perch/late-merge",
+    pr: { url: "https://github.com/o/r/pull/41" }
+  });
+
+  let clock = 1_000_000;
+  let merged = false;
+  let polls = 0;
+  const { pending } = autoReturn(h);
+  const poller = new PrPoller(
+    h.tasks,
+    async () => {
+      polls += 1;
+      return {
+        state: merged ? "MERGED" : "OPEN",
+        mergedAt: merged ? "2026-07-22T00:00:00Z" : null,
+        headRefName: "perch/late-merge",
+        headRepository: { nameWithOwner: "o/r" },
+        statusCheckRollup: [{ conclusion: "SUCCESS" }],
+        isDraft: false,
+        mergeable: "MERGEABLE",
+        mergeStateStatus: "CLEAN",
+        reviewDecision: "APPROVED"
+      };
+    },
+    { now: () => clock, fastWindowMs: 60_000 }
+  );
+
+  poller.armFast(task.id);
+  await poller.fastTick();
+  assert.equal(h.tasks.find(task.id)?.pr?.mergeReady, true);
+
+  // Checks settled before the original fast window expired. GitHub merges
+  // just afterward, so the next fast tick must still observe it rather than
+  // waiting for the five-minute baseline.
+  clock += 60_001;
+  merged = true;
+  await poller.fastTick();
+  await Promise.all(pending);
+
+  assert.equal(polls, 2, "the later fast tick observes the merge");
+  assert.equal(h.tasks.find(task.id)?.state, "closed");
+  assert.equal(h.pool.find(lease.id)?.leasedBy, undefined, "the worker slot auto-returns");
+  assert.deepEqual(h.stopped, [sessionId]);
+
+  await poller.fastTick();
+  await Promise.all(pending);
+  const kinds = h.tasks.events(task.id).map((event) => event.kind);
+  assert.equal(kinds.filter((kind) => kind === "merged").length, 1);
+  assert.equal(kinds.filter((kind) => kind === "closed").length, 1);
+  assert.equal(polls, 2, "closed tasks stop fast polling");
 
   h.cleanup();
 });
@@ -276,6 +365,47 @@ test("gate refuses committed-but-unlanded work with no merged PR", async () => {
   assert.equal(h.pool.find(lease.id)?.leasedBy, sessionId, "unlanded work stays leased");
 
   h.cleanup();
+});
+
+test("gate fetches stale origin/main before checking landed ancestry", async () => {
+  const { base, seed, clone } = makeRemoteFixture();
+  const home = mkdtempSync(join(tmpdir(), "perch-td-home-"));
+  const tasks = new TaskStore({ PERCH_HOME: home } as NodeJS.ProcessEnv);
+  const task = tasks.create({ title: "merged upstream", project: clone });
+  tasks.recordEvent(task.id, { kind: "working", source: "worker" });
+  tasks.recordEvent(task.id, { kind: "done", source: "worker" });
+
+  const localMain = execFileSync("git", ["-C", clone, "rev-parse", "main"]).toString().trim();
+  execFileSync("git", ["-C", clone, "checkout", "-q", "--detach"], { stdio: "pipe" });
+  writeFileSync(join(clone, "landed.txt"), "landed\n");
+  inSlot(clone, ["add", "."]);
+  inSlot(clone, ["commit", "-qm", "landed work"]);
+  const landedHead = execFileSync("git", ["-C", clone, "rev-parse", "HEAD"]).toString().trim();
+  execFileSync("git", ["-C", clone, "push", "-q", "origin", "HEAD:main"], { stdio: "pipe" });
+  execFileSync("git", ["-C", clone, "update-ref", "refs/remotes/origin/main", localMain], { stdio: "pipe" });
+
+  const verdict = await landedGate(tasks.find(task.id)!, clone);
+
+  assert.equal(verdict.landed, true);
+  assert.match(verdict.reason, /origin\/main|remote branch/);
+  assert.equal(
+    execFileSync("git", ["-C", clone, "rev-parse", "origin/main"]).toString().trim(),
+    landedHead,
+    "the targeted fetch refreshes the remote-tracking ref"
+  );
+  assert.equal(
+    execFileSync("git", ["-C", clone, "rev-parse", "main"]).toString().trim(),
+    localMain,
+    "the user's local default branch is untouched"
+  );
+  assert.equal(
+    execFileSync("git", ["-C", seed, "rev-parse", "main"]).toString().trim(),
+    localMain,
+    "the unrelated seed checkout is untouched"
+  );
+
+  rmSync(home, { recursive: true, force: true });
+  rmSync(base, { recursive: true, force: true });
 });
 
 test("gate refuses a merged PR record whose repo conflicts with the task", async () => {

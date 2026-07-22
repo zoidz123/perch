@@ -5,7 +5,7 @@ import type { AgentAdapter } from "./adapters/types.js";
 import type { AuditLog } from "./audit.js";
 import { validateRecordedTaskPrIdentity } from "./prPoller.js";
 import type { TaskStore } from "./tasks.js";
-import type { WorktreeLease, WorktreePool } from "./worktrees.js";
+import { fetchDefaultBranch, type WorktreeLease, type WorktreePool } from "./worktrees.js";
 import type { RuntimeManager } from "./runtimeManager.js";
 
 const execFileAsync = promisify(execFile);
@@ -57,6 +57,10 @@ export async function landedGate(task: Task, worktreePath?: string): Promise<Lan
       }
       return { landed: true, reason: `PR merged: ${task.pr.url}` };
     }
+    // Refresh only origin/<default> before ancestry checks. This shares the
+    // pool release path's fetch-only behavior: local branches are untouched,
+    // and an unavailable remote degrades to the last-known tracking ref.
+    await fetchDefaultBranch(path);
     // HEAD reachable from any remote ref: pushed, safe.
     const { stdout: remotes } = await git(path, ["branch", "-r", "--contains", "HEAD"]);
     if (remotes.trim().length > 0) {

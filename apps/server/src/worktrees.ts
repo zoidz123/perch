@@ -478,7 +478,7 @@ async function defaultBranchName(repo: string): Promise<string | undefined> {
 // are never touched. Offline or a failed fetch degrades to the last-known
 // ref with a one-line warning; a network hiccup must never block dispatch.
 // No-remote repos skip entirely (local-tip behavior unchanged).
-async function fetchDefaultBranch(repo: string): Promise<void> {
+export async function fetchDefaultBranch(repo: string): Promise<void> {
   const name = await defaultBranchName(repo);
   if (!name) {
     return;

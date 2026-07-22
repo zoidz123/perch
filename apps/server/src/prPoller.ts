@@ -152,8 +152,9 @@ export class PrPoller {
     await this.poll(() => true, "baseline");
   }
 
-  // The fast lane: only tasks inside their fast window. A no-op (zero gh
-  // calls) when nothing is expecting change.
+  // The fast lane: tasks inside their fast window plus done PRs that are ready
+  // to merge. Ready PRs stay fast until GitHub reports merged or closed, so a
+  // merge just after the original window does not wait for the slow baseline.
   async fastTick(): Promise<void> {
     const now = this.now();
     for (const [taskId, until] of this.fastUntil) {
@@ -161,10 +162,12 @@ export class PrPoller {
         this.fastUntil.delete(taskId);
       }
     }
-    if (this.fastUntil.size === 0) {
+    const include = (task: Task): boolean =>
+      this.fastUntil.has(task.id) || isAwaitingMerge(task);
+    if (this.fastUntil.size === 0 && !this.tasks.list().some(isAwaitingMerge)) {
       return;
     }
-    await this.poll((task) => this.fastUntil.has(task.id), "fast");
+    await this.poll(include, "fast");
   }
 
   // The exact commit currently checked out for this task's work, resolved
@@ -475,6 +478,10 @@ function shouldPoll(task: Task): boolean {
     !!task.pr?.url &&
     !task.pr.merged
   );
+}
+
+function isAwaitingMerge(task: Task): boolean {
+  return task.state === "done" && task.pr?.mergeReady === true && !task.pr.merged;
 }
 
 function shouldDiscover(task: Task): boolean {
