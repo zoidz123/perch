@@ -1,6 +1,15 @@
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import {
+  chmodSync,
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  renameSync,
+  rmSync,
+  writeFileSync
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
@@ -249,6 +258,42 @@ test("a reused slot is re-based on the fresh origin tip at acquire", async () =>
   const second = await pool.acquire(clone, "pty:b");
   assert.equal(second.path, first.path, "slot is reused");
   assert.equal(revParse(second.path, "HEAD"), remoteTip, "reused slot re-detaches at the fresh tip");
+
+  rmSync(root, { recursive: true, force: true });
+  rmSync(base, { recursive: true, force: true });
+});
+
+test("acquire resolves the remote default once across failed candidates", async () => {
+  const { base, clone } = makeRemoteFixture();
+  const root = mkdtempSync(join(tmpdir(), "perch-wt-pool-"));
+  const pool = new WorktreePool({ root, maxSlots: 3 });
+  const first = await pool.acquire(clone, "pty:a");
+  const second = await pool.acquire(clone, "pty:b");
+  await pool.release(first.id);
+  await pool.release(second.id);
+  renameSync(join(first.path, ".git"), join(first.path, ".git-broken"));
+  renameSync(join(second.path, ".git"), join(second.path, ".git-broken"));
+  execFileSync(
+    "git",
+    ["-C", clone, "symbolic-ref", "--delete", "refs/remotes/origin/HEAD"],
+    { stdio: "pipe" }
+  );
+  const uploadPack = join(base, "counting-upload-pack");
+  writeFileSync(
+    uploadPack,
+    `#!/bin/sh\nprintf '1\\n' >> "$0.count"\nexec git-upload-pack "$@"\n`
+  );
+  chmodSync(uploadPack, 0o755);
+  execFileSync("git", ["-C", clone, "config", "remote.origin.uploadpack", uploadPack]);
+
+  const lease = await pool.acquire(clone, "pty:c");
+
+  assert.equal(lease.slot, "3");
+  assert.equal(
+    readFileSync(`${uploadPack}.count`, "utf8").trim().split("\n").length,
+    2,
+    "one remote HEAD lookup and one targeted fetch"
+  );
 
   rmSync(root, { recursive: true, force: true });
   rmSync(base, { recursive: true, force: true });

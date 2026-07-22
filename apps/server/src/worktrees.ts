@@ -65,6 +65,10 @@ export type WorktreePoolOptions = {
   env?: NodeJS.ProcessEnv;
 };
 
+export type DefaultBranchResolution = {
+  base?: string;
+};
+
 export class WorktreePool {
   private readonly root: string;
   private readonly maxSlots: number;
@@ -108,6 +112,9 @@ export class WorktreePool {
     return this.withLock(this.poolKey(repo), async () => {
       const poolDir = this.poolDir(repo);
       const state = this.load(poolDir);
+      let defaultBranchPromise: Promise<DefaultBranchResolution> | undefined;
+      const resolveDefaultBranch = () =>
+        (defaultBranchPromise ??= fetchDefaultBranch(repo));
 
       let lease: WorktreeLease | undefined;
       for (const candidate of state.slots.filter((slot) => !slot.leasedBy && !slot.quarantinedAt)) {
@@ -119,8 +126,8 @@ export class WorktreePool {
           // A freed slot sits at whatever the default tip was when it was
           // released; re-detach it on the freshly fetched tip so a lease never
           // starts on a stale base.
-          const base = await fetchDefaultBranch(repo);
-          await resetToDefault(repo, candidate.path, base);
+          const defaultBranch = await resolveDefaultBranch();
+          await resetToDefault(repo, candidate.path, defaultBranch.base);
           lease = candidate;
           break;
         } catch (error) {
@@ -138,7 +145,7 @@ export class WorktreePool {
               : `worktree pool for ${basename(repo)} is unavailable (${this.maxSlots} slots: ${state.slots.length - quarantined} leased, ${quarantined} quarantined)`
           );
         }
-        lease = await this.createSlot(repo, poolDir, state);
+        lease = await this.createSlot(repo, poolDir, state, await resolveDefaultBranch());
       }
 
       lease.leasedBy = holder;
@@ -154,7 +161,10 @@ export class WorktreePool {
   // (mirroring teardown's landedGate, so plain session-exit release never
   // orphans committed-but-unlanded work). A clean+landed (or forced) return
   // resets to the repository's default branch tip and clears the lease.
-  async release(id: string, options: { force?: boolean } = {}): Promise<void> {
+  async release(
+    id: string,
+    options: { force?: boolean; defaultBranch?: DefaultBranchResolution } = {}
+  ): Promise<void> {
     return this.withLock(this.lockKeyForId(id), async () => {
       const located = this.locate(id);
       if (!located) {
@@ -165,7 +175,11 @@ export class WorktreePool {
       if (existsSync(lease.path)) {
         // Refresh origin/<default> before judging landed-ness: work merged on
         // GitHub counts as landed only once the remote-tracking ref knows it.
-        const base = await fetchDefaultBranch(lease.repoRoot);
+        const defaultBranch =
+          options.force && options.defaultBranch
+            ? options.defaultBranch
+            : await fetchDefaultBranch(lease.repoRoot);
+        const base = defaultBranch.base;
         if (!options.force) {
           if (await isDirty(lease.path)) {
             throw new Error(
@@ -308,13 +322,17 @@ export class WorktreePool {
     return undefined;
   }
 
-  private async createSlot(repo: string, poolDir: string, state: PoolState): Promise<WorktreeLease> {
+  private async createSlot(
+    repo: string,
+    poolDir: string,
+    state: PoolState,
+    defaultBranch: DefaultBranchResolution
+  ): Promise<WorktreeLease> {
     const slot = String(nextSlotNumber(state));
     const path = join(poolDir, slot, basename(repo));
     mkdirSync(join(poolDir, slot), { recursive: true });
 
-    const remoteBase = await fetchDefaultBranch(repo);
-    const base = remoteBase ?? (await defaultBranchCommit(repo));
+    const base = defaultBranch.base ?? (await defaultBranchCommit(repo));
     await git(repo, ["worktree", "add", "--detach", path, base]);
 
     const lease: WorktreeLease = {
@@ -496,10 +514,10 @@ async function localDefaultBranchName(repo: string): Promise<string | undefined>
 // are never touched. Offline or a failed fetch degrades to the last-known
 // ref with a one-line warning; a network hiccup must never block dispatch.
 // No-remote repos skip entirely (local-tip behavior unchanged).
-export async function fetchDefaultBranch(repo: string): Promise<string | undefined> {
+export async function fetchDefaultBranch(repo: string): Promise<DefaultBranchResolution> {
   const name = await defaultBranchName(repo);
   if (!name) {
-    return undefined;
+    return {};
   }
   const ref = `origin/${name}`;
   try {
@@ -515,9 +533,9 @@ export async function fetchDefaultBranch(repo: string): Promise<string | undefin
   }
   try {
     await git(repo, ["rev-parse", "--verify", ref]);
-    return ref;
+    return { base: ref };
   } catch {
-    return undefined;
+    return {};
   }
 }
 

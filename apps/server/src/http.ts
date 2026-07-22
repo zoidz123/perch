@@ -107,7 +107,12 @@ import { extractPrUrl, type PrPoller } from "./prPoller.js";
 import type { StateMetrics } from "./stateMetrics.js";
 import type { TaskStore } from "./tasks.js";
 import type { TaskCompletionReconciler } from "./taskCompletion.js";
-import { executeTeardown, landedGate, ownLeaseFor } from "./teardown.js";
+import {
+  executeTeardown,
+  landedGate,
+  ownLeaseFor,
+  type LandedVerdict
+} from "./teardown.js";
 import type { TimelineStore } from "./timeline.js";
 import type { WorktreePool } from "./worktrees.js";
 import { storeAttachment } from "./attachments.js";
@@ -3394,9 +3399,10 @@ async function teardownTaskRpc(
   }
 
   const force = body.force === true;
+  let verdict: LandedVerdict | undefined;
   if (!force) {
     const ownLease = ownLeaseFor(task, options.worktrees);
-    const verdict = await landedGate(task, ownLease?.path);
+    verdict = await landedGate(task, ownLease?.path);
     if (!verdict.landed) {
       return rpcError(409, `refusing teardown: ${verdict.reason}`);
     }
@@ -3411,7 +3417,7 @@ async function teardownTaskRpc(
       auditLog: options.auditLog,
       runtimeManager: options.runtimeManager
     },
-    { force }
+    { force, ...(verdict?.defaultBranch ? { defaultBranch: verdict.defaultBranch } : {}) }
   );
   return rpcOk(200, { task: updated });
 }
@@ -4541,10 +4547,11 @@ async function handleTeardown(
   }
   const body = await readJson<{ force?: boolean }>(request).catch(() => ({}) as { force?: boolean });
   const force = body.force === true;
+  let verdict: LandedVerdict | undefined;
 
   if (!force) {
     const ownLease = ownLeaseFor(task, options.worktrees);
-    const verdict = await landedGate(task, ownLease?.path);
+    verdict = await landedGate(task, ownLease?.path);
     if (!verdict.landed) {
       writeJson(response, 409, { error: `refusing teardown: ${verdict.reason}` });
       return;
@@ -4560,7 +4567,11 @@ async function handleTeardown(
       auditLog: options.auditLog,
       runtimeManager: options.runtimeManager
     },
-    { force, remoteAddress: request.socket.remoteAddress }
+    {
+      force,
+      remoteAddress: request.socket.remoteAddress,
+      ...(verdict?.defaultBranch ? { defaultBranch: verdict.defaultBranch } : {})
+    }
   );
   writeJson(response, 200, { task: updated });
 }

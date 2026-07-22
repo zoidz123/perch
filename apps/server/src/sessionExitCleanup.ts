@@ -65,13 +65,17 @@ export async function cleanupSessionExitWorktree(
     lease,
     exitContext
   });
-  await executeTeardown(task, {
-    tasks: deps.tasks,
-    worktrees: deps.worktrees,
-    adapter: deps.adapter,
-    auditLog: deps.auditLog,
-    runtimeManager: deps.runtimeManager
-  });
+  await executeTeardown(
+    task,
+    {
+      tasks: deps.tasks,
+      worktrees: deps.worktrees,
+      adapter: deps.adapter,
+      auditLog: deps.auditLog,
+      runtimeManager: deps.runtimeManager
+    },
+    verdict.defaultBranch ? { defaultBranch: verdict.defaultBranch } : {}
+  );
 }
 
 function findTaskForSessionLease(

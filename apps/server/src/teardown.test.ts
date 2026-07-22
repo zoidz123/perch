@@ -122,12 +122,16 @@ function autoReturn(h: Harness): { pending: Promise<unknown>[] } {
           source: "system",
           message: `auto-return on merge: ${verdict.reason}`
         });
-        await executeTeardown(task, {
-          tasks: h.tasks,
-          worktrees: h.pool,
-          adapter: h.adapter,
-          auditLog: h.auditLog
-        });
+        await executeTeardown(
+          task,
+          {
+            tasks: h.tasks,
+            worktrees: h.pool,
+            adapter: h.adapter,
+            auditLog: h.auditLog
+          },
+          verdict.defaultBranch ? { defaultBranch: verdict.defaultBranch } : {}
+        );
       })()
     );
   });
@@ -431,6 +435,70 @@ test("gate resolves and fetches origin/main without a local origin/HEAD", async 
     "one remote HEAD lookup and one targeted fetch"
   );
 
+  rmSync(home, { recursive: true, force: true });
+  rmSync(base, { recursive: true, force: true });
+});
+
+test("complete ancestry teardown reuses the gate's default branch", async () => {
+  const { base, clone } = makeRemoteFixture();
+  const poolRoot = mkdtempSync(join(tmpdir(), "perch-td-pool-"));
+  const home = mkdtempSync(join(tmpdir(), "perch-td-home-"));
+  const pool = new WorktreePool({ root: poolRoot, maxSlots: 1 });
+  const tasks = new TaskStore({ PERCH_HOME: home } as NodeJS.ProcessEnv);
+  const auditLog = new AuditLog(join(home, "audit.jsonl"));
+  const task = tasks.create({ title: "merged upstream", project: clone });
+  tasks.recordEvent(task.id, { kind: "working", source: "worker" });
+  tasks.recordEvent(task.id, { kind: "done", source: "worker" });
+  const sessionId = "pty:ancestry";
+  const lease = await pool.acquire(clone, sessionId);
+  tasks.update(task.id, { sessionId, worktreeId: lease.id });
+  const staleTip = execFileSync("git", ["-C", clone, "rev-parse", "origin/main"])
+    .toString()
+    .trim();
+  writeFileSync(join(lease.path, "landed.txt"), "landed\n");
+  inSlot(lease.path, ["add", "."]);
+  inSlot(lease.path, ["commit", "-qm", "landed work"]);
+  inSlot(lease.path, ["push", "-q", "origin", "HEAD:main"]);
+  execFileSync(
+    "git",
+    ["-C", clone, "update-ref", "refs/remotes/origin/main", staleTip],
+    { stdio: "pipe" }
+  );
+  execFileSync(
+    "git",
+    ["-C", clone, "symbolic-ref", "--delete", "refs/remotes/origin/HEAD"],
+    { stdio: "pipe" }
+  );
+  const uploadPack = join(base, "teardown-upload-pack");
+  writeFileSync(
+    uploadPack,
+    `#!/bin/sh\nprintf '1\\n' >> "$0.count"\nexec git-upload-pack "$@"\n`
+  );
+  chmodSync(uploadPack, 0o755);
+  execFileSync("git", ["-C", clone, "config", "remote.origin.uploadpack", uploadPack]);
+
+  const verdict = await landedGate(tasks.find(task.id)!, lease.path);
+  assert.equal(verdict.landed, true);
+  await executeTeardown(
+    tasks.find(task.id)!,
+    {
+      tasks,
+      worktrees: pool,
+      adapter: { name: "test", stopSession: async () => {} } as unknown as AgentAdapter,
+      auditLog
+    },
+    verdict.defaultBranch ? { defaultBranch: verdict.defaultBranch } : {}
+  );
+
+  assert.equal(tasks.find(task.id)?.state, "closed");
+  assert.equal(pool.find(lease.id)?.leasedBy, undefined);
+  assert.equal(
+    readFileSync(`${uploadPack}.count`, "utf8").trim().split("\n").length,
+    2,
+    "gate and forced release share one lookup and fetch"
+  );
+
+  rmSync(poolRoot, { recursive: true, force: true });
   rmSync(home, { recursive: true, force: true });
   rmSync(base, { recursive: true, force: true });
 });

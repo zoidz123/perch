@@ -5,7 +5,12 @@ import type { AgentAdapter } from "./adapters/types.js";
 import type { AuditLog } from "./audit.js";
 import { validateRecordedTaskPrIdentity } from "./prPoller.js";
 import type { TaskStore } from "./tasks.js";
-import { fetchDefaultBranch, type WorktreeLease, type WorktreePool } from "./worktrees.js";
+import {
+  fetchDefaultBranch,
+  type DefaultBranchResolution,
+  type WorktreeLease,
+  type WorktreePool
+} from "./worktrees.js";
 import type { RuntimeManager } from "./runtimeManager.js";
 
 const execFileAsync = promisify(execFile);
@@ -17,6 +22,7 @@ const execFileAsync = promisify(execFile);
 export type LandedVerdict = {
   landed: boolean;
   reason: string;
+  defaultBranch?: DefaultBranchResolution;
 };
 
 export async function landedGate(task: Task, worktreePath?: string): Promise<LandedVerdict> {
@@ -60,20 +66,24 @@ export async function landedGate(task: Task, worktreePath?: string): Promise<Lan
     // Refresh only origin/<default> before ancestry checks. This shares the
     // pool release path's fetch-only behavior: local branches are untouched,
     // and an unavailable remote degrades to the last-known tracking ref.
-    const remoteBase = await fetchDefaultBranch(path);
+    const defaultBranch = await fetchDefaultBranch(path);
     // HEAD reachable from any remote ref: pushed, safe.
     const { stdout: remotes } = await git(path, ["branch", "-r", "--contains", "HEAD"]);
     if (remotes.trim().length > 0) {
-      return { landed: true, reason: "HEAD is reachable from a remote branch" };
+      return {
+        landed: true,
+        reason: "HEAD is reachable from a remote branch",
+        defaultBranch
+      };
     }
     // HEAD an ancestor of the default branch: landed locally. origin/HEAD
     // when a remote exists, the project root's HEAD otherwise (plain local
     // repos are first-class, matching the pool's own base rule).
-    const base = remoteBase ?? (await defaultRef(path)) ?? (await headCommit(task.project));
+    const base = defaultBranch.base ?? (await defaultRef(path)) ?? (await headCommit(task.project));
     if (base) {
       try {
         await git(path, ["merge-base", "--is-ancestor", "HEAD", base]);
-        return { landed: true, reason: `HEAD is contained in ${base}` };
+        return { landed: true, reason: `HEAD is contained in ${base}`, defaultBranch };
       } catch {
         // Not an ancestor; fall through.
       }
@@ -149,7 +159,11 @@ export function isTeardownInFlight(taskId: string): boolean {
 export async function executeTeardown(
   task: Task,
   deps: TeardownDeps,
-  opts: { force?: boolean; remoteAddress?: string } = {}
+  opts: {
+    force?: boolean;
+    remoteAddress?: string;
+    defaultBranch?: DefaultBranchResolution;
+  } = {}
 ): Promise<Task> {
   const current = deps.tasks.find(task.id) ?? task;
   if (current.state === "closed" || inFlight.has(task.id)) {
@@ -168,7 +182,10 @@ export async function executeTeardown(
       // would re-trigger the squash-merge false positive on a merged, diverged
       // HEAD. The task-layer gate (or force) already authorized this teardown
       // and is the stronger, PR-aware authority.
-      await deps.worktrees.release(lease.id, { force: true }).catch(() => {});
+      await deps.worktrees.release(lease.id, {
+        force: true,
+        ...(opts.defaultBranch ? { defaultBranch: opts.defaultBranch } : {})
+      }).catch(() => {});
       // Clean up the local task branch; leave the remote branch alone (its
       // lifecycle is GitHub's - delete-on-merge is a repo setting, not ours).
       if (current.branch) {
