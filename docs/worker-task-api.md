@@ -254,6 +254,8 @@ An idempotency key may be retried with the same decision, but reusing it for dif
 
 Accept records `completion_accepted` and moves the task to `done`.
 If the attached PR merged during review, the server then records the merge and advances the task to `landed`.
+After a trusted `done` PR is first observed as merge-ready, the server keeps it on the fast polling cadence until GitHub reports it merged or closed.
+A temporary readiness regression or server restart does not return that PR to the baseline cadence.
 
 Every completion request is bound to the exact deliverable it claims: the current PR head SHA for PR modes, or the exact checkout HEAD commit SHA for `local-only`.
 The derived `ready_to_merge` presentation holds only while the mate's acceptance of the latest completion request still matches the current PR head and that head has passing checks and GitHub mergeability.
@@ -321,6 +323,8 @@ The normal body is `{}`.
 
 Teardown stops the worker, releases its worktree, and records task closure only after the landed gate proves that work is safe to release.
 Dirty or unlanded work and live holders cause refusal rather than silent data loss.
+Before using commit reachability as landing proof, the gate refreshes only the default remote-tracking branch and never moves a local branch.
+If that fetch is unavailable, the gate falls back to the last-known remote-tracking ref.
 
 ## State and event rules to preserve
 
