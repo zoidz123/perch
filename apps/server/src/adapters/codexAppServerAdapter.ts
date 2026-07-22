@@ -408,8 +408,8 @@ export class CodexAppServerAdapter implements AgentAdapter {
   ): Promise<{ turnId: string | null }> {
     const session = this.mustSession(sessionId);
     return this.enqueue(session, async () => {
-      const result = await this.startTurnAcknowledged(session, text, opts.clientUserMessageId, opts.source);
-      return result;
+      const { turnId } = await this.startTurnAcknowledged(session, text, opts.clientUserMessageId, opts.source);
+      return { turnId };
     });
   }
 
@@ -420,10 +420,16 @@ export class CodexAppServerAdapter implements AgentAdapter {
   ): Promise<void> {
     const session = this.mustSession(sessionId);
     await this.enqueue(session, async () => {
-      const result = await session.client.submitTurnAndWait(text, {
-        clientUserMessageId: opts.clientUserMessageId,
-        ...(opts.source ? { source: opts.source } : {})
-      });
+      const acknowledged = await this.startTurnAcknowledged(
+        session,
+        text,
+        opts.clientUserMessageId,
+        opts.source
+      );
+      if (!acknowledged.turnId) throw new Error("codex readiness turn did not return an id");
+      const result = acknowledged.aborted === undefined
+        ? await session.client.waitForTurnCompletion(acknowledged.turnId)
+        : { aborted: acknowledged.aborted };
       if (result.aborted) throw new Error("codex readiness turn did not complete successfully");
       this.touch(session);
     });
@@ -495,7 +501,7 @@ export class CodexAppServerAdapter implements AgentAdapter {
     text: string,
     clientUserMessageId: string,
     source?: "human" | "agent"
-  ): Promise<{ turnId: string | null }> {
+  ): Promise<{ turnId: string | null; aborted?: boolean }> {
     try {
       const { turnId } = await session.client.submitTurn(text, {
         clientUserMessageId,
@@ -520,7 +526,7 @@ export class CodexAppServerAdapter implements AgentAdapter {
     text: string,
     clientUserMessageId: string,
     source?: "human" | "agent"
-  ): Promise<{ turnId: string | null }> {
+  ): Promise<{ turnId: string | null; aborted?: boolean }> {
     const threadId = session.threadId;
     if (!threadId) {
       throw new CodexDeliveryUnknownError(
@@ -560,7 +566,8 @@ export class CodexAppServerAdapter implements AgentAdapter {
         this.events.onTimelineItem?.({ ...item, ...(source ? { source } : {}) }, false);
       }
       this.touch(session);
-      return { turnId: landed.turn.id ?? null };
+      const aborted = terminalTurnAborted(landed.turn.status);
+      return { turnId: landed.turn.id ?? null, ...(aborted === undefined ? {} : { aborted }) };
     }
     // History-verified absence: the one resend this delivery may ever make.
     // A non-RPC failure here (connection lost again mid-resend) is once more
@@ -726,6 +733,12 @@ function isThreadNotMaterializedError(error: unknown): boolean {
 function threadTurns(result: unknown): ThreadHistoryTurn[] {
   const thread = (result as { thread?: { turns?: unknown } } | undefined)?.thread;
   return Array.isArray(thread?.turns) ? (thread.turns as ThreadHistoryTurn[]) : [];
+}
+
+function terminalTurnAborted(status: string | undefined): boolean | undefined {
+  if (status === "completed") return false;
+  if (["cancelled", "canceled", "aborted", "interrupted", "failed"].includes(status ?? "")) return true;
+  return undefined;
 }
 
 export function findTurnByClientMessageId(

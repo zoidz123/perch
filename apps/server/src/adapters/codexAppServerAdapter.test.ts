@@ -284,6 +284,30 @@ test("a lost turn/start response reconciles against thread history and never dup
   }
 });
 
+test("a readiness turn with a lost response reconciles before awaiting its completion", async () => {
+  const f = await fixture("pxa-wait-lost-");
+  try {
+    await f.adapter.startOwned({ command: "codex", agent: "codex", cwd: f.dir, sessionId: "pty:s1" });
+    f.fake.nextTurnStartBehavior = "accept-no-response";
+    const waiting = f.adapter.submitAcknowledgedTurnAndWait("pty:s1", "ready", {
+      clientUserMessageId: "k1",
+      source: "agent"
+    });
+    assert.equal(await until(2_000, () => f.fake.requestLog.some((entry) => entry.method === "thread/read")), true);
+    f.fake.completeActiveTurn("thr_1", "Ready.");
+    await Promise.race([
+      waiting,
+      tick(2_000).then(() => {
+        throw new Error("timed out waiting for reconciled readiness completion");
+      })
+    ]);
+    assert.equal(f.fake.requestLog.filter((entry) => entry.method === "turn/start").length, 1);
+    assert.deepEqual(userClientIds(f.fake.thread("thr_1").turns), ["k1"]);
+  } finally {
+    await f.close();
+  }
+});
+
 test("a connection lost before the daemon applied the input resends exactly once after history proves absence", async () => {
   const f = await fixture("pxa-absent-");
   try {
