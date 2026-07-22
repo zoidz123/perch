@@ -96,10 +96,13 @@ jobs:
     name: Build, tests, package, and iOS
     if: always()
     needs: [affected, javascript, package, ios]
-    runs-on: macos-26
+    runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
       - uses: actions/checkout@v5
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 24
       - name: Verify required results
         run: >-
           node scripts/ci-aggregate.mjs
