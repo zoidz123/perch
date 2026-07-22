@@ -369,7 +369,7 @@ test("gate refuses committed-but-unlanded work with no merged PR", async () => {
   h.cleanup();
 });
 
-test("gate fetches stale origin/main before checking landed ancestry", async () => {
+test("gate resolves and fetches origin/main without a local origin/HEAD", async () => {
   const { base, seed, clone } = makeRemoteFixture();
   const home = mkdtempSync(join(tmpdir(), "perch-td-home-"));
   const tasks = new TaskStore({ PERCH_HOME: home } as NodeJS.ProcessEnv);
@@ -385,6 +385,11 @@ test("gate fetches stale origin/main before checking landed ancestry", async () 
   const landedHead = execFileSync("git", ["-C", clone, "rev-parse", "HEAD"]).toString().trim();
   execFileSync("git", ["-C", clone, "push", "-q", "origin", "HEAD:main"], { stdio: "pipe" });
   execFileSync("git", ["-C", clone, "update-ref", "refs/remotes/origin/main", localMain], { stdio: "pipe" });
+  execFileSync(
+    "git",
+    ["-C", clone, "symbolic-ref", "--delete", "refs/remotes/origin/HEAD"],
+    { stdio: "pipe" }
+  );
 
   const verdict = await landedGate(tasks.find(task.id)!, clone);
 

@@ -460,13 +460,19 @@ async function defaultBranchCommit(repo: string): Promise<string> {
   return stdout.trim();
 }
 
-// The default branch's short name ("main") resolved from origin/HEAD, or
-// undefined when the repo has no remote (or no origin/HEAD ref).
+// The default branch's short name ("main") resolved from origin/HEAD or the
+// remote's HEAD symref, or undefined when origin cannot identify one.
 async function defaultBranchName(repo: string): Promise<string | undefined> {
+  const localRef = await git(repo, ["rev-parse", "--abbrev-ref", "origin/HEAD"])
+    .then(({ stdout }) => stdout.trim())
+    .catch(() => undefined);
+  if (localRef?.startsWith("origin/")) {
+    return localRef.slice("origin/".length);
+  }
   try {
-    const { stdout } = await git(repo, ["rev-parse", "--abbrev-ref", "origin/HEAD"]);
-    const ref = stdout.trim();
-    return ref.startsWith("origin/") ? ref.slice("origin/".length) : undefined;
+    const { stdout } = await git(repo, ["ls-remote", "--symref", "origin", "HEAD"]);
+    const match = stdout.match(/^ref: refs\/heads\/(.+)\tHEAD$/m);
+    return match?.[1];
   } catch {
     return undefined;
   }
