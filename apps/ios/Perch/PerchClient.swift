@@ -72,6 +72,7 @@ final class PerchStore: ObservableObject {
     }
     @Published private(set) var presentedServerAvailability: PresentedServerAvailability = .online
     @Published var errorMessage: String?
+    @Published private(set) var taskRefreshErrorMessage: String?
     @Published var isLoading = false
     // Local usage/credit snapshot (Claude + Codex), read on the Mac.
     @Published private(set) var usage: UsageResponse?
@@ -571,9 +572,7 @@ final class PerchStore: ObservableObject {
             sessions = response.sessions
             // The crew ledger rides the same refresh; its absence (older
             // server) must never break the fleet.
-            if let taskResult: TasksResult = try? await request(path: "/tasks") {
-                tasks = taskResult.tasks
-            }
+            await refreshTaskSnapshot()
             // The project registry rides along: it draws the mate panel's
             // scope headers, so its absence (older server) leaves them empty
             // but never breaks the fleet.
@@ -1223,11 +1222,35 @@ final class PerchStore: ObservableObject {
         if let response: SessionsResponse = try? await request(path: "/sessions") {
             sessions = response.sessions
         }
-        if let response: TasksResult = try? await request(path: "/tasks") {
-            tasks = response.tasks
-        }
+        await refreshTaskSnapshot()
         if let response: ProjectsResult = try? await request(path: "/projects") {
             projects = response.projects
+        }
+    }
+
+    private func refreshTaskSnapshot() async {
+        do {
+            let response: TasksResult = try await request(path: "/tasks")
+            let refresh = WorkspaceGrouping.taskRefreshResult(
+                current: tasks,
+                result: Result<[AgentTask], Error>.success(response.tasks)
+            )
+            tasks = refresh.tasks
+            taskRefreshErrorMessage = refresh.errorMessage
+        } catch {
+            if isCancellation(error) {
+                return
+            }
+            if (error as? PerchClientError)?.httpStatusCode == 404 {
+                taskRefreshErrorMessage = nil
+                return
+            }
+            let refresh = WorkspaceGrouping.taskRefreshResult(
+                current: tasks,
+                result: Result<[AgentTask], Error>.failure(error)
+            )
+            tasks = refresh.tasks
+            taskRefreshErrorMessage = refresh.errorMessage
         }
     }
 
@@ -1806,9 +1829,7 @@ final class PerchStore: ObservableObject {
         guard Date().timeIntervalSince(lastTasksFetch) > 2 else { return }
         lastTasksFetch = Date()
         Task {
-            if let result: TasksResult = try? await self.request(path: "/tasks") {
-                self.tasks = result.tasks
-            }
+            await self.refreshTaskSnapshot()
             // Projects ride the same cadence: on the relay path refresh()
             // never runs its HTTP block, so this is where the mate panel's
             // scope headers get their data.

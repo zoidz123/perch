@@ -498,6 +498,20 @@ function strictConfigPatch(body: Record<string, unknown>): {
 
 type RpcResult = { status: number; body: unknown };
 
+function taskListResponse(url: URL, tasks: TaskStore): TasksResponse {
+  const planId = url.searchParams.get("planId");
+  const includeClosed = url.searchParams.get("includeClosed") === "1";
+  const listed = planId ? tasks.listByPlan(planId) : tasks.list();
+  if (includeClosed) {
+    return { tasks: listed };
+  }
+  return {
+    tasks: listed
+      .filter((task) => task.state !== "closed")
+      .map(({ prompt: _prompt, ...task }) => task)
+  };
+}
+
 // POST /mate/start body. Every field is optional and overrides the fleet's
 // configured mate default for this launch; the app posts `{}` and gets the
 // mate the boss configured with `mate.*` via `perch config`.
@@ -847,10 +861,7 @@ async function dispatchWebSocketRpc(
   }
 
   if (method === "GET" && pathname === "/tasks") {
-    const planId = url.searchParams.get("planId");
-    const tasks = planId ? options.tasks.listByPlan(planId) : options.tasks.list();
-    const responseBody: TasksResponse = { tasks };
-    return rpcOk(200, responseBody);
+    return rpcOk(200, taskListResponse(url, options.tasks));
   }
 
   if (method === "POST" && pathname === "/tasks") {
@@ -1698,10 +1709,7 @@ async function route(
     }
 
     if (request.method === "GET" && pathname === "/tasks") {
-      const planId = url.searchParams.get("planId");
-      const tasks = planId ? options.tasks.listByPlan(planId) : options.tasks.list();
-      const body: TasksResponse = { tasks };
-      writeJson(response, 200, body);
+      writeJson(response, 200, taskListResponse(url, options.tasks));
       return;
     }
 

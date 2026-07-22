@@ -66,7 +66,31 @@ private struct FixtureSession: WorkspaceSessionLike, Codable {
     }
 }
 
+private enum TestError: Error {
+    case offline
+}
+
 final class WorkspaceGroupingTests: XCTestCase {
+    func testTaskRefreshFailureRetainsSnapshotAndSurfacesActionableError() {
+        let stale = [FixtureTask(id: "closed", project: "/tmp/repo", state: "closed", updatedAt: "t", sessionId: nil)]
+        let result: Result<[FixtureTask], Error> = .failure(TestError.offline)
+
+        let refresh = WorkspaceGrouping.taskRefreshResult(current: stale, result: result)
+
+        XCTAssertEqual(refresh.tasks.map(\.id), ["closed"])
+        XCTAssertEqual(refresh.errorMessage, "Couldn’t refresh tasks. Pull to refresh or reconnect.")
+    }
+
+    func testSuccessfulTaskRefreshReplacesSnapshotAndRemovesStaleClosedTasks() {
+        let stale = [FixtureTask(id: "closed", project: "/tmp/repo", state: "closed", updatedAt: "t", sessionId: nil)]
+        let live = FixtureTask(id: "live", project: "/tmp/repo", state: "working", updatedAt: "t", sessionId: nil)
+
+        let refresh = WorkspaceGrouping.taskRefreshResult(current: stale, result: .success([live]))
+
+        XCTAssertEqual(refresh.tasks.map(\.id), ["live"])
+        XCTAssertNil(refresh.errorMessage)
+    }
+
     func testWorkerIdentityDecodesNewAndHistoricalTaskRecords() throws {
         let named = try JSONDecoder().decode(
             FixtureTask.self,
