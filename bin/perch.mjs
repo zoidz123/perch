@@ -167,6 +167,19 @@ async function main() {
       process.exitCode = 1;
       return;
     }
+    if (session.attachCommand) {
+      await attachNativeTui(session);
+      return;
+    }
+    if (session.agent === "codex") {
+      // App-server-owned Codex sessions have no PTY surface; without the
+      // record's attachCommand there is nothing this terminal can join.
+      const short = shortSessionId(session.id);
+      console.error(`Session ${short} is an app-server-owned Codex session with no attach command yet - its thread has not materialized, so there is no terminal to attach.`);
+      console.error("Retry once the session shows activity in `perch ls`.");
+      process.exitCode = 1;
+      return;
+    }
     await attachToSession(session.id, parsed.options);
     return;
   }
@@ -2023,6 +2036,29 @@ async function startAndAttach(request, options) {
   });
 }
 
+// App-server-owned Codex sessions have no PTY to mirror. The server-issued
+// session record carries the exact native-TUI command (`codex resume
+// <threadId> --remote unix://<socket>`); hand this terminal to that real TUI
+// as an additional same-user client. The record's whitespace-separated tokens
+// are the argv - spawned directly, never through a shell. Exiting the TUI
+// only detaches; Perch's daemon keeps the session running.
+async function attachNativeTui(session) {
+  const [command, ...args] = session.attachCommand.split(/\s+/).filter(Boolean);
+  console.error(`Attaching native Codex TUI to ${shortSessionId(session.id)} - exit the TUI to detach (the session keeps running).`);
+  const code = await new Promise((resolvePromise, rejectPromise) => {
+    const child = spawn(command, args, { stdio: "inherit" });
+    child.on("error", (error) => {
+      rejectPromise(
+        error?.code === "ENOENT"
+          ? new Error(`\`${command}\` not found on PATH - install the Codex CLI to attach its native TUI`)
+          : error
+      );
+    });
+    child.on("exit", (exitCode, signal) => resolvePromise(signal ? 1 : exitCode ?? 0));
+  });
+  process.exitCode = code;
+}
+
 async function attachToSession(sessionId, options) {
   await withSocket(options, ({ send, onEvent, finish }) => {
     const renderer = createTerminalRenderer();
@@ -2339,7 +2375,7 @@ function commandHelp(command) {
   }
   if (command === "mate") return `Usage: perch mate [options] [claude|codex]\n\nStarts or attaches to the durable Mate orchestrator.\n  --new  intentionally start a fresh Mate conversation\n${common}`;
   if (command === "recover") return "Usage: perch recover task <task-id>\n\nRecovers a task when its persisted runtime supports recovery.";
-  if (command === "attach") return `Usage: perch attach [options] <session-id>\n\nAttaches this terminal to a live Perch session. Session ids may be shortened when unambiguous.\n${common}`;
+  if (command === "attach") return `Usage: perch attach [options] <session-id>\n\nAttaches this terminal to a live Perch session. Session ids may be shortened when unambiguous.\nCodex sessions attach by launching the native Codex TUI (the session record's attach command); other sessions mirror the Perch-owned terminal (Ctrl-] detaches).\n${common}`;
   if (command === "stop") return "Usage: perch stop <session-id>\n\nStops a live Perch session. Session ids may be shortened when unambiguous.";
   if (command === "ls") return "Usage: perch ls\n\nLists Perch sessions.";
   if (command === "pair") return "Usage: perch pair [--title <device-name>]\n\nCreates a device pairing offer. Treat the printed URL and QR code as credentials.";
