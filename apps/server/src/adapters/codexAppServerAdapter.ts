@@ -89,6 +89,7 @@ export type CodexAppServerAdapterOptions = {
 };
 
 export type StartOwnedOptions = {
+  deferAttachCommand?: boolean;
   resume?: {
     threadId: string;
     // Recorded socket of a daemon that may have survived a Perch restart.
@@ -128,6 +129,7 @@ type OwnedSession = {
   pendingRaw: string;
   stopped: boolean;
   reconnecting: boolean;
+  attachCommandReady: boolean;
 };
 
 const DEFAULT_RECONNECT_DELAYS_MS = [500, 2_000];
@@ -303,7 +305,8 @@ export class CodexAppServerAdapter implements AgentAdapter {
       queue: Promise.resolve(),
       pendingRaw: "",
       stopped: false,
-      reconnecting: false
+      reconnecting: false,
+      attachCommandReady: opts.deferAttachCommand !== true
     };
     session.client = this.createClient({
       sessionId,
@@ -405,9 +408,37 @@ export class CodexAppServerAdapter implements AgentAdapter {
   ): Promise<{ turnId: string | null }> {
     const session = this.mustSession(sessionId);
     return this.enqueue(session, async () => {
-      const result = await this.startTurnAcknowledged(session, text, opts.clientUserMessageId, opts.source);
-      return result;
+      const { turnId } = await this.startTurnAcknowledged(session, text, opts.clientUserMessageId, opts.source);
+      return { turnId };
     });
+  }
+
+  async submitAcknowledgedTurnAndWait(
+    sessionId: string,
+    text: string,
+    opts: { clientUserMessageId: string; source?: "human" | "agent" }
+  ): Promise<void> {
+    const session = this.mustSession(sessionId);
+    await this.enqueue(session, async () => {
+      const acknowledged = await this.startTurnAcknowledged(
+        session,
+        text,
+        opts.clientUserMessageId,
+        opts.source
+      );
+      if (!acknowledged.turnId) throw new Error("codex readiness turn did not return an id");
+      const result = acknowledged.aborted === undefined
+        ? await session.client.waitForTurnCompletion(acknowledged.turnId)
+        : { aborted: acknowledged.aborted };
+      if (result.aborted) throw new Error("codex readiness turn did not complete successfully");
+      this.touch(session);
+    });
+  }
+
+  revealAttachCommand(sessionId: string): AgentSession {
+    const session = this.mustSession(sessionId);
+    session.attachCommandReady = true;
+    return this.toAgentSession(session);
   }
 
   // ─── Internals ──────────────────────────────────────────────
@@ -470,7 +501,7 @@ export class CodexAppServerAdapter implements AgentAdapter {
     text: string,
     clientUserMessageId: string,
     source?: "human" | "agent"
-  ): Promise<{ turnId: string | null }> {
+  ): Promise<{ turnId: string | null; aborted?: boolean }> {
     try {
       const { turnId } = await session.client.submitTurn(text, {
         clientUserMessageId,
@@ -495,7 +526,7 @@ export class CodexAppServerAdapter implements AgentAdapter {
     text: string,
     clientUserMessageId: string,
     source?: "human" | "agent"
-  ): Promise<{ turnId: string | null }> {
+  ): Promise<{ turnId: string | null; aborted?: boolean }> {
     const threadId = session.threadId;
     if (!threadId) {
       throw new CodexDeliveryUnknownError(
@@ -535,7 +566,8 @@ export class CodexAppServerAdapter implements AgentAdapter {
         this.events.onTimelineItem?.({ ...item, ...(source ? { source } : {}) }, false);
       }
       this.touch(session);
-      return { turnId: landed.turn.id ?? null };
+      const aborted = terminalTurnAborted(landed.turn.status);
+      return { turnId: landed.turn.id ?? null, ...(aborted === undefined ? {} : { aborted }) };
     }
     // History-verified absence: the one resend this delivery may ever make.
     // A non-RPC failure here (connection lost again mid-resend) is once more
@@ -676,7 +708,7 @@ export class CodexAppServerAdapter implements AgentAdapter {
       ...(session.model ? { model: session.model } : {}),
       ...(session.effort ? { effort: session.effort } : {}),
       lastActivityAt: session.lastActivityAt,
-      ...(session.threadId
+      ...(session.threadId && session.attachCommandReady
         ? {
             attachCommand: `codex resume ${session.threadId} --remote unix://${session.socketPath}`,
             attachThreadId: session.threadId,
@@ -701,6 +733,12 @@ function isThreadNotMaterializedError(error: unknown): boolean {
 function threadTurns(result: unknown): ThreadHistoryTurn[] {
   const thread = (result as { thread?: { turns?: unknown } } | undefined)?.thread;
   return Array.isArray(thread?.turns) ? (thread.turns as ThreadHistoryTurn[]) : [];
+}
+
+function terminalTurnAborted(status: string | undefined): boolean | undefined {
+  if (status === "completed") return false;
+  if (["cancelled", "canceled", "aborted", "interrupted", "failed"].includes(status ?? "")) return true;
+  return undefined;
 }
 
 export function findTurnByClientMessageId(

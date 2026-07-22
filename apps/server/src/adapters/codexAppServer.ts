@@ -288,7 +288,7 @@ export class CodexAppServerClient {
   private pendingTurnCompletion: { resolve: (aborted: boolean) => void; turnId: string | null } | null = null;
   private pendingInterrupt: Promise<void> | null = null;
   private notificationProtocol: "unknown" | "legacy" | "raw" = "unknown";
-  private completedTurnIds = new Set<string>();
+  private completedTurns = new Map<string, boolean>();
   // Raw turn/item traffic observed since the last reported completion. A
   // daemon-driven TUI turn can settle with only a thread/status/changed idle
   // (the daemon never broadcasts turn/completed to a client that did not
@@ -419,7 +419,7 @@ export class CodexAppServerClient {
     this._turnId = null;
     this.observedTurnActivity = false;
     this.notificationProtocol = "unknown";
-    this.completedTurnIds.clear();
+    this.completedTurns.clear();
     if (!opts?.preserveThreadState) {
       this._threadId = null;
       this.threadDefaults = null;
@@ -625,7 +625,13 @@ export class CodexAppServerClient {
   // Submit and wait for the turn to settle (task_complete / turn_aborted).
   async submitTurnAndWait(
     text: string,
-    opts?: { model?: string; effort?: ReasoningEffort; source?: "human" | "agent"; turnTimeoutMs?: number }
+    opts?: {
+      model?: string;
+      effort?: ReasoningEffort;
+      source?: "human" | "agent";
+      clientUserMessageId?: string;
+      turnTimeoutMs?: number;
+    }
   ): Promise<{ aborted: boolean }> {
     // Let any in-flight interrupt settle first so a stale turn/interrupt cannot
     // abort the turn we are about to start.
@@ -656,6 +662,24 @@ export class CodexAppServerClient {
     return { aborted };
   }
 
+  async waitForTurnCompletion(turnId: string, turnTimeoutMs = TURN_TIMEOUT_MS): Promise<{ aborted: boolean }> {
+    if (this.completedTurns.has(turnId)) {
+      return { aborted: this.completedTurns.get(turnId)! };
+    }
+    if (this.pendingTurnCompletion) throw new Error("a codex turn completion wait is already active");
+
+    let timer: ReturnType<typeof setTimeout> | null = null;
+    const completion = new Promise<boolean>((resolve) => {
+      this.pendingTurnCompletion = { resolve, turnId };
+      timer = setTimeout(() => {
+        if (this.pendingTurnCompletion?.turnId === turnId) this.resolvePendingTurn(true);
+      }, turnTimeoutMs);
+    });
+    const aborted = await completion;
+    if (timer) clearTimeout(timer);
+    return { aborted };
+  }
+
   // Request interruption; if the turn does not settle within the grace period,
   // force-restart the app-server and resume the thread (happy's fallback).
   async interrupt(opts?: { gracePeriodMs?: number; forceRestartOnTimeout?: boolean }): Promise<{
@@ -672,7 +696,7 @@ export class CodexAppServerClient {
     await this.sendInterrupt();
 
     const grace = opts?.gracePeriodMs ?? ABORT_GRACE_MS;
-    const settled = await this.waitForTurnCompletion(grace);
+    const settled = await this.waitForPendingTurnCompletion(grace);
     if (settled) {
       return { hadActiveTurn: true, aborted: true, forcedRestart: false, resumedThread: false };
     }
@@ -702,7 +726,7 @@ export class CodexAppServerClient {
     return this.pendingInterrupt;
   }
 
-  private async waitForTurnCompletion(timeoutMs: number): Promise<boolean> {
+  private async waitForPendingTurnCompletion(timeoutMs: number): Promise<boolean> {
     if (!this.pendingTurnCompletion) return true;
     const deadline = Date.now() + Math.max(0, timeoutMs);
     while (this.pendingTurnCompletion) {
@@ -1264,12 +1288,12 @@ export class CodexAppServerClient {
     const aborted = status === "cancelled" || status === "canceled" || status === "aborted" || status === "interrupted";
     // A turn can settle via more than one raw notification (turn/completed,
     // thread/status idle, a final_answer item); report it exactly once.
-    const firstCompletion = !turnId || !this.completedTurnIds.has(turnId);
+    const firstCompletion = !turnId || !this.completedTurns.has(turnId);
     this.tryResolvePendingTurn(aborted, turnId);
     this._turnId = null;
     this.setStatus("idle");
     if (!firstCompletion) return;
-    if (turnId) this.completedTurnIds.add(turnId);
+    if (turnId) this.completedTurns.set(turnId, aborted);
     this.fireTurnComplete(aborted);
   }
 

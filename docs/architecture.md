@@ -36,6 +36,7 @@ Perch has no hosted repository runtime or user account.
 
 Mate is one durable fleet owner, not another task row.
 `perch mate` starts it in a dedicated home with a Perch-managed role, or reconnects to its existing runtime.
+Before exposing a fresh Codex Mate's native attach command, Perch submits and awaits one visible readiness turn so the new thread has rollout-backed history and can be resumed immediately.
 
 Mate dispatches tasks into registered projects and isolated worktrees.
 Worker events wake Mate through a queued server path, so it does not poll and the user can steer the fleet from one conversation.

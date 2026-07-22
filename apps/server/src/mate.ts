@@ -3,6 +3,9 @@ import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { perchHome } from "./home.js";
 
+export const CODEX_MATE_BOOTSTRAP_PROMPT =
+  "Initialize this Perch mate session. Do not use tools or perform project work. Reply with exactly: Ready.";
+
 // ~/.perch/mate: the mate's own home - neutral by design, never a project
 // directory (the mate reads projects anywhere; it lives nowhere near them).
 // The spec (AGENTS.md) is perch-managed and refreshed on every launch so mate

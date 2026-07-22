@@ -111,7 +111,7 @@ import { executeTeardown, landedGate, ownLeaseFor } from "./teardown.js";
 import type { TimelineStore } from "./timeline.js";
 import type { WorktreePool } from "./worktrees.js";
 import { storeAttachment } from "./attachments.js";
-import { seedMateHome } from "./mate.js";
+import { CODEX_MATE_BOOTSTRAP_PROMPT, seedMateHome } from "./mate.js";
 import { isProviderPrefixedModelId, modelSwitchSteps } from "./modelSwitch.js";
 import { collectUsage } from "./usage.js";
 import { listCodexModelsOnce } from "./adapters/codexAppServer.js";
@@ -3342,6 +3342,8 @@ async function startMateRpc(
   );
   const home = seedMateHome();
   try {
+    // A freshly created Codex thread cannot be resumed by the native TUI until
+    // its first acknowledged turn has materialized rollout-backed history.
     const result = await startManagedAgent(options, {
       request: {
         command: agent,
@@ -3349,11 +3351,14 @@ async function startMateRpc(
         cwd: home,
         title: "mate",
         labels: { role: "mate" },
+        ...(agent === "codex" ? { initialPrompt: CODEX_MATE_BOOTSTRAP_PROMPT } : {}),
         ...(Array.isArray(body.args) ? { args: body.args } : {}),
         ...(model ? { model } : {}),
         ...(effort ? { effort } : {})
       },
       auditMeta: auditPeer,
+      ...(agent === "codex" ? { initialPromptSource: "agent" } : {}),
+      ...(agent === "codex" ? { awaitInitialPromptCompletion: true } : {}),
       intentionalNewMate: body.new === true
     });
     return rpcOk(201, {
