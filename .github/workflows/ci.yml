@@ -38,7 +38,7 @@ jobs:
           HEAD_SHA: ${{ github.event.pull_request.head.sha }}
         run: |
           if [[ "$EVENT_NAME" == "pull_request" ]]; then
-            git diff --name-only -z "$BASE_SHA" "$HEAD_SHA" | node scripts/ci-affected.mjs --event "$EVENT_NAME"
+            git diff --no-renames --name-only -z "$BASE_SHA" "$HEAD_SHA" | node scripts/ci-affected.mjs --event "$EVENT_NAME"
           else
             node scripts/ci-affected.mjs --event "$EVENT_NAME" </dev/null
           fi

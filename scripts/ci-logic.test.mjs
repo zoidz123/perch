@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 
 import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
 import test from "node:test";
 
 import { validateAggregate } from "./ci-aggregate.mjs";
@@ -13,7 +14,7 @@ test("main pushes and uncertain diffs run every optional job", () => {
 });
 
 test("root, lockfile, workflow, script, and shared changes fail open", () => {
-  for (const file of ["package.json", "package-lock.json", ".github/workflows/ci.yml", "scripts/check-public-seed.mjs", "design/app-icon/generate.sh", "packages/shared/src/index.ts"]) {
+  for (const file of ["package.json", "package-lock.json", ".github/workflows/ci.yml", "scripts/check-public-seed.mjs", "docs/generate.sh", "design/app-icon/generate.sh", "packages/shared/src/index.ts"]) {
     assert.deepEqual(classifyAffectedPaths([file]), { javascript: true, package: true, ios: true }, file);
   }
 });
@@ -26,9 +27,17 @@ test("known paths select only their substantive lanes", () => {
   assert.deepEqual(classifyAffectedPaths(["docs/operations.md", "design/mock.png", "public-seed.json"]), { javascript: false, package: false, ios: false });
 });
 
-test("design documentation is exempt while design support logic fails open", () => {
+test("documentation is exempt while support logic fails open", () => {
+  assert.deepEqual(classifyAffectedPaths(["docs/operations.md"]), { javascript: false, package: false, ios: false });
   assert.deepEqual(classifyAffectedPaths(["design/app-icon/icon-light.svg"]), { javascript: false, package: false, ios: false });
+  assert.deepEqual(classifyAffectedPaths(["docs/generate.sh"]), { javascript: true, package: true, ios: true });
   assert.deepEqual(classifyAffectedPaths(["design/app-icon/generate.sh"]), { javascript: true, package: true, ios: true });
+});
+
+test("workflow preserves rename source and destination paths", () => {
+  const workflow = readFileSync(new URL("../.github/workflows/ci.yml", import.meta.url), "utf8");
+  assert.match(workflow, /git diff --no-renames --name-only -z/);
+  assert.deepEqual(classifyAffectedPaths(["apps/server/src/index.ts", "docs/operations.md"]), { javascript: true, package: true, ios: false });
 });
 
 test("mixed paths union lanes and any unknown path fails open", () => {
