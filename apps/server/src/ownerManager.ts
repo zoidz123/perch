@@ -142,6 +142,20 @@ export class OwnerManager {
     );
   }
 
+  recordRecoverySession(recovering: OwnerRuntimeRecord, sessionId: string): OwnerRuntimeRecord {
+    const linked = this.tasks.stateDb.ownerRuntimes.compareAndSwap(
+      recovering.ownerId,
+      recovering.generation,
+      "recovering",
+      "recovering",
+      { metadata: { ...recovering.metadata, recoverySessionId: sessionId } }
+    );
+    if (!linked || linked.id !== recovering.id) {
+      throw new Error(`mate runtime generation conflict at g${recovering.generation}`);
+    }
+    return linked;
+  }
+
   bindRecoveredMate(
     recovering: OwnerRuntimeRecord,
     input: {

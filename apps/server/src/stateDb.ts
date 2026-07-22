@@ -807,12 +807,18 @@ export type PromptDeliverySurfaceRecord = Pick<
 
 const PROMPT_DELIVERY_LINEAGE_SCOPE_SQL = `(
   pd.perch_session_id = @sessionId
-  OR pd.task_id IN (SELECT task_id FROM runtimes WHERE pty_session_id = @sessionId)
+  OR pd.task_id IN (
+    SELECT task_id FROM runtimes
+    WHERE pty_session_id = @sessionId
+       OR json_extract(metadata_json, '$.recoverySessionId') = @sessionId
+  )
   OR pd.perch_session_id IN (
     SELECT history.pty_session_id
     FROM owner_runtimes current
     JOIN owner_runtimes history ON history.owner_id = current.owner_id
-    WHERE current.pty_session_id = @sessionId AND history.pty_session_id IS NOT NULL
+    WHERE (current.pty_session_id = @sessionId
+       OR json_extract(current.metadata_json, '$.recoverySessionId') = @sessionId)
+      AND history.pty_session_id IS NOT NULL
   )
 )`;
 

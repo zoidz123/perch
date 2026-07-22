@@ -167,6 +167,20 @@ export class RuntimeManager {
     });
   }
 
+  recordRecoverySession(recovering: RuntimeRecord, sessionId: string): RuntimeRecord {
+    const linked = this.tasks.stateDb.runtimes.compareAndSwap(
+      recovering.taskId,
+      recovering.generation,
+      "recovering",
+      "recovering",
+      { metadata: { ...recovering.metadata, recoverySessionId: sessionId } }
+    );
+    if (!linked || linked.id !== recovering.id) {
+      throw new Error(`runtime generation conflict for ${recovering.taskId} g${recovering.generation}`);
+    }
+    return linked;
+  }
+
   bindRecoveredRuntime(
     recovering: RuntimeRecord,
     input: {

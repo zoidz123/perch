@@ -650,16 +650,13 @@ test("a recovered mate inherits the prior generation's bounded delivery surface"
     await new Promise((resolve) => setTimeout(resolve, 2));
     f.tracker.markUnknown(delivery.id, "acceptance was not confirmed; not resent");
 
-    assert.ok(f.stateDb.ownerRuntimes.compareAndSwap("owner:mate", 0, "live", "ended"));
-    f.stateDb.ownerRuntimes.create({
-      ownerId: "owner:mate",
-      generation: 1,
-      state: "live",
-      agent: "claude",
-      provider: "claude",
-      ptySessionId: "pty:new-mate",
-      cwd: "/tmp"
-    });
+    assert.ok(f.stateDb.ownerRuntimes.compareAndSwap(
+      "owner:mate",
+      0,
+      "live",
+      "recovering",
+      { metadata: { recoverySessionId: "pty:new-mate" } }
+    ));
 
     const warning = promptDeliverySurface(
       f.stateDb.promptDeliveries.surfaceCandidates("pty:new-mate")
@@ -674,6 +671,16 @@ test("a recovered mate inherits the prior generation's bounded delivery surface"
       kind: "user",
       text: "mate prompt",
       at: submittedAt!
+    });
+    assert.ok(f.stateDb.ownerRuntimes.compareAndSwap("owner:mate", 0, "recovering", "ended"));
+    f.stateDb.ownerRuntimes.create({
+      ownerId: "owner:mate",
+      generation: 1,
+      state: "live",
+      agent: "claude",
+      provider: "claude",
+      ptySessionId: "pty:new-mate",
+      cwd: "/tmp"
     });
     const resolution = promptDeliverySurface(
       f.stateDb.promptDeliveries.surfaceCandidates("pty:new-mate")
