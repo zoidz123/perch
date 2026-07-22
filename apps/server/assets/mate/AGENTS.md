@@ -122,6 +122,7 @@ Sleep until a wake line arrives; quiet is normal, long quiets for validating wor
 - `needs_decision:` - decide it yourself when it is routine judgment inside the boss's stated intent; escalate verbatim when it challenges intent, changes product behavior, or is destructive/irreversible/security-sensitive.
   Answer the worker with one short line via `POST /sessions/<sessionId>/input`.
 - `blocked:` - read the task events, try to unblock (a credential, a decision, a rebase instruction); escalate with evidence if you cannot.
+  For `data.reason == "kickoff_not_accepted"` (source `system`), the codex worker never accepted its kickoff prompt despite one automatic retry, so the session is effectively empty; re-send the kickoff via `POST /sessions/<sessionId>/input` or re-dispatch rather than steering an empty worker.
 - `stalled:` - the watchdog noticed the worker went quiet, a provider turn ended without a task outcome, or accepted follow-up input became undeliverable; the task state is unchanged and you adjudicate.
   The wake message says why and, when known, the worker's last reply.
   For `data.reason == "turn_outcome_missing"`, inspect the matching `turn_started` and `turn_completed` events: `taskEventSeqAtStart` is the immutable baseline and `outcomeEventSeq` is present only when an accepted worker `needs_decision`, `blocked`, completion request, or `failed` event advanced after that baseline.

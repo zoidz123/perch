@@ -201,6 +201,10 @@ Claude and Codex provide the boundaries differently:
   Claude's `stop_hook_active` loop guard permits only this one continuation.
 - A Codex turn-completed notification is settled and cannot be continued in the same way, so the durable `stalled` event wakes Mate to retry or steer the worker.
 
+A dispatched Codex worker can also fail before any first turn: a TUI that is not ready yet silently swallows the typed kickoff prompt.
+If no first-turn evidence (a turn lifecycle event for that session, a worker event, or the rollout correlation) appears within 45 seconds of launch, the server retries the exact original kickoff once.
+After a second silent window it records a `blocked` event with `source: "system"` and `data.reason: "kickoff_not_accepted"` so Mate adjudicates instead of the worker sitting silently empty.
+
 Provider prose is never treated as the outcome.
 Even if the final assistant message says the work is finished, Mate must rely on the durable worker event and verify the deliverable.
 

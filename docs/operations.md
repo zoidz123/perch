@@ -175,6 +175,7 @@ perch recover task <task-id>
 ```
 
 Re-running `perch mate` attaches to a live Mate or attempts provider-aware recovery of its persisted conversation and then reconciles recoverable child workers.
+If the persisted Mate conversation is provably unrecoverable (a recorded Codex thread whose rollout was never written, so resume can never succeed), the same `perch mate` run retires that record and launches a fresh Mate instead of failing on every start.
 Use `perch mate --new` only when you intentionally want a fresh Mate conversation.
 
 Inspect isolated task worktrees with:
