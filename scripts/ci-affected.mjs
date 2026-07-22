@@ -6,7 +6,8 @@ import { pathToFileURL } from "node:url";
 const ALL = Object.freeze({ javascript: true, package: true, ios: true });
 const NONE = Object.freeze({ javascript: false, package: false, ios: false });
 
-const documentationPath = /^(docs|design)\//;
+const documentationPath = /^docs\//;
+const designDocumentationPath = /^design\/.*\.(?:gif|jpe?g|md|mdx|pdf|png|svg|txt|webp)$/i;
 const javascriptPath = /^(apps\/server|packages\/(relay|shared))\//;
 const iosPath = /^apps\/ios\//;
 const packagePath = /^(bin|vendor)\//;
@@ -22,7 +23,7 @@ export function classifyAffectedPaths(paths, eventName = "pull_request") {
     if (file === "package-lock.json" || file === "package.json" || file === "tsconfig.base.json" || file === ".gitignore" || file.startsWith(".github/")) {
       return { ...ALL };
     }
-    if (file === "public-seed.json" || documentationPath.test(file)) {
+    if (file === "public-seed.json" || documentationPath.test(file) || designDocumentationPath.test(file)) {
       continue;
     }
     if (file.startsWith("scripts/")) {

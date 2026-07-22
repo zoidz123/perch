@@ -13,7 +13,7 @@ test("main pushes and uncertain diffs run every optional job", () => {
 });
 
 test("root, lockfile, workflow, script, and shared changes fail open", () => {
-  for (const file of ["package.json", "package-lock.json", ".github/workflows/ci.yml", "scripts/check-public-seed.mjs", "packages/shared/src/index.ts"]) {
+  for (const file of ["package.json", "package-lock.json", ".github/workflows/ci.yml", "scripts/check-public-seed.mjs", "design/app-icon/generate.sh", "packages/shared/src/index.ts"]) {
     assert.deepEqual(classifyAffectedPaths([file]), { javascript: true, package: true, ios: true }, file);
   }
 });
@@ -24,6 +24,11 @@ test("known paths select only their substantive lanes", () => {
   assert.deepEqual(classifyAffectedPaths(["apps/ios/Perch/PerchApp.swift"]), { javascript: false, package: false, ios: true });
   assert.deepEqual(classifyAffectedPaths(["vendor/no-mistakes/manifest.json"]), { javascript: false, package: true, ios: false });
   assert.deepEqual(classifyAffectedPaths(["docs/operations.md", "design/mock.png", "public-seed.json"]), { javascript: false, package: false, ios: false });
+});
+
+test("design documentation is exempt while design support logic fails open", () => {
+  assert.deepEqual(classifyAffectedPaths(["design/app-icon/icon-light.svg"]), { javascript: false, package: false, ios: false });
+  assert.deepEqual(classifyAffectedPaths(["design/app-icon/generate.sh"]), { javascript: true, package: true, ios: true });
 });
 
 test("mixed paths union lanes and any unknown path fails open", () => {
