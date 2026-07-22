@@ -1,21 +1,13 @@
 import type { AgentKind } from "@perch/shared";
 
-// A provider usage-limit / quota-exhaustion condition read off the rendered
-// screen. A worker CLI that runs out of credits prints its own limit line and
-// then just sits there: no hook fires, no tool call is attempted, the PTY goes
-// quiet, and the session reads as a plain "idle" - so the task ledger keeps it
-// "working" forever and the orchestrator is blind to a dead-on-arrival worker.
-// This is the net for that: recognizing the CLI's own limit line on screen lets
-// perch flip the session out of idle and block the task with an actionable note
-// (which needs the owner to add credits, not the worker to keep trying).
+// A provider usage-limit / quota-exhaustion condition reported by a structured
+// provider event, a hook, or the rendered-terminal fallback below.
 export type UsageLimit = {
   // The provider whose quota is exhausted (openai/codex, anthropic/claude).
   provider: string;
-  // The CLI's limit line, verbatim (clipped), so the block note the owner sees
-  // carries the exact wording the terminal showed.
+  // Provider detail for the block note, clipped before it reaches the ledger.
   message: string;
-  // The retry/reset time the CLI named, when it named one ("3:28 PM", "3pm").
-  // Absent when the CLI printed no time (e.g. a hard "purchase credits" stop).
+  // The retry/reset time reported by the source, when present.
   retryAt?: string;
   // Where Perch learned it. Structured provider events always win over the
   // rendered-terminal safety net.
@@ -124,19 +116,50 @@ export function detectUsageLimit(
   };
 }
 
-// Codex app-server v2 deliberately leaves these notifications extensible.  Do
-// not key on prose: accept only a provider-shaped type/code, then retain its
-// message/reset metadata for the task event.
+// Codex app-server reports ordinary quota-window telemetry and actual
+// exhaustion through the same rate-limit notification. Only semantic payload
+// fields prove exhaustion: a non-null rateLimitReachedType, or the documented
+// usageLimitExceeded error code. Notification method names and prose do not.
 export function usageLimitFromCodexAppServer(value: unknown): UsageLimit | undefined {
   const record = value && typeof value === "object" ? (value as Record<string, unknown>) : undefined;
   if (!record) return undefined;
-  const kind = [record.type, record.code, record.errorCode, record.reason]
+
+  const nestedError = record.error && typeof record.error === "object"
+    ? (record.error as Record<string, unknown>)
+    : undefined;
+  const rateLimits = record.rateLimits && typeof record.rateLimits === "object"
+    ? (record.rateLimits as Record<string, unknown>)
+    : undefined;
+  const reachedType = [record.rateLimitReachedType, rateLimits?.rateLimitReachedType]
+    .find((part): part is string => typeof part === "string" && part.trim().length > 0);
+  const kind = [
+    record.type,
+    record.code,
+    record.errorCode,
+    record.reason,
+    record.codexErrorInfo,
+    nestedError?.type,
+    nestedError?.code,
+    nestedError?.errorCode,
+    nestedError?.reason,
+    nestedError?.codexErrorInfo
+  ]
     .filter((part): part is string => typeof part === "string")
-    .join(" ");
-  if (!/(usage.?limit(?:exceeded)?|rate.?limit(?:ed)?|quota.?exceeded)/i.test(kind)) return undefined;
-  const message = [record.message, record.detail, record.error]
+    .find((part) => /^(?:usageLimitExceeded|rateLimitReached|rateLimitExceeded|quotaExceeded)$/i.test(part.replace(/[^a-z]/gi, "")));
+  if (!reachedType && !kind) return undefined;
+
+  const message = [record.message, record.detail, nestedError?.message, nestedError?.detail]
     .find((part): part is string => typeof part === "string" && part.trim().length > 0) ?? "Codex provider usage limit reached";
-  const retryAt = [record.retryAt, record.retry_at, record.resetAt, record.reset_at]
+  const retryAt = [
+    record.retryAt,
+    record.retry_at,
+    record.resetAt,
+    record.reset_at,
+    nestedError?.retryAt,
+    nestedError?.retry_at,
+    nestedError?.resetAt,
+    nestedError?.reset_at
+  ]
     .find((part): part is string => typeof part === "string" && part.trim().length > 0);
   return { provider: "codex", message: message.slice(0, 300), source: "app_server", ...(retryAt ? { retryAt } : {}) };
 }

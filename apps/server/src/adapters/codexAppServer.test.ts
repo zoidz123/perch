@@ -7,6 +7,7 @@ import { PassThrough } from "node:stream";
 import { CodexAppServerClient, type CodexTransport } from "./codexAppServer.js";
 import { TaskCompletionReconciler } from "../taskCompletion.js";
 import { TaskStore } from "../tasks.js";
+import { reportUsageLimitToTask } from "../taskWatchdog.js";
 import type { TimelineItem, AgentSessionStatus, PendingServerRequest } from "@perch/shared";
 
 // A scripted codex app-server over PassThrough streams: parses the client's
@@ -95,12 +96,81 @@ async function connectedClient(overrides: Partial<{
   return { client, server };
 }
 
-test("structured app-server usageLimitExceeded fires without terminal text", async () => {
+test("documented app-server usageLimitExceeded error fires without terminal text", async () => {
   const limits: Array<{ provider: string; retryAt?: string; source?: string }> = [];
   const { server } = await connectedClient({ onUsageLimit: (limit) => limits.push(limit) });
-  server.push("turn/error", { type: "usageLimitExceeded", message: "out of credits", retryAt: "2026-07-10T22:00:00Z" });
+  server.push("error", {
+    error: {
+      message: "out of credits",
+      codexErrorInfo: "usageLimitExceeded",
+      retryAt: "2026-07-10T22:00:00Z"
+    },
+    threadId: "thr_1",
+    turnId: "turn_1",
+    willRetry: false
+  });
   await tick();
   assert.deepEqual(limits, [{ provider: "codex", message: "out of credits", retryAt: "2026-07-10T22:00:00Z", source: "app_server" }]);
+});
+
+test("routine app-server rate-limit telemetry does not durably block the task", async () => {
+  const home = mkdtempSync(join(tmpdir(), "perch-codex-rate-limit-telemetry-"));
+  const tasks = new TaskStore({ PERCH_HOME: home } as NodeJS.ProcessEnv);
+  try {
+    const task = tasks.create({ title: "healthy codex turn", project: "/tmp/repo" });
+    tasks.update(task.id, { sessionId: "sess_1" });
+    tasks.recordEvent(task.id, { kind: "working", source: "system", message: "worker session active" });
+
+    const { server } = await connectedClient({
+      onUsageLimit: (limit) => reportUsageLimitToTask(tasks, "sess_1", limit)
+    });
+    server.push("account/rateLimits/updated", {
+      rateLimits: {
+        limitId: "codex",
+        primary: { usedPercent: 12, windowDurationMins: 300, resetsAt: 1_777_534_802 },
+        secondary: { usedPercent: 9, windowDurationMins: 10_080, resetsAt: 1_777_969_707 },
+        credits: { hasCredits: false, unlimited: false, balance: "0" },
+        planType: "plus",
+        rateLimitReachedType: null
+      }
+    });
+    await tick();
+
+    assert.equal(tasks.find(task.id)?.state, "working");
+    assert.equal(tasks.events(task.id).some((event) => event.kind === "blocked"), false);
+  } finally {
+    tasks.close();
+    rmSync(home, { recursive: true, force: true });
+  }
+});
+
+test("explicit app-server reached-limit telemetry durably blocks the task", async () => {
+  const home = mkdtempSync(join(tmpdir(), "perch-codex-rate-limit-reached-"));
+  const tasks = new TaskStore({ PERCH_HOME: home } as NodeJS.ProcessEnv);
+  try {
+    const task = tasks.create({ title: "exhausted codex turn", project: "/tmp/repo" });
+    tasks.update(task.id, { sessionId: "sess_1" });
+    tasks.recordEvent(task.id, { kind: "working", source: "system", message: "worker session active" });
+
+    const { server } = await connectedClient({
+      onUsageLimit: (limit) => reportUsageLimitToTask(tasks, "sess_1", limit)
+    });
+    server.push("account/rateLimits/updated", {
+      rateLimits: {
+        limitId: "codex",
+        rateLimitReachedType: "rate_limit_reached"
+      }
+    });
+    await tick();
+
+    assert.equal(tasks.find(task.id)?.state, "blocked");
+    const blocked = tasks.events(task.id).find((event) => event.kind === "blocked");
+    assert.equal(blocked?.data?.provider, "codex");
+    assert.equal(blocked?.data?.reason, "usage_limit");
+  } finally {
+    tasks.close();
+    rmSync(home, { recursive: true, force: true });
+  }
 });
 
 test("connect performs the initialize handshake then initialized notification", async () => {

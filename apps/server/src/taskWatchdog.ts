@@ -301,15 +301,9 @@ export function reportSessionExitToTask(
   }
 }
 
-// G5: a worker CLI printed its provider usage-limit line and went quiet (see
-// usageLimitDetect). The session is dead-on-arrival - it will make no progress
-// until the owner adds credits or the limit resets - but nothing has exited, so
-// left alone the task sits "working" forever. Auto-post a system-sourced
-// "blocked" (not failed: the work resumes the moment credits return, and the
-// mate decides) carrying the provider, the CLI's own message, and the named
-// retry time. recordEvent fires the ledger subscribers, so this rides the same
-// mate wake channel every boss-relevant event does - the whole point: the stall
-// becomes an immediate notification instead of silence.
+// G5: a structured provider signal, hook, or terminal fallback reported quota
+// exhaustion (see usageLimitDetect). Block the task with the source detail and
+// retry time so the recoverable stall reaches the normal mate wake channel.
 export function reportUsageLimitToTask(
   tasks: TaskStore,
   sessionId: string,
@@ -335,7 +329,7 @@ export function reportUsageLimitToTask(
     });
     metrics?.increment("watchdog.usageLimits");
   } catch {
-    // Never let ledger bookkeeping disturb PTY monitoring.
+    // Never let ledger bookkeeping disturb usage-limit monitoring.
   }
 }
 

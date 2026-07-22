@@ -163,9 +163,8 @@ const monitor = new FleetMonitor(adapter, {
   onDisconnectDevice: (deviceId) => relayClient?.disconnectDevice(deviceId),
   onStatusChange: ({ sessionId, from, to, source }) =>
     metrics.recordSessionStatus(sessionId, from, to, source),
-  // A worker CLI printed its provider usage-limit line and stalled: block the
-  // owning task with the provider/message/retry time. recordEvent fires the
-  // mate wake channel, so the orchestrator is notified immediately.
+  // A structured provider signal, hook, or terminal fallback reported quota
+  // exhaustion. Block the owning task through the normal mate wake channel.
   onUsageLimit: (sessionId, _agent, limit) => reportUsageLimitToTask(tasks, sessionId, limit, metrics),
   onApprovalNeeded: (sessionId, approval) => surfaceApprovalToTask(tasks, sessionId, approval),
   onApprovalResolved: (sessionId, approval) => resolveApprovalForTask(tasks, sessionId, approval),

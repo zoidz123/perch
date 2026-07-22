@@ -437,7 +437,14 @@ test("a transient connection drop reconnects, resumes the thread, and replays hi
     await f.fake.restart();
     // Bounded backoff reconnect + thread/resume, no session death.
     assert.ok(await until(3_000, () => f.fake.requestLog.some((entry) => entry.method === "thread/resume")));
-    assert.ok(await until(3_000, () => f.adapter.has("pty:s1")));
+    assert.ok(
+      await until(3_000, () =>
+        f.events.timeline.some(
+          (entry) => entry.item.kind === "user" && entry.item.id === "cx-item-k1" && entry.live === false
+        )
+      )
+    );
+    assert.ok(f.adapter.has("pty:s1"));
     assert.deepEqual(f.events.exits, []);
 
     // Replayed history rows arrive as catch-up (live=false) with the same
