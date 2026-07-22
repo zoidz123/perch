@@ -513,15 +513,14 @@ export class PtyAgentAdapter implements AgentAdapter {
     validateStartRequest(request);
     ensureNodePtyCanSpawn();
 
-    // Adopt a caller-minted id when it is a well-formed, not-yet-live PTY id
-    // (the Codex `--remote` path pre-mints it so the daemon can carry this
-    // session's hook wiring); otherwise generate a fresh one.
-    const id =
-      request.sessionId &&
-      request.sessionId.startsWith(PTY_PREFIX) &&
-      !this.sessions.has(request.sessionId)
-        ? request.sessionId
-        : `${PTY_PREFIX}${randomUUID()}`;
+    // Adopt a well-formed caller-minted id, reject a live collision, and
+    // generate a fresh id for malformed or absent values.
+    if (request.sessionId?.startsWith(PTY_PREFIX) && this.sessions.has(request.sessionId)) {
+      throw new Error(`PTY session already exists: ${request.sessionId}`);
+    }
+    const id = request.sessionId?.startsWith(PTY_PREFIX)
+      ? request.sessionId
+      : `${PTY_PREFIX}${randomUUID()}`;
     const command = request.command.trim();
     const cwd = request.cwd ?? process.cwd();
     const now = new Date().toISOString();

@@ -3,7 +3,7 @@ import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
-import { PromptDeliveryTracker } from "./promptDeliveries.js";
+import { PromptDeliveryTracker, promptDeliverySurface } from "./promptDeliveries.js";
 import { StateDb } from "./stateDb.js";
 import { TimelineStore, TIMELINE_TEXT_MAX_LENGTH } from "./timeline.js";
 
@@ -259,7 +259,7 @@ test("disappearance reconciliation ignores a launch not previously observed in t
   }
 });
 
-test("same-text evidence after the unknown boundary cannot accept a kickoff", async () => {
+test("same-text evidence at the unknown boundary cannot accept a kickoff", async () => {
   const f = fixture(10);
   try {
     const delivery = f.tracker.create("pty:worker", "bounded kickoff", "agent", { allowLateReceipt: true });
@@ -270,14 +270,13 @@ test("same-text evidence after the unknown boundary cannot accept a kickoff", as
     assert.ok(unknownAt);
 
     assert.equal(f.tracker.acknowledgeHook("pty:worker", "bounded kickoff"), undefined);
-    const afterUnknown = new Date(Date.parse(unknownAt!) + 1).toISOString();
     assert.equal(
       f.stateDb.promptDeliveries.acceptMatch({
         perchSessionId: "pty:worker",
         promptText: "bounded kickoff",
         receiptKind: "transcript",
         receiptId: "later-identical-row",
-        observedAt: afterUnknown
+        observedAt: unknownAt
       }),
       undefined
     );
@@ -572,6 +571,8 @@ test("late acceptance retains durable evidence that an earlier unknown warning n
     const delivery = tracker.create("pty:worker", "late but real", "agent");
     tracker.markTyping(delivery.id);
     tracker.markSubmitted(delivery.id);
+    const submittedAt = stateDb.promptDeliveries.find(delivery.id)?.submittedAt;
+    assert.ok(submittedAt);
     await waitFor(() => Boolean(stateDb.promptDeliveries.find(delivery.id)?.unknownNotifiedAt));
 
     tracker.acknowledgeTimeline({
@@ -580,7 +581,7 @@ test("late acceptance retains durable evidence that an earlier unknown warning n
       sessionId: "pty:worker",
       kind: "user",
       text: "late but real",
-      at: stateDb.promptDeliveries.find(delivery.id)?.unknownAt ?? ""
+      at: submittedAt!
     });
     assert.equal(stateDb.promptDeliveries.find(delivery.id)?.state, "accepted");
     assert.equal(accepted.length, 1);
@@ -589,6 +590,42 @@ test("late acceptance retains durable evidence that an earlier unknown warning n
     tracker.stop();
     stateDb.close();
     rmSync(home, { recursive: true, force: true });
+  }
+});
+
+test("a newer accepted delivery cannot hide an older unresolved warning", async () => {
+  const f = fixture();
+  try {
+    const unresolved = f.tracker.create("pty:worker", "older uncertain prompt", "agent");
+    f.tracker.markTyping(unresolved.id);
+    f.tracker.markSubmitted(unresolved.id, null);
+    const unresolvedSubmittedAt = f.stateDb.promptDeliveries.find(unresolved.id)?.submittedAt;
+    assert.ok(unresolvedSubmittedAt);
+    await new Promise((resolve) => setTimeout(resolve, 2));
+    f.tracker.markUnknown(unresolved.id, "acceptance was not confirmed; not resent");
+
+    const newer = f.tracker.create("pty:worker", "newer confirmed prompt", "agent");
+    f.tracker.markTyping(newer.id);
+    f.tracker.markSubmitted(newer.id, null);
+    f.tracker.acknowledgeHook("pty:worker", "newer confirmed prompt");
+
+    const unresolvedSurface = promptDeliverySurface(f.stateDb.promptDeliveries.list("pty:worker"));
+    assert.equal(unresolvedSurface.promptDeliveryWarning?.deliveryId, unresolved.id);
+    assert.equal(unresolvedSurface.promptDeliveryResolution, undefined);
+
+    f.tracker.acknowledgeTimeline({
+      seq: 18,
+      id: "older-authentic-row",
+      sessionId: "pty:worker",
+      kind: "user",
+      text: "older uncertain prompt",
+      at: unresolvedSubmittedAt!
+    });
+    const resolvedSurface = promptDeliverySurface(f.stateDb.promptDeliveries.list("pty:worker"));
+    assert.equal(resolvedSurface.promptDeliveryWarning, undefined);
+    assert.equal(resolvedSurface.promptDeliveryResolution?.deliveryId, unresolved.id);
+  } finally {
+    f.close();
   }
 });
 

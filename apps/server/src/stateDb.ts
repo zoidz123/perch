@@ -2308,7 +2308,7 @@ export class PromptDeliveryRepository {
         if (!Number.isFinite(boundary) || observedAt! < boundary) return false;
         if (row.state === "delivery_unknown") {
           const unknownAt = Date.parse(row.unknown_at ?? "");
-          if (!Number.isFinite(unknownAt) || observedAt! > unknownAt) return false;
+          if (!Number.isFinite(unknownAt) || observedAt! >= unknownAt) return false;
         }
       }
       const expected = normalizePrompt(row.prompt_text);

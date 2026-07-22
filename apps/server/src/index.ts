@@ -44,7 +44,7 @@ import { TaskScheduler } from "./taskScheduler.js";
 import { OutboxWorker } from "./outboxWorker.js";
 import { RuntimeManager } from "./runtimeManager.js";
 import { OwnerManager } from "./ownerManager.js";
-import { PromptDeliveryTracker } from "./promptDeliveries.js";
+import { PromptDeliveryTracker, promptDeliverySurface } from "./promptDeliveries.js";
 
 const config = readConfig();
 const hooks = new HookRegistry(process.env);
@@ -222,33 +222,10 @@ const monitor = new FleetMonitor(adapter, {
   onInputSubmitted: (sessionId) =>
     markTaskWorkingFromActivity({ tasks }, sessionId, { newTurn: true }),
   promptDeliveries,
-  promptDeliveryWarning: (sessionId) => {
-    const unresolved = tasks.stateDb.promptDeliveries.list(sessionId).at(-1);
-    if (
-      !unresolved?.unknownNotifiedAt ||
-      (unresolved.state !== "not_submitted" && unresolved.state !== "delivery_unknown")
-    ) return undefined;
-    return unresolved
-      ? {
-          deliveryId: unresolved.id,
-          message: unresolved.state === "not_submitted"
-            ? unresolved.failureReason ?? "Claude prompt was not submitted; Perch did not send it"
-            : "Claude prompt delivery is unknown; Perch did not resend it",
-          at: unresolved.unknownAt ?? unresolved.updatedAt
-        }
-      : undefined;
-  },
-  promptDeliveryResolution: (sessionId) => {
-    const resolved = tasks.stateDb.promptDeliveries.list(sessionId).at(-1);
-    if (resolved?.state !== "accepted" || !resolved.unknownNotifiedAt || !resolved.acceptedNotifiedAt) {
-      return undefined;
-    }
-    return {
-      deliveryId: resolved.id,
-      message: "Claude prompt delivery was confirmed after the earlier warning",
-      at: resolved.acceptedAt ?? resolved.updatedAt
-    };
-  },
+  promptDeliveryWarning: (sessionId) =>
+    promptDeliverySurface(tasks.stateDb.promptDeliveries.list(sessionId)).promptDeliveryWarning,
+  promptDeliveryResolution: (sessionId) =>
+    promptDeliverySurface(tasks.stateDb.promptDeliveries.list(sessionId)).promptDeliveryResolution,
   onQueuedInputRejected: (sessionId, count, reason) => {
     const task = tasks.list().find((candidate) => candidate.sessionId === sessionId);
     if (!task || task.state === "closed") return;

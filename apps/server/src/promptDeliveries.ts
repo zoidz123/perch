@@ -1,10 +1,51 @@
-import type { TimelineItem } from "@perch/shared";
+import type { AgentSession, TimelineItem } from "@perch/shared";
 import type { PromptDeliveryRecord, StateDb } from "./stateDb.js";
 import { TIMELINE_TEXT_MAX_LENGTH } from "./timeline.js";
 
 const DEFAULT_RECEIPT_TIMEOUT_MS = 15_000;
 
 export type PromptDeliverySource = "human" | "agent";
+
+export function promptDeliverySurface(deliveries: PromptDeliveryRecord[]): {
+  promptDeliveryWarning?: AgentSession["promptDeliveryWarning"];
+  promptDeliveryResolution?: AgentSession["promptDeliveryResolution"];
+} {
+  const unresolved = deliveries
+    .filter(
+      (delivery) =>
+        delivery.unknownNotifiedAt &&
+        (delivery.state === "not_submitted" || delivery.state === "delivery_unknown")
+    )
+    .at(-1);
+  if (unresolved) {
+    return {
+      promptDeliveryWarning: {
+        deliveryId: unresolved.id,
+        message: unresolved.state === "not_submitted"
+          ? unresolved.failureReason ?? "Claude prompt was not submitted; Perch did not send it"
+          : "Claude prompt delivery is unknown; Perch did not resend it",
+        at: unresolved.unknownAt ?? unresolved.updatedAt
+      }
+    };
+  }
+  const resolved = deliveries
+    .filter(
+      (delivery) =>
+        delivery.state === "accepted" &&
+        delivery.unknownNotifiedAt &&
+        delivery.acceptedNotifiedAt
+    )
+    .at(-1);
+  return resolved
+    ? {
+        promptDeliveryResolution: {
+          deliveryId: resolved.id,
+          message: "Claude prompt delivery was confirmed after the earlier warning",
+          at: resolved.acceptedAt ?? resolved.updatedAt
+        }
+      }
+    : {};
+}
 
 type PromptDeliveryTrackerOptions = {
   receiptTimeoutMs?: number;

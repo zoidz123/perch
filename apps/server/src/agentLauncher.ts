@@ -246,7 +246,7 @@ export async function startManagedAgent(
 
   // Hook-independent Claude session identity: mint the provider session id
   // ourselves so the transcript location is known before the process exists.
-  const claudeIdentity = prepareClaudeIdentity(request, cwd);
+  const claudeIdentity = await prepareClaudeIdentity(options.adapter, request, cwd);
 
   // Claude's initial kickoff rides the spawn argv as the CLI's positional
   // query (interactive TUI, prompt submitted natively at boot) - never typed
@@ -508,13 +508,24 @@ const CLAUDE_SESSION_UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0
 // identified sessions keep their provider identity while still receiving a
 // pre-minted Perch session id. Mutates request and appends the provider flag
 // only for fresh sessions.
-function prepareClaudeIdentity(
+async function prepareClaudeIdentity(
+  adapter: AgentAdapter,
   request: StartAgentRequest,
   cwd: string
-): { agentSessionId: string; transcriptPath: string } | undefined {
+): Promise<{ agentSessionId: string; transcriptPath: string } | undefined> {
   if (launchAgentKind(request.command, request.agent) !== "claude") return undefined;
   const args = request.args ?? [];
-  request.sessionId ??= `pty:${randomUUID()}`;
+  const liveSessionIds = new Set((await adapter.listSessions()).map((session) => session.id));
+  if (
+    !request.sessionId ||
+    !request.sessionId.startsWith("pty:") ||
+    !CLAUDE_SESSION_UUID.test(request.sessionId.slice("pty:".length)) ||
+    liveSessionIds.has(request.sessionId)
+  ) {
+    do {
+      request.sessionId = `pty:${randomUUID()}`;
+    } while (liveSessionIds.has(request.sessionId));
+  }
   if (args.includes("--resume") || args.includes("--continue") || args.includes("--session-id")) {
     return undefined;
   }

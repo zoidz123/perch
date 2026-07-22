@@ -1094,6 +1094,7 @@ test("Claude kickoff variants keep provider identity and journal against a pre-m
         agent: "claude",
         cwd: repo,
         args: ["--resume", "abc-123"],
+        sessionId: "malformed",
         initialPrompt: "resume kickoff"
       })
     });
@@ -1102,7 +1103,7 @@ test("Claude kickoff variants keep provider identity and journal against a pre-m
       !fx.adapter.requests[0]?.args?.includes("--session-id"),
       "a resume keeps the provider-owned session id"
     );
-    assert.match(fx.adapter.requests[0]?.sessionId ?? "", /^pty:/);
+    assert.match(fx.adapter.requests[0]?.sessionId ?? "", /^pty:[0-9a-f-]{36}$/);
 
     const continued = await fetch(`${baseUrl}/agents/pty`, {
       ...authed,
@@ -1112,10 +1113,12 @@ test("Claude kickoff variants keep provider identity and journal against a pre-m
         agent: "claude",
         cwd: repo,
         args: ["--continue"],
+        sessionId: fx.adapter.requests[0]?.sessionId,
         initialPrompt: "continue kickoff"
       })
     });
     assert.equal(continued.status, 201, await continued.text());
+    assert.notEqual(fx.adapter.requests[1]?.sessionId, fx.adapter.requests[0]?.sessionId);
 
     const providerSessionId = randomUUID();
     const callerIdentified = await fetch(`${baseUrl}/agents/pty`, {
