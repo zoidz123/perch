@@ -23,6 +23,14 @@ Common launch options are `--server`, `--token`, `--cwd`, `--title`, and `--no-a
 `perch mate --new` requests an intentionally fresh Mate conversation and is refused while Mate is live.
 Press `Ctrl+]` to detach from an attached terminal without stopping its process.
 
+`perch attach` routes by how the session is owned.
+Claude and `perch run` sessions mirror the Perch-owned terminal as a thin client; `Ctrl+]` detaches.
+Codex sessions are app-server-owned with no mirrored terminal: `perch attach` launches the native Codex TUI using the session record's attach command (`codex resume <threadId> --remote unix://<socket>`), and exiting the TUI detaches while the session keeps running.
+A Codex session whose thread has not materialized yet has no attach command, and `perch attach` fails with a clear message instead of showing an empty terminal.
+The same routing applies at launch time: `perch codex` and a Codex `perch mate` launch start the session over HTTP and immediately open the native Codex TUI from the started record's attach command, while `perch claude` and Claude mate launches keep the WebSocket terminal mirror.
+If a freshly launched Codex session carries no attach command yet, the CLI prints the started session record plus a hint to retry with `perch attach <session-id>` once the session shows activity.
+`perch codex --no-attach` starts the session and exits without attaching anything.
+
 ## Projects
 
 ```text

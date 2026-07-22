@@ -17,8 +17,8 @@ import { createHash, randomBytes } from "node:crypto";
 import type { AgentSessionStatus, QuestionItem } from "@perch/shared";
 import { ASK_USER_QUESTION_TOOL, extractQuestions, questionId } from "./askQuestion.js";
 
-// Perch recovers agent structure without owning provider SDKs: every
-// perch-spawned PTY carries PERCH_SESSION_ID / PERCH_HOOK_URL /
+// Perch recovers agent structure without owning provider SDKs: every managed
+// provider process carries PERCH_SESSION_ID / PERCH_HOOK_URL /
 // PERCH_HOOK_TOKEN in its environment, and a globally-installed Claude hook
 // (gated on that env, inert everywhere else) POSTs each hook event back to
 // the local server. Fail-open by design: a dead server must never break the
@@ -730,43 +730,8 @@ export function claudeTranscriptPath(
   return join(configDir, "projects", physical.replace(/[^a-zA-Z0-9]/g, "-"), `${claudeSessionId}.jsonl`);
 }
 
-// Locates the rollout transcript for a codex session id. The filename embeds
-// the id (rollout-<timestamp>-<session_id>.jsonl) under date-sharded dirs, so
-// this scans the most recent date directories only.
-export function findCodexRollout(
-  codexSessionId: string,
-  env: NodeJS.ProcessEnv = process.env
-): string | undefined {
-  const root = join(codexHome(env), "sessions");
-  const suffix = `-${codexSessionId}.jsonl`;
-  const days: string[] = [];
-  for (let offset = -1; offset <= 2; offset += 1) {
-    const d = new Date(Date.now() - offset * 86_400_000);
-    days.push(
-      join(
-        root,
-        String(d.getFullYear()),
-        String(d.getMonth() + 1).padStart(2, "0"),
-        String(d.getDate()).padStart(2, "0")
-      )
-    );
-  }
-  for (const dir of days) {
-    try {
-      for (const name of readdirSync(dir)) {
-        if (name.startsWith("rollout-") && name.endsWith(suffix)) {
-          return join(dir, name);
-        }
-      }
-    } catch {
-      // Date dir absent; keep looking.
-    }
-  }
-  return undefined;
-}
-
-// Maps perch PTY sessions to their hook tokens and, once SessionStart
-// arrives, to the agent's own session id + transcript path.
+// Maps Perch sessions to their hook tokens and, once SessionStart arrives, to
+// the agent's own session id + transcript path.
 export type HookCorrelation = {
   sessionId: string;
   agentSessionId?: string;
@@ -776,6 +741,11 @@ export type HookCorrelation = {
 export class HookRegistry {
   private readonly tokens = new Map<string, string>(); // token -> perch session id
   private readonly correlations = new Map<string, HookCorrelation>();
+  // A rebound codex daemon's environment still carries the previous server
+  // life's PERCH_SESSION_ID/PERCH_HOOK_TOKEN (env is fixed at spawn), so the
+  // recovery bind aliases that stale identity to the live session. The alias
+  // lives only while the live session's registration does.
+  private readonly aliases = new Map<string, string>(); // previous session id -> live session id
   private readonly durablePath?: string;
 
   constructor(env?: NodeJS.ProcessEnv) {
@@ -795,9 +765,8 @@ export class HookRegistry {
   }
 
   // Deliberate credential rotation: mints a fresh token and revokes any prior
-  // token for the session. Launch paths must use ensure() instead - a codex
-  // `--remote` launch registers the same session twice (daemon env, then PTY
-  // env), and re-minting here silently invalidated the daemon's copy.
+  // token for the session. Launch paths must use ensure() instead because
+  // multiple setup paths can request credentials for the same live session.
   register(sessionId: string): { token: string } {
     for (const [token, registered] of this.tokens) {
       if (registered === sessionId) this.tokens.delete(token);
@@ -810,8 +779,8 @@ export class HookRegistry {
   }
 
   // Idempotent registration: returns the session's live token when one exists,
-  // minting only for a new session. Every registration path for the same live
-  // session (codex daemon env + PTY env) shares one credential this way.
+  // minting only for a new session. Every setup path for the same live session
+  // shares one credential this way.
   ensure(sessionId: string): { token: string } {
     for (const [token, registered] of this.tokens) {
       if (registered === sessionId) {
@@ -823,19 +792,31 @@ export class HookRegistry {
   }
 
   unregister(sessionId: string): void {
+    const revoked = new Set([sessionId]);
+    this.aliases.delete(sessionId);
+    for (const [previous, live] of this.aliases) {
+      if (live === sessionId) {
+        this.aliases.delete(previous);
+        revoked.add(previous);
+      }
+    }
     for (const [token, id] of this.tokens) {
-      if (id === sessionId) {
+      if (revoked.has(id)) {
         this.tokens.delete(token);
       }
     }
-    this.correlations.delete(sessionId);
+    for (const id of revoked) this.correlations.delete(id);
     this.persist();
   }
 
   prune(activeSessionIds: Set<string>): void {
     let changed = false;
+    for (const [previous, live] of this.aliases) {
+      if (!activeSessionIds.has(live)) this.aliases.delete(previous);
+    }
     for (const [token, sessionId] of this.tokens) {
-      if (!activeSessionIds.has(sessionId)) {
+      const live = this.aliases.get(sessionId) ?? sessionId;
+      if (!activeSessionIds.has(sessionId) && !activeSessionIds.has(live)) {
         this.tokens.delete(token);
         this.correlations.delete(sessionId);
         changed = true;
@@ -846,6 +827,19 @@ export class HookRegistry {
 
   verify(sessionId: string, token: string): boolean {
     return this.tokens.get(token) === sessionId;
+  }
+
+  // Bind a previous life's session identity (still baked into a surviving
+  // daemon's env) to the live session that adopted its daemon. Verification
+  // stays against the previous id's own durable token; resolveAlias maps the
+  // authenticated id to the live session for everything downstream.
+  aliasSession(previousSessionId: string, liveSessionId: string): void {
+    if (!previousSessionId || !liveSessionId || previousSessionId === liveSessionId) return;
+    this.aliases.set(previousSessionId, liveSessionId);
+  }
+
+  resolveAlias(sessionId: string): string {
+    return this.aliases.get(sessionId) ?? sessionId;
   }
 
   correlate(sessionId: string, agentSessionId?: string, transcriptPath?: string): HookCorrelation {

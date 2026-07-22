@@ -1,8 +1,11 @@
-// Perch-owned Codex app-server daemon lifecycle for the `--remote` topology.
-// Perch spawns the ordinary Codex installation as
+// Perch-owned Codex app-server daemon lifecycle. Perch spawns the ordinary
+// Codex installation as
 //   codex app-server --listen unix://<sock>
-// and the real TUI attaches with `codex --remote unix://<sock>`, while a perch
-// control client drives the same thread over the WebSocket `/rpc` channel.
+// one daemon per session workdir, and the owning adapter
+// (codexAppServerAdapter.ts) is its sole standing authoritative client over
+// the WebSocket `/rpc` channel. Desktop humans may additionally attach the
+// real native TUI to the same socket with
+// `codex resume <threadId> --remote unix://<sock>`.
 //
 // Any normal Codex installation with `app-server` and `--remote` support can
 // host this topology without a separately managed binary.
@@ -25,31 +28,9 @@ import { perchHome } from "../home.js";
 import { CodexAppServerClient } from "./codexAppServer.js";
 import { websocketUnixTransport } from "./wsUnixTransport.js";
 
-// Which Codex driver perch should use for a session.
-//   "app-server-remote" = Perch-owned daemon + `--remote` TUI +
-//                         control client; per-turn model chip, protocol drive).
-//   "pty"               = the existing PTY-only path (launch-time `-m` only).
-export type CodexDriver = "app-server-remote" | "pty";
-
-// Select the Codex driver. Install-independent: the only gates are that codex
-// exists on PATH and that the platform has unix sockets (never win32). An
-// operator can force the legacy path with PERCH_CODEX_REMOTE=0.
-export function selectCodexDriver(opts?: {
-  codexOnPath?: boolean;
-  platform?: NodeJS.Platform;
-  env?: NodeJS.ProcessEnv;
-}): CodexDriver {
-  const env = opts?.env ?? process.env;
-  if (env.PERCH_CODEX_REMOTE === "0" || env.PERCH_CODEX_REMOTE === "false") return "pty";
-  const platform = opts?.platform ?? process.platform;
-  if (platform === "win32") return "pty";
-  const onPath = opts?.codexOnPath ?? true;
-  return onPath ? "app-server-remote" : "pty";
-}
-
-// Whether a `codex` executable is resolvable on PATH (the only real gate for
-// the `--remote` topology). Best-effort and synchronous so it can inform driver
-// selection at boot without blocking.
+// Whether a `codex` executable is resolvable on PATH (the gate for offering
+// Codex in dispatch defaults). Best-effort and synchronous so it can inform
+// boot-time decisions without blocking.
 export function codexOnPath(env: NodeJS.ProcessEnv = process.env): boolean {
   const pathValue = env.PATH ?? "";
   const exts = process.platform === "win32" ? ["", ".exe", ".cmd", ".bat"] : [""];
@@ -62,8 +43,8 @@ export function codexOnPath(env: NodeJS.ProcessEnv = process.env): boolean {
   return false;
 }
 
-// A running (or reused) daemon: the socket a `--remote` TUI and the control
-// client both dial.
+// A running (or reused) daemon: the socket the owning adapter (and any
+// attached native TUI) dials.
 export type CodexDaemonHandle = {
   socketPath: string;
   cwd: string;
@@ -158,6 +139,13 @@ export class CodexDaemonManager {
 
   private daemonKeyFor(cwd: string, configOverrides: string[], env?: Record<string, string>): string {
     return daemonKey(cwd, configOverrides, env, this.runtimeFingerprint());
+  }
+
+  // The fingerprint of the codex runtime currently on PATH, as this manager
+  // folds it into daemon keys. Recorded on runtime metadata at launch so the
+  // adopt path can enforce the same invariant across restarts.
+  currentRuntimeFingerprint(): string | undefined {
+    return this.runtimeFingerprint();
   }
 
   async acquire(
@@ -292,6 +280,46 @@ export class CodexDaemonManager {
     };
   }
 
+  // Adopt a daemon that is already listening at a recorded socket path from a
+  // previous server life (app-server-owned recovery rebind). Health-checks the
+  // socket and registers a killable handle recovered from the pidfile so
+  // release()/stopAll() still apply. Returns null when nothing healthy answers
+  // - the caller then respawns via acquire(). The adopt key is the socket path
+  // itself: the original cwd/env-derived key is not reconstructible (the hook
+  // identity that produced it belonged to the previous life).
+  //
+  // `expectedRuntimeFingerprint` is the fingerprint recorded when the daemon
+  // was launched: acquire() folds `codex --version` into daemon keys so an
+  // older runtime's daemon is never reused, and adoption must honor the same
+  // invariant. A recorded fingerprint that no longer matches the current
+  // runtime (codex upgraded between server lives) refuses adoption, so the
+  // caller respawns and rollout-resumes on the current runtime instead of
+  // rebinding a new TUI to an old daemon.
+  async adoptExisting(
+    socketPath: string,
+    cwd: string,
+    opts: { expectedRuntimeFingerprint?: string } = {}
+  ): Promise<CodexDaemonHandle | null> {
+    if (
+      opts.expectedRuntimeFingerprint &&
+      opts.expectedRuntimeFingerprint !== this.runtimeFingerprint()
+    ) {
+      return null;
+    }
+    for (const entry of this.daemons.values()) {
+      if (entry.handle.socketPath === socketPath) return entry.handle;
+    }
+    if (!existsSync(socketPath)) return null;
+    try {
+      await this.waitHealthy(socketPath, 2_000);
+    } catch {
+      return null;
+    }
+    const handle: CodexDaemonHandle = { socketPath, cwd };
+    this.daemons.set(`adopted:${socketPath}`, { handle, process: this.adoptProcess(socketPath) });
+    return handle;
+  }
+
   // A session-scoped daemon belongs to the control session that acquired it.
   // Stop it when that session detaches so sequential tasks do not accumulate
   // one live process per historical hook identity.
@@ -319,7 +347,10 @@ export class CodexDaemonManager {
   // SIGTERM, so pid reuse can never hit an unrelated process. Call before the
   // first acquire - sockets not yet tracked by this manager are treated as
   // orphans. Bounded per pass; leftovers are picked up on the next boot.
-  sweepOrphans(): void {
+  // `keep` lists socket paths that must SURVIVE the sweep: daemons recorded on
+  // recoverable app-server-owned runtimes, whose live thread state is the very
+  // thing the post-restart rebind reconnects to.
+  sweepOrphans(keep?: ReadonlySet<string>): void {
     const dir = join(perchHome(this.env), "codex-daemons");
     let names: string[];
     try {
@@ -327,7 +358,7 @@ export class CodexDaemonManager {
     } catch {
       return;
     }
-    const owned = new Set<string>();
+    const owned = new Set<string>(keep ?? []);
     for (const entry of this.daemons.values()) {
       owned.add(entry.handle.socketPath);
     }
@@ -361,9 +392,16 @@ export class CodexDaemonManager {
     }
   }
 
-  // Stop every daemon this manager spawned (server shutdown).
-  stopAll(): void {
+  // Stop every daemon this manager spawned (server shutdown). `keep` excludes
+  // sockets of live app-server-owned sessions: their daemons deliberately
+  // outlive a graceful restart so the next life can rebind without losing the
+  // in-memory thread (their pidfiles stay for a later sweep/adopt decision).
+  stopAll(keep?: ReadonlySet<string>): void {
     for (const [key, entry] of this.daemons) {
+      if (keep?.has(entry.handle.socketPath)) {
+        this.daemons.delete(key);
+        continue;
+      }
       try {
         entry.process.kill("SIGTERM");
       } catch {

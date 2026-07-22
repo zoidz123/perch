@@ -5,7 +5,6 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
   CodexDaemonManager,
-  selectCodexDriver,
   type CodexDaemonProcess
 } from "./codexDaemon.js";
 
@@ -23,17 +22,6 @@ function fakeProcess(): CodexDaemonProcess & { killed: boolean } {
   };
   return state as CodexDaemonProcess & { killed: boolean };
 }
-
-test("selectCodexDriver picks app-server-remote from any normal install (no standalone gate)", () => {
-  assert.equal(selectCodexDriver({ codexOnPath: true, platform: "darwin", env: {} }), "app-server-remote");
-  assert.equal(selectCodexDriver({ codexOnPath: true, platform: "linux", env: {} }), "app-server-remote");
-});
-
-test("selectCodexDriver falls back to pty when codex is absent, on Windows, or force-disabled", () => {
-  assert.equal(selectCodexDriver({ codexOnPath: false, platform: "darwin", env: {} }), "pty");
-  assert.equal(selectCodexDriver({ codexOnPath: true, platform: "win32", env: {} }), "pty");
-  assert.equal(selectCodexDriver({ codexOnPath: true, platform: "darwin", env: { PERCH_CODEX_REMOTE: "0" } }), "pty");
-});
 
 test("acquire spawns one daemon per workdir and reuses a healthy one", async () => {
   const spawns: Array<{ socketPath: string; cwd: string }> = [];
@@ -314,6 +302,45 @@ test("daemons are keyed by the codex runtime fingerprint so a client never redia
   // path, so the old daemon can never be adopted merely because it answers.
   assert.notEqual(older.socketPathFor("/repo/one", [], env), current.socketPathFor("/repo/one", [], env));
   assert.equal(current.socketPathFor("/repo/one", [], env), current.socketPathFor("/repo/one", [], env));
+});
+
+test("adoptExisting enforces the recorded runtime fingerprint: match adopts, mismatch refuses", async () => {
+  const home = mkdtempSync(join(tmpdir(), "perch-daemon-adopt-fp-"));
+  const dir = join(home, "codex-daemons");
+  mkdirSync(dir, { recursive: true });
+  const socketPath = join(dir, "adopt.sock");
+  writeFileSync(socketPath, "");
+  writeFileSync(`${socketPath}.pid`, "4321");
+
+  const manager = new CodexDaemonManager({
+    env: { PERCH_HOME: home },
+    spawn: fakeProcess,
+    waitHealthy: async () => {
+      /* the recorded daemon still answers */
+    },
+    runtimeFingerprint: () => "codex-cli 0.144.6"
+  });
+  assert.equal(manager.currentRuntimeFingerprint(), "codex-cli 0.144.6");
+
+  // Codex was upgraded between server lives: the recorded daemon still
+  // answers, but adopting it would attach the new TUI to the old runtime -
+  // the exact mismatch the acquire() fingerprint keying prevents.
+  const mismatch = await manager.adoptExisting(socketPath, "/repo/one", {
+    expectedRuntimeFingerprint: "codex-cli 0.142.5"
+  });
+  assert.equal(mismatch, null);
+
+  const match = await manager.adoptExisting(socketPath, "/repo/one", {
+    expectedRuntimeFingerprint: "codex-cli 0.144.6"
+  });
+  assert.equal(match?.socketPath, socketPath);
+
+  // Runtime metadata recorded before the fingerprint existed still adopts.
+  const legacy = await manager.adoptExisting(socketPath, "/repo/one");
+  assert.equal(legacy?.socketPath, socketPath);
+
+  manager.stopAll();
+  rmSync(home, { recursive: true, force: true });
 });
 
 test("sweepOrphans retires stale sockets and recorded pids without touching owned daemons", async () => {

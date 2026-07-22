@@ -303,8 +303,8 @@ export class ChartRegistry {
 
   // Live refresh: watch the chart file itself, never its directory, and debounce editor
   // write bursts into one "updated" event. Watchers live for this process
-  // only; server-owned PTYs die with the server, so a restart's stale charts
-  // re-arm when their (new) session re-registers.
+  // only; after a restart, stale charts re-arm when their session registers
+  // them again.
   private watchChart(chart: Chart): void {
     if (this.watchers.has(chart.id)) {
       return;

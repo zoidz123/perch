@@ -11,11 +11,16 @@ import type {
   StartAgentRequest
 } from "@perch/shared";
 import type { AgentAdapter } from "./adapters/types.js";
+import {
+  CodexDeliveryUnknownError,
+  normalizeCodexLaunchRequest,
+  type CodexAppServerAdapter
+} from "./adapters/codexAppServerAdapter.js";
+import { isCodexRpcError } from "./adapters/codexAppServer.js";
 import type { AuditLog, AuditRecord } from "./audit.js";
 import { seedClaudeWorktreeTrust } from "./claudeTrust.js";
-import type { CodexControlPlane } from "./codexControl.js";
 import type { FleetMonitor } from "./fleetMonitor.js";
-import { claudeTranscriptPath, findCodexRollout, isAllowedTranscriptPath, type HookRegistry } from "./hooks.js";
+import { claudeTranscriptPath, isAllowedTranscriptPath, type HookRegistry } from "./hooks.js";
 import { resolveSessionModel } from "./models.js";
 import { assertLocalRuntimeModelId } from "./modelSwitch.js";
 import type { ProjectRegistry } from "./projects.js";
@@ -43,7 +48,9 @@ export type ManagedAgentLauncherOptions = {
   // Claude's state file (.claude.json) for pre-launch worktree trust seeding.
   // The server entrypoint wires the real path; absent means no seeding.
   claudeStateFile?: string;
-  codexControl?: CodexControlPlane;
+  // The app-server owning adapter: the ONLY Codex driver. Codex launches fail
+  // loudly without it - there is deliberately no PTY fallback for Codex.
+  codexOwned?: CodexAppServerAdapter;
   // Reinstalls the provider's hook entries ahead of a launch. Provider config
   // (~/.claude/settings.json, ~/.codex/hooks.json) is shared state that other
   // tools rewrite wholesale from stale snapshots, dropping perch's entries and
@@ -52,10 +59,6 @@ export type ManagedAgentLauncherOptions = {
   // absent in tests that must not touch real config.
   installHooks?: (agent: AgentKind) => void;
   taskCompletion?: TaskCompletionReconciler;
-  // How long a dispatched codex worker may show no first-turn evidence before
-  // its kickoff is retried once (and, after a second window, parked blocked).
-  // Tests shrink it; production uses CODEX_KICKOFF_RETRY_MS.
-  codexKickoffRetryMs?: number;
   runtimeManager?: RuntimeManager;
   recoveryCoordinator?: RecoveryCoordinator;
   ownerManager?: OwnerManager;
@@ -85,15 +88,18 @@ export type StartManagedAgentInput = {
   intentionalNewMate?: boolean;
   // A recovery failure must preserve the task-held worktree for another try.
   retainWorktreeOnFailure?: boolean;
-  // Codex recovery uses the CLI's verified native `resume <id>` path. A fresh
-  // remote daemon does not reliably broadcast identity for a resumed thread.
-  disableCodexRemote?: boolean;
+  // Codex recovery: resume this exact thread instead of starting a fresh one.
+  // `socketPath` names the daemon socket recorded on the interrupted runtime;
+  // when that daemon still answers, the session rebinds to it without a
+  // respawn (the daemon holds the live thread state). `runtimeFingerprint` is
+  // the codex runtime recorded at launch: a mismatch with the current runtime
+  // refuses the rebind and falls through to a fresh respawn+rollout-resume.
+  codexOwnedResume?: { threadId: string; socketPath?: string; runtimeFingerprint?: string };
 };
 
 export type StartManagedAgentResult = {
   session: AgentSession;
   request: StartAgentRequest;
-  codexRemote: boolean;
   worktreeId?: string;
 };
 
@@ -165,21 +171,28 @@ function canonicalLaunchPath(path: string): string {
   }
 }
 
-// One codex rollout resolver loop per session: many hooks/control signals can
-// arrive before the first attach, and each would otherwise spawn overlapping
-// filesystem polls.
-const codexRolloutResolving = new Set<string>();
-
 export async function startManagedAgent(
   options: ManagedAgentLauncherOptions,
   input: StartManagedAgentInput
 ): Promise<StartManagedAgentResult> {
-  if (!options.adapter.startAgent) {
-    throw new Error("PTY agents are not supported by this server");
-  }
-
   const request = cloneStartRequest(input.request);
   validateStartAgent(request);
+  const isCodexLaunch = launchAgentKind(request.command, request.agent) === "codex";
+  let codexOwnedResume = input.codexOwnedResume;
+  if (isCodexLaunch) {
+    const normalized = normalizeCodexLaunchRequest(request);
+    Object.assign(request, normalized.request);
+    if (!normalized.request.args) delete request.args;
+    if (normalized.resumeThreadId && !codexOwnedResume) {
+      codexOwnedResume = { threadId: normalized.resumeThreadId };
+    }
+  }
+  if (isCodexLaunch && !options.codexOwned) {
+    throw new Error("codex sessions require the app-server owning adapter");
+  }
+  if (!isCodexLaunch && !options.adapter.startAgent) {
+    throw new Error("PTY agents are not supported by this server");
+  }
 
   if (request.worktree === true && input.worktreeLease) {
     throw new Error("worktree launch cannot specify both worktree=true and an existing lease");
@@ -232,6 +245,11 @@ export async function startManagedAgent(
   // ourselves so the transcript location is known before the process exists.
   const claudeIdentity = prepareClaudeIdentity(request, cwd);
 
+  // Claude's initial kickoff rides the spawn argv as the CLI's positional
+  // query (interactive TUI, prompt submitted natively at boot) - never typed
+  // into the PTY after launch. Later follow-ups keep the existing delivery.
+  const claudeKickoffInArgs = prepareClaudeKickoffArg(request);
+
   const launchModel = resolveSessionModel(launchAgentKind(request.command, request.agent), {
     model: request.model,
     effort: request.effort
@@ -249,41 +267,86 @@ export async function startManagedAgent(
   const ownerRuntime = request.labels?.role === "mate" && input.trackOwner !== false
     ? options.ownerManager?.beginMateLaunch(request, input.intentionalNewMate === true)
     : undefined;
-  let codexSocketPath: string | null = null;
   let session: AgentSession | undefined;
   try {
-    codexSocketPath = input.disableCodexRemote
-      ? null
-      : await prepareCodexRemote(options, request, cwd, launchModel.effort);
-    if (codexSocketPath && request.sessionId) {
-      await attachCodexControl(options, request.sessionId, codexSocketPath, cwd);
+    if (isCodexLaunch && options.codexOwned) {
+      // Codex is app-server-owned: the adapter starts (or resumes) the thread
+      // itself and returns only after the protocol response carried the
+      // authoritative thread id. There is no PTY and no keystroke path.
+      session = await options.codexOwned.startOwned(
+        request,
+        codexOwnedResume ? { resume: codexOwnedResume } : {}
+      );
+    } else {
+      session = await options.adapter.startAgent!(request);
     }
-    session = await options.adapter.startAgent(request);
 
     if (request.sessionId && session.id !== request.sessionId) {
-      // The adapter refused the pre-minted id. Drop the misaddressed control
-      // client so a stale id cannot receive model or turn commands - but the
-      // spawned TUI stays dialed into the daemon, so daemon ownership moves to
-      // the adapter's id (releasing it here would kill the live session's
-      // backend; the session's exit releases it instead).
-      options.codexControl?.transferDaemon(request.sessionId, session.id);
-      await options.codexControl?.detach(request.sessionId).catch(() => {});
+      // The adapter refused the pre-minted id: drop the stale id's hook
+      // registration so its credentials cannot outlive the launch.
       options.hooks.unregister(request.sessionId);
     }
 
     if (lease) {
       await options.worktrees.assign(lease.id, session.id);
       session.worktreeId = lease.id;
+      // The owned adapter hands out session copies, so the lease must also be
+      // recorded on its internal session or later listSessions snapshots
+      // would lose the worktree association.
+      if (isCodexLaunch) options.codexOwned?.setWorktreeId(session.id, lease.id);
     }
+
+    const codexThreadId = isCodexLaunch ? options.codexOwned?.threadIdOf(session.id) : null;
+    const codexSocketPath = isCodexLaunch ? options.codexOwned?.socketPathOf(session.id) : undefined;
+    const codexRuntimeFingerprint = isCodexLaunch ? options.codexOwned?.runtimeFingerprint() : undefined;
 
     if (runtime) {
       options.runtimeManager?.markLive(runtime, session.id, options.adapter.runtimeProcess?.(session.id), {
         ...(request.model ? { model: request.model } : {}),
-        ...(lease ? { worktreeId: lease.id, leaseId: lease.id, worktreePath: lease.path } : {})
+        ...(lease ? { worktreeId: lease.id, leaseId: lease.id, worktreePath: lease.path } : {}),
+        ...(isCodexLaunch
+          ? {
+              metadata: {
+                source: "managed-launch",
+                codexDriver: "app-server-owned",
+                ...(codexSocketPath ? { appServerSocketPath: codexSocketPath } : {}),
+                ...(codexRuntimeFingerprint
+                  ? { appServerRuntimeFingerprint: codexRuntimeFingerprint }
+                  : {})
+              }
+            }
+          : {})
       });
     }
     if (ownerRuntime) {
-      options.ownerManager?.markLive(ownerRuntime, session.id, options.adapter.runtimeProcess?.(session.id));
+      options.ownerManager?.markLive(
+        ownerRuntime,
+        session.id,
+        options.adapter.runtimeProcess?.(session.id),
+        isCodexLaunch
+          ? {
+              metadata: {
+                source: "mate-launch",
+                codexDriver: "app-server-owned",
+                ...(codexSocketPath ? { appServerSocketPath: codexSocketPath } : {}),
+                ...(codexRuntimeFingerprint
+                  ? { appServerRuntimeFingerprint: codexRuntimeFingerprint }
+                  : {})
+              }
+            }
+          : {}
+      );
+    }
+
+    // The thread id from the thread/start (or thread/resume) RESPONSE is the
+    // provider identity - recorded durably at launch, and fed to the recovery
+    // coordinators so a held identity expectation resolves without hooks or
+    // rollout scanning.
+    if (isCodexLaunch && codexThreadId) {
+      options.runtimeManager?.recordProviderSession(session.id, "codex", codexThreadId);
+      options.ownerManager?.recordProviderSession(session.id, "codex", codexThreadId);
+      options.recoveryCoordinator?.observeSessionStart(session.id, "codex", codexThreadId);
+      options.mateRecoveryCoordinator?.observeSessionStart(session.id, "codex", codexThreadId);
     }
 
     options.monitor.setSessionModel(
@@ -319,9 +382,9 @@ export async function startManagedAgent(
 
     // A resumed Claude session forks its transcript into a fresh jsonl (new
     // uuid) and abandons the resumed-from file the SessionStart hook names, so
-    // the tailer must actively re-resolve to the live fork - the Claude
-    // analogue of the codex rollout scan. Scoped to `--resume` launches only;
-    // fresh sessions do not fork, and codex resume uses `resume` (no dashes).
+    // the tailer must actively re-resolve to the live fork. This is scoped to
+    // `--resume` launches only; fresh sessions do not fork, and app-server-owned
+    // Codex sessions use protocol events instead of transcript tailing.
     if (isClaudeResumeLaunch(request)) {
       options.timeline.followClaudeResume(session.id, isAllowedTranscriptPath);
     }
@@ -330,17 +393,33 @@ export async function startManagedAgent(
       if (input.initialPromptSource) {
         options.timeline.recordSource(session.id, request.initialPrompt, input.initialPromptSource);
       }
-      options.monitor.queueInitialPrompt(session.id, request.initialPrompt);
-      // The queued kickoff is typed into the TUI best-effort; a codex TUI that
-      // was not ready yet swallows it silently and the worker then sits empty
-      // forever. Watch for first-turn evidence and retry the kickoff once.
-      if (
-        input.taskId &&
-        input.initialPromptSource === "agent" &&
-        launchAgentKind(request.command, request.agent) === "codex"
-      ) {
-        armCodexKickoffWatchdog(options, session.id, input.taskId, request.initialPrompt, options.codexKickoffRetryMs);
+      if (isCodexLaunch && options.codexOwned) {
+        // Codex: the kickoff is the first acknowledged turn/start against the
+        // thread the launch just established - never a PTY write. Task
+        // kickoffs journal intent/acceptance durably; other initial prompts
+        // ride the gate-aware composer path (which submits over the protocol
+        // for owned sessions).
+        if (input.taskId && input.initialPromptSource === "agent") {
+          await submitCodexKickoff(options, session.id, input.taskId, request.initialPrompt);
+        } else {
+          await options.codexOwned.submitAcknowledgedTurn(session.id, request.initialPrompt, {
+            clientUserMessageId: `perch:${randomUUID()}`,
+            source: input.initialPromptSource ?? "human"
+          });
+        }
+      } else if (!claudeKickoffInArgs) {
+        // Non-Claude, non-Codex agents keep the queued PTY delivery. Claude's
+        // kickoff already left in the spawn argv above.
+        options.monitor.queueInitialPrompt(session.id, request.initialPrompt);
       }
+    }
+
+    // A resumed codex task runtime may hold a kickoff journaled as submitted
+    // but never acknowledged (the previous life died in the window between
+    // send and response, or between acceptance and persistence). Reconcile it
+    // against authoritative thread history - never a blind resend.
+    if (isCodexLaunch && codexOwnedResume && input.taskId) {
+      void reconcileCodexKickoff(options, session.id, input.taskId);
     }
 
     await audit(options.auditLog, {
@@ -355,17 +434,19 @@ export async function startManagedAgent(
     return {
       session,
       request,
-      codexRemote: Boolean(codexSocketPath),
       ...(lease ? { worktreeId: lease.id } : {})
     };
   } catch (error) {
     if (runtime) options.runtimeManager?.markLaunchFailed(runtime);
     if (ownerRuntime) options.ownerManager?.markLaunchFailed(ownerRuntime);
-    if (session?.id && options.adapter.stopSession) {
-      await options.adapter.stopSession(session.id).catch(() => {});
+    if (session?.id) {
+      if (options.codexOwned?.has(session.id)) {
+        await options.codexOwned.stopSession(session.id).catch(() => {});
+      } else if (options.adapter.stopSession) {
+        await options.adapter.stopSession(session.id).catch(() => {});
+      }
     }
     if (request.sessionId) {
-      await options.codexControl?.detach(request.sessionId).catch(() => {});
       options.hooks.unregister(request.sessionId);
     }
     if (lease && releaseLeaseOnFailure && !input.retainWorktreeOnFailure) {
@@ -421,38 +502,194 @@ function isClaudeResumeLaunch(request: StartAgentRequest): boolean {
   );
 }
 
-// Is this launch a Codex session? The New Agent sheet sends agent: "codex";
-// otherwise infer from the command basename.
-function isCodexLaunch(command: string, agent?: AgentKind): boolean {
-  if (agent) return agent === "codex";
-  const base = command.trim().split(/[\\/]/).pop() ?? "";
-  return base.toLowerCase().includes("codex");
+// Hard ceiling for a Claude kickoff delivered as a spawn argument. macOS and
+// Linux both bound a single argv entry well above this, but the combined
+// argv+env budget (ARG_MAX, and Linux's 128KiB per-string MAX_ARG_STRLEN) is
+// finite: a prompt beyond this limit must fail the launch truthfully rather
+// than be silently truncated by the OS or the CLI.
+export const CLAUDE_KICKOFF_ARG_MAX_BYTES = 120_000;
+
+// Claude's initial kickoff is passed as the CLI's positional query in the
+// spawn argv (node-pty spawns argv arrays directly - no shell, so no
+// interpolation and multiline/Unicode text survives byte-for-byte). The TUI
+// submits it natively at boot; nothing is ever typed into the PTY for the
+// initial prompt. Tradeoff, documented deliberately: process argv is readable
+// ACROSS users for the life of the session - /proc/<pid>/cmdline is
+// world-readable on default Linux, and `ps aux` shows it on macOS - unlike
+// transcript files, which are 0600 same-user. On shared machines this widens
+// exposure of a sensitive brief relative to the previous typed-prompt path.
+// Returns whether the kickoff now rides the argv (and must not be queued).
+function prepareClaudeKickoffArg(request: StartAgentRequest): boolean {
+  if (launchAgentKind(request.command, request.agent) !== "claude") return false;
+  const prompt = request.initialPrompt;
+  if (typeof prompt !== "string" || prompt.trim().length === 0) return false;
+  const bytes = Buffer.byteLength(prompt, "utf8");
+  if (bytes > CLAUDE_KICKOFF_ARG_MAX_BYTES) {
+    throw new Error(
+      `claude kickoff prompt is ${bytes} bytes, above the ${CLAUDE_KICKOFF_ARG_MAX_BYTES}-byte spawn-argument limit; shorten the brief (the launch was refused rather than truncating it)`
+    );
+  }
+  request.args = [...(request.args ?? []), prompt];
+  return true;
 }
 
-async function prepareCodexRemote(
-  options: ManagedAgentLauncherOptions,
-  request: StartAgentRequest,
-  cwd: string,
-  effort?: CodexReasoningEffort
-): Promise<string | null> {
-  if (!options.codexControl || !isCodexLaunch(request.command, request.agent)) return null;
+// Stable kickoff identity for a dispatched codex task: one id per task, the
+// same across restarts, persisted on the ledger before the send. Codex echoes
+// it back as the userMessage item's clientId in thread history, which is what
+// makes lost-response and restart reconciliation possible without resending.
+export function codexKickoffClientMessageId(taskId: string): string {
+  return `perch-kickoff:${taskId}`;
+}
 
-  // Pre-mint this session's id + hook token and set them on the request so the
-  // PTY adapter adopts the same id. The daemon is spawned before the session
-  // exists, so seed it with hook wiring now.
-  const sessionId = request.sessionId ?? `pty:${randomUUID()}`;
-  request.sessionId = sessionId;
-  const hookEnv: Record<string, string> = {
-    PERCH_SESSION_ID: sessionId,
-    PERCH_HOOK_URL: `http://127.0.0.1:${options.port}/hooks`,
-    PERCH_HOOK_TOKEN: options.hooks.ensure(sessionId).token,
-    ...taskCapabilityEnvironment(options.tasks, request, cwd)
-  };
-  const handle = await options.codexControl.prepareRemote(cwd, { effort, env: hookEnv });
-  if (!handle) return null;
+type CodexKickoffDeps = Pick<ManagedAgentLauncherOptions, "tasks" | "codexOwned">;
 
-  request.args = ["--remote", `unix://${handle.socketPath}`, ...(request.args ?? [])];
-  return handle.socketPath;
+// Submit a dispatched task's kickoff as the first acknowledged turn/start.
+// Ledger contract: `kickoff_submitted` (intent, durable, BEFORE the send) ->
+// `kickoff_accepted` (the provider's turn id, only from a successful
+// response or history reconciliation). A rejection parks the task blocked
+// with the provider's real error; an unknown outcome parks it blocked
+// truthfully as unknown - never a PTY retry, never a blind resend.
+export async function submitCodexKickoff(
+  deps: CodexKickoffDeps,
+  sessionId: string,
+  taskId: string,
+  kickoff: string
+): Promise<void> {
+  if (!deps.codexOwned) return;
+  const clientUserMessageId = codexKickoffClientMessageId(taskId);
+  deps.tasks.recordEvent(taskId, {
+    kind: "note",
+    source: "system",
+    message: "codex kickoff submitted over the app-server protocol; acceptance pending",
+    data: { reason: "kickoff_submitted", sessionId, clientUserMessageId }
+  });
+  try {
+    const { turnId } = await deps.codexOwned.submitAcknowledgedTurn(sessionId, kickoff, {
+      clientUserMessageId,
+      source: "agent"
+    });
+    recordKickoffAccepted(deps, taskId, sessionId, clientUserMessageId, turnId);
+    markTaskWorkingFromActivity(deps, sessionId, { newTurn: true });
+  } catch (error) {
+    recordKickoffFailure(deps, taskId, sessionId, error);
+  }
+}
+
+// Resolve a kickoff journaled as submitted but never acknowledged, after a
+// recovery resume: authoritative thread history decides. Present -> record
+// acceptance; verifiably absent -> the one history-verified resubmission;
+// unreadable -> blocked as unknown. This is the restart boundary guarantee:
+// a crash between provider acceptance and local persistence can never
+// duplicate the kickoff, because the resubmit only happens when history
+// proves the first send never landed.
+export async function reconcileCodexKickoff(
+  deps: CodexKickoffDeps,
+  sessionId: string,
+  taskId: string
+): Promise<void> {
+  if (!deps.codexOwned) return;
+  const events = deps.tasks.events(taskId);
+  const submitted = events.some((event) => event.data?.reason === "kickoff_submitted");
+  const accepted = events.some((event) => event.data?.reason === "kickoff_accepted");
+  if (!submitted || accepted) return;
+  const clientUserMessageId = codexKickoffClientMessageId(taskId);
+  let landedTurnId: string | null | undefined;
+  try {
+    const landed = await deps.codexOwned.findAcceptedTurn(sessionId, clientUserMessageId);
+    landedTurnId = landed ? (landed.id ?? null) : undefined;
+  } catch (error) {
+    recordKickoffFailure(deps, taskId, sessionId, new CodexDeliveryUnknownError(
+      `kickoff acceptance is unknown after restart: thread history could not be read (${
+        error instanceof Error ? error.message : error
+      }); not resent`
+    ));
+    return;
+  }
+  if (landedTurnId !== undefined) {
+    recordKickoffAccepted(deps, taskId, sessionId, clientUserMessageId, landedTurnId, true);
+    return;
+  }
+  const operation = deps.tasks.stateDb.operations.latestForTask(taskId, "dispatch");
+  const kickoff = (operation?.payload as { prepared?: { request?: StartAgentRequest } } | undefined)
+    ?.prepared?.request?.initialPrompt;
+  if (typeof kickoff !== "string" || kickoff.trim().length === 0) {
+    recordKickoffFailure(deps, taskId, sessionId, new CodexDeliveryUnknownError(
+      "kickoff acceptance is unknown after restart: history shows no accepted kickoff and the dispatch record no longer carries the original prompt; not resent"
+    ));
+    return;
+  }
+  try {
+    const { turnId } = await deps.codexOwned.submitAcknowledgedTurn(sessionId, kickoff, {
+      clientUserMessageId,
+      source: "agent"
+    });
+    recordKickoffAccepted(deps, taskId, sessionId, clientUserMessageId, turnId);
+    markTaskWorkingFromActivity(deps, sessionId, { newTurn: true });
+  } catch (error) {
+    recordKickoffFailure(deps, taskId, sessionId, error);
+  }
+}
+
+function recordKickoffAccepted(
+  deps: CodexKickoffDeps,
+  taskId: string,
+  sessionId: string,
+  clientUserMessageId: string,
+  turnId: string | null,
+  reconciled = false
+): void {
+  try {
+    deps.tasks.recordEvent(taskId, {
+      kind: "note",
+      source: "system",
+      message: reconciled
+        ? "codex kickoff confirmed accepted from thread history after reconnect"
+        : "codex accepted the kickoff turn",
+      data: {
+        reason: "kickoff_accepted",
+        sessionId,
+        clientUserMessageId,
+        ...(turnId ? { turnId } : {}),
+        ...(reconciled ? { reconciled: true } : {})
+      }
+    });
+  } catch {
+    // Ledger bookkeeping must never disturb the session.
+  }
+}
+
+function recordKickoffFailure(deps: CodexKickoffDeps, taskId: string, sessionId: string, error: unknown): void {
+  const task = deps.tasks.find(taskId);
+  // A task already parked (needs_you, blocked, failed) owns its truthful
+  // outcome; only a still-silent queued/working task is parked here.
+  if (!task || (task.state !== "queued" && task.state !== "working")) return;
+  const message = error instanceof Error ? error.message : String(error);
+  try {
+    if (isCodexRpcError(error)) {
+      deps.tasks.recordEvent(taskId, {
+        kind: "blocked",
+        source: "system",
+        message: `codex rejected the kickoff turn: ${message}`,
+        data: { reason: "kickoff_rejected", sessionId, code: error.code }
+      });
+    } else if (error instanceof CodexDeliveryUnknownError) {
+      deps.tasks.recordEvent(taskId, {
+        kind: "blocked",
+        source: "system",
+        message: `codex kickoff acceptance is unknown: ${message}`,
+        data: { reason: "kickoff_unknown", sessionId }
+      });
+    } else {
+      deps.tasks.recordEvent(taskId, {
+        kind: "blocked",
+        source: "system",
+        message: `codex kickoff failed: ${message}`,
+        data: { reason: "kickoff_failed", sessionId }
+      });
+    }
+  } catch {
+    // Ledger bookkeeping must never disturb the session.
+  }
 }
 
 // A dispatched task stays `queued` until its worker shows life. Claude workers
@@ -480,24 +717,17 @@ export function markTaskWorkingFromActivity(
   }
 }
 
-function publishCodexStream(
-  options: ManagedAgentLauncherOptions,
-  sessionId: string,
-  ev: { itemId: string; text: string; done: boolean }
-): void {
-  options.monitor.publish({
-    type: "assistant_stream",
-    sessionId,
-    itemId: ev.itemId,
-    text: ev.text,
-    done: ev.done,
-    at: new Date().toISOString()
-  });
-}
-
-function taskForSession(options: ManagedAgentLauncherOptions, sessionId: string) {
+function taskForSession(options: { tasks: TaskStore }, sessionId: string) {
   return options.tasks.list().find((task) => task.sessionId === sessionId);
 }
+
+// The monitor/task surface the codex server-request projection needs; the
+// index wiring calls these outside the launcher, so they must not demand the
+// full launcher option bag.
+export type CodexServerRequestSink = {
+  monitor: Pick<FleetMonitor, "setPendingServerRequest" | "resolveServerRequest" | "pendingServerRequest">;
+  tasks: TaskStore;
+};
 
 export function surfaceApprovalToTask(
   tasks: TaskStore,
@@ -560,8 +790,8 @@ function codexServerRequestEventData(request: PendingServerRequest): Record<stri
   };
 }
 
-function surfaceCodexServerRequest(
-  options: ManagedAgentLauncherOptions,
+export function surfaceCodexServerRequest(
+  options: CodexServerRequestSink,
   sessionId: string,
   request: PendingServerRequest
 ): void {
@@ -576,8 +806,8 @@ function surfaceCodexServerRequest(
   });
 }
 
-function resolveCodexServerRequest(
-  options: ManagedAgentLauncherOptions,
+export function resolveCodexServerRequest(
+  options: CodexServerRequestSink,
   sessionId: string,
   request: PendingServerRequest
 ): void {
@@ -608,253 +838,6 @@ function resolveCodexServerRequest(
     message: "Codex approval resolved",
     data: { reason: "codex_server_request_resolved", requestId: request.requestId }
   });
-}
-
-async function attachCodexControl(
-  options: ManagedAgentLauncherOptions,
-  sessionId: string,
-  socketPath: string,
-  cwd: string
-): Promise<void> {
-  if (!options.codexControl) return;
-  let sharedThreadId: string | undefined;
-  const ensureRollout = () => {
-    if (sharedThreadId) attachCodexRollout(options, sessionId, sharedThreadId);
-  };
-  const attached = await options.codexControl.attach(sessionId, {
-    socketPath,
-    cwd,
-    onSharedThread: (threadId) => {
-      sharedThreadId = threadId;
-      options.runtimeManager?.recordProviderSession(sessionId, "codex", threadId);
-      options.ownerManager?.recordProviderSession(sessionId, "codex", threadId);
-      // Feed the recovery verifier for remote-topology sessions. Recovery
-      // currently launches codex PTY-only (disableCodexRemote), so no
-      // identity expectation matches here today; the codex driver's
-      // out-of-band verifier resolves it instead. This stays wired so a
-      // future remote-enabled recovery carries same-daemon evidence.
-      options.recoveryCoordinator?.observeSessionStart(sessionId, "codex", threadId);
-      options.mateRecoveryCoordinator?.observeSessionStart(sessionId, "codex", threadId);
-      ensureRollout();
-    },
-    onAssistantStream: (ev) => {
-      ensureRollout();
-      markTaskWorkingFromActivity(options, sessionId);
-      publishCodexStream(options, sessionId, ev);
-    },
-    onStatus: (status) => {
-      // Status alone never recovers a blocked task: approval resolution also
-      // transitions back to `running` mid-turn (see onTurnStarted below).
-      options.monitor.applyExternalStatus(sessionId, status, "codex", "adapter");
-    },
-    onServerRequest: (request) => surfaceCodexServerRequest(options, sessionId, request),
-    onServerRequestResolved: (request) => resolveCodexServerRequest(options, sessionId, request),
-    onTurnStarted: () => {
-      // An actual turn start (legacy task_started / raw v2 turn/started) is
-      // the one signal allowed to recover a blocked task back to working.
-      options.taskCompletion?.onTurnStarted(sessionId, "codex");
-      markTaskWorkingFromActivity(options, sessionId, { newTurn: true });
-    },
-    onTurnComplete: (ev) => {
-      ensureRollout();
-      markTaskWorkingFromActivity(options, sessionId);
-      options.taskCompletion?.onTurnCompleted(sessionId, "codex");
-    },
-    onUsageLimit: (limit) => {
-      options.monitor.reportUsageLimit(sessionId, "codex", limit);
-    }
-  });
-  if (!attached) {
-    console.warn(`codex: control attach failed session=${sessionId.slice(0, 12)}`);
-  }
-}
-
-export function attachCodexRollout(
-  options: {
-    hooks: HookRegistry;
-    timeline: TimelineStore;
-  },
-  sessionId: string,
-  agentSessionId: string
-): void {
-  if (codexRolloutResolving.has(sessionId)) return;
-  codexRolloutResolving.add(sessionId);
-  void (async () => {
-    try {
-      // 60s window: the rollout file only appears at the thread's first turn,
-      // and turn signals re-arm a fresh pass, so a later first turn still
-      // attaches.
-      for (let attempt = 0; attempt < 30; attempt += 1) {
-        if (options.hooks.correlation(sessionId)?.transcriptPath) {
-          return;
-        }
-        const rollout = findCodexRollout(agentSessionId);
-        if (rollout) {
-          if (isAllowedTranscriptPath(rollout)) {
-            options.hooks.correlate(sessionId, agentSessionId, rollout);
-            options.timeline.attach(sessionId, rollout, isAllowedTranscriptPath, "codex", agentSessionId);
-            console.log(`codex rollout attached session=${sessionId.slice(0, 12)}`);
-          }
-          return;
-        }
-        await new Promise((resolve) => setTimeout(resolve, 2000));
-      }
-    } finally {
-      codexRolloutResolving.delete(sessionId);
-    }
-  })();
-}
-
-export const CODEX_KICKOFF_RETRY_MS = 45_000;
-
-// One armed kickoff watchdog per session, however many callers race to arm it.
-const codexKickoffWatchdogs = new Set<string>();
-
-export type CodexKickoffWatchdogDeps = {
-  tasks: TaskStore;
-  monitor: Pick<FleetMonitor, "queueOrSubmit">;
-  hooks: Pick<HookRegistry, "correlation">;
-  timeline: Pick<TimelineStore, "recordSource">;
-};
-
-// First-turn evidence for a dispatched codex worker, strongest first: the
-// provider's own turn lifecycle recorded against this exact session, a worker
-// verb (only ever curled from inside a running turn), or the rollout
-// correlation (codex writes the rollout file only at the thread's first turn).
-// Deliberately excludes transcript text, rendered-screen state, and elapsed
-// time - none of those prove the kickoff was accepted.
-export function codexFirstTurnEvidence(
-  deps: Pick<CodexKickoffWatchdogDeps, "tasks" | "hooks">,
-  sessionId: string,
-  taskId: string
-): "turn" | "worker" | "rollout" | undefined {
-  for (const event of deps.tasks.events(taskId)) {
-    if ((event.kind === "turn_started" || event.kind === "turn_completed") && event.data?.sessionId === sessionId) {
-      return "turn";
-    }
-    if (event.source === "worker") return "worker";
-  }
-  return deps.hooks.correlation(sessionId)?.transcriptPath ? "rollout" : undefined;
-}
-
-// A dispatched codex worker whose kickoff was swallowed (typed into a TUI that
-// was not ready) must not sit silently empty. After one window with no
-// first-turn evidence, resubmit the exact original kickoff once; after a
-// second window still without evidence, park the task blocked so the mate
-// adjudicates instead of the worker "working" forever. Evidence is re-checked
-// immediately before the retry, so a first turn that lands in the window
-// suppresses it, and the per-session guard makes the retry exactly-once even
-// when arming races. A submitted retry is journaled on the task ledger so a
-// rearm after a server restart never submits a second one.
-export function armCodexKickoffWatchdog(
-  deps: CodexKickoffWatchdogDeps,
-  sessionId: string,
-  taskId: string,
-  kickoff: string,
-  windowMs = CODEX_KICKOFF_RETRY_MS
-): void {
-  if (codexKickoffWatchdogs.has(sessionId)) return;
-  codexKickoffWatchdogs.add(sessionId);
-  const disarm = () => codexKickoffWatchdogs.delete(sessionId);
-  const retrySpent = () =>
-    deps.tasks
-      .events(taskId)
-      .some(
-        (event) =>
-          event.kind === "note" && event.data?.reason === "kickoff_retried" && event.data?.sessionId === sessionId
-      );
-  const finalPass = (retry: "submitted" | "gated") => {
-    try {
-      if (codexFirstTurnEvidence(deps, sessionId, taskId)) return;
-      const task = deps.tasks.find(taskId);
-      // A task already parked (needs_you, blocked, failed) owns its truthful
-      // outcome; only a still-silent queued/working task is parked here.
-      if (!task || (task.state !== "queued" && task.state !== "working")) return;
-      deps.tasks.recordEvent(taskId, {
-        kind: "blocked",
-        source: "system",
-        message:
-          retry === "submitted"
-            ? "codex worker shows no first turn after launch and one kickoff retry; the kickoff prompt was never accepted"
-            : "codex worker shows no first turn after launch and the kickoff retry was skipped by an open permission gate; the kickoff prompt was never accepted",
-        data: { reason: "kickoff_not_accepted", sessionId, retry }
-      });
-    } catch {
-      // Ledger bookkeeping must never disturb the session.
-    } finally {
-      disarm();
-    }
-  };
-  const retryPass = async () => {
-    let retry: "submitted" | "gated";
-    try {
-      if (codexFirstTurnEvidence(deps, sessionId, taskId)) return disarm();
-      if (retrySpent()) {
-        // A previous server life already spent the one retry; only the final
-        // adjudication window remains.
-        retry = "submitted";
-      } else {
-        // Exactly one retry of the exact original kickoff. queueIfGated: false -
-        // an open permission gate means the worker is not silently empty (the
-        // approval flow owns that outcome), and queued text typed later could
-        // land after the gate resolves and duplicate an accepted kickoff. Only
-        // an actually submitted retry earns a provenance record and the
-        // spent-retry journal entry.
-        const result = await deps.monitor.queueOrSubmit(sessionId, kickoff, { queueIfGated: false });
-        retry = result.gated ? "gated" : "submitted";
-        if (!result.gated) {
-          deps.timeline.recordSource(sessionId, kickoff, "agent");
-          deps.tasks.recordEvent(taskId, {
-            kind: "note",
-            source: "system",
-            message: "codex kickoff retried after a silent launch window",
-            data: { reason: "kickoff_retried", sessionId }
-          });
-        }
-      }
-    } catch {
-      // The session already ended; exit reporting owns the truthful outcome.
-      return disarm();
-    }
-    const finalTimer = setTimeout(() => finalPass(retry), windowMs);
-    finalTimer.unref?.();
-  };
-  const retryTimer = setTimeout(() => void retryPass(), windowMs);
-  retryTimer.unref?.();
-}
-
-// The armed watchdog is process memory; a server restart inside its window
-// would otherwise leave a silent dispatched worker unwatched (the generic
-// launch-stall backstop can be fooled by TUI banner activity). Rearm at boot
-// from durable state alone: still-queued/working codex task dispatches whose
-// session is live and shows no first-turn evidence, with the exact original
-// kickoff read back from the dispatch operation's prepared launch request.
-export async function rearmCodexKickoffWatchdogs(
-  deps: CodexKickoffWatchdogDeps & { adapter: Pick<AgentAdapter, "listSessions"> },
-  windowMs = CODEX_KICKOFF_RETRY_MS
-): Promise<void> {
-  let live: Set<string>;
-  try {
-    live = new Set((await deps.adapter.listSessions()).map((session) => session.id));
-  } catch {
-    return;
-  }
-  for (const task of deps.tasks.list()) {
-    try {
-      if (task.state !== "queued" && task.state !== "working") continue;
-      if (!task.sessionId || !live.has(task.sessionId)) continue;
-      const operation = deps.tasks.stateDb.operations.latestForTask(task.id, "dispatch");
-      const request = (operation?.payload as { prepared?: { request?: StartAgentRequest } } | undefined)?.prepared
-        ?.request;
-      if (!request || typeof request.initialPrompt !== "string" || request.initialPrompt.trim().length === 0) continue;
-      if (request.sessionId !== task.sessionId) continue;
-      if (launchAgentKind(request.command, request.agent) !== "codex") continue;
-      if (codexFirstTurnEvidence(deps, task.sessionId, task.id)) continue;
-      armCodexKickoffWatchdog(deps, task.sessionId, task.id, request.initialPrompt, windowMs);
-    } catch {
-      // One task's bad records must never block the boot rearm sweep.
-    }
-  }
 }
 
 // Resolve the agent kind for a launch, mirroring the PTY adapter's inference so

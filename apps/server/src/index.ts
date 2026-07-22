@@ -1,13 +1,15 @@
 import { statSync } from "node:fs";
 import { basename } from "node:path";
 import { PtyAgentAdapter } from "./adapters/pty.js";
-import { CodexControlPlane } from "./codexControl.js";
-import { codexOnPath, selectCodexDriver } from "./adapters/codexDaemon.js";
+import { CodexAppServerAdapter } from "./adapters/codexAppServerAdapter.js";
+import { CodexDaemonManager } from "./adapters/codexDaemon.js";
+import { RoutingAgentAdapter } from "./adapters/routingAdapter.js";
 import { AuditLog } from "./audit.js";
 import {
   markTaskWorkingFromActivity,
-  rearmCodexKickoffWatchdogs,
   resolveApprovalForTask,
+  resolveCodexServerRequest,
+  surfaceCodexServerRequest,
   taskCapabilityEnvironment,
   surfaceApprovalToTask
 } from "./agentLauncher.js";
@@ -49,19 +51,22 @@ const timeline = new TimelineStore();
 // G6: every task transition and session status change is stamped with its
 // source and counted; GET /doctor/state-metrics serves the snapshot.
 const metrics = new StateMetrics();
-// Codex `--remote` control plane: perch-owned `codex app-server` daemon + a
-// control client per session for the model chip and protocol turn submission.
-// Enabled from any normal codex install (no standalone gate); off cleanly when
-// codex is absent, on Windows, or via PERCH_CODEX_REMOTE=0 - Codex then runs on
-// the plain PTY path.
-const codexControl = new CodexControlPlane({
-  enabled: selectCodexDriver({ codexOnPath: codexOnPath() }) === "app-server-remote"
+// Codex is app-server-owned: perch spawns one `codex app-server` daemon per
+// session workdir on a private unix socket and is its sole standing
+// authoritative client. There is no Codex PTY and no keystroke path; rollback
+// is by release or commit, not a runtime switch.
+const codexDaemons = new CodexDaemonManager();
+const codexOwned = new CodexAppServerAdapter({
+  daemons: codexDaemons,
+  // The daemon process runs the agent's tool shells, so it carries the same
+  // per-session hook wiring a PTY session would.
+  sessionEnv: (sessionId, request) => ({
+    PERCH_SESSION_ID: sessionId,
+    PERCH_HOOK_URL: `http://127.0.0.1:${config.port}/hooks`,
+    PERCH_HOOK_TOKEN: hooks.ensure(sessionId).token,
+    ...taskCapabilityEnvironment(tasks, request)
+  })
 });
-console.log(
-  codexControl.isEnabled()
-    ? "codex: app-server --remote topology enabled"
-    : "codex: app-server --remote disabled (PTY-only)"
-);
 const ptyAdapter = new PtyAgentAdapter(undefined, {
   // Every perch-owned PTY carries its hook wiring; the installed Claude hook
   // is inert in terminals without these variables.
@@ -74,7 +79,6 @@ const ptyAdapter = new PtyAgentAdapter(undefined, {
   onSessionExit: (sessionId, exitContext) => {
     hooks.unregister(sessionId);
     timeline.detach(sessionId);
-    void codexControl.detach(sessionId);
     removeAttachments(sessionId);
     ownerManager.interruptSession(sessionId);
     // Process death updates runtime liveness without changing task meaning.
@@ -99,7 +103,7 @@ const ptyAdapter = new PtyAgentAdapter(undefined, {
     pushRouter.sessionExited(sessionId);
   }
 });
-const adapter = ptyAdapter;
+const adapter = new RoutingAgentAdapter(ptyAdapter, codexOwned);
 const auditLog = new AuditLog(config.auditLogPath);
 const devices = new DeviceRegistry();
 // Derive (or load) the long-term box keypair on boot; its public half is
@@ -185,7 +189,21 @@ void adapter
   .listSessions()
   .then((sessions) => {
     const live = new Set(sessions.map((session) => session.id));
-    hooks.prune(live);
+    // A surviving codex daemon's environment still authenticates with the
+    // session identity it was spawned with; keep those durable credentials
+    // until the runtime either rebinds (aliasing them to the live session) or
+    // ends. Pruning them here would strand every tool shell of a daemon the
+    // sweep below deliberately keeps alive.
+    const keepCredentials = new Set(live);
+    for (const runtime of [...tasks.stateDb.runtimes.active(), ...tasks.stateDb.ownerRuntimes.active()]) {
+      if (typeof runtime.metadata?.appServerSocketPath !== "string") continue;
+      const daemonSessionId =
+        typeof runtime.metadata.appServerDaemonSessionId === "string"
+          ? runtime.metadata.appServerDaemonSessionId
+          : runtime.ptySessionId;
+      if (daemonSessionId) keepCredentials.add(daemonSessionId);
+    }
+    hooks.prune(keepCredentials);
     runtimeManager.reconcile(live, (sessionId) => Boolean(adapter.runtimeProcess?.(sessionId)));
     ownerManager.reconcile(live, (sessionId) => Boolean(adapter.runtimeProcess?.(sessionId)));
   })
@@ -218,6 +236,69 @@ const pushRouter = new PushRouter(
   { fallbackMs: config.escalationFallbackMs }
 );
 monitor.setPushRouter(pushRouter);
+
+// Protocol notifications own every app-server-owned Codex session's timeline,
+// status, approvals, streaming, and turn lifecycle. This is the single wiring
+// point from the owning adapter into the monitor/task/timeline world.
+codexOwned.wireEvents({
+  onTimelineItem: (item, live) => timeline.ingest(item, { live }),
+  onStatus: (sessionId, status) => {
+    // Status alone never recovers a blocked task: approval resolution also
+    // transitions back to `running` mid-turn (see onTurnStarted below).
+    monitor.applyExternalStatus(sessionId, status, "codex", "adapter");
+  },
+  onServerRequest: (sessionId, request) => surfaceCodexServerRequest({ monitor, tasks }, sessionId, request),
+  onServerRequestResolved: (sessionId, request) => resolveCodexServerRequest({ monitor, tasks }, sessionId, request),
+  onAssistantStream: (sessionId, ev) => {
+    markTaskWorkingFromActivity({ tasks }, sessionId);
+    monitor.publish({
+      type: "assistant_stream",
+      sessionId,
+      itemId: ev.itemId,
+      text: ev.text,
+      done: ev.done,
+      at: new Date().toISOString()
+    });
+  },
+  onTurnStarted: (sessionId) => {
+    // An actual turn start is the one signal allowed to recover a blocked
+    // task back to working.
+    taskCompletion.onTurnStarted(sessionId, "codex");
+    markTaskWorkingFromActivity({ tasks }, sessionId, { newTurn: true });
+  },
+  onTurnComplete: (sessionId) => {
+    markTaskWorkingFromActivity({ tasks }, sessionId);
+    taskCompletion.onTurnCompleted(sessionId, "codex");
+  },
+  onThreadStarted: (sessionId, threadId) => {
+    runtimeManager.recordProviderSession(sessionId, "codex", threadId);
+    ownerManager.recordProviderSession(sessionId, "codex", threadId);
+  },
+  onModelResolved: (sessionId, model) =>
+    monitor.setSessionModel(sessionId, resolveSessionModel("codex", { model })),
+  onUsageLimit: (sessionId, limit) => monitor.reportUsageLimit(sessionId, "codex", limit),
+  onSessionExit: (sessionId, exitContext) => {
+    hooks.unregister(sessionId);
+    timeline.detach(sessionId);
+    removeAttachments(sessionId);
+    ownerManager.interruptSession(sessionId);
+    void cleanupSessionExitWorktree(sessionId, exitContext, {
+      tasks,
+      worktrees,
+      adapter,
+      auditLog,
+      metrics,
+      runtimeManager
+    }).catch((error) => {
+      console.warn(
+        `worktree: session-exit cleanup failed for ${sessionId}: ${
+          error instanceof Error ? error.message : error
+        }`
+      );
+    });
+    pushRouter.sessionExited(sessionId);
+  }
+});
 
 // Task-event side effects are delivered from the durable outbox. WebSocket
 // snapshots still update from the synchronous task-store listener path.
@@ -407,9 +488,9 @@ taskWatchdog.start();
 // trees stay leased and visible rather than losing work). A holder also counts
 // as live while its task is still open, so a stalled-but-decidable task never
 // loses its slot to the reaper; POST /worktrees/:id/release is the explicit
-// path for everything this skips. Runs once at startup - server-owned PTYs die
-// with the server, so a previous life's expired leases reclaim immediately -
-// and then on an interval.
+// path for everything this skips. Runs once at startup so expired leases from
+// sessions that did not survive can reclaim immediately, and then on an
+// interval.
 const reclaimOrphanedLeases = () =>
   (async () => {
     const live = new Set((await adapter.listSessions()).map((session) => session.id));
@@ -444,7 +525,7 @@ const server = createControlServer({
   tasks,
   prPoller,
   claudeStateFile: claudeStateFilePath(),
-  codexControl,
+  codexOwned,
   // Re-assert perch's hook entries at every launch: an external rewrite of
   // ~/.claude/settings.json (any tool persisting from a stale snapshot) would
   // otherwise silence hooks for all sessions launched after it until the next
@@ -507,20 +588,20 @@ server.listen(config.port, "0.0.0.0", () => {
     console.log(`relay: dialing ${config.relayUrl} for off-LAN reach`);
     relayClient.start();
   }
-  // Retire daemons orphaned by a non-graceful previous exit before any launch
-  // can acquire new ones (acquires only happen via HTTP handlers, so post-bind
-  // is still pre-first-acquire): their session-scoped hook credentials are
-  // stale and their socket paths will never be dialed again. Only after the
-  // port bind - the effective single-instance lock - so a second server racing
-  // against a live one dies on EADDRINUSE without SIGTERMing its live daemons.
-  codexControl.sweepOrphanDaemons();
+  // Retire daemons orphaned by a previous exit before any launch can acquire
+  // new ones - EXCEPT daemons recorded on active app-server-owned runtimes:
+  // those hold live thread state that recovery rebinds to without a respawn.
+  // Only after the port bind - the effective single-instance lock - so a
+  // second server racing against a live one dies on EADDRINUSE without
+  // SIGTERMing its live daemons.
+  const keepSockets = new Set<string>();
+  for (const runtime of [...tasks.stateDb.runtimes.active(), ...tasks.stateDb.ownerRuntimes.active()]) {
+    const socketPath = runtime.metadata?.appServerSocketPath;
+    if (typeof socketPath === "string" && socketPath.length > 0) keepSockets.add(socketPath);
+  }
+  codexDaemons.sweepOrphans(keepSockets);
   taskScheduler.start();
   outboxWorker.start();
-  // A kickoff watchdog armed by a previous server life is process memory;
-  // rearm from durable dispatch state so a restart inside its window cannot
-  // orphan a silent codex worker. Post-bind only, like the daemon sweep: the
-  // process that loses the port race must never inject into live sessions.
-  void rearmCodexKickoffWatchdogs({ tasks, monitor, hooks, timeline, adapter });
   console.log(`Perch server listening on http://0.0.0.0:${config.port}`);
 });
 
@@ -560,7 +641,18 @@ async function shutdown(): Promise<void> {
   for (const runtime of tasks.stateDb.ownerRuntimes.active()) {
     if (runtime.ptySessionId) ownerManager.interruptSession(runtime.ptySessionId);
   }
-  codexControl.stop();
+  // Leave live owned sessions' daemons running: they hold the in-memory
+  // thread state the next server life rebinds to (runtime rows just flipped
+  // recoverable above). Sockets recorded on still-active worker and mate
+  // runtimes survive too, so a daemon awaiting a not-yet-run recovery is
+  // never torn down by a second graceful restart. Everything else goes.
+  const surviving = codexOwned.liveSocketPaths();
+  for (const runtime of [...tasks.stateDb.runtimes.active(), ...tasks.stateDb.ownerRuntimes.active()]) {
+    const socketPath = runtime.metadata?.appServerSocketPath;
+    if (typeof socketPath === "string" && socketPath.length > 0) surviving.add(socketPath);
+  }
+  codexOwned.stop({ keepDaemons: true });
+  codexDaemons.stopAll(surviving);
   // server.close() waits for open connections; drop WebSocket clients so a
   // connected phone cannot hang the shutdown.
   monitor.closeAllClients();

@@ -19,6 +19,8 @@ import { AuditLog } from "./audit.js";
 import { FleetMonitor } from "./fleetMonitor.js";
 import { HookRegistry } from "./hooks.js";
 import { createControlServer, handleWebSocketRpcRequest } from "./http.js";
+import type { CodexAppServerAdapter } from "./adapters/codexAppServerAdapter.js";
+import { FakeCodexOwnedAdapter } from "./adapters/fakeCodexAppServer.js";
 import { DeviceRegistry } from "./pairing.js";
 import { PrPoller } from "./prPoller.js";
 import { ProjectRegistry } from "./projects.js";
@@ -128,6 +130,15 @@ async function withServer(run: (ctx: Fixture) => Promise<void>): Promise<void> {
 
   const env = { PERCH_HOME: home } as NodeJS.ProcessEnv;
   const adapter = new DispatchAdapter();
+  // Codex dispatches route to the app-server owning adapter; mirror its
+  // sessions into the shared capture so session-scoped assertions read one list.
+  const codexOwned = new FakeCodexOwnedAdapter();
+  const originalStartOwned = codexOwned.startOwned.bind(codexOwned);
+  codexOwned.startOwned = async (request, opts) => {
+    const session = await originalStartOwned(request, opts);
+    adapter.sessions.push(session as AgentSession);
+    return session;
+  };
   const monitor = new FleetMonitor(adapter, { broadcastMs: 5 });
   const tasks = new TaskStore(env);
   const projects = new ProjectRegistry(env);
@@ -151,7 +162,8 @@ async function withServer(run: (ctx: Fixture) => Promise<void>): Promise<void> {
     prPoller: new PrPoller(tasks, async () => {
       throw new Error("gh disabled in tests");
     }),
-    doctorDeps: { env: { PATH: bin }, noMistakesPath: join(bin, "no-mistakes") }
+    doctorDeps: { env: { PATH: bin }, noMistakesPath: join(bin, "no-mistakes") },
+    codexOwned: codexOwned as unknown as CodexAppServerAdapter
   };
   const server = createControlServer(options);
   await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));

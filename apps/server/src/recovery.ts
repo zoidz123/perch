@@ -1,12 +1,13 @@
-import { execFile } from "node:child_process";
 import { randomUUID } from "node:crypto";
-import { promisify } from "node:util";
 import { realpathSync } from "node:fs";
 import type { AgentKind, StartAgentRequest, Task } from "@perch/shared";
-import { startManagedAgent, type ManagedAgentLauncherOptions } from "./agentLauncher.js";
+import type { CodexAppServerAdapter } from "./adapters/codexAppServerAdapter.js";
+import {
+  startManagedAgent,
+  type ManagedAgentLauncherOptions,
+  type StartManagedAgentInput
+} from "./agentLauncher.js";
 import type { AuditRecord } from "./audit.js";
-import type { CodexControlPlane } from "./codexControl.js";
-import { CodexAppServerClient } from "./adapters/codexAppServer.js";
 import type { HookEventPayload } from "./hooks.js";
 import { claudeRecoveryDriver } from "./providerRecovery.js";
 import { isTrustedProviderIdentity } from "./runtimeManager.js";
@@ -14,12 +15,14 @@ import type { RuntimeRecord, OperationRecord } from "./stateDb.js";
 import type { OperationExecutionContext } from "./taskScheduler.js";
 import { terminateMatchingOrphan } from "./orphanProcess.js";
 
-const execFileAsync = promisify(execFile);
 const DEFAULT_IDENTITY_TIMEOUT_MS = 30_000;
 
 export type PreparedProviderRecovery = {
   request: StartAgentRequest;
   expectedProviderSessionId: string;
+  // Extra launcher input the driver needs carried into startManagedAgent
+  // (the codex driver passes the resume thread + recorded daemon socket).
+  launchInput?: Pick<StartManagedAgentInput, "codexOwnedResume">;
 };
 
 export type RecoveryProviderDriver = {
@@ -31,7 +34,6 @@ export type RecoveryProviderDriver = {
     sessionId: string;
     providerSessionId: string;
     cwd: string;
-    codexControl?: CodexControlPlane;
   }): Promise<string | undefined>;
 };
 
@@ -202,7 +204,7 @@ export class RecoveryCoordinator {
         request,
         taskId: task.id,
         trackRuntime: false,
-        disableCodexRemote: driver.provider === "codex",
+        ...(prepared.launchInput ?? {}),
         ...(lease ? { worktreeLease: lease, retainWorktreeOnFailure: true } : {}),
         projectRoot: task.project,
         auditMeta: payload.auditMeta
@@ -222,10 +224,10 @@ export class RecoveryCoordinator {
       }
       try {
         await identity;
-        // Identity evidence can arrive out-of-band (the codex driver resumes
+        // Identity evidence can arrive out-of-band (the Codex driver resumes
         // the thread against its own app-server), which proves the persisted
-        // conversation is resumable but not that the freshly spawned TUI
-        // survived startup. Never bind a live generation to a PTY that has
+        // conversation is resumable but not that the replacement session
+        // survived startup. Never bind a live generation to a session that
         // already exited.
         const alive = (await this.options.adapter.listSessions()).some(
           (session) => session.id === launchedSessionId && session.status !== "done" && session.status !== "error"
@@ -249,12 +251,22 @@ export class RecoveryCoordinator {
         sessionId: result.session.id,
         ...(payload.auditMeta ?? {})
       });
+      const bindFacts = codexOwnedBindFacts(
+        this.options.codexOwned,
+        result.session.id,
+        runtime,
+        prepared.launchInput?.codexOwnedResume
+      );
       this.options.runtimeManager?.bindRecoveredRuntime(runtime, {
         sessionId: result.session.id,
         provider: driver.provider,
         providerSessionId,
-        ownership: this.options.adapter.runtimeProcess?.(result.session.id)
+        ownership: this.options.adapter.runtimeProcess?.(result.session.id),
+        ...(bindFacts ? { metadata: bindFacts.metadata } : {})
       });
+      if (bindFacts?.aliasSessionId) {
+        this.options.hooks.aliasSession(bindFacts.aliasSessionId, result.session.id);
+      }
     } catch (error) {
       let cleanupError: unknown;
       if (launched) {
@@ -321,8 +333,7 @@ export class RecoveryCoordinator {
     const verified = await driver.verifyIdentity?.({
       sessionId,
       providerSessionId,
-      cwd,
-      codexControl: this.options.codexControl
+      cwd
     });
     if (verified && verified !== providerSessionId) {
       throw new Error(
@@ -372,44 +383,52 @@ export class RecoveryCoordinator {
   }
 }
 
-let codexResumeSyntax: Promise<void> | undefined;
-
+// App-server-owned Codex recovery: the launch itself is the identity proof.
+// The owning adapter thread/resumes the recorded thread and returns only when
+// the protocol response carries the resumed thread id; the launcher feeds
+// that id straight into the coordinator's identity expectation. A runtime
+// whose metadata recorded the daemon socket rebinds to that daemon when it
+// still answers (Perch restart with a healthy daemon - no respawn, live
+// thread state intact); otherwise a fresh daemon resumes the rollout-backed
+// thread and codex represents the stale in-flight turn as interrupted.
+//
+// Legacy runtimes recorded before app-server ownership carry no driver
+// metadata but the same authoritative thread id, so they migrate through the
+// identical thread/resume path when the rollout exists. When it never will
+// (the -32600 missing-rollout condition), the resume fails with the exact
+// classifiable message and the runtime ends truthfully - never a PTY resume.
 export const codexRecoveryDriver: RecoveryProviderDriver = {
   provider: "codex",
-  verifyBeforeLaunch: true,
-  // A resumed codex TUI emits no SessionStart hook and touches no rollout at
-  // startup (evidence only appears at its first turn), so recovery cannot wait
-  // on the hook path the way Claude does. Prove the persisted thread is
-  // resumable before launching the PTY: a second app-server resume can block
-  // once the TUI already owns that thread. The coordinator then launches the
-  // exact thread id and requires the PTY to remain alive before binding.
-  async verifyIdentity({ sessionId, providerSessionId, cwd, codexControl }) {
-    const shared = await codexControl?.verifyResumedThread(sessionId, providerSessionId);
-    if (shared) return shared;
-    const verifier = new CodexAppServerClient({ sessionId: `${sessionId}:verify`, clientName: "perch-recovery" });
-    try {
-      await verifier.connect();
-      const resumed = await verifier.resumeThread({ threadId: providerSessionId, cwd });
-      return resumed.threadId;
-    } finally {
-      await verifier.disconnect().catch(() => {});
+  prepare(runtime, task) {
+    if (runtime.state !== "recovering") {
+      throw new Error(`Codex recovery unavailable: runtime is ${runtime.state}, not a held recovering claim`);
     }
-  },
-  async prepare(runtime, task) {
-    if (!codexResumeSyntax) {
-      codexResumeSyntax = verifyCodexResumeSyntax().catch((error) => {
-        codexResumeSyntax = undefined;
-        throw error;
-      });
+    if (runtime.provider !== "codex" || runtime.agent !== "codex") {
+      throw new Error(
+        `Codex recovery unavailable: runtime identity is agent=${runtime.agent} provider=${runtime.provider ?? "unknown"}, not codex`
+      );
     }
-    await codexResumeSyntax;
+    if (!isTrustedProviderIdentity(runtime.provider, runtime.providerSessionId)) {
+      throw new Error(
+        "Codex recovery unavailable: trusted provider thread identity is missing. This runtime predates app-server ownership and cannot be migrated; end it and dispatch a fresh worker."
+      );
+    }
+    const threadId = runtime.providerSessionId!;
     const sessionId = `pty:${randomUUID()}`;
+    const socketPath =
+      typeof runtime.metadata?.appServerSocketPath === "string"
+        ? (runtime.metadata.appServerSocketPath as string)
+        : undefined;
+    const runtimeFingerprint =
+      typeof runtime.metadata?.appServerRuntimeFingerprint === "string"
+        ? (runtime.metadata.appServerRuntimeFingerprint as string)
+        : undefined;
     return {
-      expectedProviderSessionId: runtime.providerSessionId!,
+      expectedProviderSessionId: threadId,
       request: {
         command: "codex",
         agent: "codex" as AgentKind,
-        args: ["resume", runtime.providerSessionId!],
+        args: ["resume", threadId],
         sessionId,
         cwd: canonicalPath(runtime.worktreePath ?? task.project),
         title: `codex - ${task.title}`,
@@ -419,10 +438,58 @@ export const codexRecoveryDriver: RecoveryProviderDriver = {
           ...(runtime.workerName ? { workerName: runtime.workerName } : {}),
           ...(runtime.parentSessionId ? { parent: runtime.parentSessionId } : {})
         }
+      },
+      launchInput: {
+        codexOwnedResume: {
+          threadId,
+          ...(socketPath ? { socketPath } : {}),
+          ...(runtimeFingerprint ? { runtimeFingerprint } : {})
+        }
       }
     };
   }
 };
+
+// Driver facts a codex recovery must re-record on the freshly bound
+// generation: the CURRENT daemon socket (so the rebind guarantee holds across
+// every later restart, not just the first), and - when the launch adopted the
+// surviving daemon instead of respawning - the session identity/generation
+// still baked into that daemon's environment. The daemon env cannot change,
+// so the hook registry aliases that stale identity (aliasSessionId) to the
+// live session; tool-shell verbs authenticated with the old credentials then
+// resolve to the live runtime. Returns undefined for non-owned (Claude)
+// sessions.
+export function codexOwnedBindFacts(
+  codexOwned: Pick<CodexAppServerAdapter, "socketPathOf" | "runtimeFingerprint"> | undefined,
+  liveSessionId: string,
+  recovering: Pick<RuntimeRecord, "generation" | "ptySessionId" | "metadata">,
+  resume: { threadId: string; socketPath?: string } | undefined
+): { metadata: Record<string, unknown>; aliasSessionId?: string } | undefined {
+  const socketPath = codexOwned?.socketPathOf(liveSessionId);
+  if (!socketPath) return undefined;
+  const runtimeFingerprint = codexOwned?.runtimeFingerprint();
+  const metadata: Record<string, unknown> = {
+    codexDriver: "app-server-owned",
+    appServerSocketPath: socketPath,
+    ...(runtimeFingerprint ? { appServerRuntimeFingerprint: runtimeFingerprint } : {})
+  };
+  const rebound = Boolean(resume?.socketPath && resume.socketPath === socketPath);
+  if (!rebound) return { metadata };
+  const daemonSessionId =
+    typeof recovering.metadata?.appServerDaemonSessionId === "string"
+      ? recovering.metadata.appServerDaemonSessionId
+      : recovering.ptySessionId;
+  if (!daemonSessionId) return { metadata };
+  metadata.appServerDaemonSessionId = daemonSessionId;
+  metadata.appServerDaemonGeneration =
+    typeof recovering.metadata?.appServerDaemonGeneration === "number"
+      ? recovering.metadata.appServerDaemonGeneration
+      : recovering.generation;
+  return {
+    metadata,
+    ...(daemonSessionId !== liveSessionId ? { aliasSessionId: daemonSessionId } : {})
+  };
+}
 
 // The codex app-server rejects thread/resume for a recorded thread whose
 // rollout JSONL was never written (the file only appears at the thread's first
@@ -434,14 +501,6 @@ export const codexRecoveryDriver: RecoveryProviderDriver = {
 export function isCodexMissingRolloutResumeError(error: unknown): boolean {
   const message = error instanceof Error ? error.message : String(error);
   return message.includes("(code=-32600)") && message.includes("no rollout found for thread id");
-}
-
-async function verifyCodexResumeSyntax(): Promise<void> {
-  const { stdout, stderr } = await execFileAsync("codex", ["resume", "--help"], { timeout: 5_000 });
-  const help = `${stdout}\n${stderr}`;
-  if (!/Usage:\s+codex resume/.test(help) || !/\[SESSION_ID\]/.test(help)) {
-    throw new Error("installed Codex CLI does not support `codex resume <SESSION_ID>`");
-  }
 }
 
 function processExists(processId: number): boolean {

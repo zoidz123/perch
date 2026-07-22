@@ -164,6 +164,23 @@ export class TimelineStore {
     };
   }
 
+  // Ingest a protocol-native timeline item directly (app-server-owned Codex
+  // sessions: thread/turn/item notifications own the timeline, no transcript
+  // tailer). Dedupe by item id makes resume-history replays idempotent
+  // against rows already ingested live. `live: false` (catch-up replay)
+  // populates the store without notifying listeners, mirroring the tailer's
+  // catch-up read - clients page history via GET /timeline instead. A user
+  // item without provenance resolves against recorded injections exactly like
+  // a tailed row, so mate steers and kickoffs keep their agent attribution.
+  ingest(item: TimelineItem, opts: { live?: boolean } = {}): void {
+    let resolved = item;
+    if (item.kind === "user" && !item.source && item.text) {
+      const source = this.resolveSource(item.sessionId, item.text);
+      if (source) resolved = { ...item, source };
+    }
+    this.append(resolved.sessionId, resolved, opts.live !== false);
+  }
+
   // Begin (or re-point) tailing a session's transcript. Called when the
   // SessionStart hook correlates a perch session to its transcript path.
   // `isPathAllowed` re-verifies containment every time the tailer opens the
@@ -229,10 +246,10 @@ export class TimelineStore {
   // `claude --resume` forks the conversation into a fresh jsonl (new uuid) in
   // the same project dir and abandons the resumed-from file, often only at the
   // first post-resume turn (which for an idle mate can be hours later). No
-  // further SessionStart hook names the fork, so this active re-resolution -
-  // the Claude analogue of the codex rollout scan - is the only way to follow
-  // it. Lineage is confirmed by the shared root message uuid, so a concurrent
-  // unrelated session in the same dir is never adopted. Idempotent per session;
+  // further SessionStart hook names the fork, so this active re-resolution is
+  // the only way to follow it. Lineage is confirmed by the shared root message
+  // uuid, so a concurrent unrelated session in the same dir is never adopted.
+  // Idempotent per session;
   // the resolver reads whatever transcript the SessionStart hook attaches, so
   // calling this before the first attach is safe (it waits).
   followClaudeResume(sessionId: string, isPathAllowed?: (path: string) => boolean): void {

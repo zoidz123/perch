@@ -20,7 +20,7 @@ const execFileAsync = promisify(execFile);
 // with a durable lease and returned with a reset. The lifecycle is
 // treehouse's get/return (the lease flavor - the holder is a task/session
 // record, not a subshell), with the gap it left open closed here: leases
-// carry a TTL and are reaped against PTY-session liveness, which this server
+// carry a TTL and are reaped against managed-session liveness, which this server
 // knows authoritatively instead of inferring from process working
 // directories.
 //
@@ -201,7 +201,7 @@ export class WorktreePool {
   }
 
   // Force-release leases whose holder is gone: the holder-liveness check is
-  // supplied by the caller (PTY session liveness), and the TTL guards the
+  // supplied by the caller (managed-session liveness), and the TTL guards the
   // window where a holder died before ever being observed.
   async reap(isHolderAlive: (holder: string) => boolean, ttlMs = LEASE_TTL_MS): Promise<string[]> {
     const reaped: string[] = [];

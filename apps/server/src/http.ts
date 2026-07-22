@@ -132,9 +132,8 @@ import type {
   FleetSettings,
   MateDefaultsUpdate
 } from "./settings.js";
-import type { CodexControlPlane } from "./codexControl.js";
+import type { CodexAppServerAdapter } from "./adapters/codexAppServerAdapter.js";
 import {
-  attachCodexRollout,
   canonicalRepository,
   canonicalRepositoryForPath,
   markTaskWorkingFromActivity,
@@ -184,7 +183,10 @@ export type HttpServerOptions = {
   claudeStateFile?: string;
   // Codex `--remote` control plane. Absent (or with no acquirable daemon) means
   // every Codex session runs on the plain PTY path and the model chip is off.
-  codexControl?: CodexControlPlane;
+  // The app-server owning adapter: the only Codex driver. Model switching,
+  // structured server-request answers, and the hook turn-boundary guard all
+  // route through it.
+  codexOwned?: CodexAppServerAdapter;
   // Launch-time hook reinstaller (see ManagedAgentLauncherOptions.installHooks).
   // Wired to the real installers by the entrypoint; absent in test fixtures so
   // tests never rewrite real provider config.
@@ -1942,17 +1944,16 @@ async function route(
       }
       // Codex switches over the app-server protocol (per-turn `turn/start` model
       // override, no keystrokes). No push fires on a model change; the override
-      // applies on the next submitted turn and the `--remote` TUI footer
-      // reflects it. When the session is PTY-only (no daemon) the chip is off.
+      // applies on the next submitted turn.
       if (agent === "codex") {
-        const armed = options.codexControl?.switchModel(
+        const armed = options.codexOwned?.switchModel(
           canonicalSessionId,
           body.model.trim(),
           body.effort
         );
         if (!armed) {
           writeJson(response, 409, {
-            error: "This Codex session is running PTY-only; model switching needs the app-server daemon"
+            error: "This Codex session is not connected to its app-server; model switching is unavailable"
           });
           return;
         }
@@ -2018,7 +2019,7 @@ async function route(
         }
         return;
       }
-      if (!options.codexControl?.respondToServerRequest(canonicalSessionId, body)) {
+      if (!options.codexOwned?.respondToServerRequest(canonicalSessionId, body)) {
         writeJson(response, 409, { error: "The response is stale or invalid for this request" });
         return;
       }
@@ -2682,33 +2683,19 @@ function assetContentType(file: string): string {
   return ASSET_CONTENT_TYPES[extname(file).toLowerCase()] ?? "application/octet-stream";
 }
 
-// Deliver composer text so it actually SUBMITS - a raw PTY write leaves the
-// text sitting unsent in the agent TUI's input line (both claude and codex
-// treat embedded/trailing newlines as composer content, never as Enter), so
-// every delivery path must end with a distinct Enter. Codex `--remote`: when a
-// control client owns the shared thread and no permission prompt is open,
-// submit the turn over the protocol so any armed model override actually
-// reaches the daemon (and the turn shows in the real TUI). Any miss falls
-// through to the monitor's PTY path (text landed in the input line, then a
-// separate Enter), which also queue-gates while a permission prompt is open.
+// Deliver composer text so it actually SUBMITS. Claude: a raw PTY write
+// leaves the text sitting unsent in the TUI's input line, so the monitor's
+// path ends with a distinct Enter. Codex: the session is app-server-owned,
+// and the monitor's submitToAdapter routes to the owning adapter, which
+// serializes the input and delivers it over the protocol (turn/start when
+// idle, turn/steer into the active turn) - acknowledged, never keystrokes.
+// Both paths queue-gate while a permission prompt is open.
 async function deliverInput(
   options: HttpServerOptions,
   canonicalSessionId: string,
   text: string,
-  source: "human" | "agent"
+  _source: "human" | "agent"
 ): Promise<{ queued: boolean }> {
-  if (
-    options.codexControl?.has(canonicalSessionId) &&
-    !options.monitor.pendingApproval(canonicalSessionId)
-  ) {
-    if (await options.codexControl.submitTurn(canonicalSessionId, text, source)) {
-      // Protocol submission bypasses FleetMonitor.submitToAdapter, so mirror
-      // its post-submit lifecycle signal here. This is an accepted new turn,
-      // not generic running/status activity.
-      markTaskWorkingFromActivity({ tasks: options.tasks }, canonicalSessionId, { newTurn: true });
-      return { queued: false };
-    }
-  }
   return options.monitor.queueOrSubmit(canonicalSessionId, text);
 }
 
@@ -2865,7 +2852,9 @@ async function handleCreateTask(
       writeJson(response, 401, { error: "Unauthorized" });
       return;
     }
-    if (!body.parent) body.parent = hookSessionId;
+    // A rebound codex daemon's env still names its spawn-time session; the
+    // alias resolves that identity to the live session so crew still groups.
+    if (!body.parent) body.parent = options.hooks.resolveAlias(hookSessionId);
   }
 
   if (body.planEdit) {
@@ -3777,9 +3766,9 @@ async function switchModelRpc(
   }
 
   if (agent === "codex") {
-    const armed = options.codexControl?.switchModel(canonicalSessionId, body.model.trim(), body.effort);
+    const armed = options.codexOwned?.switchModel(canonicalSessionId, body.model.trim(), body.effort);
     if (!armed) {
-      return rpcError(409, "This Codex session is running PTY-only; model switching needs the app-server daemon");
+      return rpcError(409, "This Codex session is not connected to its app-server; model switching is unavailable");
     }
     const switched = resolveSessionModel("codex", { model: body.model.trim() });
     options.monitor.setSessionModel(canonicalSessionId, {
@@ -3868,11 +3857,15 @@ async function handleTaskEvent(
   const bearer = authenticate(request, options);
   let source: "worker" | "system" = "system";
   if (!bearer) {
-    const sessionId = String(request.headers["x-perch-session"] ?? "");
+    const presentedSessionId = String(request.headers["x-perch-session"] ?? "");
     const token = String(request.headers["x-perch-token"] ?? "");
-    const reason = !sessionId || !token
+    // Verification is against the presented (possibly spawn-time) identity;
+    // the alias maps a rebound daemon's stale env credentials to the live
+    // session the task now runs under.
+    const sessionId = options.hooks.resolveAlias(presentedSessionId);
+    const reason = !presentedSessionId || !token
       ? "missing_credentials"
-      : !options.hooks.verify(sessionId, token)
+      : !options.hooks.verify(presentedSessionId, token)
         ? "invalid_credentials"
         : task.sessionId !== sessionId
           ? "task_session_mismatch"
@@ -3881,7 +3874,7 @@ async function handleTaskEvent(
       // curl -f intentionally hides the response body from workers. Keep the
       // rejection visible in server.log without ever printing the hook token.
       console.warn(
-        `task-event: rejected status=401 task=${taskId} session=${sessionId ? sessionId.slice(0, 16) : "missing"} reason=${reason}`
+        `task-event: rejected status=401 task=${taskId} session=${presentedSessionId ? presentedSessionId.slice(0, 16) : "missing"} reason=${reason}`
       );
       writeJson(response, 401, { error: "Unauthorized" });
       return;
@@ -3996,12 +3989,16 @@ async function handleNoMistakesAuthorization(
   response: ServerResponse,
   options: HttpServerOptions
 ): Promise<void> {
-  const sessionId = String(request.headers["x-perch-session"] ?? "");
+  const presentedSessionId = String(request.headers["x-perch-session"] ?? "");
   const token = String(request.headers["x-perch-token"] ?? "");
-  if (!sessionId || !token || !options.hooks.verify(sessionId, token)) {
+  if (!presentedSessionId || !token || !options.hooks.verify(presentedSessionId, token)) {
     writeJson(response, 401, { error: "Unauthorized" });
     return;
   }
+  // A rebound codex daemon authenticates with the identity baked into its env
+  // at spawn; the alias (registered only while the recovered generation is
+  // live) resolves it to the live session and runtime.
+  const sessionId = options.hooks.resolveAlias(presentedSessionId);
 
   // Runtime ownership is authoritative and is bound before the kickoff prompt
   // can run. Task projection linkage follows immediately after launch, so
@@ -4028,6 +4025,14 @@ async function handleNoMistakesAuthorization(
   const durableMode = boundedPolicyString(body.durableMode, 32);
   const requestGeneration = Number.isSafeInteger(body.runtimeGeneration) ? body.runtimeGeneration : -1;
   const runtime = sessionRuntime ?? options.tasks.stateDb.runtimes.latestForTask(task.id);
+  // Env cannot change in a surviving daemon: an aliased caller truthfully
+  // echoes the generation recorded at daemon spawn, which the recovery bind
+  // persisted on the live runtime. Anything else must match the live
+  // generation exactly.
+  const daemonEnvGeneration =
+    presentedSessionId !== sessionId && typeof runtime?.metadata?.appServerDaemonGeneration === "number"
+      ? (runtime.metadata.appServerDaemonGeneration as number)
+      : undefined;
   const expectedWorktree = runtime?.worktreePath ??
     (task.worktreeId ? options.worktrees.find(task.worktreeId)?.path : undefined);
   const expectedBranch = task.branch ?? `perch/${task.id}`;
@@ -4062,7 +4067,7 @@ async function handleNoMistakesAuthorization(
     reason = "request_replayed";
   } else if (taskId !== task.id) {
     reason = "task_mismatch";
-  } else if (requestSessionId !== sessionId) {
+  } else if (requestSessionId !== presentedSessionId) {
     reason = "session_mismatch";
   } else if (canonicalPolicyPath(projectPath) !== canonicalPolicyPath(task.project)) {
     reason = "project_mismatch";
@@ -4070,7 +4075,7 @@ async function handleNoMistakesAuthorization(
     reason = "repository_mismatch";
   } else if (!runtime) {
     reason = "runtime_missing";
-  } else if (requestGeneration !== runtime.generation) {
+  } else if (requestGeneration !== runtime.generation && requestGeneration !== daemonEnvGeneration) {
     reason = "runtime_generation_mismatch";
   } else if (runtime.ptySessionId !== sessionId) {
     reason = "runtime_session_mismatch";
@@ -4184,7 +4189,7 @@ async function handleRegisterChart(
       writeJson(response, 401, { error: "Unauthorized" });
       return;
     }
-    result = await registerChartCore(body.file, sessionId, options, {
+    result = await registerChartCore(body.file, options.hooks.resolveAlias(sessionId), options, {
       remoteAddress: request.socket.remoteAddress
     });
   }
@@ -4565,15 +4570,18 @@ async function handleHookReport(
 ): Promise<void> {
   let synchronousClaudeControl = false;
   try {
-    const sessionId = String(request.headers["x-perch-session"] ?? "");
+    const presentedSessionId = String(request.headers["x-perch-session"] ?? "");
     const token = String(request.headers["x-perch-token"] ?? "");
+    // Hook posts from a rebound codex daemon's shells carry the daemon's
+    // spawn-time identity; attribute them to the live session it aliases to.
+    const sessionId = options.hooks.resolveAlias(presentedSessionId);
     const payload = await readJsonOrEmpty<HookEventPayload>(request);
     const requestedEventName = hookEventName(payload);
     synchronousClaudeControl = requestedEventName === "PermissionRequest" ||
       requestedEventName === "Elicitation" || requestedEventName === "ElicitationResult" ||
       (requestedEventName === "PreToolUse" &&
         (payload.tool_name === ASK_USER_QUESTION_TOOL || payload.tool_name === "ExitPlanMode"));
-    if (!sessionId || !options.hooks.verify(sessionId, token)) {
+    if (!presentedSessionId || !options.hooks.verify(presentedSessionId, token)) {
       // PermissionRequest is synchronous control, so authentication failure
       // must be visible to the bridge and fall back to Claude's local dialog.
       // Telemetry hooks retain their historical fail-open 200 response.
@@ -4630,12 +4638,12 @@ async function handleHookReport(
     );
 
     const eventName = hookEventName(payload);
-    const codexControlOwnsTurnBoundary = format === "codex" && options.codexControl?.has(sessionId) === true;
+    const codexOwnedTurnBoundary = format === "codex" && options.codexOwned?.has(sessionId) === true;
 
     // Snapshot the immutable task-event sequence before the automatic
-    // new-turn working event. Native Codex control owns this boundary when
-    // attached; plain Codex PTY fallback uses its verified hooks like Claude.
-    if (eventName === "UserPromptSubmit" && !codexControlOwnsTurnBoundary) {
+    // new-turn working event. App-server-owned Codex control owns this
+    // boundary; hook-driven providers use their verified hooks.
+    if (eventName === "UserPromptSubmit" && !codexOwnedTurnBoundary) {
       options.taskCompletion?.onTurnStarted(sessionId, format);
     }
 
@@ -4648,18 +4656,6 @@ async function handleHookReport(
       newTurn: eventName === "UserPromptSubmit"
     });
 
-    // Codex hooks carry the codex session id but no transcript path; the
-    // rollout filename embeds that id, so resolve it by scanning the sessions
-    // dir. The file can appear moments after SessionStart, hence the retry.
-    if (
-      format === "codex" &&
-      normalized.correlation?.agentSessionId &&
-      !normalized.correlation.transcriptPath &&
-      !options.hooks.correlation(sessionId)?.transcriptPath
-    ) {
-      attachCodexRollout(options, sessionId, normalized.correlation.agentSessionId);
-    }
-
     if (normalized.correlation?.transcriptPath) {
       // Hook payloads originate inside the agent's PTY (any child process
       // holds the hook token), so only transcript paths under known agent
@@ -4671,7 +4667,9 @@ async function handleHookReport(
           normalized.correlation.agentSessionId,
           normalized.correlation.transcriptPath
         );
-        if (correlation.transcriptPath) {
+        // App-server-owned Codex sessions get their timeline from protocol
+        // notifications; tailing the rollout here would double every row.
+        if (correlation.transcriptPath && !(format === "codex" && options.codexOwned?.has(sessionId))) {
           options.timeline.attach(
             sessionId,
             correlation.transcriptPath,
@@ -4696,7 +4694,7 @@ async function handleHookReport(
     // Daemon-controlled Codex uses app-server turn/completed instead, avoiding
     // double evidence when a newer Codex also emits compatibility hooks.
     const turnResult =
-      eventName === "Stop" && !codexControlOwnsTurnBoundary
+      eventName === "Stop" && !codexOwnedTurnBoundary
         ? options.taskCompletion?.onTurnCompleted(sessionId, format, {
             continuation: payload.stop_hook_active === true
           })

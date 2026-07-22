@@ -4,7 +4,7 @@ import type { HookEventPayload } from "./hooks.js";
 import { startManagedAgent, type ManagedAgentLauncherOptions } from "./agentLauncher.js";
 import { MATE_OWNER_ID, type OwnerManager } from "./ownerManager.js";
 import { claudeRecoveryDriver } from "./providerRecovery.js";
-import { codexRecoveryDriver, type RecoveryProviderDriver } from "./recovery.js";
+import { codexOwnedBindFacts, codexRecoveryDriver, type RecoveryProviderDriver } from "./recovery.js";
 import { isTrustedProviderIdentity } from "./runtimeManager.js";
 import type { OwnerRuntimeRecord, RuntimeRecord } from "./stateDb.js";
 import type { TaskScheduler } from "./taskScheduler.js";
@@ -149,7 +149,7 @@ export class MateRecoveryCoordinator {
         request: prepared.request,
         trackRuntime: false,
         trackOwner: false,
-        disableCodexRemote: claimed.provider === "codex",
+        ...(prepared.launchInput ?? {}),
         registerProject: false
       });
       launched = true;
@@ -170,12 +170,23 @@ export class MateRecoveryCoordinator {
       );
       if (!alive) throw new Error(`recovered ${claimed.provider} mate exited before bind`);
       await this.options.auditLog.write({ action: "recover_agent", sessionId: launchedSessionId });
-      return this.options.ownerManager.bindRecoveredMate(claimed, {
+      const bindFacts = codexOwnedBindFacts(
+        this.options.codexOwned,
+        launchedSessionId,
+        claimed,
+        prepared.launchInput?.codexOwnedResume
+      );
+      const bound = this.options.ownerManager.bindRecoveredMate(claimed, {
         sessionId: launchedSessionId,
         provider: claimed.provider,
         providerSessionId,
-        ownership: this.options.adapter.runtimeProcess?.(launchedSessionId)
+        ownership: this.options.adapter.runtimeProcess?.(launchedSessionId),
+        ...(bindFacts ? { metadata: bindFacts.metadata } : {})
       });
+      if (bindFacts?.aliasSessionId) {
+        this.options.hooks.aliasSession(bindFacts.aliasSessionId, launchedSessionId);
+      }
+      return bound;
     } catch (error) {
       const recent = launched
         ? await this.options.adapter.readRecentEvents(launchedSessionId, 12).catch(() => undefined)
@@ -223,8 +234,7 @@ export class MateRecoveryCoordinator {
     const verified = await driver.verifyIdentity?.({
       sessionId,
       providerSessionId,
-      cwd,
-      codexControl: this.options.codexControl
+      cwd
     });
     if (verified && verified !== providerSessionId) {
       throw new Error(

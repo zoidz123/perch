@@ -9,7 +9,6 @@ import {
   applyPerchUninstall,
   claudeSettingsPath,
   codexHookHash,
-  findCodexRollout,
   HookRegistry,
   installClaudeHooks,
   installCodexHooks,
@@ -365,6 +364,39 @@ test("hook auth survives restart with 0600 storage and prunes stale sessions", (
   rmSync(home, { recursive: true, force: true });
 });
 
+test("a rebound daemon's stale identity aliases to the live session and dies with it", () => {
+  const registry = new HookRegistry();
+  const previous = registry.register("pty:previous-life");
+  registry.register("pty:live-life");
+
+  // The recovery bind aliases the daemon's spawn-time identity to the live
+  // session: the stale credentials still verify AS the presented id, and
+  // resolveAlias maps them to the live session for everything downstream.
+  registry.aliasSession("pty:previous-life", "pty:live-life");
+  assert.equal(registry.verify("pty:previous-life", previous.token), true);
+  assert.equal(registry.resolveAlias("pty:previous-life"), "pty:live-life");
+  assert.equal(registry.resolveAlias("pty:live-life"), "pty:live-life");
+
+  // Pruning with only the live session active keeps the aliased credential.
+  registry.prune(new Set(["pty:live-life"]));
+  assert.equal(registry.verify("pty:previous-life", previous.token), true);
+  assert.equal(registry.resolveAlias("pty:previous-life"), "pty:live-life");
+
+  // The alias lives exactly as long as the live session's registration:
+  // unregistering the live session revokes the aliased credential too.
+  registry.unregister("pty:live-life");
+  assert.equal(registry.verify("pty:previous-life", previous.token), false);
+  assert.equal(registry.resolveAlias("pty:previous-life"), "pty:previous-life");
+
+  // Pruning without the live session drops the alias and the stale token.
+  const again = new HookRegistry();
+  const stale = again.register("pty:gone");
+  again.aliasSession("pty:gone", "pty:also-gone");
+  again.prune(new Set());
+  assert.equal(again.verify("pty:gone", stale.token), false);
+  assert.equal(again.resolveAlias("pty:gone"), "pty:gone");
+});
+
 test("normalizes hook events into status transitions and approvals", () => {
   assert.equal(normalizeHookEvent({ hook_event_name: "UserPromptSubmit" }).status, "running");
   assert.equal(normalizeHookEvent({ hook_event_name: "PreToolUse" }).status, "running");
@@ -562,39 +594,3 @@ test("codex hook payloads normalize through the nested envelope", () => {
   assert.equal(normalizeHookEvent({ hook_event: { event_type: "stop" } }).status, "idle");
 });
 
-test("findCodexRollout locates rollouts by session id in date dirs", () => {
-  const home = mkdtempSync(join(tmpdir(), "perch-codex-roll-"));
-  const now = new Date();
-  const day = join(
-    home,
-    "sessions",
-    String(now.getFullYear()),
-    String(now.getMonth() + 1).padStart(2, "0"),
-    String(now.getDate()).padStart(2, "0")
-  );
-  mkdirSync(day, { recursive: true });
-  const file = join(day, "rollout-2026-07-02T10-00-00-0199ffff-aaaa-bbbb.jsonl");
-  writeFileSync(file, "");
-  const env = makeCodexEnv(home);
-  assert.equal(findCodexRollout("0199ffff-aaaa-bbbb", env), file);
-  assert.equal(findCodexRollout("missing", env), undefined);
-  rmSync(home, { recursive: true, force: true });
-});
-
-test("findCodexRollout searches days back for older sessions", () => {
-  const home = mkdtempSync(join(tmpdir(), "perch-codex-roll-"));
-  const twoDaysAgo = new Date(Date.now() - 2 * 86_400_000);
-  const day = join(
-    home,
-    "sessions",
-    String(twoDaysAgo.getFullYear()),
-    String(twoDaysAgo.getMonth() + 1).padStart(2, "0"),
-    String(twoDaysAgo.getDate()).padStart(2, "0")
-  );
-  mkdirSync(day, { recursive: true });
-  const file = join(day, "rollout-2026-06-30T10-00-00-0199ffff-cccc-dddd.jsonl");
-  writeFileSync(file, "");
-  const env = makeCodexEnv(home);
-  assert.equal(findCodexRollout("0199ffff-cccc-dddd", env), file);
-  rmSync(home, { recursive: true, force: true });
-});

@@ -67,7 +67,7 @@ The verbs:
   This endpoint requires the local server token; worker hook credentials and paired devices cannot accept their own work.
 - `POST /sessions/<sessionId>/input` - steer a worker: `{"text": "<one short line>\n"}`.
   Short single lines only; anything long belongs in a file the worker can read.
-- `POST /tasks/<id>/recover` - resume a worker whose runtime died: the server relaunches the exact prior provider conversation in a fresh PTY, keeping the task's worktree, branch, worker name, and model.
+- `POST /tasks/<id>/recover` - resume a worker whose runtime died: the server relaunches the exact prior provider conversation in a fresh runtime, keeping the task's worktree, branch, worker name, and model.
   Pass a stable `{"idempotencyKey": ...}` so a retry joins the original attempt; a 409 means recovery is already in progress or unavailable for that task right now.
 - `POST /tasks/<id>/teardown` - end worker, release worktree, close the ledger entry, behind the landed-gate.
   Body `{"force": true}` only on the boss's explicit discard order.
@@ -122,7 +122,8 @@ Sleep until a wake line arrives; quiet is normal, long quiets for validating wor
 - `needs_decision:` - decide it yourself when it is routine judgment inside the boss's stated intent; escalate verbatim when it challenges intent, changes product behavior, or is destructive/irreversible/security-sensitive.
   Answer the worker with one short line via `POST /sessions/<sessionId>/input`.
 - `blocked:` - read the task events, try to unblock (a credential, a decision, a rebase instruction); escalate with evidence if you cannot.
-  For `data.reason == "kickoff_not_accepted"` (source `system`), the codex worker never accepted its kickoff prompt (`data.retry` says whether the one automatic retry was `submitted` or skipped as `gated` behind an open permission prompt), so the session is effectively empty; re-send the kickoff via `POST /sessions/<sessionId>/input` or re-dispatch rather than steering an empty worker.
+  For `data.reason == "kickoff_rejected"` (source `system`), codex refused the worker's kickoff turn and the message carries the provider's real error; fix the cause (usually model or auth) and re-dispatch rather than steering an empty worker.
+  For `data.reason == "kickoff_unknown"` (source `system`), the kickoff's acceptance could not be confirmed and was deliberately not resent; check the session timeline, then re-send the kickoff via `POST /sessions/<sessionId>/input` or re-dispatch.
 - `stalled:` - the watchdog noticed the worker went quiet, a provider turn ended without a task outcome, or accepted follow-up input became undeliverable; the task state is unchanged and you adjudicate.
   The wake message says why and, when known, the worker's last reply.
   For `data.reason == "turn_outcome_missing"`, inspect the matching `turn_started` and `turn_completed` events: `taskEventSeqAtStart` is the immutable baseline and `outcomeEventSeq` is present only when an accepted worker `needs_decision`, `blocked`, completion request, or `failed` event advanced after that baseline.

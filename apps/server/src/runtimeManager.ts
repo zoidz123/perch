@@ -67,7 +67,16 @@ export class RuntimeManager {
     runtime: RuntimeRecord,
     sessionId: string,
     ownership?: RuntimeProcessOwnership,
-    patch: { model?: string; worktreeId?: string; worktreePath?: string; leaseId?: string } = {}
+    patch: {
+      model?: string;
+      worktreeId?: string;
+      worktreePath?: string;
+      leaseId?: string;
+      // Driver facts recorded at launch (codexDriver, appServerSocketPath):
+      // a session never changes ownership mid-life, and recovery reads these
+      // to rebind to the same daemon socket.
+      metadata?: Record<string, unknown>;
+    } = {}
   ): RuntimeRecord {
     const live = this.tasks.stateDb.runtimes.compareAndSwap(
       runtime.taskId,
@@ -110,9 +119,10 @@ export class RuntimeManager {
 
   // Returns the updated record only when this call transitioned the runtime;
   // undefined when it was already settled or the CAS lost. A "recovering"
-  // runtime is excluded: its ptySessionId still names the dead pre-recovery
-  // PTY, so old-session death evidence must not revoke the held recovery
-  // claim - bind, failRecovery, or the startup reconcile own that lifecycle.
+  // runtime is excluded: its legacy-named ptySessionId still identifies the
+  // dead pre-recovery session, so old-session death evidence must not revoke
+  // the held recovery claim - bind, failRecovery, or the startup reconcile own
+  // that lifecycle.
   interruptSession(
     sessionId: string,
     message = "worker runtime interrupted",
@@ -164,6 +174,10 @@ export class RuntimeManager {
       provider: string;
       providerSessionId: string;
       ownership?: RuntimeProcessOwnership;
+      // Driver facts re-recorded at bind (codexDriver, appServerSocketPath):
+      // the recovered generation must keep protecting its live daemon across
+      // the NEXT restart, not just the first one.
+      metadata?: Record<string, unknown>;
     }
   ): RuntimeRecord {
     if (
@@ -193,7 +207,8 @@ export class RuntimeManager {
         metadata: {
           source: "provider-recovery",
           previousRuntimeId: recovering.id,
-          previousGeneration: recovering.generation
+          previousGeneration: recovering.generation,
+          ...(input.metadata ?? {})
         }
       });
       if (!next) return undefined;
@@ -232,7 +247,7 @@ export class RuntimeManager {
     return failed;
   }
 
-  // A candidate PTY that refused to die may still hold the provider
+  // A candidate runtime that refused to die may still hold the provider
   // conversation, so the claim deliberately stays "recovering" rather than
   // reopening recovery against a possibly-live duplicate. There is no
   // same-process retry path from here: POST /tasks/:id/recover answers 409

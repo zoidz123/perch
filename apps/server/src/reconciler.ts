@@ -4,8 +4,8 @@ import type { StateMetrics } from "./stateMetrics.js";
 // Reconciliation sweep (G1). Session status is push-driven by one-shot hook
 // curls with no retry, so a lost Stop hook leaves a session "running" forever
 // and a lost UserPromptSubmit hides a turn. The sweep re-derives status for
-// suspicious sessions from ground truth the server already holds - the
-// rendered terminal screen and the transcript/rollout file's mtime - and
+// suspicious Claude sessions from ground truth the server already holds -
+// the rendered terminal screen and the transcript file's mtime - and
 // corrects drift through the same applyExternalStatus path the hooks use
 // (source "reconciler"), so a lost push becomes a temporary lie instead of a
 // permanent one. Pushes stay the fast path; this never replaces them.
@@ -14,8 +14,8 @@ import type { StateMetrics } from "./stateMetrics.js";
 // upstream: the PTY adapter sweeps dead processes on every listSessions call,
 // which each sweep pass performs.
 
-// Claude and codex both render this line while a turn is in flight; it sits in
-// the bottom few screen lines and disappears when the turn ends.
+// Claude renders this line while a turn is in flight; it sits in the bottom
+// few screen lines and disappears when the turn ends.
 const RUNNING_MARKER = /esc to interrupt/i;
 
 export type ReconcilerDeps = {
@@ -24,7 +24,7 @@ export type ReconcilerDeps = {
   // Last few rendered screen lines for a terminal session; undefined when the
   // session cannot be captured (gone, non-terminal).
   screenTail: (sessionId: string) => Promise<string | undefined>;
-  // Age of the session's transcript/rollout file; undefined when no transcript
+  // Age of the session's transcript file; undefined when no transcript
   // is correlated (sessions without hooks are never corrected - their status
   // is not hook-driven, so there is no lost push to repair).
   transcriptAgeMs: (sessionId: string) => number | undefined;

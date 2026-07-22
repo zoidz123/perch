@@ -7,6 +7,10 @@ import { test } from "node:test";
 import type { AddressInfo } from "node:net";
 import type { AgentSession, RecentEventsResult, StartAgentRequest } from "@perch/shared";
 import type { AgentAdapter } from "./adapters/types.js";
+import type { CodexAppServerAdapter } from "./adapters/codexAppServerAdapter.js";
+import { FakeCodexOwnedAdapter } from "./adapters/fakeCodexAppServer.js";
+import type { PtyAgentAdapter } from "./adapters/pty.js";
+import { RoutingAgentAdapter } from "./adapters/routingAdapter.js";
 import { AuditLog } from "./audit.js";
 import { FleetMonitor } from "./fleetMonitor.js";
 import { HookRegistry } from "./hooks.js";
@@ -14,7 +18,7 @@ import { createControlServer } from "./http.js";
 import { DeviceRegistry } from "./pairing.js";
 import { PrPoller } from "./prPoller.js";
 import { ProjectRegistry } from "./projects.js";
-import { RecoveryCoordinator, type RecoveryProviderDriver } from "./recovery.js";
+import { codexRecoveryDriver, RecoveryCoordinator, type RecoveryProviderDriver } from "./recovery.js";
 import { RuntimeManager } from "./runtimeManager.js";
 import type { OperationRecord } from "./stateDb.js";
 import { TaskStore } from "./tasks.js";
@@ -78,7 +82,8 @@ const driver: RecoveryProviderDriver = {
       title: task.title,
       model: runtime.model,
       labels: { task: task.id, workerName: runtime.workerName!, parent: runtime.parentSessionId! }
-    }
+    },
+    launchInput: { codexOwnedResume: { threadId: runtime.providerSessionId! } }
   })
 };
 
@@ -89,7 +94,14 @@ function harness(providerSessionId = CODEX_THREAD_ID, agent: "claude" | "codex" 
   const tasks = new TaskStore({ PERCH_HOME: home } as NodeJS.ProcessEnv);
   const runtimeManager = new RuntimeManager(tasks);
   const adapter = new RecoveryAdapter();
-  const monitor = new FleetMonitor(adapter);
+  // Codex recovery drives the app-server owning adapter; the routing facade
+  // is what the coordinator sees, exactly like production.
+  const codexOwned = new FakeCodexOwnedAdapter();
+  const routing = new RoutingAgentAdapter(
+    adapter as unknown as PtyAgentAdapter,
+    codexOwned as unknown as CodexAppServerAdapter
+  );
+  const monitor = new FleetMonitor(routing);
   const task = tasks.create({ title: "recover this task", project: home });
   const named = tasks.claimWorkerName(task.id);
   tasks.update(task.id, { sessionId: "pty:old", parentSessionId: "pty:mate", worktreeId: "wt:kept" });
@@ -119,7 +131,8 @@ function harness(providerSessionId = CODEX_THREAD_ID, agent: "claude" | "codex" 
     }]
   }));
   const options = {
-    adapter,
+    adapter: routing,
+    codexOwned: codexOwned as unknown as CodexAppServerAdapter,
     auditLog: new AuditLog(join(home, "audit.jsonl")),
     monitor,
     projects: new ProjectRegistry({ PERCH_HOME: home } as NodeJS.ProcessEnv),
@@ -133,8 +146,12 @@ function harness(providerSessionId = CODEX_THREAD_ID, agent: "claude" | "codex" 
     providers: [driver]
   };
   const coordinator = new RecoveryCoordinator(options);
+  // Production wiring (http.ts): the launcher resolves a held identity
+  // expectation by feeding the coordinator the thread id the protocol
+  // response carried.
+  (options as { recoveryCoordinator?: RecoveryCoordinator }).recoveryCoordinator = coordinator;
   return {
-    home, tasks, task: tasks.find(task.id)!, runtimeManager, adapter, coordinator, options,
+    home, tasks, task: tasks.find(task.id)!, runtimeManager, adapter, codexOwned, coordinator, options,
     cleanup() {
       monitor.stop();
       tasks.close();
@@ -170,7 +187,6 @@ function context(boundary?: (name: "beforeLaunch" | "afterLaunch") => void) {
 
 test("Codex recovery resumes the exact thread and atomically binds g+1 without changing task identity", async () => {
   const h = harness();
-  h.adapter.onStart = (sessionId) => h.coordinator.observeSessionStart(sessionId, "codex", CODEX_THREAD_ID);
   await h.coordinator.execute(operation(h.task.id), context());
   const task = h.tasks.find(h.task.id)!;
   assert.equal(task.state, "working");
@@ -180,7 +196,9 @@ test("Codex recovery resumes the exact thread and atomically binds g+1 without c
   assert.equal(task.runtime?.generation, 1);
   assert.equal(task.runtime?.state, "live");
   assert.equal(task.runtime?.providerSessionId, CODEX_THREAD_ID);
-  assert.deepEqual(h.adapter.requests[0]?.args, ["resume", CODEX_THREAD_ID]);
+  // The resume went through the owning adapter against the exact thread.
+  assert.equal(h.codexOwned.launches.length, 1);
+  assert.deepEqual(h.codexOwned.launches[0]?.resume, { threadId: CODEX_THREAD_ID });
   assert.equal(
     h.tasks.stateDb.operations.findByIdempotencyKey(`continuation:${h.task.id}:g1`)?.state,
     "pending",
@@ -188,7 +206,7 @@ test("Codex recovery resumes the exact thread and atomically binds g+1 without c
   );
   const firstSession = task.sessionId;
   await h.coordinator.execute(operation(h.task.id), context());
-  assert.equal(h.adapter.requests.length, 1);
+  assert.equal(h.codexOwned.launches.length, 1);
   assert.equal(h.tasks.find(h.task.id)?.sessionId, firstSession);
   h.cleanup();
 });
@@ -196,13 +214,13 @@ test("Codex recovery resumes the exact thread and atomically binds g+1 without c
 test("missing or mismatched identity and stale process ownership never launch", async () => {
   const missing = harness("");
   await assert.rejects(missing.coordinator.execute(operation(missing.task.id), context()), /missing or untrusted/);
-  assert.equal(missing.adapter.requests.length, 0);
+  assert.equal(missing.codexOwned.launches.length, 0);
   missing.cleanup();
 
   const mismatched = harness();
   mismatched.tasks.stateDb.runtimes.compareAndSwap(mismatched.task.id, 0, "recoverable", "recoverable", { provider: "claude" });
   await assert.rejects(mismatched.coordinator.execute(operation(mismatched.task.id), context()), /missing or untrusted/);
-  assert.equal(mismatched.adapter.requests.length, 0);
+  assert.equal(mismatched.codexOwned.launches.length, 0);
   mismatched.cleanup();
 
   const stale = harness();
@@ -214,16 +232,15 @@ test("missing or mismatched identity and stale process ownership never launch", 
 
 test("SessionStart mismatch and generation CAS loss stop the fresh worker and leave safe evidence", async () => {
   const mismatch = harness();
-  mismatch.adapter.onStart = (sessionId) => mismatch.coordinator.observeSessionStart(sessionId, "codex", "wrong-thread");
+  mismatch.codexOwned.resumedThreadOverride = "wrong-thread";
   await assert.rejects(mismatch.coordinator.execute(operation(mismatch.task.id), context()), /identity mismatch/);
-  assert.equal(mismatch.adapter.stopped.length, 1);
+  assert.equal(mismatch.codexOwned.stopped.length, 1);
   assert.equal(mismatch.tasks.find(mismatch.task.id)?.runtime?.state, "recoverable");
   assert.equal(mismatch.tasks.stateDb.operations.findByIdempotencyKey(`continuation:${mismatch.task.id}:g1`), undefined);
   assert.match(String(mismatch.tasks.stateDb.runtimes.latestForTask(mismatch.task.id)?.metadata?.lastRecoveryFailure), /identity mismatch/);
   mismatch.cleanup();
 
   const cas = harness();
-  cas.adapter.onStart = (sessionId) => cas.coordinator.observeSessionStart(sessionId, "codex", CODEX_THREAD_ID);
   await assert.rejects(
     cas.coordinator.execute(operation(cas.task.id), context((name) => {
       if (name === "afterLaunch") {
@@ -232,17 +249,19 @@ test("SessionStart mismatch and generation CAS loss stop the fresh worker and le
     })),
     /generation conflict/
   );
-  assert.equal(cas.adapter.stopped.length, 1);
+  assert.equal(cas.codexOwned.stopped.length, 1);
   assert.equal(cas.tasks.find(cas.task.id)?.runtime?.state, "recoverable");
   cas.cleanup();
 });
 
 test("out-of-band identity alone never binds a candidate whose PTY already exited", async () => {
   const h = harness();
-  h.adapter.onStart = (sessionId) => {
-    const index = h.adapter.sessions.findIndex((session) => session.id === sessionId);
-    if (index >= 0) h.adapter.sessions.splice(index, 1);
-    h.coordinator.observeSessionStart(sessionId, "codex", CODEX_THREAD_ID);
+  // The candidate resumes and proves identity over the protocol, then dies
+  // before the coordinator can bind: protocol identity alone must not bind.
+  const originalObserve = h.coordinator.observeSessionStart.bind(h.coordinator);
+  h.coordinator.observeSessionStart = (sessionId, provider, providerSessionId, payload) => {
+    h.codexOwned.killSession(sessionId);
+    originalObserve(sessionId, provider, providerSessionId, payload);
   };
   await assert.rejects(h.coordinator.execute(operation(h.task.id), context()), /exited before the runtime bind/);
   assert.equal(h.tasks.find(h.task.id)?.runtime?.state, "recoverable");
@@ -256,14 +275,14 @@ test("out-of-band identity alone never binds a candidate whose PTY already exite
 
 test("failed candidate cleanup keeps the recovery claim held with durable evidence", async () => {
   const h = harness();
-  h.adapter.refuseStop = true;
-  h.adapter.onStart = (sessionId) => h.coordinator.observeSessionStart(sessionId, "codex", "wrong-thread");
+  h.codexOwned.refuseStop = true;
+  h.codexOwned.resumedThreadOverride = "wrong-thread";
 
   await assert.rejects(h.coordinator.execute(operation(h.task.id), context()), /cleanup failed/);
 
   const runtime = h.tasks.stateDb.runtimes.latestForTask(h.task.id)!;
   assert.equal(runtime.state, "recovering");
-  assert.equal(runtime.metadata?.candidateSessionId, h.adapter.sessions[0]?.id);
+  assert.equal(runtime.metadata?.candidateSessionId, (await h.codexOwned.listSessions())[0]?.id);
   assert.match(String(runtime.metadata?.lastRecoveryFailure), /cleanup failed/);
   assert.equal(h.tasks.events(h.task.id).at(-1)?.data?.recoveryAvailable, false);
   h.cleanup();
@@ -274,14 +293,15 @@ test("a recovery claim resumed by a new server owner is reclaimed safely before 
   assert.ok(h.runtimeManager.claimRecovery(h.task.id, 0));
   const priorOwner = h.runtimeManager.instanceId;
   const restartedManager = new RuntimeManager(h.tasks);
-  const restarted = new RecoveryCoordinator({ ...h.options, runtimeManager: restartedManager });
-  h.adapter.onStart = (sessionId) => restarted.observeSessionStart(sessionId, "codex", CODEX_THREAD_ID);
+  const restartedOptions = { ...h.options, runtimeManager: restartedManager };
+  const restarted = new RecoveryCoordinator(restartedOptions);
+  (restartedOptions as { recoveryCoordinator?: RecoveryCoordinator }).recoveryCoordinator = restarted;
   await restarted.execute(
     operation(h.task.id, 0, { claimed: true, claimOwnerInstanceId: priorOwner }),
     context()
   );
   assert.equal(h.tasks.find(h.task.id)?.runtime?.generation, 1);
-  assert.equal(h.adapter.requests.length, 1);
+  assert.equal(h.codexOwned.launches.length, 1);
   h.cleanup();
 });
 
@@ -317,13 +337,12 @@ test("a resumed operation never revokes a recovering claim held by another owner
   const runtime = h.tasks.stateDb.runtimes.latestForTask(h.task.id)!;
   assert.equal(runtime.state, "recovering");
   assert.equal(runtime.ownerInstanceId, restartedManager.instanceId);
-  assert.equal(h.adapter.requests.length, 0);
+  assert.equal(h.codexOwned.launches.length, 0);
   h.cleanup();
 });
 
 test("POST /tasks/:id/recover drives one duplicate-safe durable operation", async () => {
   const h = harness();
-  h.adapter.onStart = (sessionId) => h.coordinator.observeSessionStart(sessionId, "codex", CODEX_THREAD_ID);
   const scheduler = new TaskScheduler({ stateDb: h.tasks.stateDb, operationKinds: ["dispatch", "recovery"] });
   const server = createControlServer({
     ...h.options,
@@ -345,14 +364,98 @@ test("POST /tasks/:id/recover drives one duplicate-safe durable operation", asyn
     const oversized = await recover(JSON.stringify({ idempotencyKey: "k".repeat(201) }));
     assert.equal(oversized.status, 400);
     assert.match((await oversized.json()).error, /too long/);
-    assert.equal(h.adapter.requests.length, 0);
+    assert.equal(h.codexOwned.launches.length, 0);
     const repeatedBody = JSON.stringify({ idempotencyKey: "same-recovery" });
     const responses = await Promise.all([recover(repeatedBody), recover(repeatedBody)]);
     assert.deepEqual(responses.map((response) => response.status), [200, 200]);
-    assert.equal(h.adapter.requests.length, 1);
+    assert.equal(h.codexOwned.launches.length, 1);
     const duplicate = await recover(repeatedBody);
     assert.equal(duplicate.status, 200);
     assert.equal((await duplicate.json()).recovered, true);
+  } finally {
+    server.closeAllConnections?.();
+    await new Promise<void>((resolve) => server.close(() => resolve()));
+    await scheduler.stop();
+    h.cleanup();
+  }
+});
+
+test("a daemon rebind re-records the socket every cycle and aliases the stale env identity to the live runtime", async () => {
+  const h = harness();
+  const daemonSocket = "/fake/daemons/surviving.sock";
+  // Boot-time state: the durable hook credential the daemon env still carries,
+  // and the launch-recorded driver facts on the interrupted g0 runtime.
+  const stale = h.options.hooks.ensure("pty:old");
+  h.tasks.stateDb.runtimes.compareAndSwap(h.task.id, 0, "recoverable", "recoverable", {
+    metadata: {
+      source: "managed-launch",
+      codexDriver: "app-server-owned",
+      appServerSocketPath: daemonSocket
+    }
+  });
+  const options = { ...h.options, providers: [codexRecoveryDriver] };
+  const coordinator = new RecoveryCoordinator(options);
+  (options as { recoveryCoordinator?: RecoveryCoordinator }).recoveryCoordinator = coordinator;
+
+  await coordinator.execute(operation(h.task.id), context());
+
+  const g1 = h.tasks.stateDb.runtimes.latestForTask(h.task.id)!;
+  assert.equal(g1.generation, 1);
+  assert.equal(g1.state, "live");
+  assert.equal(h.codexOwned.launches[0]?.resume?.socketPath, daemonSocket, "the recorded socket rode codexOwnedResume");
+  // The bind re-recorded the driver facts, so the NEXT restart's keep-sweep
+  // and rebind still find the daemon - not just the first cycle.
+  assert.equal(g1.metadata?.codexDriver, "app-server-owned");
+  assert.equal(g1.metadata?.appServerSocketPath, daemonSocket);
+  assert.equal(g1.metadata?.appServerDaemonSessionId, "pty:old");
+  assert.equal(g1.metadata?.appServerDaemonGeneration, 0);
+  assert.equal(h.options.hooks.resolveAlias("pty:old"), g1.ptySessionId);
+
+  // A task-event POST with the stale env credentials (the surviving daemon's
+  // tool shells can never see fresh ones) resolves to the live session.
+  const scheduler = new TaskScheduler({ stateDb: h.tasks.stateDb, operationKinds: ["dispatch", "recovery"] });
+  const server = createControlServer({
+    ...options,
+    authToken: "rebind-token",
+    boxSecretKey: new Uint8Array(32),
+    devices: new DeviceRegistry({ PERCH_HOME: h.home } as NodeJS.ProcessEnv),
+    prPoller: new PrPoller(h.tasks),
+    taskScheduler: scheduler,
+    recoveryCoordinator: coordinator
+  });
+  await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+  const port = (server.address() as AddressInfo).port;
+  try {
+    const postEvent = () => fetch(`http://127.0.0.1:${port}/tasks/${encodeURIComponent(h.task.id)}/events`, {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        "x-perch-session": "pty:old",
+        "x-perch-token": stale.token
+      },
+      body: JSON.stringify({ kind: "note", message: "still reporting after the rebind" })
+    });
+    const first = await postEvent();
+    assert.equal(first.status, 200);
+    assert.equal(h.tasks.events(h.task.id).at(-1)?.source, "worker");
+
+    // Second restart cycle: the daemon (and its unchanged env) outlives g1
+    // too. The re-recorded socket must rebind again and re-point the alias.
+    h.codexOwned.killSession(g1.ptySessionId!);
+    h.tasks.stateDb.runtimes.compareAndSwap(h.task.id, 1, "live", "recoverable", { metadata: g1.metadata });
+    await coordinator.execute(operation(h.task.id, 1), context());
+    const g2 = h.tasks.stateDb.runtimes.latestForTask(h.task.id)!;
+    assert.equal(g2.generation, 2);
+    assert.equal(h.codexOwned.launches[1]?.resume?.socketPath, daemonSocket);
+    assert.equal(g2.metadata?.appServerSocketPath, daemonSocket);
+    assert.equal(g2.metadata?.appServerDaemonSessionId, "pty:old");
+    assert.equal(g2.metadata?.appServerDaemonGeneration, 0);
+    assert.equal(h.options.hooks.resolveAlias("pty:old"), g2.ptySessionId);
+
+    const second = await postEvent();
+    assert.equal(second.status, 200);
+    assert.equal(h.tasks.events(h.task.id).at(-1)?.source, "worker");
+    assert.equal(h.tasks.find(h.task.id)?.sessionId, g2.ptySessionId);
   } finally {
     server.closeAllConnections?.();
     await new Promise<void>((resolve) => server.close(() => resolve()));
