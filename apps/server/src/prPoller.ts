@@ -15,9 +15,11 @@ const execFileAsync = promisify(execFile);
 // Cadence is adaptive (G5): 5 min is the resting baseline, but a PR that is
 // "expecting change" - just attached, checks unsettled, or a sibling PR in the
 // same repo just merged (merge-train) - rides a fast window and is re-polled
-// every ~25s until it stabilizes, then falls back to the baseline. All gh
-// calls (both cadences) serialize through one single-flighted pass, so the
-// fast lane can never stampede gh or stack onto a slow baseline pass.
+// every ~25s. Stable PRs fall back to the baseline, but a trusted done PR stays
+// fast after it first becomes merge-ready until GitHub reports it merged or
+// closed. All gh calls (both cadences) serialize through one single-flighted
+// pass, so the fast lane can never stampede gh or stack onto a slow baseline
+// pass.
 
 export const POLL_INTERVAL_MS = 5 * 60_000;
 export const FAST_POLL_MS = 25_000;
@@ -478,9 +480,10 @@ export class PrPoller {
     }
 
     // Adaptive cadence: unsettled checks mean change is coming - keep the PR
-    // in the fast window (sliding, re-armed each pass while pending). A merge
-    // ends this PR's polling and often unblocks siblings in the same repo
-    // (merge-train), so those get a fast window instead.
+    // in the fast window (sliding, re-armed each pass while pending). A done PR
+    // that has become merge-ready stays fast through the durable awaitingMerge
+    // marker above. A merge ends this PR's polling and often unblocks siblings
+    // in the same repo (merge-train), so those get a fast window instead.
     if (justMerged) {
       this.fastUntil.delete(task.id);
       for (const other of this.tasks.list()) {
