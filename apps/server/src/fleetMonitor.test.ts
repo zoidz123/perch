@@ -11,6 +11,7 @@ import type {
 import type { WebSocket } from "ws";
 import type { AgentAdapter } from "./adapters/types.js";
 import { FleetMonitor } from "./fleetMonitor.js";
+import type { PromptDeliveryTracker } from "./promptDeliveries.js";
 
 function session(id: string, kind: SurfaceKind, workspaceId: string): AgentSession {
   return {
@@ -119,6 +120,46 @@ function monitor(adapter: AgentAdapter): FleetMonitor {
     detailThrottleMs: 1
   });
 }
+
+test("durable prompt delivery warnings replay on every fleet snapshot", async () => {
+  const adapter = new FakeAdapter([session("A", "terminal", "wsA")]);
+  let warning: AgentSession["promptDeliveryWarning"] = {
+    deliveryId: "delivery-1",
+    message: "Delivery unknown",
+    at: "2026-07-22T00:00:00.000Z"
+  };
+  const hub = new FleetMonitor(adapter, { promptDeliveryWarning: () => warning });
+  after(() => hub.stop());
+
+  assert.deepEqual(hub.withLiveState(await adapter.listSessions())[0]?.promptDeliveryWarning, warning);
+  warning = undefined;
+  assert.equal(hub.withLiveState(await adapter.listSessions())[0]?.promptDeliveryWarning, undefined);
+});
+
+test("an adapter-reported session exit closes outstanding prompt deliveries", async () => {
+  const adapter = new FakeAdapter([session("A", "terminal", "wsA")]);
+  const ended: string[] = [];
+  const promptDeliveries = {
+    markSessionEnded: (sessionId: string) => ended.push(sessionId),
+    reconcileActiveSessions: () => {}
+  } as unknown as PromptDeliveryTracker;
+  const hub = new FleetMonitor(adapter, {
+    reconcileMs: 10_000,
+    broadcastMs: 5,
+    promptDeliveries
+  });
+  after(() => hub.stop());
+  hub.addClient(asWebSocket(new FakeSocket()));
+  await tick(20);
+
+  adapter.emit({
+    kind: "status",
+    sessionId: "A",
+    status: "done",
+    at: new Date().toISOString()
+  });
+  assert.deepEqual(ended, ["A"]);
+});
 
 test("does no adapter work until a client connects, and stops after the last disconnects", async () => {
   const adapter = new FakeAdapter([session("A", "terminal", "wsA")]);

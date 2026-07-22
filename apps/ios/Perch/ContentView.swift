@@ -1065,6 +1065,12 @@ struct SessionRow: View {
                     .font(.system(size: 17, weight: .medium))
                     .foregroundStyle(isEnded ? Style.textSecondary : Style.textPrimary)
                     .lineLimit(1)
+                if let warning = session.promptDeliveryWarning {
+                    Text(warning.message)
+                        .font(.system(size: 12.5))
+                        .foregroundStyle(Color.orange)
+                        .lineLimit(2)
+                }
                 if let context = workContext {
                     Text(context)
                         .font(.system(size: 12.5))
@@ -1143,9 +1149,10 @@ struct MateRow: View {
                         MateModelBadge(label: badge)
                     }
                 }
-                Text("Runs the crew for you")
+                Text(session.promptDeliveryWarning?.message ?? "Runs the crew for you")
                     .font(.system(size: 12.5))
-                    .foregroundStyle(Style.textSecondary)
+                    .foregroundStyle(session.promptDeliveryWarning == nil ? Style.textSecondary : Color.orange)
+                    .lineLimit(2)
             }
 
             Spacer(minLength: 8)

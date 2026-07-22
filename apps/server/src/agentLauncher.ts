@@ -29,6 +29,7 @@ import type { TaskCompletionReconciler } from "./taskCompletion.js";
 import type { RuntimeManager } from "./runtimeManager.js";
 import type { RecoveryCoordinator } from "./recovery.js";
 import type { OwnerManager } from "./ownerManager.js";
+import type { PromptDeliveryTracker } from "./promptDeliveries.js";
 import type { MateRecoveryCoordinator } from "./mateRecovery.js";
 import type { TimelineStore } from "./timeline.js";
 import type { WorktreeLease, WorktreePool } from "./worktrees.js";
@@ -63,6 +64,7 @@ export type ManagedAgentLauncherOptions = {
   recoveryCoordinator?: RecoveryCoordinator;
   ownerManager?: OwnerManager;
   mateRecoveryCoordinator?: MateRecoveryCoordinator;
+  promptDeliveries?: PromptDeliveryTracker;
 };
 
 export type StartManagedAgentInput = {
@@ -268,6 +270,16 @@ export async function startManagedAgent(
   const ownerRuntime = request.labels?.role === "mate" && input.trackOwner !== false
     ? options.ownerManager?.beginMateLaunch(request, input.intentionalNewMate === true)
     : undefined;
+  const claudeKickoffDelivery =
+    claudeKickoffInArgs && request.sessionId && typeof request.initialPrompt === "string"
+        ? options.promptDeliveries?.create(
+          request.sessionId,
+          request.initialPrompt,
+          input.initialPromptSource ?? "human",
+          { allowLateReceipt: true }
+        )
+      : undefined;
+  if (claudeKickoffDelivery) options.promptDeliveries?.markTyping(claudeKickoffDelivery.id);
   let session: AgentSession | undefined;
   try {
     if (isCodexLaunch && options.codexOwned) {
@@ -284,6 +296,10 @@ export async function startManagedAgent(
     } else {
       session = await options.adapter.startAgent!(request);
     }
+    // Startup gates can delay the positional prompt substantially. Bound the
+    // uncertainty without resending; this kickoff remains eligible for a
+    // later genuine receipt that resolves the warning.
+    if (claudeKickoffDelivery) options.promptDeliveries?.markSubmitted(claudeKickoffDelivery.id, 120_000);
 
     if (request.sessionId && session.id !== request.sessionId) {
       // The adapter refused the pre-minted id: drop the stale id's hook
@@ -447,6 +463,14 @@ export async function startManagedAgent(
       ...(lease ? { worktreeId: lease.id } : {})
     };
   } catch (error) {
+    if (claudeKickoffDelivery) {
+      options.promptDeliveries?.markUnknown(
+        claudeKickoffDelivery.id,
+        `Claude launch failed before kickoff acceptance could be confirmed: ${
+          error instanceof Error ? error.message : String(error)
+        }; not resent`
+      );
+    }
     if (runtime) options.runtimeManager?.markLaunchFailed(runtime);
     if (ownerRuntime) options.ownerManager?.markLaunchFailed(ownerRuntime);
     if (session?.id) {

@@ -22,6 +22,12 @@ struct CrewSessionRow: View {
                         .foregroundStyle(Style.textSecondary)
                         .lineLimit(1)
                 }
+                if let warning = session.promptDeliveryWarning {
+                    Text(warning.message)
+                        .font(.system(size: 12.5))
+                        .foregroundStyle(Style.warningText)
+                        .lineLimit(2)
+                }
             }
 
             Spacer(minLength: 8)
@@ -145,6 +151,13 @@ struct TaskRow: View {
                         .font(.system(size: 13))
                         .foregroundStyle(Style.textSecondary)
                         .lineLimit(1)
+                }
+
+                if let warning = session?.promptDeliveryWarning {
+                    Text(warning.message)
+                        .font(.system(size: 12.5))
+                        .foregroundStyle(Style.warningText)
+                        .lineLimit(2)
                 }
 
                 VStack(alignment: .leading, spacing: 4) {

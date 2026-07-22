@@ -44,6 +44,13 @@ export type AgentSession = {
   // Small last-lines preview for the fleet overview tier. Terminal surfaces
   // only, captured on activity - not full scrollback (that is the detail tier).
   tail?: string;
+  // Durable Claude PTY delivery uncertainty, derived from the server ledger
+  // on every fleet snapshot so reconnecting clients cannot miss it.
+  promptDeliveryWarning?: {
+    deliveryId: string;
+    message: string;
+    at: string;
+  };
   // App-server-owned Codex sessions only: the exact command a desktop human
   // runs to attach the real native TUI to this session's live thread
   // (`codex resume <threadId> --remote unix://<socket>`). Append-only;

@@ -21,6 +21,7 @@ import { RuntimeManager } from "./runtimeManager.js";
 import { createControlServer, handleWebSocketRpcRequest } from "./http.js";
 import { DeviceRegistry } from "./pairing.js";
 import { PrPoller } from "./prPoller.js";
+import { PromptDeliveryTracker } from "./promptDeliveries.js";
 import { ProjectRegistry } from "./projects.js";
 import { FleetSettings } from "./settings.js";
 import { TaskStore } from "./tasks.js";
@@ -128,7 +129,15 @@ function fixture(durableBoundary?: "afterLaunch" | "durable") {
   const auditLog = new AuditLog(join(home, "audit.jsonl"));
   const tasks = new TaskStore(env);
   const timeline = new TimelineStore();
-  const monitor = new FleetMonitor(routing, { auditLog, broadcastMs: 5, tailThrottleMs: 1, detailThrottleMs: 1 });
+  const promptDeliveries = new PromptDeliveryTracker(tasks.stateDb, { receiptTimeoutMs: 5_000 });
+  const monitor = new FleetMonitor(routing, {
+    auditLog,
+    broadcastMs: 5,
+    tailThrottleMs: 1,
+    detailThrottleMs: 1,
+    promptDeliveries
+  });
+  timeline.observe((item) => promptDeliveries.acknowledgeTimeline(item));
   // Mirror the index.ts wiring the approval pipeline depends on.
   codexOwned.wireEvents({
     onServerRequest: (sessionId, request) => surfaceCodexServerRequest({ monitor, tasks }, sessionId, request),
@@ -183,6 +192,7 @@ function fixture(durableBoundary?: "afterLaunch" | "durable") {
     // ledger and no hook reinstall side effects.
     runtimeManager: undefined as RuntimeManager | undefined,
     installHooks: undefined as ((agent: AgentKind) => void) | undefined,
+    promptDeliveries,
     ...(taskScheduler ? { taskScheduler } : {})
   };
   const server = createControlServer(options);
@@ -195,6 +205,7 @@ function fixture(durableBoundary?: "afterLaunch" | "durable") {
     server,
     cleanup: async (...extra: string[]) => {
       timeline.stop();
+      promptDeliveries.stop();
       monitor.stop();
       await taskScheduler?.stop();
       server.closeAllConnections?.();
@@ -867,6 +878,10 @@ test("dispatching a Claude worker seeds folder trust for the pool worktree", asy
     const state = JSON.parse(readFileSync(join(fx.home, ".claude.json"), "utf8"));
     const entry = state.projects[realpathSync(worktree!)];
     assert.deepEqual(entry, { hasTrustDialogAccepted: true });
+    const [kickoff] = fx.options.tasks.stateDb.promptDeliveries.list();
+    assert.equal(kickoff?.state, "submitted");
+    assert.match(kickoff?.promptText ?? "", /PERCH TASK BRIEF/);
+    assert.equal(fx.adapter.requests[0]?.args?.filter((arg) => arg === kickoff?.promptText).length, 1);
   } finally {
     await fx.cleanup(repo);
   }

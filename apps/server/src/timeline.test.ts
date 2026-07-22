@@ -140,7 +140,9 @@ test("transcript appearing after attach backfills without listener fan-out", asy
 
   const store = new TimelineStore();
   const received: string[] = [];
+  const observed: string[] = [];
   store.subscribe((item) => received.push(item.text ?? ""));
+  store.observe((item) => observed.push(item.text ?? ""));
 
   // Attach before the file exists (SessionStart racing transcript creation);
   // the history written moments later must not replay as live frames.
@@ -153,6 +155,7 @@ test("transcript appearing after attach backfills without listener fan-out", asy
 
   await waitFor(() => store.fetch("pty:1", 0, 10).items.length >= 2);
   assert.deepEqual(received, []);
+  assert.deepEqual(observed, ["old1", "old2"]);
 
   appendFileSync(
     transcript,
@@ -160,9 +163,36 @@ test("transcript appearing after attach backfills without listener fan-out", asy
   );
   await waitFor(() => received.length >= 1);
   assert.deepEqual(received, ["live"]);
+  assert.deepEqual(observed, ["old1", "old2", "live"]);
 
   store.stop();
   rmSync(dir, { recursive: true, force: true });
+});
+
+test("catch-up waits for an unterminated transcript row to finish", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "perch-tl-partial-catchup-"));
+  const transcript = join(dir, "session.jsonl");
+  const row = JSON.stringify({
+    type: "user",
+    uuid: "partial-user",
+    timestamp: new Date().toISOString(),
+    message: { content: "complete me" }
+  });
+  writeFileSync(transcript, row.slice(0, -2));
+  const store = new TimelineStore();
+  const caughtUp: string[] = [];
+  store.observeCatchUp((sessionId) => caughtUp.push(sessionId));
+  try {
+    store.attach("pty:partial", transcript);
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    assert.deepEqual(caughtUp, []);
+    appendFileSync(transcript, `${row.slice(-2)}\n`);
+    await waitFor(() => caughtUp.length === 1);
+    assert.deepEqual(caughtUp, ["pty:partial"]);
+  } finally {
+    store.stop();
+    rmSync(dir, { recursive: true, force: true });
+  }
 });
 
 test("lastActivityAt ignores user rows and reports the last worker-produced row", async () => {

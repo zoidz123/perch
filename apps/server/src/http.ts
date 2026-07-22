@@ -160,6 +160,7 @@ import {
 } from "./claudeApprovals.js";
 import { ClaudeQuestionCoordinator, publicQuestion } from "./claudeQuestions.js";
 import { ClaudeInteractionCoordinator, publicInteraction } from "./claudeInteractions.js";
+import type { PromptDeliveryTracker } from "./promptDeliveries.js";
 
 export { markTaskWorkingFromActivity } from "./agentLauncher.js";
 
@@ -223,6 +224,7 @@ export type HttpServerOptions = {
   claudeApprovals?: ClaudeApprovalCoordinator;
   claudeQuestions?: ClaudeQuestionCoordinator;
   claudeInteractions?: ClaudeInteractionCoordinator;
+  promptDeliveries?: PromptDeliveryTracker;
 };
 
 const CODEX_ON_PATH_TTL_MS = 30_000;
@@ -2699,9 +2701,9 @@ async function deliverInput(
   options: HttpServerOptions,
   canonicalSessionId: string,
   text: string,
-  _source: "human" | "agent"
+  source: "human" | "agent"
 ): Promise<{ queued: boolean }> {
-  return options.monitor.queueOrSubmit(canonicalSessionId, text);
+  return options.monitor.queueOrSubmit(canonicalSessionId, text, { source });
 }
 
 const INPUT_ACCEPT_WAIT_MS = 1000;
@@ -4655,6 +4657,14 @@ async function handleHookReport(
 
     const eventName = hookEventName(payload);
     const codexOwnedTurnBoundary = format === "codex" && options.codexOwned?.has(sessionId) === true;
+
+    if (eventName === "UserPromptSubmit" && format === "claude" && typeof payload.prompt === "string") {
+      options.promptDeliveries?.acknowledgeHook(
+        sessionId,
+        payload.prompt,
+        typeof payload.session_id === "string" ? payload.session_id : undefined
+      );
+    }
 
     // Snapshot the immutable task-event sequence before the automatic
     // new-turn working event. App-server-owned Codex control owns this
