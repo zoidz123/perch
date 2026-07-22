@@ -59,6 +59,9 @@ export type ResumeConversationParams = {
 // turn/start params. Only `threadId` + `input` are required; every override is
 // "for this turn and subsequent turns". `model` MUST be omitted (never sent as
 // "") - an empty model string errors ("model '' not supported").
+// `clientUserMessageId` (0.144.6) is a caller-supplied identifier persisted
+// into thread history as the userMessage item's `clientId`; codex does NOT
+// deduplicate on it, so it is a reconciliation key, never resend protection.
 export type TurnStartParams = {
   threadId: ThreadId;
   input: InputItem[];
@@ -67,6 +70,53 @@ export type TurnStartParams = {
   cwd?: string;
   approvalPolicy?: ApprovalPolicy;
   sandboxPolicy?: { type: string };
+  clientUserMessageId?: string;
+};
+
+// turn/steer params (0.144.6): inject input into the ACTIVE turn. The
+// `expectedTurnId` is a compare-and-swap guard - the daemon rejects the steer
+// when the active turn is not the one the caller believes it is steering.
+export type TurnSteerParams = {
+  threadId: ThreadId;
+  expectedTurnId: string;
+  input: InputItem[];
+  clientUserMessageId?: string;
+};
+
+// thread/read params (0.144.6): read a thread and, with `includeTurns`, its
+// full turn/item history rebuilt from the rollout. The authoritative source
+// for reconciling an input whose turn/start response was lost.
+export type ThreadReadParams = {
+  threadId: ThreadId;
+  includeTurns?: boolean;
+};
+
+// The subset of thread/read's response perch consumes for reconciliation and
+// history replay. Tolerant by design: the protocol is experimental, so every
+// field is optional and unknown item types flow through untyped.
+export type ThreadHistoryItem = {
+  id?: string;
+  type?: string;
+  clientId?: string | null;
+  content?: unknown;
+  text?: string;
+  [key: string]: unknown;
+};
+
+export type ThreadHistoryTurn = {
+  id?: string;
+  status?: string;
+  items?: ThreadHistoryItem[];
+  [key: string]: unknown;
+};
+
+export type ThreadReadResult = {
+  thread?: {
+    id?: string;
+    turns?: ThreadHistoryTurn[];
+    [key: string]: unknown;
+  };
+  [key: string]: unknown;
 };
 
 export type InterruptConversationParams = {

@@ -44,6 +44,12 @@ export type AgentSession = {
   // Small last-lines preview for the fleet overview tier. Terminal surfaces
   // only, captured on activity - not full scrollback (that is the detail tier).
   tail?: string;
+  // App-server-owned Codex sessions only: the exact command a desktop human
+  // runs to attach the real native TUI to this session's live thread
+  // (`codex resume <threadId> --remote unix://<socket>`). Append-only;
+  // absent for PTY-backed sessions, which are attached through the desktop
+  // terminal surface instead.
+  attachCommand?: string;
   // Optional desktop location for a Perch-owned process. The session `id`
   // remains the canonical agent id; this is only where it is attached locally.
   desktop?: DesktopContext;

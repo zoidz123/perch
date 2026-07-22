@@ -19,16 +19,14 @@
 //      machine is unit-testable against mock streams, with no daemon or codex
 //      install. The default transport spawns a stdio `app-server` child.
 //
-// Topology note (option b): the same protocol engine drives either a
-// per-session stdio `app-server` (the opt-in fallback, via the default stdio
-// `spawn`) or a control connection to a perch-owned `codex app-server --listen
-// unix://` daemon that a real `codex --remote` TUI is also attached to (the
-// primary path, via `websocketUnixTransport` in wsUnixTransport.ts). The engine
-// is identical; only the `spawn` factory and whether we thread/start vs
-// thread/resume differ. The daemon lifecycle lives in codexDaemon.ts and the
-// live session/model/approval routing in codexControl.ts. When the control
-// client attaches to a daemon whose TUI already owns a thread, it learns that
-// thread id from the daemon's `thread/started` broadcast (see onThreadStarted).
+// Topology note: the same protocol engine drives either a one-shot stdio
+// `app-server` child (model registry, utilities, via the default stdio
+// `spawn`) or the standing owner connection to a perch-owned `codex
+// app-server --listen unix://` daemon (production sessions, via
+// `websocketUnixTransport` in wsUnixTransport.ts). The engine is identical;
+// only the `spawn` factory and whether we thread/start vs thread/resume
+// differ. The daemon lifecycle lives in codexDaemon.ts and the owning session
+// adapter in codexAppServerAdapter.ts.
 
 import { spawn as childSpawn } from "node:child_process";
 import { createInterface, type Interface as ReadlineInterface } from "node:readline";
@@ -50,8 +48,10 @@ import type {
   ResumeConversationParams,
   ReviewDecision,
   SandboxMode,
+  ThreadReadResult,
   ThreadResult,
-  TurnStartParams
+  TurnStartParams,
+  TurnSteerParams
 } from "./codexAppServerTypes.js";
 import { usageLimitFromCodexAppServer, type UsageLimit } from "../usageLimitDetect.js";
 
@@ -67,6 +67,29 @@ export interface CodexTransport {
 }
 
 export type SpawnTransport = () => CodexTransport;
+
+// A JSON-RPC error RESPONSE from the app-server: the daemon received the
+// request and rejected it, so the outcome is authoritatively known. Message
+// format stays `<method>: <message> (code=<code>)` - the mate recovery
+// classifier matches on that exact shape.
+export class CodexRpcError extends Error {
+  constructor(
+    readonly method: string,
+    readonly rpcMessage: string,
+    readonly code: number
+  ) {
+    super(`${method}: ${rpcMessage} (code=${code})`);
+    this.name = "CodexRpcError";
+  }
+}
+
+// Was the request authoritatively REJECTED (vs. lost in transit)? Anything
+// that is not a CodexRpcError - process exit, disconnect, timeout - means the
+// request may or may not have been applied, and callers must reconcile
+// against thread history instead of assuming either outcome.
+export function isCodexRpcError(error: unknown): error is CodexRpcError {
+  return error instanceof CodexRpcError;
+}
 
 // A normalized approval request handed to the consumer. The consumer returns a
 // decision; the client maps it to the correct wire format for the method.
@@ -124,6 +147,10 @@ export type CodexAppServerOptions = {
   // launcher accepts to recover a blocked task back to working.
   onTurnStarted?: () => void;
   onUsageLimit?: (limit: UsageLimit) => void;
+  // Fired when the CURRENT transport drops out from under a connected client
+  // (daemon exit, socket churn) - never for a deliberate disconnect(). The
+  // owning adapter uses it to drive bounded reconnect + truthful session death.
+  onDisconnected?: () => void;
   clientName?: string;
 };
 
@@ -229,6 +256,7 @@ export class CodexAppServerClient {
   private readonly onTurnComplete?: (ev: { message: string }) => void;
   private readonly onTurnStarted?: () => void;
   private readonly onUsageLimit?: (limit: UsageLimit) => void;
+  private readonly onDisconnected?: () => void;
   private readonly clientName: string;
 
   private transport: CodexTransport | null = null;
@@ -295,6 +323,7 @@ export class CodexAppServerClient {
     this.onTurnComplete = options.onTurnComplete;
     this.onTurnStarted = options.onTurnStarted;
     this.onUsageLimit = options.onUsageLimit;
+    this.onDisconnected = options.onDisconnected;
     this.clientName = options.clientName ?? "perch";
   }
 
@@ -321,6 +350,7 @@ export class CodexAppServerClient {
 
     transport.onExit((code) => {
       if (this.transport !== transport || this.processEpoch !== epoch) return;
+      const wasConnected = this.connected;
       this.connected = false;
       for (const [id, req] of this.pending) {
         if (req.epoch !== epoch) continue;
@@ -329,6 +359,9 @@ export class CodexAppServerClient {
       }
       this.clearPendingServerRequests();
       this.resolvePendingTurn(true);
+      // Only an ESTABLISHED connection dropping is a disconnect event; a
+      // failed initial connect surfaces through connect()'s own rejection.
+      if (wasConnected) this.onDisconnected?.();
     });
 
     transport.stderr?.on("data", () => {
@@ -357,6 +390,10 @@ export class CodexAppServerClient {
     this.readline?.close();
     this.readline = null;
 
+    // Drop connected BEFORE killing the transport: a ws transport fires its
+    // exit callback synchronously from kill(), and a deliberate disconnect
+    // must never register as an unexpected drop (onDisconnected).
+    this.connected = false;
     try {
       transport?.stdin.end();
       transport?.kill("SIGTERM");
@@ -425,14 +462,15 @@ export class CodexAppServerClient {
   }
 
   // Rejoin an existing thread (the daemon/`--remote` case: the TUI already owns
-  // the thread; the control client thread/resume-rejoins to steer it).
+  // the thread; the control client thread/resume-rejoins to steer it). The raw
+  // `result` carries the replayed turn history for owners that ingest it.
   async resumeThread(opts: {
     threadId?: string;
     model?: string;
     cwd?: string;
     approvalPolicy?: ApprovalPolicy;
     sandbox?: SandboxMode;
-  }): Promise<{ threadId: string; model: string }> {
+  }): Promise<{ threadId: string; model: string; result: ThreadResult }> {
     const threadId = opts.threadId ?? this._threadId;
     if (!threadId) throw new Error("No thread available to resume.");
     const defaults = this.threadDefaults ?? {};
@@ -454,7 +492,7 @@ export class CodexAppServerClient {
       approvalPolicy: opts.approvalPolicy ?? defaults.approvalPolicy,
       sandbox: opts.sandbox ?? defaults.sandbox
     };
-    return { threadId: result.thread.id, model: result.model };
+    return { threadId: result.thread.id, model: result.model, result };
   }
 
   private async reconnectAndResumeThread(): Promise<boolean> {
@@ -498,12 +536,22 @@ export class CodexAppServerClient {
   // completion arrives asynchronously via notifications.
   async submitTurn(
     text: string,
-    opts?: { model?: string; effort?: ReasoningEffort; source?: "human" | "agent" }
+    opts?: {
+      model?: string;
+      effort?: ReasoningEffort;
+      source?: "human" | "agent";
+      // Persisted into thread history as the userMessage item's clientId
+      // (0.144.6), so a lost turn/start response can be reconciled by reading
+      // the thread back. Also used as the echoed timeline item's stable id so
+      // a later history replay dedupes against it.
+      clientUserMessageId?: string;
+    }
   ): Promise<{ turnId: string | null }> {
     if (!this._threadId) throw new Error("No active thread. Call startThread or resumeThread first.");
 
     const input: InputItem[] = [{ type: "text", text }];
     const params: TurnStartParams = { threadId: this._threadId, input };
+    if (opts?.clientUserMessageId) params.clientUserMessageId = opts.clientUserMessageId;
 
     // Merge the standing override with per-call opts (per-call wins). An empty
     // model string is an error on the wire, so only set it when non-empty.
@@ -519,7 +567,7 @@ export class CodexAppServerClient {
     // Echo the user turn into the timeline immediately (the protocol may not
     // reflect it back promptly). Mirrors perch's human/agent provenance.
     if (text.length > 0) {
-      this.emitTimelineItem("user", text, undefined, opts?.source ?? "human");
+      this.emitTimelineItem("user", text, undefined, opts?.source, opts?.clientUserMessageId);
     }
 
     const result = (await this.request("turn/start", params)) as { turn?: { id?: string | null } };
@@ -529,6 +577,36 @@ export class CodexAppServerClient {
       if (this.pendingTurnCompletion) this.pendingTurnCompletion.turnId = turnId;
     }
     return { turnId };
+  }
+
+  // Steer input into the ACTIVE turn (`turn/steer`, 0.144.6). The
+  // expectedTurnId CAS means a steer can never land in a turn the caller was
+  // not addressing; a mismatch rejects with a CodexRpcError and the caller
+  // re-reads the live turn state.
+  async steerTurn(
+    text: string,
+    opts: { expectedTurnId: string; source?: "human" | "agent"; clientUserMessageId?: string }
+  ): Promise<void> {
+    if (!this._threadId) throw new Error("No active thread. Call startThread or resumeThread first.");
+    const params: TurnSteerParams = {
+      threadId: this._threadId,
+      expectedTurnId: opts.expectedTurnId,
+      input: [{ type: "text", text }]
+    };
+    if (opts.clientUserMessageId) params.clientUserMessageId = opts.clientUserMessageId;
+    if (text.length > 0) {
+      this.emitTimelineItem("user", text, undefined, opts.source, opts.clientUserMessageId);
+    }
+    await this.request("turn/steer", params);
+  }
+
+  // Authoritative thread history (`thread/read` with includeTurns), rebuilt by
+  // the daemon from the rollout. Used to reconcile inputs whose response was
+  // lost and to replay history after a resume.
+  async readThread(threadId?: string): Promise<ThreadReadResult> {
+    const id = threadId ?? this._threadId;
+    if (!id) throw new Error("No thread available to read.");
+    return (await this.request("thread/read", { threadId: id, includeTurns: true })) as ThreadReadResult;
   }
 
   // Submit and wait for the turn to settle (task_complete / turn_aborted).
@@ -700,7 +778,7 @@ export class CodexAppServerClient {
       if (msg.error) {
         const limit = usageLimitFromCodexAppServer(msg.error);
         if (limit) this.onUsageLimit?.(limit);
-        pending.reject(new Error(`${pending.method}: ${msg.error.message} (code=${msg.error.code})`));
+        pending.reject(new CodexRpcError(pending.method, msg.error.message, msg.error.code));
       } else {
         pending.resolve(msg.result);
       }
@@ -1101,26 +1179,34 @@ export class CodexAppServerClient {
     if (!item || typeof item !== "object") return method.startsWith("item/");
 
     const itemType = typeof item.type === "string" ? item.type : "";
+    const protocolItemId = typeof item.id === "string" && item.id.length > 0 ? item.id : undefined;
+    const stagedId = (stage: string) => (protocolItemId ? `${protocolItemId}:${stage}` : undefined);
 
     if (method === "item/started" && itemType === "commandExecution") {
-      this.emitTimelineItem("tool_call", undefined, {
-        name: "shell",
-        input: this.stringifyCommand(item.command)
-      });
+      this.emitTimelineItem(
+        "tool_call",
+        undefined,
+        {
+          name: "shell",
+          input: this.stringifyCommand(item.command)
+        },
+        undefined,
+        stagedId("call")
+      );
       return true;
     }
     if (method === "item/completed" && itemType === "commandExecution") {
       const output = typeof item.aggregatedOutput === "string" ? item.aggregatedOutput : "";
-      this.emitTimelineItem("tool_result", output);
+      this.emitTimelineItem("tool_result", output, undefined, undefined, stagedId("result"));
       return true;
     }
     if (itemType === "fileChange" && method === "item/started") {
-      this.emitTimelineItem("tool_call", undefined, { name: "apply_patch" });
+      this.emitTimelineItem("tool_call", undefined, { name: "apply_patch" }, undefined, stagedId("call"));
       return true;
     }
     if (itemType === "fileChange" && method === "item/completed") {
       const status = typeof item.status === "string" ? item.status : "completed";
-      this.emitTimelineItem("tool_result", `File change ${status}`);
+      this.emitTimelineItem("tool_result", `File change ${status}`, undefined, undefined, stagedId("result"));
       return true;
     }
     if (method === "item/completed" && itemType === "agentMessage") {
@@ -1132,7 +1218,7 @@ export class CodexAppServerClient {
       this.finishAssistantStream(itemId ?? undefined, text);
       if (text.length > 0) {
         this.lastAssistantMessage = text;
-        this.emitTimelineItem("assistant", text);
+        this.emitTimelineItem("assistant", text, undefined, undefined, protocolItemId);
       }
       if (item.phase === "final_answer" && this.pendingTurnCompletion) {
         this.emitRawTurnCompletion(this.extractTurnId(params), "completed");
@@ -1224,16 +1310,21 @@ export class CodexAppServerClient {
 
   // ─── Emission helpers ───────────────────────────────────────
 
+  // `stableId`, when the protocol supplies one (item id, clientUserMessageId),
+  // makes the emitted item idempotent across reconnects and history replays -
+  // TimelineStore.append dedupes by id. Without one the per-process synthetic
+  // id keeps legacy behavior.
   private emitTimelineItem(
     kind: TimelineItemKind,
     text?: string,
     tool?: TimelineItem["tool"],
-    source?: "human" | "agent"
+    source?: "human" | "agent",
+    stableId?: string
   ): void {
     if (!this.onTimelineItem) return;
     const item: TimelineItem = {
       seq: ++this.seqCounter,
-      id: `cx-${this.sessionId}-${this.seqCounter}`,
+      id: stableId ? `cx-item-${stableId}` : `cx-${this.sessionId}-${this.seqCounter}`,
       sessionId: this.sessionId,
       kind,
       at: new Date().toISOString()

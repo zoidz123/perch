@@ -292,6 +292,28 @@ export class CodexDaemonManager {
     };
   }
 
+  // Adopt a daemon that is already listening at a recorded socket path from a
+  // previous server life (app-server-owned recovery rebind). Health-checks the
+  // socket and registers a killable handle recovered from the pidfile so
+  // release()/stopAll() still apply. Returns null when nothing healthy answers
+  // - the caller then respawns via acquire(). The adopt key is the socket path
+  // itself: the original cwd/env-derived key is not reconstructible (the hook
+  // identity that produced it belonged to the previous life).
+  async adoptExisting(socketPath: string, cwd: string): Promise<CodexDaemonHandle | null> {
+    for (const entry of this.daemons.values()) {
+      if (entry.handle.socketPath === socketPath) return entry.handle;
+    }
+    if (!existsSync(socketPath)) return null;
+    try {
+      await this.waitHealthy(socketPath, 2_000);
+    } catch {
+      return null;
+    }
+    const handle: CodexDaemonHandle = { socketPath, cwd };
+    this.daemons.set(`adopted:${socketPath}`, { handle, process: this.adoptProcess(socketPath) });
+    return handle;
+  }
+
   // A session-scoped daemon belongs to the control session that acquired it.
   // Stop it when that session detaches so sequential tasks do not accumulate
   // one live process per historical hook identity.
@@ -319,7 +341,10 @@ export class CodexDaemonManager {
   // SIGTERM, so pid reuse can never hit an unrelated process. Call before the
   // first acquire - sockets not yet tracked by this manager are treated as
   // orphans. Bounded per pass; leftovers are picked up on the next boot.
-  sweepOrphans(): void {
+  // `keep` lists socket paths that must SURVIVE the sweep: daemons recorded on
+  // recoverable app-server-owned runtimes, whose live thread state is the very
+  // thing the post-restart rebind reconnects to.
+  sweepOrphans(keep?: ReadonlySet<string>): void {
     const dir = join(perchHome(this.env), "codex-daemons");
     let names: string[];
     try {
@@ -327,7 +352,7 @@ export class CodexDaemonManager {
     } catch {
       return;
     }
-    const owned = new Set<string>();
+    const owned = new Set<string>(keep ?? []);
     for (const entry of this.daemons.values()) {
       owned.add(entry.handle.socketPath);
     }
@@ -361,9 +386,16 @@ export class CodexDaemonManager {
     }
   }
 
-  // Stop every daemon this manager spawned (server shutdown).
-  stopAll(): void {
+  // Stop every daemon this manager spawned (server shutdown). `keep` excludes
+  // sockets of live app-server-owned sessions: their daemons deliberately
+  // outlive a graceful restart so the next life can rebind without losing the
+  // in-memory thread (their pidfiles stay for a later sweep/adopt decision).
+  stopAll(keep?: ReadonlySet<string>): void {
     for (const [key, entry] of this.daemons) {
+      if (keep?.has(entry.handle.socketPath)) {
+        this.daemons.delete(key);
+        continue;
+      }
       try {
         entry.process.kill("SIGTERM");
       } catch {
