@@ -10,7 +10,7 @@ It does not catalog unrelated device, configuration, usage, or chart-review rout
 ## Actors and credentials
 
 The local server normally listens at `http://127.0.0.1:8787`.
-Workers receive these values in their PTY environment:
+Workers receive these values in their process environment (the PTY for Claude, the app-server daemon for Codex):
 
 | Variable | Purpose |
 | --- | --- |
@@ -309,7 +309,7 @@ Recovery accepts an optional stable key:
 { "idempotencyKey": "recover-task-123-after-server-restart" }
 ```
 
-The server resumes the exact verified provider conversation in a new PTY runtime generation while preserving the task, event log, worktree, branch, and worker identity.
+The server resumes the exact verified provider conversation in a new runtime generation while preserving the task, event log, worktree, branch, and worker identity.
 Recovery changes runtime state, not task meaning.
 A `409` means recovery is already running or is unavailable for the current durable runtime.
 

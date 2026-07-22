@@ -159,8 +159,8 @@ The default server URL is `http://127.0.0.1:8787` from the CLI, while the server
 Use `PERCH_SERVER_URL` to select another loopback port for development or isolated checks.
 Never expose the server port directly to the public internet.
 
-Stopping the server interrupts its owned PTYs.
-Managed workers and Mate are recoverable only when Perch has persisted a verified provider conversation identity and can prove the old process is gone.
+Stopping the server interrupts its owned PTYs; app-server-owned Codex daemons keep running so the next start can rebind their live threads.
+Managed workers and Mate are recoverable only when Perch has persisted a verified provider conversation identity and can either rebind a surviving Codex daemon or prove the old process is gone.
 Solo sessions and arbitrary `perch run` commands do not have managed task recovery.
 
 ## Recovery and worktrees
