@@ -75,7 +75,8 @@ test("a dispatched codex worker's timeline reaches a client that did not start i
     daemons: {
       acquire: async () => ({ socketPath, cwd: repo }),
       release: () => {},
-      adoptExisting: async () => null
+      adoptExisting: async () => null,
+      currentRuntimeFingerprint: () => "fp-test"
     } as unknown as CodexDaemonManager
   });
   const adapter = new RoutingAgentAdapter(pty as unknown as PtyAgentAdapter, codexOwned);
