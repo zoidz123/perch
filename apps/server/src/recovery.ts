@@ -419,6 +419,10 @@ export const codexRecoveryDriver: RecoveryProviderDriver = {
       typeof runtime.metadata?.appServerSocketPath === "string"
         ? (runtime.metadata.appServerSocketPath as string)
         : undefined;
+    const runtimeFingerprint =
+      typeof runtime.metadata?.appServerRuntimeFingerprint === "string"
+        ? (runtime.metadata.appServerRuntimeFingerprint as string)
+        : undefined;
     return {
       expectedProviderSessionId: threadId,
       request: {
@@ -436,7 +440,11 @@ export const codexRecoveryDriver: RecoveryProviderDriver = {
         }
       },
       launchInput: {
-        codexOwnedResume: { threadId, ...(socketPath ? { socketPath } : {}) }
+        codexOwnedResume: {
+          threadId,
+          ...(socketPath ? { socketPath } : {}),
+          ...(runtimeFingerprint ? { runtimeFingerprint } : {})
+        }
       }
     };
   }
@@ -452,16 +460,18 @@ export const codexRecoveryDriver: RecoveryProviderDriver = {
 // resolve to the live runtime. Returns undefined for non-owned (Claude)
 // sessions.
 export function codexOwnedBindFacts(
-  codexOwned: Pick<CodexAppServerAdapter, "socketPathOf"> | undefined,
+  codexOwned: Pick<CodexAppServerAdapter, "socketPathOf" | "runtimeFingerprint"> | undefined,
   liveSessionId: string,
   recovering: Pick<RuntimeRecord, "generation" | "ptySessionId" | "metadata">,
   resume: { threadId: string; socketPath?: string } | undefined
 ): { metadata: Record<string, unknown>; aliasSessionId?: string } | undefined {
   const socketPath = codexOwned?.socketPathOf(liveSessionId);
   if (!socketPath) return undefined;
+  const runtimeFingerprint = codexOwned?.runtimeFingerprint();
   const metadata: Record<string, unknown> = {
     codexDriver: "app-server-owned",
-    appServerSocketPath: socketPath
+    appServerSocketPath: socketPath,
+    ...(runtimeFingerprint ? { appServerRuntimeFingerprint: runtimeFingerprint } : {})
   };
   const rebound = Boolean(resume?.socketPath && resume.socketPath === socketPath);
   if (!rebound) return { metadata };

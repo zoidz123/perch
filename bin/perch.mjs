@@ -199,6 +199,23 @@ async function main() {
     return;
   }
 
+  if (request.agent === "codex") {
+    // App-server-owned Codex sessions have no PTY to mirror, so a launch-time
+    // attach starts over HTTP and hands this terminal to the native TUI the
+    // session record advertises. Claude launches keep the WebSocket mirror.
+    const session = await startViaHttp(request, parsed.options);
+    if (session.attachCommand) {
+      await attachNativeTui(session);
+      return;
+    }
+    printStarted(session);
+    console.error(
+      `Session ${shortSessionId(session.id)} has no attach command yet - its thread has not materialized. ` +
+        `Retry with \`perch attach ${shortSessionId(session.id)}\` once it shows activity in \`perch ls\`.`
+    );
+    return;
+  }
+
   await startAndAttach(request, parsed.options);
 }
 
@@ -1990,6 +2007,12 @@ async function runMateCommand(parsed) {
     printStarted(session);
     return;
   }
+  if (session.attachCommand) {
+    // A Codex mate is app-server-owned: attach the native TUI instead of the
+    // WebSocket terminal mirror, which such a session cannot feed.
+    await attachNativeTui(session);
+    return;
+  }
   await attachToSession(session.id, parsed.options);
 }
 
@@ -2039,11 +2062,16 @@ async function startAndAttach(request, options) {
 // App-server-owned Codex sessions have no PTY to mirror. The server-issued
 // session record carries the exact native-TUI command (`codex resume
 // <threadId> --remote unix://<socket>`); hand this terminal to that real TUI
-// as an additional same-user client. The record's whitespace-separated tokens
-// are the argv - spawned directly, never through a shell. Exiting the TUI
-// only detaches; Perch's daemon keeps the session running.
+// as an additional same-user client. The record's structured fields
+// (attachThreadId + attachSocketPath) build the argv so a socket path with
+// whitespace survives; older servers without them fall back to splitting the
+// display command on whitespace. Spawned directly, never through a shell.
+// Exiting the TUI only detaches; Perch's daemon keeps the session running.
 async function attachNativeTui(session) {
-  const [command, ...args] = session.attachCommand.split(/\s+/).filter(Boolean);
+  const [command, ...args] =
+    session.attachThreadId && session.attachSocketPath
+      ? ["codex", "resume", session.attachThreadId, "--remote", `unix://${session.attachSocketPath}`]
+      : session.attachCommand.split(/\s+/).filter(Boolean);
   console.error(`Attaching native Codex TUI to ${shortSessionId(session.id)} - exit the TUI to detach (the session keeps running).`);
   const code = await new Promise((resolvePromise, rejectPromise) => {
     const child = spawn(command, args, { stdio: "inherit" });

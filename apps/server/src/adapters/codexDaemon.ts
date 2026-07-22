@@ -141,6 +141,13 @@ export class CodexDaemonManager {
     return daemonKey(cwd, configOverrides, env, this.runtimeFingerprint());
   }
 
+  // The fingerprint of the codex runtime currently on PATH, as this manager
+  // folds it into daemon keys. Recorded on runtime metadata at launch so the
+  // adopt path can enforce the same invariant across restarts.
+  currentRuntimeFingerprint(): string | undefined {
+    return this.runtimeFingerprint();
+  }
+
   async acquire(
     cwd: string,
     opts: { configOverrides?: string[]; env?: Record<string, string> } = {}
@@ -280,7 +287,25 @@ export class CodexDaemonManager {
   // - the caller then respawns via acquire(). The adopt key is the socket path
   // itself: the original cwd/env-derived key is not reconstructible (the hook
   // identity that produced it belonged to the previous life).
-  async adoptExisting(socketPath: string, cwd: string): Promise<CodexDaemonHandle | null> {
+  //
+  // `expectedRuntimeFingerprint` is the fingerprint recorded when the daemon
+  // was launched: acquire() folds `codex --version` into daemon keys so an
+  // older runtime's daemon is never reused, and adoption must honor the same
+  // invariant. A recorded fingerprint that no longer matches the current
+  // runtime (codex upgraded between server lives) refuses adoption, so the
+  // caller respawns and rollout-resumes on the current runtime instead of
+  // rebinding a new TUI to an old daemon.
+  async adoptExisting(
+    socketPath: string,
+    cwd: string,
+    opts: { expectedRuntimeFingerprint?: string } = {}
+  ): Promise<CodexDaemonHandle | null> {
+    if (
+      opts.expectedRuntimeFingerprint &&
+      opts.expectedRuntimeFingerprint !== this.runtimeFingerprint()
+    ) {
+      return null;
+    }
     for (const entry of this.daemons.values()) {
       if (entry.handle.socketPath === socketPath) return entry.handle;
     }

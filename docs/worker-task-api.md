@@ -207,6 +207,7 @@ The ledger carries the durable contract: a `note` with `data.reason: "kickoff_su
 A rejected `turn/start` parks the task `blocked` with `data.reason: "kickoff_rejected"` and the provider's real error; an outcome that stays unknown after `thread/read` reconciliation parks it `blocked` with `data.reason: "kickoff_unknown"` and is never blindly resent.
 After a restart, a kickoff journaled as submitted but never acknowledged reconciles against authoritative thread history by its `clientUserMessageId`: found means accepted is recorded, verifiably absent means the exact kickoff is resubmitted once with the same id.
 Claude's kickoff rides the spawn argv as the CLI's positional query; launches whose brief exceeds the spawn-argument limit are refused rather than truncated.
+Process argv is readable across users for the life of the session (world-readable `/proc/<pid>/cmdline` on default Linux, `ps aux` on macOS), unlike the 0600 same-user transcript files, so on shared machines a sensitive brief is more exposed than it was on the typed-prompt path.
 
 Provider prose is never treated as the outcome.
 Even if the final assistant message says the work is finished, Mate must rely on the durable worker event and verify the deliverable.

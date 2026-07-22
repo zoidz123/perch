@@ -55,6 +55,7 @@ async function fixture(prefix: string, opts: { reconnectDelaysMs?: number[] } = 
   await fake.start(socketPath);
   const daemons = { acquires: 0, releases: [] as string[], adopts: [] as string[] };
   const fakeManager = {
+    currentRuntimeFingerprint: () => "fp-live",
     acquire: async () => {
       daemons.acquires += 1;
       return { socketPath, cwd: dir };
@@ -62,7 +63,16 @@ async function fixture(prefix: string, opts: { reconnectDelaysMs?: number[] } = 
     release: (path: string) => {
       daemons.releases.push(path);
     },
-    adoptExisting: async (path: string, cwd: string) => {
+    adoptExisting: async (
+      path: string,
+      cwd: string,
+      opts: { expectedRuntimeFingerprint?: string } = {}
+    ) => {
+      // Fingerprint refusal mirrors the production manager: a recorded
+      // fingerprint that no longer matches the current runtime never adopts.
+      if (opts.expectedRuntimeFingerprint && opts.expectedRuntimeFingerprint !== "fp-live") {
+        return null;
+      }
       daemons.adopts.push(path);
       // Health probe against the real socket, like the production manager.
       const probe = new CodexAppServerClient({ sessionId: "probe", spawn: websocketUnixTransport({ socketPath: path }) });
@@ -435,6 +445,50 @@ test("startOwned resume rebinds to a surviving daemon socket without a respawn a
     );
     assert.ok(interrupted, "interrupted turn marker replayed");
     assert.equal(interrupted?.live, false);
+  } finally {
+    await f.close();
+  }
+});
+
+test("startOwned resume adopts the recorded daemon when its runtime fingerprint still matches", async () => {
+  const f = await fixture("pxa-fp-match-");
+  try {
+    await f.adapter.startOwned({ command: "codex", agent: "codex", cwd: f.dir, sessionId: "pty:old" });
+    await f.adapter.submitAcknowledgedTurn("pty:old", "kick", { clientUserMessageId: "k1" });
+    f.adapter.stop({ keepDaemons: true });
+    await f.fake.restart();
+
+    const session = await f.adapter.startOwned(
+      { command: "codex", agent: "codex", cwd: f.dir, sessionId: "pty:new", args: ["resume", "thr_1"] },
+      { resume: { threadId: "thr_1", socketPath: f.socketPath, runtimeFingerprint: "fp-live" } }
+    );
+    assert.equal(session.id, "pty:new");
+    assert.equal(f.adapter.threadIdOf("pty:new"), "thr_1");
+    assert.deepEqual(f.daemons.adopts, [f.socketPath]);
+    assert.equal(f.daemons.acquires, 1); // only the original launch
+  } finally {
+    await f.close();
+  }
+});
+
+test("startOwned resume refuses a daemon recorded by a different codex runtime and respawns", async () => {
+  const f = await fixture("pxa-fp-mismatch-");
+  try {
+    await f.adapter.startOwned({ command: "codex", agent: "codex", cwd: f.dir, sessionId: "pty:old" });
+    await f.adapter.submitAcknowledgedTurn("pty:old", "kick", { clientUserMessageId: "k1" });
+    f.adapter.stop({ keepDaemons: true });
+    await f.fake.restart();
+
+    const session = await f.adapter.startOwned(
+      { command: "codex", agent: "codex", cwd: f.dir, sessionId: "pty:new", args: ["resume", "thr_1"] },
+      { resume: { threadId: "thr_1", socketPath: f.socketPath, runtimeFingerprint: "fp-old" } }
+    );
+    assert.equal(session.id, "pty:new");
+    assert.equal(f.adapter.threadIdOf("pty:new"), "thr_1");
+    // The stale-runtime daemon was never adopted; a fresh acquire resumed the
+    // rollout-backed thread on the current runtime instead.
+    assert.deepEqual(f.daemons.adopts, []);
+    assert.equal(f.daemons.acquires, 2);
   } finally {
     await f.close();
   }

@@ -50,6 +50,11 @@ export type AgentSession = {
   // absent for PTY-backed sessions, which are attached through the desktop
   // terminal surface instead.
   attachCommand?: string;
+  // Structured counterparts of attachCommand, so clients build the attach
+  // argv without re-parsing the display string (a socket path containing
+  // whitespace survives). Append-only; present whenever attachCommand is.
+  attachThreadId?: string;
+  attachSocketPath?: string;
   // Optional desktop location for a Perch-owned process. The session `id`
   // remains the canonical agent id; this is only where it is attached locally.
   desktop?: DesktopContext;

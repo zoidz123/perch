@@ -96,6 +96,11 @@ export type StartOwnedOptions = {
     // daemon; when it is dead, a fresh daemon resumes the rollout-backed
     // thread.
     socketPath?: string;
+    // Codex runtime fingerprint recorded when the daemon was launched. A
+    // surviving daemon is only adopted when the current runtime still
+    // matches; a mismatch (codex upgraded between lives) falls through to a
+    // fresh daemon resuming the rollout-backed thread.
+    runtimeFingerprint?: string;
   };
 };
 
@@ -177,6 +182,20 @@ export class CodexAppServerAdapter implements AgentAdapter {
     return this.sessions.get(sessionId)?.socketPath;
   }
 
+  // Fingerprint of the codex runtime this adapter's daemons run, for durable
+  // runtime metadata (the rebind path re-checks it before adopting a daemon).
+  runtimeFingerprint(): string | undefined {
+    return this.daemons.currentRuntimeFingerprint();
+  }
+
+  // The launcher assigns the worktree lease only after the session exists;
+  // record it on the adapter's own session so later listSessions snapshots
+  // keep the association (toAgentSession returns copies, not live objects).
+  setWorktreeId(sessionId: string, worktreeId: string): void {
+    const session = this.sessions.get(sessionId);
+    if (session) session.worktreeId = worktreeId;
+  }
+
   // Sockets of live owned sessions, excluded from daemon teardown at graceful
   // shutdown so a healthy daemon survives for the post-restart rebind.
   liveSocketPaths(): Set<string> {
@@ -251,7 +270,11 @@ export class CodexAppServerAdapter implements AgentAdapter {
     // killing it); otherwise acquire a fresh per-worktree daemon.
     let socketPath: string | undefined;
     if (opts.resume?.socketPath) {
-      const adopted = await this.daemons.adoptExisting(opts.resume.socketPath, cwd);
+      const adopted = await this.daemons.adoptExisting(opts.resume.socketPath, cwd, {
+        ...(opts.resume.runtimeFingerprint
+          ? { expectedRuntimeFingerprint: opts.resume.runtimeFingerprint }
+          : {})
+      });
       if (adopted) socketPath = adopted.socketPath;
     }
     if (!socketPath) {
@@ -507,10 +530,22 @@ export class CodexAppServerAdapter implements AgentAdapter {
       return { turnId: landed.id ?? null };
     }
     // History-verified absence: the one resend this delivery may ever make.
-    const { turnId } = await session.client.submitTurn(text, {
-      clientUserMessageId,
-      ...(source ? { source } : {})
-    });
+    // A non-RPC failure here (connection lost again mid-resend) is once more
+    // an UNKNOWN outcome, not a plain failure - report it as such.
+    let turnId: string | null;
+    try {
+      ({ turnId } = await session.client.submitTurn(text, {
+        clientUserMessageId,
+        ...(source ? { source } : {})
+      }));
+    } catch (error) {
+      if (isCodexRpcError(error)) throw error;
+      throw new CodexDeliveryUnknownError(
+        `input delivery is unknown: the history-verified resend itself failed (${
+          error instanceof Error ? error.message : error
+        }); acceptance was not confirmed`
+      );
+    }
     if (turnId) session.activeTurnId = turnId;
     this.touch(session);
     return { turnId };
@@ -633,7 +668,11 @@ export class CodexAppServerAdapter implements AgentAdapter {
       ...(session.effort ? { effort: session.effort } : {}),
       lastActivityAt: session.lastActivityAt,
       ...(session.threadId
-        ? { attachCommand: `codex resume ${session.threadId} --remote unix://${session.socketPath}` }
+        ? {
+            attachCommand: `codex resume ${session.threadId} --remote unix://${session.socketPath}`,
+            attachThreadId: session.threadId,
+            attachSocketPath: session.socketPath
+          }
         : {})
     };
   }

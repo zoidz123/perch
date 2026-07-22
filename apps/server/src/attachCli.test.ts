@@ -1,8 +1,11 @@
-// `perch attach` routing: an app-server-owned Codex session (record carries
-// attachCommand) execs the native Codex TUI with exactly the record's command
-// tokens and never opens the PTY WebSocket path; a Claude session still PTY-
-// attaches over the WebSocket; a Codex session without attachCommand fails
-// with a clear message instead of silently rendering nothing.
+// Native-TUI attach routing, for `perch attach` and launch-time attach alike:
+// an app-server-owned Codex session (record carries attachCommand) execs the
+// native Codex TUI - from the record's structured fields when present, else
+// exactly the display command's whitespace tokens - and never opens the PTY
+// WebSocket path. `perch codex` and a Codex `perch mate` launch route the
+// same way from the started record; a Claude session/launch still PTY-attaches
+// over the WebSocket; a Codex session without attachCommand fails (or, at
+// launch, prints the record plus a retry hint) instead of rendering nothing.
 import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
 import { chmodSync, existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
@@ -26,10 +29,15 @@ type Harness = {
   close(): Promise<void>;
 };
 
-// Stub perch server (GET /sessions) plus a fake `codex` binary on PATH that
-// records its argv; the WebSocket side answers a subscribe with a terminal
-// status event so a PTY attach terminates deterministically.
-async function startHarness(sessions: unknown[]): Promise<Harness> {
+// Stub perch server (GET /sessions, POST /agents/pty, POST /mate/start, GET
+// /config and /models for the mate launch path) plus a fake `codex` binary on
+// PATH that records its argv; the WebSocket side answers a subscribe with a
+// terminal status event, and a start_agent by announcing a session then
+// ending it, so PTY attaches terminate deterministically.
+async function startHarness(
+  sessions: unknown[],
+  opts: { startSession?: unknown; mateSession?: unknown } = {}
+): Promise<Harness> {
   const home = mkdtempSync(join(tmpdir(), "perch-attach-cli-"));
   const fakeBinDir = join(home, "fakebin");
   const fakeCodexLog = join(home, "codex-argv.log");
@@ -49,10 +57,24 @@ async function startHarness(sessions: unknown[]): Promise<Harness> {
   };
 
   const server = createServer((request, response) => {
+    request.resume();
     response.setHeader("content-type", "application/json");
     if (request.url === "/health") return response.end(JSON.stringify({ ok: true, adapter: "stub" }));
     if (request.url === "/sessions" && request.method === "GET") {
       return response.end(JSON.stringify({ sessions }));
+    }
+    // /config and /models carry query strings; match on the prefix.
+    if (request.url?.startsWith("/config") && request.method === "GET") {
+      return response.end(JSON.stringify({ entries: {}, mateDefaults: {} }));
+    }
+    if (request.url?.startsWith("/models") && request.method === "GET") {
+      return response.end(JSON.stringify({ providers: [] }));
+    }
+    if (request.url === "/agents/pty" && request.method === "POST" && opts.startSession) {
+      return response.end(JSON.stringify({ session: opts.startSession }));
+    }
+    if (request.url === "/mate/start" && request.method === "POST" && opts.mateSession) {
+      return response.end(JSON.stringify({ session: opts.mateSession }));
     }
     response.statusCode = 404;
     response.end(JSON.stringify({ error: "not found" }));
@@ -70,6 +92,23 @@ async function startHarness(sessions: unknown[]): Promise<Harness> {
             JSON.stringify({
               type: "event",
               event: { type: "status", sessionId: message.sessionId, status: "done", at: new Date().toISOString() }
+            })
+          );
+        }
+        if (message.type === "start_agent") {
+          // Announce the launched session (the CLI attaches on the first
+          // session-scoped event), then end it so the run terminates.
+          const sessionId = "pty:ws-launched-1";
+          ws.send(
+            JSON.stringify({
+              type: "event",
+              event: { type: "status", sessionId, status: "running", at: new Date().toISOString() }
+            })
+          );
+          ws.send(
+            JSON.stringify({
+              type: "event",
+              event: { type: "status", sessionId, status: "done", at: new Date().toISOString() }
             })
           );
         }
@@ -152,6 +191,107 @@ test("attach keeps the PTY WebSocket path for a Claude session and never spawns 
       [{ type: "subscribe", sessionId: "pty:claude-1" }]
     );
     assert.equal(existsSync(harness.fakeCodexLog), false);
+  } finally {
+    await harness.close();
+  }
+});
+
+test("perch codex launch-attaches the native TUI from the started record and never opens the WebSocket", async () => {
+  const harness = await startHarness([], {
+    startSession: {
+      id: "pty:codex-new-1",
+      agent: "codex",
+      status: "idle",
+      title: "codex worker",
+      // A socket path with whitespace: the structured fields must win over
+      // splitting the display command, which would break this argv.
+      attachCommand: "codex resume thr-9 --remote unix:///tmp/perch codex/codex.sock",
+      attachThreadId: "thr-9",
+      attachSocketPath: "/tmp/perch codex/codex.sock",
+      lastActivityAt: new Date().toISOString()
+    }
+  });
+  try {
+    const result = await harness.run(["codex"]);
+    assert.equal(result.code, 0);
+    assert.deepEqual(result.stdout.trim().split("\n"), [
+      "resume",
+      "thr-9",
+      "--remote",
+      "unix:///tmp/perch codex/codex.sock"
+    ]);
+    assert.match(result.stderr, /native Codex TUI/);
+    assert.equal(harness.upgrades, 0);
+  } finally {
+    await harness.close();
+  }
+});
+
+test("perch codex launch without an attach command prints the record and a truthful retry hint", async () => {
+  const harness = await startHarness([], {
+    startSession: {
+      id: "pty:codex-new-2",
+      agent: "codex",
+      status: "idle",
+      title: "codex worker",
+      lastActivityAt: new Date().toISOString()
+    }
+  });
+  try {
+    const result = await harness.run(["codex"]);
+    assert.equal(result.code, 0);
+    assert.match(result.stdout, /Started codex worker/);
+    assert.match(result.stdout, /Session: pty:codex-new-2/);
+    assert.match(result.stderr, /no attach command yet/);
+    assert.match(result.stderr, /perch attach codex-ne/);
+    assert.equal(harness.upgrades, 0);
+    assert.equal(existsSync(harness.fakeCodexLog), false);
+  } finally {
+    await harness.close();
+  }
+});
+
+test("perch claude launch keeps the WebSocket start_agent path and never spawns codex", async () => {
+  const harness = await startHarness([]);
+  try {
+    const result = await harness.run(["claude"]);
+    assert.equal(result.code, 0);
+    assert.equal(harness.upgrades, 1);
+    assert.equal(
+      harness.wsMessages.filter((message) => (message as { type?: string }).type === "start_agent").length,
+      1
+    );
+    assert.equal(existsSync(harness.fakeCodexLog), false);
+  } finally {
+    await harness.close();
+  }
+});
+
+test("perch mate codex launch-attaches the native TUI instead of the terminal mirror", async () => {
+  const harness = await startHarness([], {
+    mateSession: {
+      id: "pty:mate-codex-1",
+      agent: "codex",
+      status: "idle",
+      title: "mate",
+      labels: { role: "mate" },
+      attachCommand: "codex resume thr-mate --remote unix:///tmp/perch-test/mate.sock",
+      attachThreadId: "thr-mate",
+      attachSocketPath: "/tmp/perch-test/mate.sock",
+      lastActivityAt: new Date().toISOString()
+    }
+  });
+  try {
+    const result = await harness.run(["mate", "codex"]);
+    assert.equal(result.code, 0);
+    assert.deepEqual(result.stdout.trim().split("\n"), [
+      "resume",
+      "thr-mate",
+      "--remote",
+      "unix:///tmp/perch-test/mate.sock"
+    ]);
+    assert.match(result.stderr, /native Codex TUI/);
+    assert.equal(harness.upgrades, 0);
   } finally {
     await harness.close();
   }

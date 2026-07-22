@@ -90,8 +90,10 @@ export type StartManagedAgentInput = {
   // Codex recovery: resume this exact thread instead of starting a fresh one.
   // `socketPath` names the daemon socket recorded on the interrupted runtime;
   // when that daemon still answers, the session rebinds to it without a
-  // respawn (the daemon holds the live thread state).
-  codexOwnedResume?: { threadId: string; socketPath?: string };
+  // respawn (the daemon holds the live thread state). `runtimeFingerprint` is
+  // the codex runtime recorded at launch: a mismatch with the current runtime
+  // refuses the rebind and falls through to a fresh respawn+rollout-resume.
+  codexOwnedResume?: { threadId: string; socketPath?: string; runtimeFingerprint?: string };
 };
 
 export type StartManagedAgentResult = {
@@ -278,10 +280,15 @@ export async function startManagedAgent(
     if (lease) {
       await options.worktrees.assign(lease.id, session.id);
       session.worktreeId = lease.id;
+      // The owned adapter hands out session copies, so the lease must also be
+      // recorded on its internal session or later listSessions snapshots
+      // would lose the worktree association.
+      if (isCodexLaunch) options.codexOwned?.setWorktreeId(session.id, lease.id);
     }
 
     const codexThreadId = isCodexLaunch ? options.codexOwned?.threadIdOf(session.id) : null;
     const codexSocketPath = isCodexLaunch ? options.codexOwned?.socketPathOf(session.id) : undefined;
+    const codexRuntimeFingerprint = isCodexLaunch ? options.codexOwned?.runtimeFingerprint() : undefined;
 
     if (runtime) {
       options.runtimeManager?.markLive(runtime, session.id, options.adapter.runtimeProcess?.(session.id), {
@@ -292,7 +299,10 @@ export async function startManagedAgent(
               metadata: {
                 source: "managed-launch",
                 codexDriver: "app-server-owned",
-                ...(codexSocketPath ? { appServerSocketPath: codexSocketPath } : {})
+                ...(codexSocketPath ? { appServerSocketPath: codexSocketPath } : {}),
+                ...(codexRuntimeFingerprint
+                  ? { appServerRuntimeFingerprint: codexRuntimeFingerprint }
+                  : {})
               }
             }
           : {})
@@ -308,7 +318,10 @@ export async function startManagedAgent(
               metadata: {
                 source: "mate-launch",
                 codexDriver: "app-server-owned",
-                ...(codexSocketPath ? { appServerSocketPath: codexSocketPath } : {})
+                ...(codexSocketPath ? { appServerSocketPath: codexSocketPath } : {}),
+                ...(codexRuntimeFingerprint
+                  ? { appServerRuntimeFingerprint: codexRuntimeFingerprint }
+                  : {})
               }
             }
           : {}
@@ -495,9 +508,11 @@ export const CLAUDE_KICKOFF_ARG_MAX_BYTES = 120_000;
 // spawn argv (node-pty spawns argv arrays directly - no shell, so no
 // interpolation and multiline/Unicode text survives byte-for-byte). The TUI
 // submits it natively at boot; nothing is ever typed into the PTY for the
-// initial prompt. Tradeoff, documented deliberately: a process argument is
-// visible in `ps` output to other same-user processes for the life of the
-// session, exactly as the typed-prompt transcript already was.
+// initial prompt. Tradeoff, documented deliberately: process argv is readable
+// ACROSS users for the life of the session - /proc/<pid>/cmdline is
+// world-readable on default Linux, and `ps aux` shows it on macOS - unlike
+// transcript files, which are 0600 same-user. On shared machines this widens
+// exposure of a sensitive brief relative to the previous typed-prompt path.
 // Returns whether the kickoff now rides the argv (and must not be queued).
 function prepareClaudeKickoffArg(request: StartAgentRequest): boolean {
   if (launchAgentKind(request.command, request.agent) !== "claude") return false;

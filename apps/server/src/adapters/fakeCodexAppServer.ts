@@ -393,10 +393,20 @@ export class FakeCodexOwnedAdapter {
   // clientUserMessageId -> accepted turn (findAcceptedTurn reads this).
   readonly history = new Map<string, { id: string }>();
   historyReadError: Error | null = null;
+  // Reported by runtimeFingerprint() (rebind invariant tests set it).
+  fakeRuntimeFingerprint: string | undefined;
 
   private readonly sessions = new Map<
     string,
-    { id: string; threadId: string; socketPath: string; title: string; cwd?: string; labels?: Record<string, string> }
+    {
+      id: string;
+      threadId: string;
+      socketPath: string;
+      title: string;
+      cwd?: string;
+      labels?: Record<string, string>;
+      worktreeId?: string;
+    }
   >();
   private threadCounter = 0;
   private turnCounter = 0;
@@ -415,6 +425,15 @@ export class FakeCodexOwnedAdapter {
 
   socketPathOf(sessionId: string): string | undefined {
     return this.sessions.get(sessionId)?.socketPath;
+  }
+
+  runtimeFingerprint(): string | undefined {
+    return this.fakeRuntimeFingerprint;
+  }
+
+  setWorktreeId(sessionId: string, worktreeId: string): void {
+    const session = this.sessions.get(sessionId);
+    if (session) session.worktreeId = worktreeId;
   }
 
   liveSocketPaths(): Set<string> {
@@ -450,7 +469,9 @@ export class FakeCodexOwnedAdapter {
       kind: "terminal" as const,
       status: "idle" as const,
       lastActivityAt: new Date().toISOString(),
-      attachCommand: `codex resume ${threadId} --remote unix://${socketPath}`
+      attachCommand: `codex resume ${threadId} --remote unix://${socketPath}`,
+      attachThreadId: threadId,
+      attachSocketPath: socketPath
     };
   }
 
@@ -501,10 +522,13 @@ export class FakeCodexOwnedAdapter {
       agent: "codex" as const,
       cwd: session.cwd,
       ...(session.labels ? { labels: session.labels } : {}),
+      ...(session.worktreeId ? { worktreeId: session.worktreeId } : {}),
       kind: "terminal" as const,
       status: "idle" as const,
       lastActivityAt: new Date().toISOString(),
-      attachCommand: `codex resume ${session.threadId} --remote unix://${session.socketPath}`
+      attachCommand: `codex resume ${session.threadId} --remote unix://${session.socketPath}`,
+      attachThreadId: session.threadId,
+      attachSocketPath: session.socketPath
     }));
   }
 

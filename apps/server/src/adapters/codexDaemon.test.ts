@@ -304,6 +304,45 @@ test("daemons are keyed by the codex runtime fingerprint so a client never redia
   assert.equal(current.socketPathFor("/repo/one", [], env), current.socketPathFor("/repo/one", [], env));
 });
 
+test("adoptExisting enforces the recorded runtime fingerprint: match adopts, mismatch refuses", async () => {
+  const home = mkdtempSync(join(tmpdir(), "perch-daemon-adopt-fp-"));
+  const dir = join(home, "codex-daemons");
+  mkdirSync(dir, { recursive: true });
+  const socketPath = join(dir, "adopt.sock");
+  writeFileSync(socketPath, "");
+  writeFileSync(`${socketPath}.pid`, "4321");
+
+  const manager = new CodexDaemonManager({
+    env: { PERCH_HOME: home },
+    spawn: fakeProcess,
+    waitHealthy: async () => {
+      /* the recorded daemon still answers */
+    },
+    runtimeFingerprint: () => "codex-cli 0.144.6"
+  });
+  assert.equal(manager.currentRuntimeFingerprint(), "codex-cli 0.144.6");
+
+  // Codex was upgraded between server lives: the recorded daemon still
+  // answers, but adopting it would attach the new TUI to the old runtime -
+  // the exact mismatch the acquire() fingerprint keying prevents.
+  const mismatch = await manager.adoptExisting(socketPath, "/repo/one", {
+    expectedRuntimeFingerprint: "codex-cli 0.142.5"
+  });
+  assert.equal(mismatch, null);
+
+  const match = await manager.adoptExisting(socketPath, "/repo/one", {
+    expectedRuntimeFingerprint: "codex-cli 0.144.6"
+  });
+  assert.equal(match?.socketPath, socketPath);
+
+  // Runtime metadata recorded before the fingerprint existed still adopts.
+  const legacy = await manager.adoptExisting(socketPath, "/repo/one");
+  assert.equal(legacy?.socketPath, socketPath);
+
+  manager.stopAll();
+  rmSync(home, { recursive: true, force: true });
+});
+
 test("sweepOrphans retires stale sockets and recorded pids without touching owned daemons", async () => {
   const home = mkdtempSync(join(tmpdir(), "perch-daemon-sweep-"));
   const dir = join(home, "codex-daemons");
