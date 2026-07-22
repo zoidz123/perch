@@ -24,7 +24,7 @@ Claude's initial worker brief rides the spawn argv as the CLI's positional query
 
 Codex sessions are app-server-owned: Perch spawns one `codex app-server` daemon per session workdir on a private unix socket and remains its sole standing authoritative client.
 Perch creates or resumes the thread itself, captures the thread id from the protocol response, serializes all programmatic input (`turn/start` when idle, `turn/steer` with `expectedTurnId` while a turn is active), and stamps every input with a `clientUserMessageId` so a lost response reconciles against `thread/read` history instead of resending blind.
-There is no Codex PTY and no keystroke injection; a desktop human attaches the real native TUI as an additional same-user client with the session's surfaced `attachCommand` (`codex resume <threadId> --remote unix://<socket>`).
+There is no Codex PTY and no keystroke injection; a desktop human attaches the real native TUI as an additional same-user client with the session's surfaced `attachCommand` (`codex resume <threadId> --remote unix://<socket>`), which `perch attach` execs directly (argv, no shell) when the session record carries it.
 
 `perch claude` and `perch codex` launch real provider sessions.
 `perch run` can host another command, but arbitrary processes do not gain provider timelines or managed recovery.
