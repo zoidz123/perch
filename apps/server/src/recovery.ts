@@ -1,6 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { realpathSync } from "node:fs";
 import type { AgentKind, StartAgentRequest, Task } from "@perch/shared";
+import type { CodexAppServerAdapter } from "./adapters/codexAppServerAdapter.js";
 import {
   startManagedAgent,
   type ManagedAgentLauncherOptions,
@@ -250,12 +251,22 @@ export class RecoveryCoordinator {
         sessionId: result.session.id,
         ...(payload.auditMeta ?? {})
       });
+      const bindFacts = codexOwnedBindFacts(
+        this.options.codexOwned,
+        result.session.id,
+        runtime,
+        prepared.launchInput?.codexOwnedResume
+      );
       this.options.runtimeManager?.bindRecoveredRuntime(runtime, {
         sessionId: result.session.id,
         provider: driver.provider,
         providerSessionId,
-        ownership: this.options.adapter.runtimeProcess?.(result.session.id)
+        ownership: this.options.adapter.runtimeProcess?.(result.session.id),
+        ...(bindFacts ? { metadata: bindFacts.metadata } : {})
       });
+      if (bindFacts?.aliasSessionId) {
+        this.options.hooks.aliasSession(bindFacts.aliasSessionId, result.session.id);
+      }
     } catch (error) {
       let cleanupError: unknown;
       if (launched) {
@@ -430,6 +441,45 @@ export const codexRecoveryDriver: RecoveryProviderDriver = {
     };
   }
 };
+
+// Driver facts a codex recovery must re-record on the freshly bound
+// generation: the CURRENT daemon socket (so the rebind guarantee holds across
+// every later restart, not just the first), and - when the launch adopted the
+// surviving daemon instead of respawning - the session identity/generation
+// still baked into that daemon's environment. The daemon env cannot change,
+// so the hook registry aliases that stale identity (aliasSessionId) to the
+// live session; tool-shell verbs authenticated with the old credentials then
+// resolve to the live runtime. Returns undefined for non-owned (Claude)
+// sessions.
+export function codexOwnedBindFacts(
+  codexOwned: Pick<CodexAppServerAdapter, "socketPathOf"> | undefined,
+  liveSessionId: string,
+  recovering: Pick<RuntimeRecord, "generation" | "ptySessionId" | "metadata">,
+  resume: { threadId: string; socketPath?: string } | undefined
+): { metadata: Record<string, unknown>; aliasSessionId?: string } | undefined {
+  const socketPath = codexOwned?.socketPathOf(liveSessionId);
+  if (!socketPath) return undefined;
+  const metadata: Record<string, unknown> = {
+    codexDriver: "app-server-owned",
+    appServerSocketPath: socketPath
+  };
+  const rebound = Boolean(resume?.socketPath && resume.socketPath === socketPath);
+  if (!rebound) return { metadata };
+  const daemonSessionId =
+    typeof recovering.metadata?.appServerDaemonSessionId === "string"
+      ? recovering.metadata.appServerDaemonSessionId
+      : recovering.ptySessionId;
+  if (!daemonSessionId) return { metadata };
+  metadata.appServerDaemonSessionId = daemonSessionId;
+  metadata.appServerDaemonGeneration =
+    typeof recovering.metadata?.appServerDaemonGeneration === "number"
+      ? recovering.metadata.appServerDaemonGeneration
+      : recovering.generation;
+  return {
+    metadata,
+    ...(daemonSessionId !== liveSessionId ? { aliasSessionId: daemonSessionId } : {})
+  };
+}
 
 // The codex app-server rejects thread/resume for a recorded thread whose
 // rollout JSONL was never written (the file only appears at the thread's first

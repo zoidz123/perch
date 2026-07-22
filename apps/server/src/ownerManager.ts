@@ -63,13 +63,23 @@ export class OwnerManager {
     });
   }
 
-  markLive(runtime: OwnerRuntimeRecord, sessionId: string, ownership?: RuntimeProcessOwnership): OwnerRuntimeRecord {
+  markLive(
+    runtime: OwnerRuntimeRecord,
+    sessionId: string,
+    ownership?: RuntimeProcessOwnership,
+    patch: {
+      // Driver facts recorded at launch (codexDriver, appServerSocketPath):
+      // mate recovery reads these to rebind to the same daemon socket, exactly
+      // like worker runtimes.
+      metadata?: Record<string, unknown>;
+    } = {}
+  ): OwnerRuntimeRecord {
     const live = this.tasks.stateDb.ownerRuntimes.compareAndSwap(
       runtime.ownerId,
       runtime.generation,
       "starting",
       "live",
-      { ptySessionId: sessionId, ownerInstanceId: this.instanceId, ...(ownership ?? {}) }
+      { ptySessionId: sessionId, ownerInstanceId: this.instanceId, ...(ownership ?? {}), ...patch }
     );
     if (!live) throw new Error(`mate runtime generation conflict at g${runtime.generation}`);
     return live;
@@ -134,7 +144,13 @@ export class OwnerManager {
 
   bindRecoveredMate(
     recovering: OwnerRuntimeRecord,
-    input: { sessionId: string; provider: string; providerSessionId: string; ownership?: RuntimeProcessOwnership }
+    input: {
+      sessionId: string;
+      provider: string;
+      providerSessionId: string;
+      ownership?: RuntimeProcessOwnership;
+      metadata?: Record<string, unknown>;
+    }
   ): OwnerRuntimeRecord {
     if (
       recovering.state !== "recovering" ||
@@ -164,7 +180,11 @@ export class OwnerManager {
         cwd: recovering.cwd,
         ...(recovering.model ? { model: recovering.model } : {}),
         ownerInstanceId: this.instanceId,
-        metadata: { source: "mate-provider-recovery", previousRuntimeId: recovering.id }
+        metadata: {
+          source: "mate-provider-recovery",
+          previousRuntimeId: recovering.id,
+          ...(input.metadata ?? {})
+        }
       });
     });
     if (!next) throw new Error(`mate runtime generation conflict at g${recovering.generation}`);

@@ -364,6 +364,39 @@ test("hook auth survives restart with 0600 storage and prunes stale sessions", (
   rmSync(home, { recursive: true, force: true });
 });
 
+test("a rebound daemon's stale identity aliases to the live session and dies with it", () => {
+  const registry = new HookRegistry();
+  const previous = registry.register("pty:previous-life");
+  registry.register("pty:live-life");
+
+  // The recovery bind aliases the daemon's spawn-time identity to the live
+  // session: the stale credentials still verify AS the presented id, and
+  // resolveAlias maps them to the live session for everything downstream.
+  registry.aliasSession("pty:previous-life", "pty:live-life");
+  assert.equal(registry.verify("pty:previous-life", previous.token), true);
+  assert.equal(registry.resolveAlias("pty:previous-life"), "pty:live-life");
+  assert.equal(registry.resolveAlias("pty:live-life"), "pty:live-life");
+
+  // Pruning with only the live session active keeps the aliased credential.
+  registry.prune(new Set(["pty:live-life"]));
+  assert.equal(registry.verify("pty:previous-life", previous.token), true);
+  assert.equal(registry.resolveAlias("pty:previous-life"), "pty:live-life");
+
+  // The alias lives exactly as long as the live session's registration:
+  // unregistering the live session revokes the aliased credential too.
+  registry.unregister("pty:live-life");
+  assert.equal(registry.verify("pty:previous-life", previous.token), false);
+  assert.equal(registry.resolveAlias("pty:previous-life"), "pty:previous-life");
+
+  // Pruning without the live session drops the alias and the stale token.
+  const again = new HookRegistry();
+  const stale = again.register("pty:gone");
+  again.aliasSession("pty:gone", "pty:also-gone");
+  again.prune(new Set());
+  assert.equal(again.verify("pty:gone", stale.token), false);
+  assert.equal(again.resolveAlias("pty:gone"), "pty:gone");
+});
+
 test("normalizes hook events into status transitions and approvals", () => {
   assert.equal(normalizeHookEvent({ hook_event_name: "UserPromptSubmit" }).status, "running");
   assert.equal(normalizeHookEvent({ hook_event_name: "PreToolUse" }).status, "running");

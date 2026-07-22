@@ -299,7 +299,20 @@ export async function startManagedAgent(
       });
     }
     if (ownerRuntime) {
-      options.ownerManager?.markLive(ownerRuntime, session.id, options.adapter.runtimeProcess?.(session.id));
+      options.ownerManager?.markLive(
+        ownerRuntime,
+        session.id,
+        options.adapter.runtimeProcess?.(session.id),
+        isCodexLaunch
+          ? {
+              metadata: {
+                source: "mate-launch",
+                codexDriver: "app-server-owned",
+                ...(codexSocketPath ? { appServerSocketPath: codexSocketPath } : {})
+              }
+            }
+          : {}
+      );
     }
 
     // The thread id from the thread/start (or thread/resume) RESPONSE is the

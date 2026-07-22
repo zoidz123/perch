@@ -741,6 +741,11 @@ export type HookCorrelation = {
 export class HookRegistry {
   private readonly tokens = new Map<string, string>(); // token -> perch session id
   private readonly correlations = new Map<string, HookCorrelation>();
+  // A rebound codex daemon's environment still carries the previous server
+  // life's PERCH_SESSION_ID/PERCH_HOOK_TOKEN (env is fixed at spawn), so the
+  // recovery bind aliases that stale identity to the live session. The alias
+  // lives only while the live session's registration does.
+  private readonly aliases = new Map<string, string>(); // previous session id -> live session id
   private readonly durablePath?: string;
 
   constructor(env?: NodeJS.ProcessEnv) {
@@ -788,19 +793,31 @@ export class HookRegistry {
   }
 
   unregister(sessionId: string): void {
+    const revoked = new Set([sessionId]);
+    this.aliases.delete(sessionId);
+    for (const [previous, live] of this.aliases) {
+      if (live === sessionId) {
+        this.aliases.delete(previous);
+        revoked.add(previous);
+      }
+    }
     for (const [token, id] of this.tokens) {
-      if (id === sessionId) {
+      if (revoked.has(id)) {
         this.tokens.delete(token);
       }
     }
-    this.correlations.delete(sessionId);
+    for (const id of revoked) this.correlations.delete(id);
     this.persist();
   }
 
   prune(activeSessionIds: Set<string>): void {
     let changed = false;
+    for (const [previous, live] of this.aliases) {
+      if (!activeSessionIds.has(live)) this.aliases.delete(previous);
+    }
     for (const [token, sessionId] of this.tokens) {
-      if (!activeSessionIds.has(sessionId)) {
+      const live = this.aliases.get(sessionId) ?? sessionId;
+      if (!activeSessionIds.has(sessionId) && !activeSessionIds.has(live)) {
         this.tokens.delete(token);
         this.correlations.delete(sessionId);
         changed = true;
@@ -811,6 +828,19 @@ export class HookRegistry {
 
   verify(sessionId: string, token: string): boolean {
     return this.tokens.get(token) === sessionId;
+  }
+
+  // Bind a previous life's session identity (still baked into a surviving
+  // daemon's env) to the live session that adopted its daemon. Verification
+  // stays against the previous id's own durable token; resolveAlias maps the
+  // authenticated id to the live session for everything downstream.
+  aliasSession(previousSessionId: string, liveSessionId: string): void {
+    if (!previousSessionId || !liveSessionId || previousSessionId === liveSessionId) return;
+    this.aliases.set(previousSessionId, liveSessionId);
+  }
+
+  resolveAlias(sessionId: string): string {
+    return this.aliases.get(sessionId) ?? sessionId;
   }
 
   correlate(sessionId: string, agentSessionId?: string, transcriptPath?: string): HookCorrelation {
