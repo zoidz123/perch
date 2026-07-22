@@ -5,7 +5,6 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
   CodexDaemonManager,
-  selectCodexDriver,
   type CodexDaemonProcess
 } from "./codexDaemon.js";
 
@@ -23,17 +22,6 @@ function fakeProcess(): CodexDaemonProcess & { killed: boolean } {
   };
   return state as CodexDaemonProcess & { killed: boolean };
 }
-
-test("selectCodexDriver picks app-server-remote from any normal install (no standalone gate)", () => {
-  assert.equal(selectCodexDriver({ codexOnPath: true, platform: "darwin", env: {} }), "app-server-remote");
-  assert.equal(selectCodexDriver({ codexOnPath: true, platform: "linux", env: {} }), "app-server-remote");
-});
-
-test("selectCodexDriver falls back to pty when codex is absent, on Windows, or force-disabled", () => {
-  assert.equal(selectCodexDriver({ codexOnPath: false, platform: "darwin", env: {} }), "pty");
-  assert.equal(selectCodexDriver({ codexOnPath: true, platform: "win32", env: {} }), "pty");
-  assert.equal(selectCodexDriver({ codexOnPath: true, platform: "darwin", env: { PERCH_CODEX_REMOTE: "0" } }), "pty");
-});
 
 test("acquire spawns one daemon per workdir and reuses a healthy one", async () => {
   const spawns: Array<{ socketPath: string; cwd: string }> = [];

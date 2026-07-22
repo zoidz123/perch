@@ -1,8 +1,11 @@
-// Perch-owned Codex app-server daemon lifecycle for the `--remote` topology.
-// Perch spawns the ordinary Codex installation as
+// Perch-owned Codex app-server daemon lifecycle. Perch spawns the ordinary
+// Codex installation as
 //   codex app-server --listen unix://<sock>
-// and the real TUI attaches with `codex --remote unix://<sock>`, while a perch
-// control client drives the same thread over the WebSocket `/rpc` channel.
+// one daemon per session workdir, and the owning adapter
+// (codexAppServerAdapter.ts) is its sole standing authoritative client over
+// the WebSocket `/rpc` channel. Desktop humans may additionally attach the
+// real native TUI to the same socket with
+// `codex resume <threadId> --remote unix://<sock>`.
 //
 // Any normal Codex installation with `app-server` and `--remote` support can
 // host this topology without a separately managed binary.
@@ -25,31 +28,9 @@ import { perchHome } from "../home.js";
 import { CodexAppServerClient } from "./codexAppServer.js";
 import { websocketUnixTransport } from "./wsUnixTransport.js";
 
-// Which Codex driver perch should use for a session.
-//   "app-server-remote" = Perch-owned daemon + `--remote` TUI +
-//                         control client; per-turn model chip, protocol drive).
-//   "pty"               = the existing PTY-only path (launch-time `-m` only).
-export type CodexDriver = "app-server-remote" | "pty";
-
-// Select the Codex driver. Install-independent: the only gates are that codex
-// exists on PATH and that the platform has unix sockets (never win32). An
-// operator can force the legacy path with PERCH_CODEX_REMOTE=0.
-export function selectCodexDriver(opts?: {
-  codexOnPath?: boolean;
-  platform?: NodeJS.Platform;
-  env?: NodeJS.ProcessEnv;
-}): CodexDriver {
-  const env = opts?.env ?? process.env;
-  if (env.PERCH_CODEX_REMOTE === "0" || env.PERCH_CODEX_REMOTE === "false") return "pty";
-  const platform = opts?.platform ?? process.platform;
-  if (platform === "win32") return "pty";
-  const onPath = opts?.codexOnPath ?? true;
-  return onPath ? "app-server-remote" : "pty";
-}
-
-// Whether a `codex` executable is resolvable on PATH (the only real gate for
-// the `--remote` topology). Best-effort and synchronous so it can inform driver
-// selection at boot without blocking.
+// Whether a `codex` executable is resolvable on PATH (the gate for offering
+// Codex in dispatch defaults). Best-effort and synchronous so it can inform
+// boot-time decisions without blocking.
 export function codexOnPath(env: NodeJS.ProcessEnv = process.env): boolean {
   const pathValue = env.PATH ?? "";
   const exts = process.platform === "win32" ? ["", ".exe", ".cmd", ".bat"] : [""];
@@ -62,8 +43,8 @@ export function codexOnPath(env: NodeJS.ProcessEnv = process.env): boolean {
   return false;
 }
 
-// A running (or reused) daemon: the socket a `--remote` TUI and the control
-// client both dial.
+// A running (or reused) daemon: the socket the owning adapter (and any
+// attached native TUI) dials.
 export type CodexDaemonHandle = {
   socketPath: string;
   cwd: string;

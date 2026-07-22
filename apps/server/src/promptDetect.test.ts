@@ -112,63 +112,6 @@ test("only Claude's frame is claimed", () => {
   assert.equal(detectPrompt(MODEL_SWITCH, undefined), undefined);
 });
 
-test("Codex recognizes the live four-choice Computer Use field prompt with exact choices", () => {
-  const computerUse = [
-    "Field 1/1",
-    'Allow Computer Use to use "Xcode"?',
-    "App: Xcode",
-    "› 1. Allow                   Run the tool and continue.",
-    "  2. Allow for this session  Run the tool and remember this choice for this session.",
-    "  3. Always allow            Run the tool and remember this choice for future tool calls.",
-    "  4. Cancel                  Cancel this tool call",
-    "enter to submit | esc to cancel"
-  ].join("\n");
-  const prompt = detectPrompt(computerUse, "codex");
-  assert.ok(prompt);
-  assert.equal(prompt.summary, 'Allow Computer Use to use "Xcode"?');
-  assert.deepEqual(prompt.context, { app: "Xcode", tool: "Computer Use" });
-  assert.deepEqual(
-    prompt.decisions?.map(({ id, label, persistence, destructive }) => ({ id, label, persistence, destructive })),
-    [
-      { id: "allow", label: "Allow", persistence: "turn", destructive: undefined },
-      { id: "allow_session", label: "Allow for this session", persistence: "session", destructive: undefined },
-      { id: "allow_always", label: "Always allow", persistence: "always", destructive: undefined },
-      { id: "cancel", label: "Cancel", persistence: undefined, destructive: true }
-    ]
-  );
-  assert.equal(detectPrompt(MODEL_SWITCH, "codex"), undefined);
-});
-
-test("the older verified Computer Use frame remains a truthful desktop-only fallback", () => {
-  const prompt = detectPrompt(
-    "Computer Use wants permission\n❯ 1. Allow\n  2. Allow for this session\n  3. Always allow\n  4. Cancel",
-    "codex"
-  );
-  assert.equal(prompt?.remoteResolutionUnavailable, true);
-  assert.equal(prompt?.decisions, undefined);
-});
-
-test("Codex Computer Use detection is app-agnostic but rejects lookalike output", () => {
-  const prompt = detectPrompt(
-    [
-      "Field 1/1",
-      'Allow Computer Use to use "Simulator"?',
-      "App: Simulator",
-      "› 1. Allow  Run the tool and continue.",
-      "  2. Allow for this session  Remember this session.",
-      "  3. Always allow  Remember future calls.",
-      "  4. Cancel  Cancel this tool call"
-    ].join("\n"),
-    "codex"
-  );
-  assert.equal(prompt?.context?.app, "Simulator");
-  assert.equal(
-    detectPrompt("Allow Computer Use to use Xcode?\n› 1. Allow\n2. Allow for this session\n3. Always allow\n4. Cancel", "codex"),
-    undefined,
-    "an App field is required so ordinary numbered text cannot become an actionable prompt"
-  );
-});
-
 test("a prompt with no question line falls back to its topmost content line", () => {
   const frame = ["▔▔▔▔▔▔▔▔", "Pick a branch", "❯ 1. main", "  2. dev"].join("\n");
   assert.equal(detectPrompt(frame, "claude")?.summary, "Pick a branch");

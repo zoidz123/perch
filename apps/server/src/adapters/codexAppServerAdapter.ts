@@ -9,9 +9,10 @@
 // additional same-user client with `codex resume <threadId> --remote
 // unix://<socket>` (surfaced as AgentSession.attachCommand).
 //
-// Selected per NEW session behind PERCH_CODEX_OWNER=app-server; the legacy
-// PTY driver remains the default and the rollback path. A session never
-// changes drivers mid-life: the choice is persisted on its runtime record.
+// App-server ownership is the ONLY Codex driver: there is no runtime
+// fallback to PTY injection, and rollback is a release or commit rollback.
+// The driver and daemon socket persist on the runtime record so recovery
+// rebinds a session to the same daemon and thread it launched with.
 
 import { randomUUID } from "node:crypto";
 import type {
@@ -26,7 +27,7 @@ import type {
   TopologyResponse
 } from "@perch/shared";
 import type { UsageLimit } from "../usageLimitDetect.js";
-import { CodexAppServerClient, isCodexRpcError } from "./codexAppServer.js";
+import { CodexAppServerClient, isCodexRpcError, type CodexRpcError } from "./codexAppServer.js";
 import type { CodexDaemonManager } from "./codexDaemon.js";
 import type { ThreadHistoryTurn } from "./codexAppServerTypes.js";
 import { websocketUnixTransport } from "./wsUnixTransport.js";
@@ -486,11 +487,19 @@ export class CodexAppServerAdapter implements AgentAdapter {
     try {
       turns = threadTurns(await session.client.readThread(threadId));
     } catch (error) {
-      throw new CodexDeliveryUnknownError(
-        `input delivery is unknown: thread history could not be read after reconnect (${
-          error instanceof Error ? error.message : error
-        }); not resent`
-      );
+      if (isThreadNotMaterializedError(error)) {
+        // Verified live on 0.144.6: a thread with no first user message is
+        // "not materialized" and refuses includeTurns. That is authoritative
+        // PROOF the lost input never landed - safe to fall through to the
+        // single resend below.
+        turns = [];
+      } else {
+        throw new CodexDeliveryUnknownError(
+          `input delivery is unknown: thread history could not be read after reconnect (${
+            error instanceof Error ? error.message : error
+          }); not resent`
+        );
+      }
     }
     const landed = findTurnByClientMessageId(turns, clientUserMessageId);
     if (landed) {
@@ -628,6 +637,17 @@ export class CodexAppServerAdapter implements AgentAdapter {
         : {})
     };
   }
+}
+
+// 0.144.6, verified live: thread/read {includeTurns} on a thread with no
+// first user message rejects -32600 "not materialized yet". For lost-input
+// reconciliation that rejection is affirmative evidence of absence.
+function isThreadNotMaterializedError(error: unknown): boolean {
+  return (
+    isCodexRpcError(error) &&
+    (error as CodexRpcError).code === -32600 &&
+    /not materialized yet/.test((error as CodexRpcError).rpcMessage)
+  );
 }
 
 function threadTurns(result: unknown): ThreadHistoryTurn[] {
