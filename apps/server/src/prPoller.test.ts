@@ -418,6 +418,109 @@ test("a merge arms the fast window for sibling PRs in the same repo (merge-train
   rmSync(home, { recursive: true, force: true });
 });
 
+test("awaiting-merge fast cadence survives restart after readiness regresses", async () => {
+  const home = mkdtempSync(join(tmpdir(), "perch-poller-"));
+  const tasks = new TaskStore({ PERCH_HOME: home } as NodeJS.ProcessEnv);
+  const task = tasks.create({ title: "restart latch", project: "/tmp/repo" });
+  tasks.recordEvent(task.id, { kind: "working", source: "worker" });
+  tasks.recordEvent(task.id, { kind: "done", source: "worker" });
+  tasks.update(task.id, {
+    branch: "perch/restart-latch",
+    pr: { url: "https://github.com/o/r/pull/31" }
+  });
+
+  let clock = 1_000_000;
+  let phase: "ready" | "regressed" | "merged" = "ready";
+  let polls = 0;
+  const runGh = async (): Promise<GhPrView> => {
+    polls += 1;
+    return view({
+      state: phase === "merged" ? "MERGED" : "OPEN",
+      mergedAt: phase === "merged" ? "2026-07-22T00:00:00Z" : null,
+      headRefName: "perch/restart-latch",
+      statusCheckRollup: [{ conclusion: "SUCCESS" }],
+      isDraft: false,
+      mergeable: phase === "regressed" ? "UNKNOWN" : "MERGEABLE",
+      mergeStateStatus: phase === "regressed" ? "UNKNOWN" : "CLEAN",
+      reviewDecision: "APPROVED"
+    });
+  };
+  const options = {
+    now: () => clock,
+    fastWindowMs: 60_000,
+    resolveLocalRepo: async () => "o/r"
+  };
+
+  const poller = new PrPoller(tasks, runGh, options);
+  poller.armFast(task.id);
+  await poller.fastTick();
+  clock += 60_001;
+  phase = "regressed";
+  await poller.fastTick();
+  assert.equal(tasks.find(task.id)?.pr?.mergeReady, false);
+  assert.equal(tasks.find(task.id)?.pr?.awaitingMerge, true);
+
+  phase = "merged";
+  const restarted = new PrPoller(tasks, runGh, options);
+  await restarted.fastTick();
+
+  assert.equal(polls, 3);
+  assert.equal(tasks.find(task.id)?.state, "landed");
+  assert.equal(tasks.find(task.id)?.pr?.awaitingMerge, false);
+
+  rmSync(home, { recursive: true, force: true });
+});
+
+test("identity-incomplete terminal response clears awaiting-merge cadence only", async () => {
+  const home = mkdtempSync(join(tmpdir(), "perch-poller-"));
+  const tasks = new TaskStore({ PERCH_HOME: home } as NodeJS.ProcessEnv);
+  const task = tasks.create({ title: "terminal latch", project: "/tmp/repo" });
+  tasks.recordEvent(task.id, { kind: "working", source: "worker" });
+  tasks.recordEvent(task.id, { kind: "done", source: "worker" });
+  tasks.update(task.id, {
+    branch: "perch/terminal-latch",
+    pr: { url: "https://github.com/o/r/pull/32" }
+  });
+
+  let clock = 1_000_000;
+  let terminal = false;
+  let polls = 0;
+  const poller = new PrPoller(
+    tasks,
+    async () => {
+      polls += 1;
+      if (terminal) {
+        return { state: "CLOSED" };
+      }
+      return view({
+        headRefName: "perch/terminal-latch",
+        statusCheckRollup: [{ conclusion: "SUCCESS" }],
+        isDraft: false,
+        mergeable: "MERGEABLE",
+        mergeStateStatus: "CLEAN",
+        reviewDecision: "APPROVED"
+      });
+    },
+    { now: () => clock, fastWindowMs: 60_000, resolveLocalRepo: async () => "o/r" }
+  );
+
+  poller.armFast(task.id);
+  await poller.fastTick();
+  clock += 60_001;
+  terminal = true;
+  await poller.fastTick();
+
+  assert.equal(tasks.find(task.id)?.pr?.awaitingMerge, false);
+  assert.equal(tasks.find(task.id)?.pr?.merged, undefined);
+  assert.equal(tasks.find(task.id)?.state, "done");
+  assert.equal(tasks.events(task.id).filter((event) => event.kind === "merged").length, 0);
+
+  await poller.fastTick();
+  assert.equal(polls, 2);
+
+  rmSync(home, { recursive: true, force: true });
+});
+
 test("resolveTaskPr binds a reused branch when the PR head commit is the checkout HEAD", async () => {
   const home = mkdtempSync(join(tmpdir(), "perch-poller-"));
   const tasks = new TaskStore({ PERCH_HOME: home } as NodeJS.ProcessEnv);

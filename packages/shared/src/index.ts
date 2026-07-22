@@ -465,6 +465,7 @@ export type TaskPr = {
   checks?: "pending" | "passing" | "failing";
   checkDetails?: TaskPrCheck[];
   mergeReady?: boolean;
+  awaitingMerge?: boolean;
   isDraft?: boolean;
   mergeable?: string;
   mergeStateStatus?: string;
