@@ -52,6 +52,10 @@ export type ManagedAgentLauncherOptions = {
   // absent in tests that must not touch real config.
   installHooks?: (agent: AgentKind) => void;
   taskCompletion?: TaskCompletionReconciler;
+  // How long a dispatched codex worker may show no first-turn evidence before
+  // its kickoff is retried once (and, after a second window, parked blocked).
+  // Tests shrink it; production uses CODEX_KICKOFF_RETRY_MS.
+  codexKickoffRetryMs?: number;
   runtimeManager?: RuntimeManager;
   recoveryCoordinator?: RecoveryCoordinator;
   ownerManager?: OwnerManager;
@@ -327,6 +331,16 @@ export async function startManagedAgent(
         options.timeline.recordSource(session.id, request.initialPrompt, input.initialPromptSource);
       }
       options.monitor.queueInitialPrompt(session.id, request.initialPrompt);
+      // The queued kickoff is typed into the TUI best-effort; a codex TUI that
+      // was not ready yet swallows it silently and the worker then sits empty
+      // forever. Watch for first-turn evidence and retry the kickoff once.
+      if (
+        input.taskId &&
+        input.initialPromptSource === "agent" &&
+        launchAgentKind(request.command, request.agent) === "codex"
+      ) {
+        armCodexKickoffWatchdog(options, session.id, input.taskId, request.initialPrompt, options.codexKickoffRetryMs);
+      }
     }
 
     await audit(options.auditLog, {
@@ -689,6 +703,96 @@ export function attachCodexRollout(
       codexRolloutResolving.delete(sessionId);
     }
   })();
+}
+
+export const CODEX_KICKOFF_RETRY_MS = 45_000;
+
+// One armed kickoff watchdog per session, however many callers race to arm it.
+const codexKickoffWatchdogs = new Set<string>();
+
+export type CodexKickoffWatchdogDeps = {
+  tasks: TaskStore;
+  monitor: Pick<FleetMonitor, "queueOrSubmit">;
+  hooks: Pick<HookRegistry, "correlation">;
+  timeline: Pick<TimelineStore, "recordSource">;
+};
+
+// First-turn evidence for a dispatched codex worker, strongest first: the
+// provider's own turn lifecycle recorded against this exact session, a worker
+// verb (only ever curled from inside a running turn), or the rollout
+// correlation (codex writes the rollout file only at the thread's first turn).
+// Deliberately excludes transcript text, rendered-screen state, and elapsed
+// time - none of those prove the kickoff was accepted.
+export function codexFirstTurnEvidence(
+  deps: Pick<CodexKickoffWatchdogDeps, "tasks" | "hooks">,
+  sessionId: string,
+  taskId: string
+): "turn" | "worker" | "rollout" | undefined {
+  for (const event of deps.tasks.events(taskId)) {
+    if ((event.kind === "turn_started" || event.kind === "turn_completed") && event.data?.sessionId === sessionId) {
+      return "turn";
+    }
+    if (event.source === "worker") return "worker";
+  }
+  return deps.hooks.correlation(sessionId)?.transcriptPath ? "rollout" : undefined;
+}
+
+// A dispatched codex worker whose kickoff was swallowed (typed into a TUI that
+// was not ready) must not sit silently empty. After one window with no
+// first-turn evidence, resubmit the exact original kickoff once; after a
+// second window still without evidence, park the task blocked so the mate
+// adjudicates instead of the worker "working" forever. Evidence is re-checked
+// immediately before the retry, so a first turn that lands in the window
+// suppresses it, and the per-session guard makes the retry exactly-once even
+// when arming races.
+export function armCodexKickoffWatchdog(
+  deps: CodexKickoffWatchdogDeps,
+  sessionId: string,
+  taskId: string,
+  kickoff: string,
+  windowMs = CODEX_KICKOFF_RETRY_MS
+): void {
+  if (codexKickoffWatchdogs.has(sessionId)) return;
+  codexKickoffWatchdogs.add(sessionId);
+  const disarm = () => codexKickoffWatchdogs.delete(sessionId);
+  const finalPass = () => {
+    try {
+      if (codexFirstTurnEvidence(deps, sessionId, taskId)) return;
+      const task = deps.tasks.find(taskId);
+      // A task already parked (needs_you, blocked, failed) owns its truthful
+      // outcome; only a still-silent queued/working task is parked here.
+      if (!task || (task.state !== "queued" && task.state !== "working")) return;
+      deps.tasks.recordEvent(taskId, {
+        kind: "blocked",
+        source: "system",
+        message:
+          "codex worker shows no first turn after launch and one kickoff retry; the kickoff prompt was never accepted",
+        data: { reason: "kickoff_not_accepted", sessionId }
+      });
+    } catch {
+      // Ledger bookkeeping must never disturb the session.
+    } finally {
+      disarm();
+    }
+  };
+  const retryPass = async () => {
+    try {
+      if (codexFirstTurnEvidence(deps, sessionId, taskId)) return disarm();
+      // Exactly one retry of the exact original kickoff. queueIfGated: false -
+      // an open permission gate means the worker is not silently empty (the
+      // approval flow owns that outcome), and queued text typed later could
+      // land after the gate resolves and duplicate an accepted kickoff.
+      deps.timeline.recordSource(sessionId, kickoff, "agent");
+      await deps.monitor.queueOrSubmit(sessionId, kickoff, { queueIfGated: false });
+    } catch {
+      // The session already ended; exit reporting owns the truthful outcome.
+      return disarm();
+    }
+    const finalTimer = setTimeout(finalPass, windowMs);
+    finalTimer.unref?.();
+  };
+  const retryTimer = setTimeout(() => void retryPass(), windowMs);
+  retryTimer.unref?.();
 }
 
 // Resolve the agent kind for a launch, mirroring the PTY adapter's inference so

@@ -171,6 +171,24 @@ export class OwnerManager {
     return next;
   }
 
+  // A recoverable mate generation whose provider conversation can never be
+  // resumed (a codex thread recorded at thread/started that never wrote a
+  // rollout) would re-arm the same permanent failure on every start. Retire it
+  // (recoverable -> ended) so the caller can fall through to a fresh launch.
+  // CAS-guarded: a concurrent recovery claim (recovering) or a finished
+  // generation loses the race and the caller must not launch fresh.
+  retireUnrecoverableMate(generation: number, reason: string): OwnerRuntimeRecord | undefined {
+    const latest = this.latestMate();
+    if (!latest || latest.generation !== generation || latest.state !== "recoverable") return undefined;
+    return this.tasks.stateDb.ownerRuntimes.compareAndSwap(
+      MATE_OWNER_ID,
+      generation,
+      "recoverable",
+      "ended",
+      { metadata: { ...latest.metadata, endedReason: "unrecoverable-provider-conversation", endedError: reason } }
+    );
+  }
+
   failRecovery(recovering: OwnerRuntimeRecord, message: string): OwnerRuntimeRecord | undefined {
     return this.tasks.stateDb.ownerRuntimes.compareAndSwap(
       recovering.ownerId,

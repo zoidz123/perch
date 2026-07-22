@@ -143,7 +143,7 @@ import {
 import type { OperationRecord } from "./stateDb.js";
 import type { OperationExecutionContext, TaskScheduler } from "./taskScheduler.js";
 import type { RuntimeManager } from "./runtimeManager.js";
-import { RecoveryCoordinator } from "./recovery.js";
+import { isCodexMissingRolloutResumeError, RecoveryCoordinator } from "./recovery.js";
 import { RecoveryContinuationCoordinator } from "./recoveryContinuation.js";
 import type { OwnerManager } from "./ownerManager.js";
 import { MateRecoveryCoordinator } from "./mateRecovery.js";
@@ -3317,7 +3317,17 @@ async function startMateRpc(
         mateOwner: options.ownerManager?.snapshot()
       });
     } catch (error) {
-      return rpcError(409, error instanceof Error ? error.message : String(error));
+      const message = error instanceof Error ? error.message : String(error);
+      // A recorded codex thread that never wrote a rollout can never be
+      // resumed; left recoverable, every start would re-arm this same failure.
+      // Retire that stale generation and fall through to a fresh mate launch
+      // in this same request. Transient failures (and any other error shape)
+      // keep the generation recoverable and still answer 409.
+      const retired =
+        prior.provider === "codex" && isCodexMissingRolloutResumeError(error)
+          ? options.ownerManager?.retireUnrecoverableMate(prior.generation, message)
+          : undefined;
+      if (!retired) return rpcError(409, message);
     }
   }
   // Fleet mate defaults (`mate.*` via `perch config`) shape a fresh mate here just
