@@ -23,6 +23,7 @@ The desktop terminal attaches as a thin client, so `Ctrl+]` can detach without k
 Claude's initial worker brief rides the spawn argv as the CLI's positional query, so nothing is ever typed into a fresh PTY to start work.
 
 Codex sessions are app-server-owned: Perch spawns one `codex app-server` daemon per session workdir on a private unix socket and remains its sole standing authoritative client.
+The daemon key also includes launch overrides, the session-scoped hook identity, and the Codex runtime fingerprint, so managed workers normally have one isolated daemon and one thread each; the thread ID identifies the conversation, while the daemon boundary isolates process state and credentials.
 Perch creates or resumes the thread itself, captures the thread id from the protocol response, serializes all programmatic input (`turn/start` when idle, `turn/steer` with `expectedTurnId` while a turn is active), and stamps every input with a `clientUserMessageId` so a lost response reconciles against `thread/read` history instead of resending blind.
 There is no Codex PTY and no keystroke injection; a desktop human attaches the real native TUI as an additional same-user client with the session's surfaced `attachCommand` (`codex resume <threadId> --remote unix://<socket>`), which `perch attach` execs directly (argv, no shell) when the session record carries it.
 

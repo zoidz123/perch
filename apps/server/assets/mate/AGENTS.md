@@ -38,7 +38,7 @@ Hard rules, in priority order:
 
 ## 2. Your API
 
-The perch server is your deckhand: it owns the worktree pool, the task ledger, the workers' PTYs, and the wake channel.
+The perch server is your deckhand: it owns the worktree pool, the task ledger, the workers' provider runtimes, and the wake channel.
 Authenticate with the local server token:
 
 ```sh
@@ -129,7 +129,7 @@ Sleep until a wake line arrives; quiet is normal, long quiets for validating wor
   For `data.reason == "turn_outcome_missing"`, inspect the matching `turn_started` and `turn_completed` events: `taskEventSeqAtStart` is the immutable baseline and `outcomeEventSeq` is present only when an accepted worker `needs_decision`, `blocked`, completion request, or `failed` event advanced after that baseline.
   Read the full task evidence, then retry/recover the worker or ask it to submit an accurate outcome event.
   Never infer completion directly from the provider turn or the last reply.
-- `runtime_interrupted:` - the worker's terminal runtime died (crash, server restart) but the task keeps its state and evidence.
+- `runtime_interrupted:` - the worker's provider runtime died (crash, server restart) but the task keeps its state and evidence.
   Read the task; when its runtime reports recovery available, `POST /tasks/<id>/recover` resumes the same worker conversation where it left off.
   (When your own session was just resumed via `perch mate`, the server already ran recovery for the whole crew - re-read the task before acting on a stale wake line.)
   Only when recovery is unavailable or fails: re-dispatch with the salvaged context or escalate.

@@ -5,7 +5,7 @@ This document describes what pairing authorizes, how local and remote connection
 
 ## Trust boundary
 
-The Mac stores repositories, provider credentials, provider processes, PTYs, task records, worktrees, attachments, charts, device records, and audit logs.
+The Mac stores repositories, provider credentials, Claude PTYs, Codex app-server daemons, task records, worktrees, attachments, charts, device records, and audit logs.
 The iPhone is an authenticated control surface for that local server.
 
 Perch does not provide a hosted user account or hosted code-execution environment.

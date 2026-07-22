@@ -37,7 +37,7 @@ Copy `apps/server/assets/charts/chart.css` next to your chart file only if the f
 
 ## Register and iterate
 
-Write the file to `.charts/<slug>.html` in your workspace (keep it out of commits; the mate uses `~/.perch/mate/charts/`), then register it once with your session's hook token (already in your PTY env):
+Write the file to `.charts/<slug>.html` in your workspace (keep it out of commits; the mate uses `~/.perch/mate/charts/`), then register it once with your session's hook token (already in your provider-session environment):
 
 ```sh
 curl -sf -X POST "${PERCH_HOOK_URL%/hooks}/charts" \
