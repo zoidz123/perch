@@ -13,7 +13,7 @@ import { HookRegistry } from "./hooks.js";
 import { createControlServer } from "./http.js";
 import type { CodexAppServerAdapter } from "./adapters/codexAppServerAdapter.js";
 import { FakeCodexOwnedAdapter } from "./adapters/fakeCodexAppServer.js";
-import { seedMateHome } from "./mate.js";
+import { CODEX_MATE_BOOTSTRAP_PROMPT, seedMateHome } from "./mate.js";
 import { MATE_CLAUDE_FALLBACK_MODEL, MATE_CODEX_FALLBACK } from "./models.js";
 import { DeviceRegistry } from "./pairing.js";
 import { PrPoller } from "./prPoller.js";
@@ -95,7 +95,7 @@ function serverFixture(home: string) {
     }),
     settings: new FleetSettings(env)
   });
-  return { adapter, monitor, timeline, server };
+  return { adapter, codexOwned, monitor, timeline, server };
 }
 
 test("GET /sessions returns the latest observed Codex runtime effort instead of the launch stamp", async () => {
@@ -240,6 +240,43 @@ test("POST /mate/start applies the fleet mate defaults, and an explicit override
     assert.equal(explicit?.command, "claude");
     assert.equal(explicit?.model, "opus");
     assert.equal(explicit?.effort, undefined);
+  } finally {
+    timeline.stop();
+    server.closeAllConnections?.();
+    await new Promise<void>((resolve) => server.close(() => resolve()));
+    if (priorHome === undefined) delete process.env.PERCH_HOME;
+    else process.env.PERCH_HOME = priorHome;
+    rmSync(home, { recursive: true, force: true });
+  }
+});
+
+test("POST /mate/start materializes a fresh Codex mate before returning its native attach command", async () => {
+  const home = mkdtempSync(join(tmpdir(), "perch-mate-codex-bootstrap-"));
+  const priorHome = process.env.PERCH_HOME;
+  process.env.PERCH_HOME = home;
+
+  const { adapter, codexOwned, timeline, server } = serverFixture(home);
+  await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+  const port = (server.address() as AddressInfo).port;
+  const authed = { headers: { authorization: "Bearer test-token", "content-type": "application/json" } };
+
+  try {
+    const started = await fetch(`http://127.0.0.1:${port}/mate/start`, {
+      ...authed,
+      method: "POST",
+      body: JSON.stringify({ agent: "codex" })
+    });
+    assert.equal(started.status, 201, await started.clone().text());
+    const { session } = (await started.json()) as { session: AgentSession };
+
+    assert.equal(adapter.requests.at(-1)?.initialPrompt, CODEX_MATE_BOOTSTRAP_PROMPT);
+    assert.equal(codexOwned.submitted.length, 1);
+    const bootstrap = codexOwned.submitted[0];
+    assert.equal(bootstrap?.sessionId, session.id);
+    assert.equal(bootstrap?.text, CODEX_MATE_BOOTSTRAP_PROMPT);
+    assert.equal(bootstrap?.source, "agent");
+    assert.match(bootstrap?.clientUserMessageId ?? "", /^perch:/);
+    assert.match(session.attachCommand ?? "", /^codex resume .+ --remote unix:\/\//);
   } finally {
     timeline.stop();
     server.closeAllConnections?.();
