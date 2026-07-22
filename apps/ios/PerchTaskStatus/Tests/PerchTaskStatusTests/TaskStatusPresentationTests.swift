@@ -23,6 +23,15 @@ final class TaskStatusPresentationTests: XCTestCase {
         XCTAssertEqual(TaskStatusPresentation.primaryChip(taskState: "failed", pr: nil, presentationState: "failed").label, "Failed")
     }
 
+    func testNoMistakesModeAloneNeverPromotesWorkingToReviewing() {
+        // The server owns the Working -> Reviewing transition through its
+        // presentation state; the client must render mode=no-mistakes tasks
+        // as Working both before that state arrives and while it says working.
+        XCTAssertEqual(TaskStatusPresentation.primaryChip(taskState: "working", pr: nil, presentationState: "working", mode: "no-mistakes").label, "Working")
+        XCTAssertEqual(TaskStatusPresentation.primaryChip(taskState: "working", pr: nil, presentationState: nil, mode: "no-mistakes").label, "Working")
+        XCTAssertEqual(TaskStatusPresentation.primaryChip(taskState: "working", pr: nil, presentationState: "reviewing", mode: "no-mistakes").label, "Reviewing")
+    }
+
     func testOtherModesStayWorkingUntilVerification() {
         XCTAssertEqual(TaskStatusPresentation.primaryChip(taskState: "working", pr: nil, presentationState: "working", mode: "direct-PR").label, "Working")
         XCTAssertEqual(TaskStatusPresentation.primaryChip(taskState: "working", pr: nil, presentationState: "working", mode: "local-only").label, "Working")

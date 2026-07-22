@@ -103,9 +103,10 @@ An optional `planId` query filters tasks linked to one finalized plan.
 
 Each returned task also carries a server-derived `presentation` with a single `state`:
 `working`, `reviewing`, `needs_you`, `blocked`, `awaiting_verification`, `ready_to_merge`, `ready_to_apply`, `failed`, or `closed`.
-It is derived from the durable lifecycle, PR, and verification facts, never persisted as task state, and clients render the primary task status from it instead of inferring readiness from PR checks or mergeability.
+It is derived from the durable lifecycle, PR, verification, and review facts, never persisted as task state, and clients render the primary task status from it instead of inferring readiness from PR checks or mergeability.
 A `landed` task presents as `closed`, so merged work leaves the active task list immediately instead of wearing a badge until teardown closes the record.
-A `no-mistakes` task in the `working` lifecycle state presents as `reviewing`, making the active no-mistakes review visible; other modes stay `working` until `awaiting_verification`.
+A `working` `no-mistakes` task presents as `reviewing` only while durable review facts prove the pipeline is engaged: the latest allowed runtime authorization (`run`, `gate-push`, or `agent-launch`) recorded on the ledger, surrendered by any event that returns the state to `working`.
+Mode alone never promotes the badge, so scouting and implementation stay `working` until the gate truly starts; other modes stay `working` until `awaiting_verification`.
 
 Mate uses this detail endpoint before acting on a wake notification.
 The event `seq` is the stable identifier used for completion decisions and turn-boundary evidence.

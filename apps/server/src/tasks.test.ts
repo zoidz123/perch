@@ -365,3 +365,68 @@ test("derived readiness follows verification and PR facts, and never persists", 
   tasks.close();
   rmSync(home, { recursive: true, force: true });
 });
+
+test("no-mistakes Reviewing follows durable review facts, not project mode", () => {
+  const { store: tasks, home } = store();
+  const task = tasks.create({ title: "gated work", project: "/tmp/repo", mode: "no-mistakes" });
+
+  // Scouting and implementation stay Working from launch.
+  const working = tasks.recordEvent(task.id, { kind: "working", source: "worker", message: "implementing" });
+  assert.equal(working.presentation?.state, "working");
+
+  // A denied authorization never marks review.
+  const denied = tasks.recordEvent(task.id, {
+    kind: "note",
+    source: "system",
+    data: { noMistakesAuthorization: { allowed: false, reason: "runtime_not_live" } }
+  });
+  assert.equal(denied.presentation?.state, "working");
+
+  // Only the system-recorded authorize decision counts; a worker-sourced note
+  // claiming allowed never creates the review fact.
+  const forged = tasks.recordEvent(task.id, {
+    kind: "note",
+    source: "worker",
+    data: { noMistakesAuthorization: { allowed: true, operation: "run", reason: "authorized" } }
+  });
+  assert.equal(forged.presentation?.state, "working");
+
+  // The allowed authorization is the durable proof the pipeline engaged.
+  const reviewing = tasks.recordEvent(task.id, {
+    kind: "note",
+    source: "system",
+    data: { noMistakesAuthorization: { allowed: true, operation: "run", reason: "authorized" } }
+  });
+  assert.equal(reviewing.presentation?.state, "reviewing");
+  assert.equal(tasks.list().find((candidate) => candidate.id === task.id)?.presentation?.state, "reviewing");
+
+  // A parked gate takes its primary state; resumed work surrenders review.
+  const parked = tasks.recordEvent(task.id, { kind: "needs_decision", source: "worker", message: "gate findings" });
+  assert.equal(parked.presentation?.state, "needs_you");
+  const resumed = tasks.recordEvent(task.id, { kind: "working", source: "worker", message: "addressing findings" });
+  assert.equal(resumed.presentation?.state, "working");
+
+  // Re-entering the pipeline restores Reviewing; a mate reject surrenders it.
+  tasks.recordEvent(task.id, {
+    kind: "note",
+    source: "system",
+    data: { noMistakesAuthorization: { allowed: true, operation: "gate-push", reason: "authorized" } }
+  });
+  assert.equal(tasks.find(task.id)?.presentation?.state, "reviewing");
+  tasks.recordEvent(task.id, {
+    kind: "completion_requested",
+    source: "worker",
+    data: { deliverable: { kind: "pr", headOid: "head-a" } }
+  });
+  const requestSeq = tasks.events(task.id).at(-1)!.seq;
+  assert.equal(tasks.find(task.id)?.presentation?.state, "awaiting_verification");
+  const rejected = tasks.recordEvent(task.id, {
+    kind: "completion_rejected",
+    source: "system",
+    data: { completionDecision: { requestSeq } }
+  });
+  assert.equal(rejected.presentation?.state, "working");
+
+  tasks.close();
+  rmSync(home, { recursive: true, force: true });
+});
