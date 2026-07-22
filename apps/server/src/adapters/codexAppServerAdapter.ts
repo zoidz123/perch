@@ -89,6 +89,7 @@ export type CodexAppServerAdapterOptions = {
 };
 
 export type StartOwnedOptions = {
+  deferAttachCommand?: boolean;
   resume?: {
     threadId: string;
     // Recorded socket of a daemon that may have survived a Perch restart.
@@ -128,6 +129,7 @@ type OwnedSession = {
   pendingRaw: string;
   stopped: boolean;
   reconnecting: boolean;
+  attachCommandReady: boolean;
 };
 
 const DEFAULT_RECONNECT_DELAYS_MS = [500, 2_000];
@@ -303,7 +305,8 @@ export class CodexAppServerAdapter implements AgentAdapter {
       queue: Promise.resolve(),
       pendingRaw: "",
       stopped: false,
-      reconnecting: false
+      reconnecting: false,
+      attachCommandReady: opts.deferAttachCommand !== true
     };
     session.client = this.createClient({
       sessionId,
@@ -408,6 +411,28 @@ export class CodexAppServerAdapter implements AgentAdapter {
       const result = await this.startTurnAcknowledged(session, text, opts.clientUserMessageId, opts.source);
       return result;
     });
+  }
+
+  async submitAcknowledgedTurnAndWait(
+    sessionId: string,
+    text: string,
+    opts: { clientUserMessageId: string; source?: "human" | "agent" }
+  ): Promise<void> {
+    const session = this.mustSession(sessionId);
+    await this.enqueue(session, async () => {
+      const result = await session.client.submitTurnAndWait(text, {
+        clientUserMessageId: opts.clientUserMessageId,
+        ...(opts.source ? { source: opts.source } : {})
+      });
+      if (result.aborted) throw new Error("codex readiness turn did not complete successfully");
+      this.touch(session);
+    });
+  }
+
+  revealAttachCommand(sessionId: string): AgentSession {
+    const session = this.mustSession(sessionId);
+    session.attachCommandReady = true;
+    return this.toAgentSession(session);
   }
 
   // ─── Internals ──────────────────────────────────────────────
@@ -676,7 +701,7 @@ export class CodexAppServerAdapter implements AgentAdapter {
       ...(session.model ? { model: session.model } : {}),
       ...(session.effort ? { effort: session.effort } : {}),
       lastActivityAt: session.lastActivityAt,
-      ...(session.threadId
+      ...(session.threadId && session.attachCommandReady
         ? {
             attachCommand: `codex resume ${session.threadId} --remote unix://${session.socketPath}`,
             attachThreadId: session.threadId,

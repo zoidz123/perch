@@ -256,22 +256,37 @@ test("POST /mate/start materializes a fresh Codex mate before returning its nati
   process.env.PERCH_HOME = home;
 
   const { adapter, codexOwned, timeline, server } = serverFixture(home);
+  codexOwned.autoCompleteAcknowledgedTurns = false;
   await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
   const port = (server.address() as AddressInfo).port;
   const authed = { headers: { authorization: "Bearer test-token", "content-type": "application/json" } };
 
   try {
-    const started = await fetch(`http://127.0.0.1:${port}/mate/start`, {
+    const starting = fetch(`http://127.0.0.1:${port}/mate/start`, {
       ...authed,
       method: "POST",
       body: JSON.stringify({ agent: "codex" })
     });
+    while (codexOwned.submitted.length === 0) {
+      await new Promise((resolve) => setTimeout(resolve, 1));
+    }
+
+    const pending = await fetch(`http://127.0.0.1:${port}/sessions`, authed);
+    assert.equal(pending.status, 200, await pending.clone().text());
+    const pendingSessions = (await pending.json()) as { sessions: AgentSession[] };
+    const pendingMate = pendingSessions.sessions.find((candidate) => candidate.labels?.role === "mate");
+    assert.equal(pendingMate?.attachCommand, undefined);
+
+    const bootstrap = codexOwned.submitted[0];
+    assert.ok(bootstrap);
+    codexOwned.emitTurnCompleted(bootstrap.sessionId);
+
+    const started = await starting;
     assert.equal(started.status, 201, await started.clone().text());
     const { session } = (await started.json()) as { session: AgentSession };
 
     assert.equal(adapter.requests.at(-1)?.initialPrompt, CODEX_MATE_BOOTSTRAP_PROMPT);
     assert.equal(codexOwned.submitted.length, 1);
-    const bootstrap = codexOwned.submitted[0];
     assert.equal(bootstrap?.sessionId, session.id);
     assert.equal(bootstrap?.text, CODEX_MATE_BOOTSTRAP_PROMPT);
     assert.equal(bootstrap?.source, "agent");

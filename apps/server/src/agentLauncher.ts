@@ -86,6 +86,7 @@ export type StartManagedAgentInput = {
   // replacement only after provider identity verification.
   trackOwner?: boolean;
   intentionalNewMate?: boolean;
+  awaitInitialPromptCompletion?: boolean;
   // A recovery failure must preserve the task-held worktree for another try.
   retainWorktreeOnFailure?: boolean;
   // Codex recovery: resume this exact thread instead of starting a fresh one.
@@ -275,7 +276,10 @@ export async function startManagedAgent(
       // authoritative thread id. There is no PTY and no keystroke path.
       session = await options.codexOwned.startOwned(
         request,
-        codexOwnedResume ? { resume: codexOwnedResume } : {}
+        {
+          ...(codexOwnedResume ? { resume: codexOwnedResume } : {}),
+          ...(input.awaitInitialPromptCompletion ? { deferAttachCommand: true } : {})
+        }
       );
     } else {
       session = await options.adapter.startAgent!(request);
@@ -401,6 +405,12 @@ export async function startManagedAgent(
         // for owned sessions).
         if (input.taskId && input.initialPromptSource === "agent") {
           await submitCodexKickoff(options, session.id, input.taskId, request.initialPrompt);
+        } else if (input.awaitInitialPromptCompletion) {
+          await options.codexOwned.submitAcknowledgedTurnAndWait(session.id, request.initialPrompt, {
+            clientUserMessageId: `perch:${randomUUID()}`,
+            source: input.initialPromptSource ?? "human"
+          });
+          session = options.codexOwned.revealAttachCommand(session.id);
         } else {
           await options.codexOwned.submitAcknowledgedTurn(session.id, request.initialPrompt, {
             clientUserMessageId: `perch:${randomUUID()}`,

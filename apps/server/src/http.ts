@@ -3358,6 +3358,7 @@ async function startMateRpc(
       },
       auditMeta: auditPeer,
       ...(agent === "codex" ? { initialPromptSource: "agent" } : {}),
+      ...(agent === "codex" ? { awaitInitialPromptCompletion: true } : {}),
       intentionalNewMate: body.new === true
     });
     return rpcOk(201, {

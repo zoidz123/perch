@@ -373,6 +373,17 @@ async function removeSocketFile(socketPath: string): Promise<void> {
 // that assert routing, journaling, and lifecycle - not wire behavior (the
 // adapter suite covers that against FakeCodexAppServer above). Tests cast it
 // `as unknown as CodexAppServerAdapter`.
+type FakeOwnedSession = {
+  id: string;
+  threadId: string;
+  socketPath: string;
+  title: string;
+  cwd?: string;
+  labels?: Record<string, string>;
+  worktreeId?: string;
+  attachCommandReady: boolean;
+};
+
 export class FakeCodexOwnedAdapter {
   readonly name = "fake-codex-owned";
   launches: Array<{ request: Record<string, unknown>; resume?: { threadId: string; socketPath?: string } }> = [];
@@ -395,19 +406,10 @@ export class FakeCodexOwnedAdapter {
   historyReadError: Error | null = null;
   // Reported by runtimeFingerprint() (rebind invariant tests set it).
   fakeRuntimeFingerprint: string | undefined;
+  autoCompleteAcknowledgedTurns = true;
 
-  private readonly sessions = new Map<
-    string,
-    {
-      id: string;
-      threadId: string;
-      socketPath: string;
-      title: string;
-      cwd?: string;
-      labels?: Record<string, string>;
-      worktreeId?: string;
-    }
-  >();
+  private readonly sessions = new Map<string, FakeOwnedSession>();
+  private readonly turnCompletionWaiters = new Map<string, () => void>();
   private threadCounter = 0;
   private turnCounter = 0;
 
@@ -442,7 +444,7 @@ export class FakeCodexOwnedAdapter {
 
   async startOwned(
     request: { sessionId?: string; title?: string; cwd?: string; labels?: Record<string, string> },
-    opts: { resume?: { threadId: string; socketPath?: string } } = {}
+    opts: { deferAttachCommand?: boolean; resume?: { threadId: string; socketPath?: string } } = {}
   ) {
     if (this.failStart) throw this.failStart;
     const id = request.sessionId ?? `pty:${Math.random().toString(36).slice(2)}`;
@@ -456,7 +458,8 @@ export class FakeCodexOwnedAdapter {
       socketPath,
       title: request.title ?? "codex",
       cwd: request.cwd,
-      labels: request.labels
+      labels: request.labels,
+      attachCommandReady: opts.deferAttachCommand !== true
     });
     this.onStartOwned?.(id);
     return {
@@ -469,9 +472,13 @@ export class FakeCodexOwnedAdapter {
       kind: "terminal" as const,
       status: "idle" as const,
       lastActivityAt: new Date().toISOString(),
-      attachCommand: `codex resume ${threadId} --remote unix://${socketPath}`,
-      attachThreadId: threadId,
-      attachSocketPath: socketPath
+      ...(opts.deferAttachCommand !== true
+        ? {
+            attachCommand: `codex resume ${threadId} --remote unix://${socketPath}`,
+            attachThreadId: threadId,
+            attachSocketPath: socketPath
+          }
+        : {})
     };
   }
 
@@ -496,6 +503,28 @@ export class FakeCodexOwnedAdapter {
     return { turnId: `turn-fake-${++this.turnCounter}` };
   }
 
+  async submitAcknowledgedTurnAndWait(
+    sessionId: string,
+    text: string,
+    opts: { clientUserMessageId: string; source?: "human" | "agent" }
+  ): Promise<void> {
+    await this.submitAcknowledgedTurn(sessionId, text, opts);
+    if (this.autoCompleteAcknowledgedTurns) return;
+    await new Promise<void>((resolve) => this.turnCompletionWaiters.set(sessionId, resolve));
+  }
+
+  emitTurnCompleted(sessionId: string): void {
+    this.turnCompletionWaiters.get(sessionId)?.();
+    this.turnCompletionWaiters.delete(sessionId);
+  }
+
+  revealAttachCommand(sessionId: string) {
+    const session = this.sessions.get(sessionId);
+    if (!session) throw new Error(`unknown fake codex session: ${sessionId}`);
+    session.attachCommandReady = true;
+    return this.toAgentSession(session);
+  }
+
   async findAcceptedTurn(_sessionId: string, clientUserMessageId: string): Promise<{ id: string } | undefined> {
     if (this.historyReadError) throw this.historyReadError;
     return this.history.get(clientUserMessageId);
@@ -515,7 +544,11 @@ export class FakeCodexOwnedAdapter {
   }
 
   async listSessions() {
-    return [...this.sessions.values()].map((session) => ({
+    return [...this.sessions.values()].map((session) => this.toAgentSession(session));
+  }
+
+  private toAgentSession(session: FakeOwnedSession) {
+    return {
       id: session.id,
       title: session.title,
       ...(session.labels?.workerName ? { workerName: session.labels.workerName } : {}),
@@ -526,10 +559,14 @@ export class FakeCodexOwnedAdapter {
       kind: "terminal" as const,
       status: "idle" as const,
       lastActivityAt: new Date().toISOString(),
-      attachCommand: `codex resume ${session.threadId} --remote unix://${session.socketPath}`,
-      attachThreadId: session.threadId,
-      attachSocketPath: session.socketPath
-    }));
+      ...(session.attachCommandReady
+        ? {
+            attachCommand: `codex resume ${session.threadId} --remote unix://${session.socketPath}`,
+            attachThreadId: session.threadId,
+            attachSocketPath: session.socketPath
+          }
+        : {})
+    };
   }
 
   async readRecentEvents() {

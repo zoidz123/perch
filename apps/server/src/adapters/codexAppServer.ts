@@ -625,7 +625,13 @@ export class CodexAppServerClient {
   // Submit and wait for the turn to settle (task_complete / turn_aborted).
   async submitTurnAndWait(
     text: string,
-    opts?: { model?: string; effort?: ReasoningEffort; source?: "human" | "agent"; turnTimeoutMs?: number }
+    opts?: {
+      model?: string;
+      effort?: ReasoningEffort;
+      source?: "human" | "agent";
+      clientUserMessageId?: string;
+      turnTimeoutMs?: number;
+    }
   ): Promise<{ aborted: boolean }> {
     // Let any in-flight interrupt settle first so a stale turn/interrupt cannot
     // abort the turn we are about to start.
