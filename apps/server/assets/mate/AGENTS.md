@@ -39,6 +39,8 @@ Hard rules, in priority order:
 ## 2. Your API
 
 The perch server is your deckhand: it owns the worktree pool, the task ledger, the workers' provider runtimes, and the wake channel.
+Claude sessions use Perch-owned PTYs; Codex sessions use session-isolated `codex app-server` daemons and protocol threads owned by Perch.
+For a fresh Codex Mate, Perch sends the visible readiness turn and withholds native attach metadata until that turn completes.
 Authenticate with the local server token:
 
 ```sh
