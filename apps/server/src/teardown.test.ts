@@ -1,6 +1,13 @@
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
-import { existsSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import {
+  chmodSync,
+  existsSync,
+  mkdtempSync,
+  readFileSync,
+  rmSync,
+  writeFileSync
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
@@ -23,6 +30,7 @@ function makeRepo(): string {
   writeFileSync(join(dir, "readme.md"), "hello\n");
   run(["add", "."]);
   run(["commit", "-qm", "init"]);
+  run(["config", "remote.origin.uploadpack", "/usr/bin/false"]);
   return dir;
 }
 
@@ -390,6 +398,13 @@ test("gate resolves and fetches origin/main without a local origin/HEAD", async 
     ["-C", clone, "symbolic-ref", "--delete", "refs/remotes/origin/HEAD"],
     { stdio: "pipe" }
   );
+  const uploadPack = join(base, "counting-upload-pack");
+  writeFileSync(
+    uploadPack,
+    `#!/bin/sh\nprintf '1\\n' >> "$0.count"\nexec git-upload-pack "$@"\n`
+  );
+  chmodSync(uploadPack, 0o755);
+  execFileSync("git", ["-C", clone, "config", "remote.origin.uploadpack", uploadPack]);
 
   const verdict = await landedGate(tasks.find(task.id)!, clone);
 
@@ -410,6 +425,44 @@ test("gate resolves and fetches origin/main without a local origin/HEAD", async 
     localMain,
     "the unrelated seed checkout is untouched"
   );
+  assert.equal(
+    readFileSync(`${uploadPack}.count`, "utf8").trim().split("\n").length,
+    2,
+    "one remote HEAD lookup and one targeted fetch"
+  );
+
+  rmSync(home, { recursive: true, force: true });
+  rmSync(base, { recursive: true, force: true });
+});
+
+test("gate bounds offline default-branch discovery without retrying", async () => {
+  const { base, clone } = makeRemoteFixture();
+  const home = mkdtempSync(join(tmpdir(), "perch-td-home-"));
+  const tasks = new TaskStore({ PERCH_HOME: home } as NodeJS.ProcessEnv);
+  const task = tasks.create({ title: "offline origin", project: clone });
+  tasks.recordEvent(task.id, { kind: "working", source: "worker" });
+  tasks.recordEvent(task.id, { kind: "done", source: "worker" });
+  execFileSync(
+    "git",
+    ["-C", clone, "symbolic-ref", "--delete", "refs/remotes/origin/HEAD"],
+    { stdio: "pipe" }
+  );
+  const uploadPack = join(base, "slow-upload-pack");
+  writeFileSync(uploadPack, `#!/bin/sh\nprintf '1\\n' >> "$0.count"\nread request\nexit 1\n`);
+  chmodSync(uploadPack, 0o755);
+  execFileSync("git", ["-C", clone, "config", "remote.origin.uploadpack", uploadPack]);
+
+  const startedAt = Date.now();
+  const verdict = await landedGate(tasks.find(task.id)!, clone);
+  const elapsed = Date.now() - startedAt;
+
+  assert.equal(verdict.landed, true);
+  assert.equal(
+    readFileSync(`${uploadPack}.count`, "utf8").trim().split("\n").length,
+    1,
+    "offline discovery makes one remote request"
+  );
+  assert.ok(elapsed < 5_000, `offline lookup took ${elapsed}ms`);
 
   rmSync(home, { recursive: true, force: true });
   rmSync(base, { recursive: true, force: true });

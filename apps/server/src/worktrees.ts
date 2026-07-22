@@ -119,8 +119,8 @@ export class WorktreePool {
           // A freed slot sits at whatever the default tip was when it was
           // released; re-detach it on the freshly fetched tip so a lease never
           // starts on a stale base.
-          await fetchDefaultBranch(repo);
-          await resetToDefault(repo, candidate.path);
+          const base = await fetchDefaultBranch(repo);
+          await resetToDefault(repo, candidate.path, base);
           lease = candidate;
           break;
         } catch (error) {
@@ -165,21 +165,21 @@ export class WorktreePool {
       if (existsSync(lease.path)) {
         // Refresh origin/<default> before judging landed-ness: work merged on
         // GitHub counts as landed only once the remote-tracking ref knows it.
-        await fetchDefaultBranch(lease.repoRoot);
+        const base = await fetchDefaultBranch(lease.repoRoot);
         if (!options.force) {
           if (await isDirty(lease.path)) {
             throw new Error(
               `Worktree ${id} has uncommitted changes; pass force to discard them`
             );
           }
-          if (await hasUnlandedCommits(lease.repoRoot, lease.path)) {
+          if (await hasUnlandedCommits(lease.repoRoot, lease.path, base)) {
             throw new Error(
               `Worktree ${id} has committed work not landed on any branch or the default branch; pass force to discard it`
             );
           }
         }
         try {
-          await resetToDefault(lease.repoRoot, lease.path);
+          await resetToDefault(lease.repoRoot, lease.path, base);
         } catch (error) {
           lease.leasedBy = undefined;
           lease.leasedAt = undefined;
@@ -313,8 +313,8 @@ export class WorktreePool {
     const path = join(poolDir, slot, basename(repo));
     mkdirSync(join(poolDir, slot), { recursive: true });
 
-    await fetchDefaultBranch(repo);
-    const base = await defaultBranchCommit(repo);
+    const remoteBase = await fetchDefaultBranch(repo);
+    const base = remoteBase ?? (await defaultBranchCommit(repo));
     await git(repo, ["worktree", "add", "--detach", path, base]);
 
     const lease: WorktreeLease = {
@@ -368,7 +368,11 @@ async function isDirty(worktree: string): Promise<boolean> {
 // commits that live on no branch ref (local or remote) and are not contained
 // in the repository's default branch. A fresh detached slot (HEAD == base
 // tip) is contained in the default branch, so it reports false.
-async function hasUnlandedCommits(repo: string, worktree: string): Promise<boolean> {
+async function hasUnlandedCommits(
+  repo: string,
+  worktree: string,
+  base?: string
+): Promise<boolean> {
   const { stdout: branches } = await git(worktree, ["branch", "-a", "--contains", "HEAD"]);
   // Each line is `  name` / `* name`; a detached HEAD lists a parenthesized
   // marker ("* (no branch)") that is not a real ref - ignore those.
@@ -379,7 +383,7 @@ async function hasUnlandedCommits(repo: string, worktree: string): Promise<boole
   if (onRealBranch) {
     return false;
   }
-  const base = await defaultBranchCommit(repo);
+  base ??= await defaultBranchCommit(repo);
   try {
     await git(worktree, ["merge-base", "--is-ancestor", "HEAD", base]);
     return false;
@@ -397,11 +401,11 @@ async function currentBranch(worktree: string): Promise<string | undefined> {
 // Reset a slot for reuse: discard everything, then re-detach at the current
 // default-branch tip so the next acquire starts fresh. Callers that want the
 // remote's real tip fetch first (fetchDefaultBranch); this only reads refs.
-async function resetToDefault(repo: string, worktree: string): Promise<void> {
+async function resetToDefault(repo: string, worktree: string, base?: string): Promise<void> {
   await git(worktree, ["reset", "--hard"]);
   await makeUntrackedPathsOwnerWritable(worktree);
   await git(worktree, ["clean", "-fd"]);
-  const base = await defaultBranchCommit(repo);
+  base ??= await defaultBranchCommit(repo);
   await git(worktree, ["checkout", "--detach", base]);
 }
 
@@ -452,7 +456,7 @@ function makePathOwnerWritable(path: string): void {
 // origin/HEAD when a remote exists, the local HEAD otherwise (plain local
 // repos are first-class: tests, scratch projects).
 async function defaultBranchCommit(repo: string): Promise<string> {
-  const name = await defaultBranchName(repo);
+  const name = await localDefaultBranchName(repo);
   if (name) {
     return `origin/${name}`;
   }
@@ -463,19 +467,27 @@ async function defaultBranchCommit(repo: string): Promise<string> {
 // The default branch's short name ("main") resolved from origin/HEAD or the
 // remote's HEAD symref, or undefined when origin cannot identify one.
 async function defaultBranchName(repo: string): Promise<string | undefined> {
+  const localName = await localDefaultBranchName(repo);
+  if (localName) {
+    return localName;
+  }
+  try {
+    const { stdout } = await git(repo, ["ls-remote", "--symref", "origin", "HEAD"], 2_000);
+    const match = stdout.match(/^ref: refs\/heads\/(.+)\tHEAD$/m);
+    return match?.[1];
+  } catch {
+    return undefined;
+  }
+}
+
+async function localDefaultBranchName(repo: string): Promise<string | undefined> {
   const localRef = await git(repo, ["rev-parse", "--abbrev-ref", "origin/HEAD"])
     .then(({ stdout }) => stdout.trim())
     .catch(() => undefined);
   if (localRef?.startsWith("origin/")) {
     return localRef.slice("origin/".length);
   }
-  try {
-    const { stdout } = await git(repo, ["ls-remote", "--symref", "origin", "HEAD"]);
-    const match = stdout.match(/^ref: refs\/heads\/(.+)\tHEAD$/m);
-    return match?.[1];
-  } catch {
-    return undefined;
-  }
+  return undefined;
 }
 
 // Refresh origin/<default> before basing a slot on it: PRs merge on GitHub,
@@ -484,11 +496,12 @@ async function defaultBranchName(repo: string): Promise<string | undefined> {
 // are never touched. Offline or a failed fetch degrades to the last-known
 // ref with a one-line warning; a network hiccup must never block dispatch.
 // No-remote repos skip entirely (local-tip behavior unchanged).
-export async function fetchDefaultBranch(repo: string): Promise<void> {
+export async function fetchDefaultBranch(repo: string): Promise<string | undefined> {
   const name = await defaultBranchName(repo);
   if (!name) {
-    return;
+    return undefined;
   }
+  const ref = `origin/${name}`;
   try {
     await git(repo, [
       "fetch",
@@ -499,6 +512,12 @@ export async function fetchDefaultBranch(repo: string): Promise<void> {
   } catch (error) {
     const detail = (error instanceof Error ? error.message : String(error)).split("\n")[0];
     console.warn(`worktree: fetch origin/${name} failed for ${basename(repo)}; using last-known ref (${detail})`);
+  }
+  try {
+    await git(repo, ["rev-parse", "--verify", ref]);
+    return ref;
+  } catch {
+    return undefined;
   }
 }
 
@@ -519,10 +538,14 @@ function readDirNames(dir: string): string[] {
   }
 }
 
-async function git(cwd: string, args: string[]): Promise<{ stdout: string; stderr: string }> {
+async function git(
+  cwd: string,
+  args: string[],
+  timeout = 15_000
+): Promise<{ stdout: string; stderr: string }> {
   try {
     return await execFileAsync("git", ["-C", cwd, ...args], {
-      timeout: 15_000,
+      timeout,
       maxBuffer: 4 * 1024 * 1024
     });
   } catch (error) {

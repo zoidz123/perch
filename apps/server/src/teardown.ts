@@ -60,7 +60,7 @@ export async function landedGate(task: Task, worktreePath?: string): Promise<Lan
     // Refresh only origin/<default> before ancestry checks. This shares the
     // pool release path's fetch-only behavior: local branches are untouched,
     // and an unavailable remote degrades to the last-known tracking ref.
-    await fetchDefaultBranch(path);
+    const remoteBase = await fetchDefaultBranch(path);
     // HEAD reachable from any remote ref: pushed, safe.
     const { stdout: remotes } = await git(path, ["branch", "-r", "--contains", "HEAD"]);
     if (remotes.trim().length > 0) {
@@ -69,7 +69,7 @@ export async function landedGate(task: Task, worktreePath?: string): Promise<Lan
     // HEAD an ancestor of the default branch: landed locally. origin/HEAD
     // when a remote exists, the project root's HEAD otherwise (plain local
     // repos are first-class, matching the pool's own base rule).
-    const base = (await defaultRef(path)) ?? (await headCommit(task.project));
+    const base = remoteBase ?? (await defaultRef(path)) ?? (await headCommit(task.project));
     if (base) {
       try {
         await git(path, ["merge-base", "--is-ancestor", "HEAD", base]);
