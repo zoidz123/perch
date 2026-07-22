@@ -1242,6 +1242,7 @@ final class PerchStore: ObservableObject {
                 return
             }
             if (error as? PerchClientError)?.httpStatusCode == 404 {
+                taskRefreshErrorMessage = nil
                 return
             }
             let refresh = WorkspaceGrouping.taskRefreshResult(
