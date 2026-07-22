@@ -8,6 +8,8 @@ import { join } from "node:path";
 import { after, before, test } from "node:test";
 import type { AgentSession, RecentEventsResult, StartAgentRequest } from "@perch/shared";
 import type { AgentAdapter } from "./adapters/types.js";
+import type { CodexAppServerAdapter } from "./adapters/codexAppServerAdapter.js";
+import { FakeCodexOwnedAdapter } from "./adapters/fakeCodexAppServer.js";
 import { AuditLog } from "./audit.js";
 import { FleetMonitor } from "./fleetMonitor.js";
 import { HookRegistry } from "./hooks.js";
@@ -74,6 +76,17 @@ execFileSync("git", ["-c", "user.email=t@t", "-c", "user.name=t", "commit", "-qm
 
 const env = { PERCH_HOME: home } as NodeJS.ProcessEnv;
 const adapter = new CapturingAdapter();
+// Codex dispatches route to the app-server owning adapter; mirror its
+// launches into the shared capture list so every default/override assertion
+// reads one stream regardless of agent.
+const codexOwned = new FakeCodexOwnedAdapter();
+const originalStartOwned = codexOwned.startOwned.bind(codexOwned);
+codexOwned.startOwned = async (request, opts) => {
+  adapter.startRequests.push(request as StartAgentRequest);
+  const session = await originalStartOwned(request, opts);
+  adapter.sessions.push(session as AgentSession);
+  return session;
+};
 const hooks = new HookRegistry();
 const tasks = new TaskStore(env);
 const timeline = new TimelineStore();
@@ -96,7 +109,8 @@ const serverOptions = {
     throw new Error("gh disabled in tests");
   }),
   settings,
-  codexOnPath: () => codexOnPath
+  codexOnPath: () => codexOnPath,
+  codexOwned: codexOwned as unknown as CodexAppServerAdapter
 };
 const server = createControlServer(serverOptions);
 

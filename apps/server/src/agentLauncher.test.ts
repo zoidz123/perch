@@ -9,7 +9,11 @@ import { join } from "node:path";
 import { test } from "node:test";
 import type { AgentKind, AgentSession, AgentSessionStatus, FleetEvent, PendingServerRequest, RecentEventsResult, ServerRequestResponse, StartAgentRequest } from "@perch/shared";
 import type { AgentAdapter } from "./adapters/types.js";
-import type { CodexControlPlane } from "./codexControl.js";
+import type { CodexAppServerAdapter } from "./adapters/codexAppServerAdapter.js";
+import { FakeCodexOwnedAdapter } from "./adapters/fakeCodexAppServer.js";
+import type { PtyAgentAdapter } from "./adapters/pty.js";
+import { RoutingAgentAdapter } from "./adapters/routingAdapter.js";
+import { resolveCodexServerRequest, startManagedAgent, surfaceCodexServerRequest } from "./agentLauncher.js";
 import { AuditLog } from "./audit.js";
 import { FleetMonitor } from "./fleetMonitor.js";
 import { HookRegistry, installClaudeHooks, perchHookPath } from "./hooks.js";
@@ -27,84 +31,14 @@ import { TaskScheduler } from "./taskScheduler.js";
 
 const tick = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 
-class FakeCodexControl {
-  prepareReturns = true;
-  prepared: Array<{ cwd: string; effort?: string; env?: Record<string, string> }> = [];
-  attached: Array<{ sessionId: string; socketPath: string; cwd: string }> = [];
-  detached: string[] = [];
-  transferred: Array<{ from: string; to: string }> = [];
-  private readonly live = new Set<string>();
-  callbacks = new Map<string, {
-    onStatus?: (status: AgentSessionStatus) => void;
-    onServerRequest?: (request: PendingServerRequest) => void;
-    onServerRequestResolved?: (request: PendingServerRequest) => void;
-  }>();
-  responses: Array<{ sessionId: string; response: ServerRequestResponse }> = [];
-
-  isEnabled(): boolean {
-    return true;
-  }
-
-  async prepareRemote(cwd: string, opts: { effort?: string; env?: Record<string, string> } = {}) {
-    this.prepared.push({ cwd, effort: opts.effort, env: opts.env });
-    if (!this.prepareReturns) return null;
-    return { socketPath: join(cwd, ".codex.sock"), cwd };
-  }
-
-  async attach(sessionId: string, args: {
-    socketPath: string;
-    cwd: string;
-    onStatus?: (status: AgentSessionStatus) => void;
-    onServerRequest?: (request: PendingServerRequest) => void;
-    onServerRequestResolved?: (request: PendingServerRequest) => void;
-  }): Promise<boolean> {
-    this.live.add(sessionId);
-    this.attached.push({ sessionId, socketPath: args.socketPath, cwd: args.cwd });
-    this.callbacks.set(sessionId, args);
-    return true;
-  }
-
-  has(sessionId: string): boolean {
-    return this.live.has(sessionId);
-  }
-
-  switchModel(): boolean {
-    return false;
-  }
-
-  async submitTurn(): Promise<boolean> {
-    return false;
-  }
-
-  respondToServerRequest(sessionId: string, response: ServerRequestResponse): boolean {
-    if (!this.live.has(sessionId)) return false;
-    this.responses.push({ sessionId, response });
-    return true;
-  }
-
-  async detach(sessionId: string): Promise<void> {
-    this.detached.push(sessionId);
-    this.live.delete(sessionId);
-  }
-
-  transferDaemon(fromSessionId: string, toSessionId: string): void {
-    this.transferred.push({ from: fromSessionId, to: toSessionId });
-  }
-
-  stop(): void {}
-}
-
 class CapturingAdapter implements AgentAdapter {
   readonly name = "fake-pty";
   requests: StartAgentRequest[] = [];
   sessions: AgentSession[] = [];
-  controlAttachedAtSpawn: boolean[] = [];
-  // When set, startAgent records the (already control-attached, id-minted,
-  // lease-bound) request and then throws, exercising reverse-order unwinding.
+  // When set, startAgent records the (id-minted, lease-bound) request and
+  // then throws, exercising reverse-order unwinding.
   failStartAgent = false;
   stopped: string[] = [];
-
-  constructor(private readonly control?: FakeCodexControl) {}
 
   async stopSession(sessionId: string): Promise<void> {
     this.stopped.push(sessionId);
@@ -128,7 +62,6 @@ class CapturingAdapter implements AgentAdapter {
 
   async startAgent(request: StartAgentRequest): Promise<AgentSession> {
     this.requests.push({ ...request, args: request.args ? [...request.args] : undefined });
-    this.controlAttachedAtSpawn.push(request.sessionId ? Boolean(this.control?.has(request.sessionId)) : false);
     if (this.failStartAgent) {
       throw new Error("pty spawn failed");
     }
@@ -184,12 +117,24 @@ function makeRepo(): string {
 function fixture(durableBoundary?: "afterLaunch" | "durable") {
   const home = mkdtempSync(join(tmpdir(), "perch-launch-home-"));
   const env = { PERCH_HOME: home } as NodeJS.ProcessEnv;
-  const control = new FakeCodexControl();
-  const adapter = new CapturingAdapter(control);
+  const pty = new CapturingAdapter();
+  const codexOwned = new FakeCodexOwnedAdapter();
+  // The production topology: one routing facade over the Claude PTY backend
+  // and the app-server-owned Codex backend.
+  const routing = new RoutingAgentAdapter(
+    pty as unknown as PtyAgentAdapter,
+    codexOwned as unknown as CodexAppServerAdapter
+  );
   const auditLog = new AuditLog(join(home, "audit.jsonl"));
   const tasks = new TaskStore(env);
   const timeline = new TimelineStore();
-  const monitor = new FleetMonitor(adapter, { auditLog, broadcastMs: 5, tailThrottleMs: 1, detailThrottleMs: 1 });
+  const monitor = new FleetMonitor(routing, { auditLog, broadcastMs: 5, tailThrottleMs: 1, detailThrottleMs: 1 });
+  // Mirror the index.ts wiring the approval pipeline depends on.
+  codexOwned.wireEvents({
+    onServerRequest: (sessionId, request) => surfaceCodexServerRequest({ monitor, tasks }, sessionId, request),
+    onServerRequestResolved: (sessionId, request) => resolveCodexServerRequest({ monitor, tasks }, sessionId, request),
+    onStatus: (sessionId, status) => monitor.applyExternalStatus(sessionId, status, "codex", "adapter")
+  });
   let injected = false;
   const taskScheduler = durableBoundary
     ? new TaskScheduler({
@@ -214,7 +159,7 @@ function fixture(durableBoundary?: "afterLaunch" | "durable") {
       })
     : undefined;
   const options = {
-    adapter,
+    adapter: routing,
     auditLog,
     authToken: "test-token",
     boxSecretKey: new Uint8Array(32),
@@ -232,7 +177,7 @@ function fixture(durableBoundary?: "afterLaunch" | "durable") {
       throw new Error("gh disabled in tests");
     }),
     settings: new FleetSettings(env),
-    codexControl: control as unknown as CodexControlPlane,
+    codexOwned: codexOwned as unknown as CodexAppServerAdapter,
     codexOnPath: () => true,
     // Individual tests opt in by assigning these; absent means no runtime
     // ledger and no hook reinstall side effects.
@@ -243,8 +188,8 @@ function fixture(durableBoundary?: "afterLaunch" | "durable") {
   const server = createControlServer(options);
   return {
     home,
-    control,
-    adapter,
+    adapter: pty,
+    codexOwned,
     monitor,
     options,
     server,
@@ -271,7 +216,7 @@ async function listen(server: ReturnType<typeof createControlServer>, options: {
 
 const authed = { headers: { authorization: "Bearer test-token", "content-type": "application/json" } };
 
-test("direct HTTP POST /agents/pty uses Codex remote control before spawning the TUI", async () => {
+test("direct HTTP POST /agents/pty routes Codex to the app-server owning adapter, never a PTY", async () => {
   const fx = fixture();
   const repo = makeRepo();
   const baseUrl = await listen(fx.server, fx.options);
@@ -283,25 +228,27 @@ test("direct HTTP POST /agents/pty uses Codex remote control before spawning the
       body: JSON.stringify({ command: "codex", agent: "codex", cwd: repo, model: "gpt-5.5", effort: "xhigh" })
     });
     assert.equal(response.status, 201, await response.text());
-    const request = fx.adapter.requests[0];
-    assert.equal(request?.args?.[0], "--remote");
-    assert.equal(request?.args?.[1], `unix://${join(repo, ".codex.sock")}`);
-    assert.equal(request?.sessionId, fx.control.attached[0]?.sessionId);
-    assert.equal(fx.adapter.controlAttachedAtSpawn[0], true);
-    assert.equal(fx.control.prepared[0]?.cwd, repo);
-    assert.equal(fx.control.prepared[0]?.effort, "xhigh");
-    assert.equal(fx.control.prepared[0]?.env?.PERCH_SESSION_ID, request?.sessionId);
+    // No PTY spawn happened at all for a Codex launch.
+    assert.equal(fx.adapter.requests.length, 0);
+    assert.equal(fx.codexOwned.launches.length, 1);
+    const request = fx.codexOwned.launches[0]!.request as { cwd?: string; model?: string; effort?: string };
+    assert.equal(request.cwd, repo);
+    assert.equal(request.model, "gpt-5.5");
+    assert.equal(request.effort, "xhigh");
+    // The session surfaces the native desktop attach command.
+    const sessions = (await (await fetch(`${baseUrl}/sessions`, authed)).json()) as { sessions: AgentSession[] };
+    assert.match(sessions.sessions[0]?.attachCommand ?? "", /^codex resume thr-fake-\d+ --remote unix:\/\//);
     assert.match(readFileSync(join(fx.home, "audit.jsonl"), "utf8"), /"action":"start_agent"/);
   } finally {
     await fx.cleanup(repo);
   }
 });
 
-test("Codex launch falls back to the plain PTY path when remote preparation is unavailable", async () => {
+test("a Codex launch fails loudly when the owning adapter cannot start - there is no PTY fallback", async () => {
   const fx = fixture();
   const repo = makeRepo();
   const baseUrl = await listen(fx.server, fx.options);
-  fx.control.prepareReturns = false;
+  fx.codexOwned.failStart = new Error("codex daemon did not become healthy");
 
   try {
     const response = await fetch(`${baseUrl}/agents/pty`, {
@@ -309,12 +256,29 @@ test("Codex launch falls back to the plain PTY path when remote preparation is u
       method: "POST",
       body: JSON.stringify({ command: "codex", agent: "codex", cwd: repo })
     });
-    assert.equal(response.status, 201, await response.text());
-    const request = fx.adapter.requests[0];
-    assert.ok(!request?.args?.includes("--remote"), "fallback spawn is plain PTY codex");
-    assert.equal(fx.control.prepared.length, 1);
-    assert.equal(fx.control.attached.length, 0);
-    assert.equal(fx.adapter.controlAttachedAtSpawn[0], false);
+    assert.equal(response.status, 500);
+    assert.match(await response.text(), /codex daemon did not become healthy/);
+    // The regression this pins: no Codex path may ever reach PTY prompt
+    // submission or a PTY spawn, even when app-server startup fails.
+    assert.equal(fx.adapter.requests.length, 0);
+    assert.equal(fx.adapter.sessions.length, 0);
+  } finally {
+    await fx.cleanup(repo);
+  }
+});
+
+test("a Codex launch without the owning adapter is refused outright", async () => {
+  const fx = fixture();
+  const repo = makeRepo();
+  try {
+    await assert.rejects(
+      startManagedAgent(
+        { ...fx.options, codexOwned: undefined },
+        { request: { command: "codex", agent: "codex", cwd: repo } }
+      ),
+      /codex sessions require the app-server owning adapter/
+    );
+    assert.equal(fx.adapter.requests.length, 0);
   } finally {
     await fx.cleanup(repo);
   }
@@ -334,20 +298,12 @@ test("FleetMonitor start_agent delegates attached WebSocket launches to the shar
     );
     await tick(40);
 
-    const request = fx.adapter.requests[0];
-    assert.equal(request?.args?.[0], "--remote");
-    assert.equal(fx.adapter.controlAttachedAtSpawn[0], true);
+    // Codex went to the owning adapter, not the PTY backend.
+    assert.equal(fx.adapter.requests.length, 0);
+    assert.equal(fx.codexOwned.launches.length, 1);
+    const ownedId = (await fx.codexOwned.listSessions())[0]!.id;
     const fleet = socket.fleets().at(-1);
-    assert.ok((fleet?.sessions as AgentSession[]).some((session) => session.id === fx.adapter.sessions[0]?.id));
-
-    fx.monitor.publish({ type: "terminal_output", sessionId: fx.adapter.sessions[0]!.id, text: "streamed", at: "" });
-    assert.ok(
-      socket.events().some((message) => {
-        const event = message.event as { sessionId: string; text?: string };
-        return event.sessionId === fx.adapter.sessions[0]?.id && event.text === "streamed";
-      }),
-      "starting client is subscribed to the new session"
-    );
+    assert.ok((fleet?.sessions as AgentSession[]).some((session) => session.id === ownedId));
     assert.match(readFileSync(join(fx.home, "audit.jsonl"), "utf8"), /"deviceId":"phone-1"/);
   } finally {
     await fx.cleanup(repo);
@@ -372,10 +328,9 @@ test("relay-style RPC /agents/pty and /mate/start use the same managed launcher"
       fx.options
     );
     assert.equal(started.status, 201);
-    assert.equal(fx.adapter.requests[0]?.args?.[0], "--remote");
-    assert.equal(fx.adapter.controlAttachedAtSpawn[0], true);
+    assert.equal(fx.adapter.requests.length, 0);
+    assert.equal(fx.codexOwned.launches.length, 1);
 
-    fx.adapter.sessions[0] = { ...fx.adapter.sessions[0]!, status: "done" };
     const mate = await handleWebSocketRpcRequest(
       {
         type: "rpc",
@@ -388,11 +343,10 @@ test("relay-style RPC /agents/pty and /mate/start use the same managed launcher"
       fx.options
     );
     assert.equal(mate.status, 201);
-    const mateRequest = fx.adapter.requests.at(-1);
-    assert.equal(mateRequest?.labels?.role, "mate");
-    assert.equal(mateRequest?.agent, "codex");
-    assert.equal(mateRequest?.args?.[0], "--remote");
-    assert.equal(fx.adapter.controlAttachedAtSpawn.at(-1), true);
+    // The Codex mate is app-server-owned too: same launcher, same adapter.
+    const mateLaunch = fx.codexOwned.launches.at(-1)!.request as { labels?: Record<string, string>; agent?: string };
+    assert.equal(mateLaunch.labels?.role, "mate");
+    assert.equal(mateLaunch.agent, "codex");
   } finally {
     if (priorHome === undefined) delete process.env.PERCH_HOME;
     else process.env.PERCH_HOME = priorHome;
@@ -416,17 +370,27 @@ test("task dispatch keeps task worktree behavior while launching through the sha
     const body = JSON.parse(responseText) as {
       task: { id: string; workerName?: string; sessionId?: string; worktreeId?: string; branch?: string };
     };
-    const request = fx.adapter.requests[0];
-    assert.equal(request?.labels?.task, body.task.id);
-    assert.equal(request?.labels?.workerName, body.task.workerName);
+    // Codex dispatch launches through the owning adapter; the PTY backend
+    // never sees it.
+    assert.equal(fx.adapter.requests.length, 0);
+    const launch = fx.codexOwned.launches[0]!.request as {
+      labels?: Record<string, string>;
+      cwd?: string;
+      initialPrompt?: string;
+      sessionId?: string;
+    };
+    assert.equal(launch.labels?.task, body.task.id);
+    assert.equal(launch.labels?.workerName, body.task.workerName);
     assert.match(body.task.workerName ?? "", /^[A-Z][a-z]+(?: \d+)?$/);
-    assert.equal(request?.args?.[0], "--remote");
-    assert.equal(fx.adapter.controlAttachedAtSpawn[0], true);
-    assert.ok(request?.cwd?.includes("/worktrees/"), `expected pooled worktree cwd, got ${request?.cwd}`);
-    assert.ok(request?.initialPrompt?.includes(`PERCH TASK BRIEF (task ${body.task.id})`));
-    assert.equal(body.task.sessionId, fx.adapter.sessions[0]?.id);
-    assert.equal(body.task.worktreeId, fx.adapter.sessions[0]?.worktreeId);
+    assert.ok(launch.cwd?.includes("/worktrees/"), `expected pooled worktree cwd, got ${launch.cwd}`);
+    assert.ok(launch.initialPrompt?.includes(`PERCH TASK BRIEF (task ${body.task.id})`));
+    assert.equal(body.task.sessionId, launch.sessionId);
     assert.equal(body.task.branch, `perch/${body.task.id}`);
+    // The kickoff went through the acknowledged app-server path, exactly once.
+    assert.equal(fx.codexOwned.submitted.length, 1);
+    assert.equal(fx.codexOwned.submitted[0]?.text, launch.initialPrompt);
+    assert.equal(fx.codexOwned.submitted[0]?.clientUserMessageId, `perch-kickoff:${body.task.id}`);
+    assert.equal(fx.codexOwned.submitted[0]?.source, "agent");
 
     const sessionsResponse = await fetch(`${baseUrl}/sessions`, authed);
     assert.equal(sessionsResponse.status, 200);
@@ -456,7 +420,7 @@ test("durable dispatch adopts an after-launch crash and repeated idempotency key
       body: JSON.stringify(body)
     });
     assert.equal(crashed.status, 500);
-    assert.equal(fx.adapter.requests.length, 1, "the worker launched before the injected crash");
+    assert.equal(fx.codexOwned.launches.length, 1, "the worker launched before the injected crash");
     await tick(10);
 
     const [firstRetry, concurrentRetry] = await Promise.all([
@@ -470,11 +434,16 @@ test("durable dispatch adopts an after-launch crash and repeated idempotency key
     const firstTask = (JSON.parse(firstText) as { task: { id: string; sessionId?: string } }).task;
     const secondTask = (JSON.parse(secondText) as { task: { id: string; sessionId?: string } }).task;
     assert.equal(firstTask.id, secondTask.id);
-    assert.equal(firstTask.sessionId, fx.adapter.sessions[0]?.id);
-    assert.equal(fx.adapter.requests.length, 1, "reconciliation never launches a duplicate PTY");
+    assert.equal(firstTask.sessionId, (await fx.codexOwned.listSessions())[0]?.id);
+    assert.equal(fx.codexOwned.launches.length, 1, "reconciliation never launches a duplicate worker");
     const operation = fx.options.tasks.stateDb.operations.findByIdempotencyKey("dispatch:request:phone-request-1");
     assert.equal(operation?.state, "succeeded");
-    assert.deepEqual(fx.options.tasks.events(firstTask.id).map((event) => event.kind), ["created", "working"]);
+    // The ledger carries the durable kickoff contract: intent journaled
+    // before the send, the accepted turn after it.
+    const events = fx.options.tasks.events(firstTask.id);
+    assert.deepEqual(events.map((event) => event.kind), ["created", "note", "note", "working"]);
+    assert.equal(events[1]?.data?.reason, "kickoff_submitted");
+    assert.equal(events[2]?.data?.reason, "kickoff_accepted");
   } finally {
     await fx.cleanup(repo);
   }
@@ -493,18 +462,18 @@ test("replaying a durably failed idempotency key returns the failed task without
     idempotencyKey: "phone-request-2"
   };
   try {
-    fx.adapter.failStartAgent = true;
+    fx.codexOwned.failStart = new Error("codex daemon spawn failed");
     const failed = await fetch(`${baseUrl}/tasks`, { ...authed, method: "POST", body: JSON.stringify(body) });
     assert.equal(failed.status, 500);
-    assert.equal(fx.adapter.requests.length, 1);
+    assert.equal(fx.codexOwned.launches.length, 0);
 
-    fx.adapter.failStartAgent = false;
+    fx.codexOwned.failStart = null;
     const replayed = await fetch(`${baseUrl}/tasks`, { ...authed, method: "POST", body: JSON.stringify(body) });
     const replayedText = await replayed.text();
     assert.equal(replayed.status, 201, replayedText);
     const task = (JSON.parse(replayedText) as { task: { id: string; state: string } }).task;
     assert.equal(task.state, "failed", "the caller sees the durable failure, not a server error");
-    assert.equal(fx.adapter.requests.length, 1, "a failed key never relaunches");
+    assert.equal(fx.codexOwned.launches.length, 0, "a failed key never relaunches");
     assert.equal(
       fx.options.tasks.stateDb.operations.findByIdempotencyKey("dispatch:request:phone-request-2")?.state,
       "failed"
@@ -550,7 +519,7 @@ test("a first-time request losing the idempotency-key race adopts the winner's t
     assert.equal(loser.status, 201, loserText);
     const loserTask = (JSON.parse(loserText) as { task: { id: string } }).task;
     assert.equal(loserTask.id, winnerTask.id, "the raced request returns the winning operation's task");
-    assert.equal(fx.adapter.requests.length, 1, "the race never launches a second worker");
+    assert.equal(fx.codexOwned.launches.length, 1, "the race never launches a second worker");
     assert.equal(fx.options.tasks.list().length, 1, "the losing task record is rolled back, not orphaned");
   } finally {
     await fx.cleanup(repo);
@@ -568,8 +537,7 @@ test("E2E structured approval reaches API, gates input, resolves by request id, 
       body: JSON.stringify({ title: "structured approval", project: repo, dispatch: true, agent: "codex", prompt: "go" })
     });
     const { task } = (await dispatched.json()) as { task: { id: string; sessionId: string } };
-    const callback = fx.control.callbacks.get(task.sessionId);
-    assert.ok(callback?.onServerRequest);
+    const callback = ownedCallbacks(fx, task.sessionId);
     const request: PendingServerRequest = {
       requestId: "rpc-47",
       threadId: "thr-1",
@@ -583,8 +551,8 @@ test("E2E structured approval reaches API, gates input, resolves by request id, 
       persistence: { source: "advertised", session: true, metadata: { codex_approval_kind: "mcp_tool_call" } },
       at: new Date().toISOString()
     };
-    callback!.onServerRequest!(request);
-    callback!.onServerRequest!(request);
+    callback.onServerRequest(request);
+    callback.onServerRequest(request);
 
     let sessions = (await (await fetch(`${baseUrl}/sessions`, authed)).json()) as { sessions: AgentSession[] };
     assert.equal(sessions.sessions[0]?.status, "needs_approval");
@@ -607,10 +575,10 @@ test("E2E structured approval reaches API, gates input, resolves by request id, 
     });
     assert.equal(response.status, 202, await response.text());
     assert.equal(fx.options.tasks.find(task.id)?.state, "needs_you", "wire response waits for serverRequest/resolved");
-    assert.equal(fx.control.responses[0]?.response.requestId, "rpc-47");
+    assert.equal(fx.codexOwned.serverResponses[0]?.response.requestId, "rpc-47");
 
-    callback!.onServerRequestResolved!(request);
-    callback!.onServerRequestResolved!(request);
+    callback.onServerRequestResolved(request);
+    callback.onServerRequestResolved(request);
     sessions = (await (await fetch(`${baseUrl}/sessions`, authed)).json()) as { sessions: AgentSession[] };
     assert.equal(sessions.sessions[0]?.pendingServerRequest, undefined);
     assert.equal(fx.options.tasks.find(task.id)?.state, "working");
@@ -630,6 +598,17 @@ test("E2E structured approval reaches API, gates input, resolves by request id, 
 // Codex can open several JSON-RPC approvals in one session (parallel tool
 // calls). Each stays pending until Codex confirms that exact request id
 // resolved; the overview presents them as a deterministic queue, oldest first.
+// Drive the owning adapter's event sink exactly as the protocol client would
+// for this session (the index.ts-mirroring wiring lives in the fixture).
+function ownedCallbacks(fx: ReturnType<typeof fixture>, sessionId: string) {
+  return {
+    onServerRequest: (request: PendingServerRequest) => fx.codexOwned.events.onServerRequest?.(sessionId, request),
+    onServerRequestResolved: (request: PendingServerRequest) =>
+      fx.codexOwned.events.onServerRequestResolved?.(sessionId, request),
+    onStatus: (status: AgentSessionStatus) => fx.codexOwned.events.onStatus?.(sessionId, status)
+  };
+}
+
 function structuredRequest(requestId: string | number, summary: string): PendingServerRequest {
   return {
     requestId,
@@ -657,12 +636,11 @@ test("E2E overlapping Codex approvals: resolving B first keeps A pending, gated,
       body: JSON.stringify({ title: "overlapping approvals", project: repo, dispatch: true, agent: "codex", prompt: "go" })
     });
     const { task } = (await dispatched.json()) as { task: { id: string; sessionId: string } };
-    const callback = fx.control.callbacks.get(task.sessionId);
-    assert.ok(callback?.onServerRequest);
+    const callback = ownedCallbacks(fx, task.sessionId);
     const requestA = structuredRequest("rpc-a", "Run: rm -rf build");
     const requestB = structuredRequest("rpc-b", "Run: npm install");
-    callback!.onServerRequest!(requestA);
-    callback!.onServerRequest!(requestB);
+    callback.onServerRequest(requestA);
+    callback.onServerRequest(requestB);
 
     let sessions = (await (await fetch(`${baseUrl}/sessions`, authed)).json()) as { sessions: AgentSession[] };
     assert.equal(sessions.sessions[0]?.status, "needs_approval");
@@ -671,7 +649,7 @@ test("E2E overlapping Codex approvals: resolving B first keeps A pending, gated,
     assert.equal(fx.options.tasks.events(task.id).filter((event) => event.kind === "needs_decision").length, 2);
 
     // Codex resolves B first (answered on the desktop TUI). A must survive.
-    callback!.onServerRequestResolved!(requestB);
+    callback.onServerRequestResolved(requestB);
 
     sessions = (await (await fetch(`${baseUrl}/sessions`, authed)).json()) as { sessions: AgentSession[] };
     assert.equal(sessions.sessions[0]?.pendingServerRequest?.requestId, "rpc-a", "resolving B must not drop A");
@@ -696,12 +674,12 @@ test("E2E overlapping Codex approvals: resolving B first keeps A pending, gated,
       body: JSON.stringify({ requestId: "rpc-a", decision: "accept" })
     });
     assert.equal(answer.status, 202, await answer.text());
-    assert.equal(fx.control.responses.at(-1)?.response.requestId, "rpc-a");
+    assert.equal(fx.codexOwned.serverResponses.at(-1)?.response.requestId, "rpc-a");
 
     // Codex confirms A resolved; a duplicate notification stays one event.
-    callback!.onServerRequestResolved!(requestA);
-    callback!.onServerRequestResolved!(requestA);
-    callback!.onStatus!("running");
+    callback.onServerRequestResolved(requestA);
+    callback.onServerRequestResolved(requestA);
+    callback.onStatus("running");
     await tick(20);
 
     sessions = (await (await fetch(`${baseUrl}/sessions`, authed)).json()) as { sessions: AgentSession[] };
@@ -736,13 +714,12 @@ test("E2E overlapping Codex approvals resolve in order and the queued request is
       body: JSON.stringify({ title: "queued approvals", project: repo, dispatch: true, agent: "codex", prompt: "go" })
     });
     const { task } = (await dispatched.json()) as { task: { id: string; sessionId: string } };
-    const callback = fx.control.callbacks.get(task.sessionId);
-    assert.ok(callback?.onServerRequest);
+    const callback = ownedCallbacks(fx, task.sessionId);
     const requestA = structuredRequest("rpc-a", "Run: rm -rf build");
     // A numeric JSON-RPC id must be preserved end to end, never coerced.
     const requestB = structuredRequest(48, "Apply file changes");
-    callback!.onServerRequest!(requestA);
-    callback!.onServerRequest!(requestB);
+    callback.onServerRequest(requestA);
+    callback.onServerRequest(requestB);
 
     // B is queued behind A on the card, but already answerable by exact id.
     let sessions = (await (await fetch(`${baseUrl}/sessions`, authed)).json()) as { sessions: AgentSession[] };
@@ -753,10 +730,10 @@ test("E2E overlapping Codex approvals resolve in order and the queued request is
       body: JSON.stringify({ requestId: 48, decision: "accept" })
     });
     assert.equal(answerB.status, 202, await answerB.text());
-    assert.equal(fx.control.responses.at(-1)?.response.requestId, 48);
+    assert.equal(fx.codexOwned.serverResponses.at(-1)?.response.requestId, 48);
 
     // A resolves first: B surfaces as the next card and the task stays gated.
-    callback!.onServerRequestResolved!(requestA);
+    callback.onServerRequestResolved(requestA);
     sessions = (await (await fetch(`${baseUrl}/sessions`, authed)).json()) as { sessions: AgentSession[] };
     assert.equal(sessions.sessions[0]?.pendingServerRequest?.requestId, 48, "the next open request surfaces");
     assert.equal(sessions.sessions[0]?.status, "needs_approval");
@@ -768,7 +745,7 @@ test("E2E overlapping Codex approvals resolve in order and the queued request is
     );
 
     // Only resolving the final open request clears the gate.
-    callback!.onServerRequestResolved!(requestB);
+    callback.onServerRequestResolved(requestB);
     sessions = (await (await fetch(`${baseUrl}/sessions`, authed)).json()) as { sessions: AgentSession[] };
     assert.equal(sessions.sessions[0]?.pendingServerRequest, undefined);
     assert.equal(fx.options.tasks.find(task.id)?.state, "working");
@@ -788,14 +765,13 @@ test("E2E three overlapping Codex approvals: the ledger re-points only when the 
       body: JSON.stringify({ title: "triple approvals", project: repo, dispatch: true, agent: "codex", prompt: "go" })
     });
     const { task } = (await dispatched.json()) as { task: { id: string; sessionId: string } };
-    const callback = fx.control.callbacks.get(task.sessionId);
-    assert.ok(callback?.onServerRequest);
+    const callback = ownedCallbacks(fx, task.sessionId);
     const requestA = structuredRequest("rpc-a", "Run: rm -rf build");
     const requestB = structuredRequest("rpc-b", "Run: npm install");
     const requestC = structuredRequest("rpc-c", "Apply file changes");
-    callback!.onServerRequest!(requestA);
-    callback!.onServerRequest!(requestB);
-    callback!.onServerRequest!(requestC);
+    callback.onServerRequest(requestA);
+    callback.onServerRequest(requestB);
+    callback.onServerRequest(requestC);
 
     let sessions = (await (await fetch(`${baseUrl}/sessions`, authed)).json()) as { sessions: AgentSession[] };
     assert.equal(sessions.sessions[0]?.pendingServerRequest?.requestId, "rpc-a", "the oldest open request is the card");
@@ -804,7 +780,7 @@ test("E2E three overlapping Codex approvals: the ledger re-points only when the 
 
     // B resolves: it is neither the queue head nor the request the ledger last
     // named (C), so the ledger stays untouched instead of duplicating B or A.
-    callback!.onServerRequestResolved!(requestB);
+    callback.onServerRequestResolved(requestB);
     sessions = (await (await fetch(`${baseUrl}/sessions`, authed)).json()) as { sessions: AgentSession[] };
     assert.equal(sessions.sessions[0]?.pendingServerRequest?.requestId, "rpc-a", "the head is unchanged");
     assert.equal(fx.options.tasks.find(task.id)?.state, "needs_you");
@@ -816,7 +792,7 @@ test("E2E three overlapping Codex approvals: the ledger re-points only when the 
 
     // C resolves: it is the request the ledger last named, so the ledger
     // re-points at the surviving queue head A with exactly one new event.
-    callback!.onServerRequestResolved!(requestC);
+    callback.onServerRequestResolved(requestC);
     sessions = (await (await fetch(`${baseUrl}/sessions`, authed)).json()) as { sessions: AgentSession[] };
     assert.equal(sessions.sessions[0]?.pendingServerRequest?.requestId, "rpc-a");
     assert.equal(fx.options.tasks.find(task.id)?.state, "needs_you");
@@ -825,7 +801,7 @@ test("E2E three overlapping Codex approvals: the ledger re-points only when the 
     assert.equal(decisions.at(-1)?.data?.requestId, "rpc-a", "the ledger re-points at the surviving queue head");
 
     // Only resolving the final open request clears the gate.
-    callback!.onServerRequestResolved!(requestA);
+    callback.onServerRequestResolved(requestA);
     sessions = (await (await fetch(`${baseUrl}/sessions`, authed)).json()) as { sessions: AgentSession[] };
     assert.equal(sessions.sessions[0]?.pendingServerRequest, undefined);
     assert.equal(fx.options.tasks.find(task.id)?.state, "working");
@@ -838,11 +814,11 @@ test("E2E three overlapping Codex approvals: the ledger re-points only when the 
   }
 });
 
-test("a failed spawn unwinds Codex control, pre-minted identity, and the worktree lease in reverse order", async () => {
+test("a failed Codex launch unwinds the worktree lease and leaves no session behind", async () => {
   const fx = fixture();
   const repo = makeRepo();
   const baseUrl = await listen(fx.server, fx.options);
-  fx.adapter.failStartAgent = true;
+  fx.codexOwned.failStart = new Error("codex daemon spawn failed");
 
   try {
     const response = await fetch(`${baseUrl}/agents/pty`, {
@@ -853,24 +829,16 @@ test("a failed spawn unwinds Codex control, pre-minted identity, and the worktre
     // The launch surfaces the failure rather than swallowing it.
     assert.equal(response.status, 500, await response.text());
 
-    // The pre-minted id reached the adapter (control was attached before spawn)
-    // but nothing survives the failure: the lease is released, the control
-    // client is detached, and the hook token is unregistered under that id.
-    const mintedId = fx.adapter.requests[0]?.sessionId;
-    assert.ok(mintedId, "codex launch pre-mints a session id before spawning");
-    assert.equal(fx.adapter.controlAttachedAtSpawn[0], true);
-    assert.deepEqual(fx.control.detached, [mintedId]);
-    assert.equal(fx.control.has(mintedId!), false);
-    assert.equal(fx.options.hooks.correlation(mintedId!), undefined);
-    // The worktree acquired for this launch is returned to the pool: the slot
-    // persists for reuse, but nothing holds a lease on it anymore.
+    // Nothing survives the failure: no session anywhere, and the worktree
+    // acquired for this launch is returned to the pool.
+    assert.equal(fx.adapter.requests.length, 0);
+    assert.equal((await fx.codexOwned.listSessions()).length, 0);
     assert.equal(fx.options.worktrees.findByHolder("pending"), undefined);
     assert.equal(
       fx.options.worktrees.list().filter((lease) => lease.leasedBy).length,
       0,
       "no worktree lease survives the failed launch"
     );
-    // No orphan session was left running (spawn never returned one).
     assert.equal(fx.adapter.stopped.length, 0);
   } finally {
     await fx.cleanup(repo);
@@ -948,7 +916,8 @@ test("dispatching a Codex worker never touches the Claude state file", async () 
       body: JSON.stringify({ title: "codex", project: repo, dispatch: true, agent: "codex", prompt: "go" })
     });
     assert.equal(response.status, 201, await response.text());
-    assert.ok(fx.adapter.requests[0]?.cwd, "codex worker launched into a pool worktree");
+    const launch = fx.codexOwned.launches[0]?.request as { cwd?: string } | undefined;
+    assert.ok(launch?.cwd, "codex worker launched into a pool worktree");
     assert.equal(existsSync(join(fx.home, ".claude.json")), false);
   } finally {
     await fx.cleanup(repo);
