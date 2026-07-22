@@ -149,7 +149,7 @@ export class MateRecoveryCoordinator {
         request: prepared.request,
         trackRuntime: false,
         trackOwner: false,
-        disableCodexRemote: claimed.provider === "codex",
+        ...(prepared.launchInput ?? {}),
         registerProject: false
       });
       launched = true;
@@ -223,8 +223,7 @@ export class MateRecoveryCoordinator {
     const verified = await driver.verifyIdentity?.({
       sessionId,
       providerSessionId,
-      cwd,
-      codexControl: this.options.codexControl
+      cwd
     });
     if (verified && verified !== providerSessionId) {
       throw new Error(
