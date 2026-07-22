@@ -529,10 +529,13 @@ export class CodexAppServerAdapter implements AgentAdapter {
         );
       }
     }
-    const landed = findTurnByClientMessageId(turns, clientUserMessageId);
+    const landed = findUserMessageByClientMessageId(turns, clientUserMessageId);
     if (landed) {
+      for (const item of historyItemToTimeline(session.id, landed.item)) {
+        this.events.onTimelineItem?.({ ...item, ...(source ? { source } : {}) }, false);
+      }
       this.touch(session);
-      return { turnId: landed.id ?? null };
+      return { turnId: landed.turn.id ?? null };
     }
     // History-verified absence: the one resend this delivery may ever make.
     // A non-RPC failure here (connection lost again mid-resend) is once more
@@ -704,9 +707,16 @@ export function findTurnByClientMessageId(
   turns: ThreadHistoryTurn[],
   clientUserMessageId: string
 ): ThreadHistoryTurn | undefined {
+  return findUserMessageByClientMessageId(turns, clientUserMessageId)?.turn;
+}
+
+function findUserMessageByClientMessageId(
+  turns: ThreadHistoryTurn[],
+  clientUserMessageId: string
+): { turn: ThreadHistoryTurn; item: Record<string, unknown> } | undefined {
   for (const turn of turns) {
     for (const item of turn.items ?? []) {
-      if (item.type === "userMessage" && item.clientId === clientUserMessageId) return turn;
+      if (item.type === "userMessage" && item.clientId === clientUserMessageId) return { turn, item };
     }
   }
   return undefined;
@@ -741,39 +751,41 @@ function historyItemToTimeline(sessionId: string, item: Record<string, unknown>)
     if (!id) return [];
     const command = stringifyHistoryCommand(item.command);
     const output = typeof item.aggregatedOutput === "string" ? item.aggregatedOutput : "";
-    return [
-      {
-        seq: 0,
-        id: `cx-item-${id}:call`,
-        sessionId,
-        kind: "tool_call",
-        at,
-        tool: { name: "shell", ...(command ? { input: command } : {}) }
-      },
-      { seq: 0, id: `cx-item-${id}:result`, sessionId, kind: "tool_result", text: output, at }
-    ];
+    const items: TimelineItem[] = [{
+      seq: 0,
+      id: `cx-item-${id}:call`,
+      sessionId,
+      kind: "tool_call",
+      at,
+      tool: { name: "shell", ...(command ? { input: command } : {}) }
+    }];
+    if (isTerminalHistoryItem(item) || (typeof item.status !== "string" && "aggregatedOutput" in item)) {
+      items.push({ seq: 0, id: `cx-item-${id}:result`, sessionId, kind: "tool_result", text: output, at });
+    }
+    return items;
   }
   if (type === "fileChange") {
     if (!id) return [];
     const status = typeof item.status === "string" ? item.status : "completed";
-    return [
-      {
-        seq: 0,
-        id: `cx-item-${id}:call`,
-        sessionId,
-        kind: "tool_call",
-        at,
-        tool: { name: "apply_patch" }
-      },
-      {
+    const items: TimelineItem[] = [{
+      seq: 0,
+      id: `cx-item-${id}:call`,
+      sessionId,
+      kind: "tool_call",
+      at,
+      tool: { name: "apply_patch" }
+    }];
+    if (isTerminalHistoryItem(item)) {
+      items.push({
         seq: 0,
         id: `cx-item-${id}:result`,
         sessionId,
         kind: "tool_result",
         text: `File change ${status}`,
         at
-      }
-    ];
+      });
+    }
+    return items;
   }
   return [];
 }
@@ -782,6 +794,11 @@ function stringifyHistoryCommand(command: unknown): string | undefined {
   if (typeof command === "string") return command;
   if (Array.isArray(command)) return command.map(String).join(" ");
   return undefined;
+}
+
+function isTerminalHistoryItem(item: Record<string, unknown>): boolean {
+  if (typeof item.status !== "string") return false;
+  return ["completed", "failed", "declined", "cancelled"].includes(item.status.toLowerCase());
 }
 
 export function normalizeCodexLaunchRequest(request: StartAgentRequest): {

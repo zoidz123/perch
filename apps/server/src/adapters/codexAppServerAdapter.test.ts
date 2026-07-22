@@ -265,12 +265,20 @@ test("a lost turn/start response reconciles against thread history and never dup
     await f.adapter.startOwned({ command: "codex", agent: "codex", cwd: f.dir, sessionId: "pty:s1" });
     // The daemon applied the turn but the response never arrived.
     f.fake.nextTurnStartBehavior = "accept-no-response";
-    const { turnId } = await f.adapter.submitAcknowledgedTurn("pty:s1", "kick", { clientUserMessageId: "k1" });
+    const { turnId } = await f.adapter.submitAcknowledgedTurn("pty:s1", "kick", {
+      clientUserMessageId: "k1",
+      source: "agent"
+    });
     // Reconciliation found the accepted turn in history - same turn id, no resend.
     assert.equal(turnId, "turn_1");
     assert.deepEqual(userClientIds(f.fake.thread("thr_1").turns), ["k1"]);
     assert.equal(f.fake.requestLog.filter((entry) => entry.method === "turn/start").length, 1);
     assert.equal(f.fake.requestLog.filter((entry) => entry.method === "thread/read").length, 1);
+    assert.ok(
+      f.events.timeline.some(
+        (entry) => entry.item.id === "cx-item-k1" && entry.item.text === "kick" && entry.item.source === "agent"
+      )
+    );
   } finally {
     await f.close();
   }
@@ -410,7 +418,9 @@ test("a transient connection drop reconnects, resumes the thread, and replays hi
     await until(2_000, () => f.events.turnCompletes.length === 1);
     f.fake.thread("thr_1").turns[0]!.items.push(
       { id: "cmd_1", type: "commandExecution", command: ["npm", "test"], aggregatedOutput: "all passed" },
-      { id: "patch_1", type: "fileChange", status: "completed" }
+      { id: "patch_1", type: "fileChange", status: "completed" },
+      { id: "cmd_live", type: "commandExecution", command: ["npm", "run", "build"], status: "inProgress" },
+      { id: "patch_live", type: "fileChange", status: "inProgress" }
     );
 
     await f.fake.restart();
@@ -439,6 +449,14 @@ test("a transient connection drop reconnects, resumes the thread, and replays hi
         ["tool_call", undefined, { name: "apply_patch" }],
         ["tool_result", "File change completed", undefined]
       ]
+    );
+    assert.deepEqual(
+      replayedTools.filter((item) => item.id.startsWith("cx-item-cmd_live")).map((item) => item.kind),
+      ["tool_call"]
+    );
+    assert.deepEqual(
+      replayedTools.filter((item) => item.id.startsWith("cx-item-patch_live")).map((item) => item.kind),
+      ["tool_call"]
     );
 
     // The session still works: submit another turn.

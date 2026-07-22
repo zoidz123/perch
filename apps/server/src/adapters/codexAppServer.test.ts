@@ -247,6 +247,22 @@ test("raw v2 item/completed agentMessage normalizes to an assistant item", async
   assert.ok(items.some((i) => i.kind === "assistant" && i.text === "done"));
 });
 
+test("raw v2 userMessage from a native TUI enters the mobile timeline", async () => {
+  const items: TimelineItem[] = [];
+  const { client, server } = await connectedClient({ onTimelineItem: (i) => items.push(i) });
+  await client.startThread();
+  server.push("item/started", {
+    item: {
+      type: "userMessage",
+      id: "user_1",
+      clientId: "native_1",
+      content: [{ type: "text", text: "from the TUI" }]
+    }
+  });
+  await tick();
+  assert.ok(items.some((i) => i.kind === "user" && i.id === "cx-item-native_1" && i.text === "from the TUI"));
+});
+
 test("submitTurn echoes the user turn with provenance", async () => {
   const items: TimelineItem[] = [];
   const { client } = await connectedClient({ onTimelineItem: (i) => items.push(i) });

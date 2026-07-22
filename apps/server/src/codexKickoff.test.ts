@@ -164,6 +164,33 @@ test("a kickoff is not sent when its durable intent cannot be recorded", async (
   }
 });
 
+test("a managed launch fails and stops its worker when kickoff intent cannot be recorded", async () => {
+  const f = fixture("perch-launch-ledger-fail-");
+  try {
+    f.tasks.recordEvent = (() => {
+      throw new Error("ledger unavailable");
+    }) as typeof f.tasks.recordEvent;
+    await assert.rejects(
+      startManagedAgent(f.launcherOptions(), {
+        request: {
+          command: "codex",
+          agent: "codex",
+          sessionId: f.sessionId,
+          cwd: f.home,
+          initialPrompt: "go build it"
+        },
+        taskId: f.taskId,
+        initialPromptSource: "agent"
+      }),
+      /ledger unavailable/
+    );
+    assert.equal(f.codexOwned.submitted.length, 0);
+    assert.deepEqual(f.codexOwned.stopped, [f.sessionId]);
+  } finally {
+    f.close();
+  }
+});
+
 test("a rejected kickoff parks the task blocked with the provider's real error and never retries", async () => {
   const f = fixture("perch-kick-reject-");
   try {
@@ -323,8 +350,6 @@ test("REGRESSION: a Codex dispatch launch reaches no PTY submission path at all"
       initialPromptSource: "agent"
     });
     assert.equal(result.session.id, f.sessionId);
-    // Wait for the async kickoff journal to settle.
-    await new Promise((resolve) => setTimeout(resolve, 50));
     // The owning adapter got the launch and the acknowledged kickoff...
     assert.equal(f.codexOwned.launches.length, 1);
     assert.equal(f.codexOwned.submitted.length, 1);
@@ -350,7 +375,6 @@ test("a positional codex launch argument becomes one acknowledged kickoff", asyn
         args: ["Fix this"]
       }
     });
-    await new Promise((resolve) => setTimeout(resolve, 50));
     assert.equal(f.codexOwned.submitted.length, 1);
     assert.equal(f.codexOwned.submitted[0]?.text, "Fix this");
     assert.deepEqual(f.codexOwned.launches[0]?.request.args, undefined);

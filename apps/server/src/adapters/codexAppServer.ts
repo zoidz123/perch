@@ -264,6 +264,7 @@ export class CodexAppServerClient {
   private nextId = 1;
   private pending = new Map<number, PendingRequest>();
   private readonly pendingServerRequests = new Map<string, PendingServerRequest>();
+  private readonly pendingUserSources = new Map<string, "human" | "agent">();
   private processEpoch = 0;
   private connected = false;
 
@@ -564,9 +565,17 @@ export class CodexAppServerClient {
     if (effort) params.effort = effort;
     this.pendingModelOverride = {};
 
-    const result = (await this.request("turn/start", params)) as { turn?: { id?: string | null } };
-    if (text.length > 0) {
-      this.emitTimelineItem("user", text, undefined, opts?.source, opts?.clientUserMessageId);
+    if (opts?.clientUserMessageId && opts.source) {
+      this.pendingUserSources.set(opts.clientUserMessageId, opts.source);
+    }
+    let result: { turn?: { id?: string | null } };
+    try {
+      result = (await this.request("turn/start", params)) as { turn?: { id?: string | null } };
+      if (text.length > 0) {
+        this.emitTimelineItem("user", text, undefined, opts?.source, opts?.clientUserMessageId);
+      }
+    } finally {
+      if (opts?.clientUserMessageId) this.pendingUserSources.delete(opts.clientUserMessageId);
     }
     const turnId = typeof result?.turn?.id === "string" ? result.turn.id : null;
     if (turnId) {
@@ -591,9 +600,16 @@ export class CodexAppServerClient {
       input: [{ type: "text", text }]
     };
     if (opts.clientUserMessageId) params.clientUserMessageId = opts.clientUserMessageId;
-    await this.request("turn/steer", params);
-    if (text.length > 0) {
-      this.emitTimelineItem("user", text, undefined, opts.source, opts.clientUserMessageId);
+    if (opts.clientUserMessageId && opts.source) {
+      this.pendingUserSources.set(opts.clientUserMessageId, opts.source);
+    }
+    try {
+      await this.request("turn/steer", params);
+      if (text.length > 0) {
+        this.emitTimelineItem("user", text, undefined, opts.source, opts.clientUserMessageId);
+      }
+    } finally {
+      if (opts.clientUserMessageId) this.pendingUserSources.delete(opts.clientUserMessageId);
     }
   }
 
@@ -1179,6 +1195,21 @@ export class CodexAppServerClient {
     const protocolItemId = typeof item.id === "string" && item.id.length > 0 ? item.id : undefined;
     const stagedId = (stage: string) => (protocolItemId ? `${protocolItemId}:${stage}` : undefined);
 
+    if ((method === "item/started" || method === "item/completed") && itemType === "userMessage") {
+      const text = rawUserMessageText(item);
+      const clientId = typeof item.clientId === "string" && item.clientId.length > 0 ? item.clientId : undefined;
+      if (text) {
+        this.emitTimelineItem(
+          "user",
+          text,
+          undefined,
+          clientId ? this.pendingUserSources.get(clientId) : undefined,
+          clientId ?? protocolItemId
+        );
+      }
+      return true;
+    }
+
     if (method === "item/started" && itemType === "commandExecution") {
       this.emitTimelineItem(
         "tool_call",
@@ -1338,6 +1369,19 @@ export class CodexAppServerClient {
     this.status = status;
     this.onStatus?.(status);
   }
+}
+
+function rawUserMessageText(item: Record<string, unknown>): string {
+  if (typeof item.text === "string" && item.text.length > 0) return item.text;
+  if (!Array.isArray(item.content)) return "";
+  return item.content
+    .map((entry) =>
+      entry && typeof entry === "object" && typeof (entry as { text?: unknown }).text === "string"
+        ? (entry as { text: string }).text
+        : ""
+    )
+    .filter(Boolean)
+    .join("\n");
 }
 
 export async function listCodexModelsOnce(timeoutMs = MODEL_LIST_TIMEOUT_MS): Promise<unknown> {

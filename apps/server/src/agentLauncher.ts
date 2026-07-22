@@ -400,22 +400,11 @@ export async function startManagedAgent(
         // ride the gate-aware composer path (which submits over the protocol
         // for owned sessions).
         if (input.taskId && input.initialPromptSource === "agent") {
-          void submitCodexKickoff(options, session.id, input.taskId, request.initialPrompt).catch((error) => {
-            console.warn(
-              `codex: kickoff journal failed for ${session!.id.slice(0, 12)}: ${
-                error instanceof Error ? error.message : error
-              }`
-            );
-          });
+          await submitCodexKickoff(options, session.id, input.taskId, request.initialPrompt);
         } else {
-          const sessionId = session.id;
-          const prompt = request.initialPrompt;
-          void options.monitor.queueOrSubmit(sessionId, prompt).catch((error) => {
-            console.warn(
-              `codex: initial prompt submission failed for ${sessionId.slice(0, 12)}: ${
-                error instanceof Error ? error.message : error
-              }`
-            );
+          await options.codexOwned.submitAcknowledgedTurn(session.id, request.initialPrompt, {
+            clientUserMessageId: `perch:${randomUUID()}`,
+            source: input.initialPromptSource ?? "human"
           });
         }
       } else if (!claudeKickoffInArgs) {
