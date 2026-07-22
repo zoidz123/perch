@@ -54,12 +54,13 @@ test("aggregate accepts successful selected jobs and skipped optional jobs", () 
   ]), []);
 });
 
-test("aggregate rejects failed or cancelled required selections", () => {
+test("aggregate rejects failed, skipped, or cancelled required selections", () => {
   assert.deepEqual(validateAggregate([
     { name: "public-seed", required: true, selected: false, status: "success" },
     { name: "javascript", required: false, selected: true, status: "failure" },
+    { name: "package", required: false, selected: true, status: "skipped" },
     { name: "ios", required: false, selected: true, status: "cancelled" }
-  ]), ["javascript was selected but failure", "ios was selected but cancelled"]);
+  ]), ["javascript was selected but failure", "package was selected but skipped", "ios was selected but cancelled"]);
   assert.deepEqual(validateAggregate([
     { name: "public-seed", required: true, selected: false, status: "failure" }
   ]), ["public-seed was failure"]);
