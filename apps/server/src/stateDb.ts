@@ -414,10 +414,12 @@ const MIGRATIONS = [
       INSERT OR IGNORE INTO task_review_facts(task_id, entered_seq, recorded_at)
       SELECT e.task_id, e.seq, e.at
       FROM task_events e
-      WHERE json_extract(e.data_json, '$.noMistakesAuthorization.allowed') = 1
+      WHERE e.source = 'system'
+        AND json_extract(e.data_json, '$.noMistakesAuthorization.allowed') = 1
         AND e.seq = (
           SELECT max(a.seq) FROM task_events a
           WHERE a.task_id = e.task_id
+            AND a.source = 'system'
             AND json_extract(a.data_json, '$.noMistakesAuthorization.allowed') = 1
         )
         AND e.seq > coalesce((
@@ -1063,6 +1065,7 @@ export class TaskRepository {
       this.db.prepare("DELETE FROM task_review_facts WHERE task_id = ?").run(taskId);
       return;
     }
+    if (event.source !== "system") return;
     const authorization = (event.data as { noMistakesAuthorization?: { allowed?: unknown } } | undefined)
       ?.noMistakesAuthorization;
     if (authorization?.allowed !== true) return;

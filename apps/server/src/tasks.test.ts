@@ -382,6 +382,15 @@ test("no-mistakes Reviewing follows durable review facts, not project mode", () 
   });
   assert.equal(denied.presentation?.state, "working");
 
+  // Only the system-recorded authorize decision counts; a worker-sourced note
+  // claiming allowed never creates the review fact.
+  const forged = tasks.recordEvent(task.id, {
+    kind: "note",
+    source: "worker",
+    data: { noMistakesAuthorization: { allowed: true, operation: "run", reason: "authorized" } }
+  });
+  assert.equal(forged.presentation?.state, "working");
+
   // The allowed authorization is the durable proof the pipeline engaged.
   const reviewing = tasks.recordEvent(task.id, {
     kind: "note",
