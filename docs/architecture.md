@@ -80,7 +80,7 @@ Perch refuses ordinary release of dirty trees, unlanded commits, and live holder
 Recovery is explicit and provider-aware.
 It is available only when the durable runtime record contains a verified, provider-matching conversation identity.
 
-Before recovery, Perch proves the previous process is gone.
+Before recovery launches a replacement process, Perch proves the previous one is gone; rebinding to a surviving Codex daemon launches nothing.
 It only reaps a crash orphan when the executable, PID birth time, and expected provider match the persisted runtime record.
 
 Claude recovery resumes the exact conversation and requires a matching authenticated session-start event.

@@ -76,7 +76,6 @@ Remote approval is state-bound:
   Perch surfaces those detected PTY gates as desktop-only manual actions and never treats a keystroke or notification as proof of remote approval.
 - Codex approvals use the structured app-server request and are answered by exact JSON-RPC request ID.
   Several requests can be open at once; each stays answerable only until that exact ID resolves.
-- Codex attention without an authoritative structured request remains desktop-only.
 - Stale, missing, changed, or ambiguous prompts return a conflict instead of sending guessed input.
 
 Composer text queues while a permission prompt is open.
@@ -89,7 +88,7 @@ Perch separates task state from runtime state, so losing a process does not rewr
 
 Before launching a replacement, Perch proves the old process is gone.
 Crash orphans are reaped only when the persisted process birth marker and provider executable match.
-The replacement conversation identity and live PTY are verified before the next runtime generation is committed.
+The replacement conversation identity and live session are verified before the next runtime generation is committed.
 
 Solo provider sessions and arbitrary `perch run` commands do not receive managed task recovery.
 
