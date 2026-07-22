@@ -764,7 +764,7 @@ struct HomeView: View {
             // Errors ride above the composer, which only exists once paired.
             // Before pairing, pairing problems surface inside the pair sheet.
             if store.isPaired {
-                if let error = store.errorMessage, !error.isEmpty {
+                if let error = store.errorMessage ?? store.taskRefreshErrorMessage, !error.isEmpty {
                     Text(error)
                         .font(.system(size: 12.5, weight: .medium))
                         .foregroundStyle(Style.warningText)

@@ -86,7 +86,8 @@ That brief contains the exact event commands, worktree and branch rules, and the
 
 ### `GET /tasks` and `GET /tasks/:id`
 
-`GET /tasks` returns `{ "tasks": [...] }`.
+`GET /tasks` returns `{ "tasks": [...] }` for non-closed tasks and omits their stored prompts.
+CLI history consumers may explicitly request `GET /tasks?includeClosed=1` to receive the full ledger with prompts intact.
 An optional `planId` query filters tasks linked to one finalized plan.
 
 `GET /tasks/:id` returns:

@@ -1122,7 +1122,7 @@ async function runWorktreesCommand(args, options) {
 
   const [worktreesResponse, tasksResponse] = await Promise.all([
     fetch(httpUrl(options, "/worktrees"), { headers: jsonHeaders(options) }),
-    fetch(httpUrl(options, "/tasks"), { headers: jsonHeaders(options) })
+    fetch(httpUrl(options, "/tasks?includeClosed=1"), { headers: jsonHeaders(options) })
   ]);
   if (!worktreesResponse.ok) {
     throw new Error(await responseError(worktreesResponse));

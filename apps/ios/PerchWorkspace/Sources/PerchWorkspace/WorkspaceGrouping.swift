@@ -74,6 +74,18 @@ struct WorkspaceProjectSectionModel: Identifiable, Equatable {
 }
 
 enum WorkspaceGrouping {
+    static func taskRefreshResult<Task>(
+        current: [Task],
+        result: Result<[Task], Error>
+    ) -> (tasks: [Task], errorMessage: String?) {
+        switch result {
+        case let .success(tasks):
+            return (tasks, nil)
+        case .failure:
+            return (current, "Couldn’t refresh tasks. Pull to refresh or reconnect.")
+        }
+    }
+
     // Worker identity and work description stay separate. Older task records
     // omit workerName and retain the old title-only presentation.
     static func workerIdentity(workerName: String?, title: String) -> String {

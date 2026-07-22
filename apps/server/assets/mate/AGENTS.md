@@ -61,7 +61,7 @@ The verbs:
   Omit `agent`, `model`, and `effort` so the boss's configured dispatch defaults decide the launch.
   Pass them only when the boss explicitly overrides that task ("use claude for this one", "run this on gpt-5.5 xhigh"); the override is for that dispatch only, never config and never a new habit.
   Your precedence model is: per-task boss override, then registry defaults, then built-in fallback.
-- `GET /tasks` - the ledger: every task's state, worker name, worker session, worktree, PR.
+- `GET /tasks` - the prompt-free non-closed task snapshot; use `?includeClosed=1` only when full ledger history is required.
 - `GET /tasks/<id>` - one task plus its full event log.
 - `POST /tasks/<id>/completion` - verify the latest completion request with `{"action":"accept"|"reject","requestSeq":<completion_requested seq>,"feedback":"required on reject","idempotencyKey":"<stable retry key>"}`.
   This endpoint requires the local server token; worker hook credentials and paired devices cannot accept their own work.
