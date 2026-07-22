@@ -67,7 +67,16 @@ export class RuntimeManager {
     runtime: RuntimeRecord,
     sessionId: string,
     ownership?: RuntimeProcessOwnership,
-    patch: { model?: string; worktreeId?: string; worktreePath?: string; leaseId?: string } = {}
+    patch: {
+      model?: string;
+      worktreeId?: string;
+      worktreePath?: string;
+      leaseId?: string;
+      // Driver facts recorded at launch (codexDriver, appServerSocketPath):
+      // a session never changes ownership mid-life, and recovery reads these
+      // to rebind to the same daemon socket.
+      metadata?: Record<string, unknown>;
+    } = {}
   ): RuntimeRecord {
     const live = this.tasks.stateDb.runtimes.compareAndSwap(
       runtime.taskId,
