@@ -203,15 +203,27 @@ test("a missing receipt becomes delivery_unknown and is never resent", async () 
   }
 });
 
-test("a live Claude kickoff becomes unknown but a later trust-gated receipt resolves it", async () => {
+test("a transcript observed after timeout resolves only when its authentic timestamp predates unknown", async () => {
   const f = fixture(10);
   try {
     const delivery = f.tracker.create("pty:worker", "slow kickoff", "agent", { allowLateReceipt: true });
     f.tracker.markTyping(delivery.id);
     f.tracker.markSubmitted(delivery.id);
+    const submittedAt = f.stateDb.promptDeliveries.find(delivery.id)?.submittedAt;
+    assert.ok(submittedAt);
     await new Promise((resolve) => setTimeout(resolve, 30));
     assert.equal(f.stateDb.promptDeliveries.find(delivery.id)?.state, "delivery_unknown");
-    assert.equal(f.tracker.acknowledgeHook("pty:worker", "slow kickoff")?.state, "accepted");
+    assert.equal(
+      f.tracker.acknowledgeTimeline({
+        seq: 6,
+        id: "delayed-authentic-row",
+        sessionId: "pty:worker",
+        kind: "user",
+        text: "slow kickoff",
+        at: submittedAt!
+      })?.state,
+      "accepted"
+    );
   } finally {
     f.close();
   }
@@ -247,7 +259,7 @@ test("disappearance reconciliation ignores a launch not previously observed in t
   }
 });
 
-test("a kickoff late-receipt allowance expires before a much later identical turn", async () => {
+test("same-text evidence after the unknown boundary cannot accept a kickoff", async () => {
   const f = fixture(10);
   try {
     const delivery = f.tracker.create("pty:worker", "bounded kickoff", "agent", { allowLateReceipt: true });
@@ -257,13 +269,15 @@ test("a kickoff late-receipt allowance expires before a much later identical tur
     const unknownAt = f.stateDb.promptDeliveries.find(delivery.id)?.unknownAt;
     assert.ok(unknownAt);
 
-    const muchLater = new Date(Date.parse(unknownAt!) + 11 * 60_000).toISOString();
+    assert.equal(f.tracker.acknowledgeHook("pty:worker", "bounded kickoff"), undefined);
+    const afterUnknown = new Date(Date.parse(unknownAt!) + 1).toISOString();
     assert.equal(
       f.stateDb.promptDeliveries.acceptMatch({
         perchSessionId: "pty:worker",
         promptText: "bounded kickoff",
-        receiptKind: "user_prompt_submit",
-        now: muchLater
+        receiptKind: "transcript",
+        receiptId: "later-identical-row",
+        observedAt: afterUnknown
       }),
       undefined
     );
@@ -505,7 +519,7 @@ test("an ambiguous hook cannot steal evidence from either one-sided identical de
   }
 });
 
-test("an unmatched restart delivery surfaces after the reconciliation window", async () => {
+test("a queued restart delivery is durably reported as not submitted", async () => {
   const home = mkdtempSync(join(tmpdir(), "perch-prompt-restart-warning-"));
   const firstDb = new StateDb({ PERCH_HOME: home } as NodeJS.ProcessEnv);
   const delivery = firstDb.promptDeliveries.create({
@@ -534,9 +548,10 @@ test("an unmatched restart delivery surfaces after the reconciliation window", a
       undefined,
       "a queued prompt was never typed and cannot be reconciled from later evidence"
     );
-    await waitFor(() => warnings.length === 1);
     assert.deepEqual(warnings, [delivery.id]);
-    assert.equal(secondDb.promptDeliveries.find(delivery.id)?.state, "delivery_unknown");
+    const notSubmitted = secondDb.promptDeliveries.find(delivery.id);
+    assert.equal(notSubmitted?.state, "not_submitted");
+    assert.match(notSubmitted?.failureReason ?? "", /not submitted/);
   } finally {
     tracker.stop();
     secondDb.close();
@@ -565,7 +580,7 @@ test("late acceptance retains durable evidence that an earlier unknown warning n
       sessionId: "pty:worker",
       kind: "user",
       text: "late but real",
-      at: new Date().toISOString()
+      at: stateDb.promptDeliveries.find(delivery.id)?.unknownAt ?? ""
     });
     assert.equal(stateDb.promptDeliveries.find(delivery.id)?.state, "accepted");
     assert.equal(accepted.length, 1);

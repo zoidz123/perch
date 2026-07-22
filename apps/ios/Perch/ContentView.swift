@@ -1070,6 +1070,11 @@ struct SessionRow: View {
                         .font(.system(size: 12.5))
                         .foregroundStyle(Color.orange)
                         .lineLimit(2)
+                } else if let resolution = session.promptDeliveryResolution {
+                    Text(resolution.message)
+                        .font(.system(size: 12.5))
+                        .foregroundStyle(Style.successText)
+                        .lineLimit(2)
                 }
                 if let context = workContext {
                     Text(context)
@@ -1149,9 +1154,13 @@ struct MateRow: View {
                         MateModelBadge(label: badge)
                     }
                 }
-                Text(session.promptDeliveryWarning?.message ?? "Runs the crew for you")
+                Text(session.promptDeliveryWarning?.message ?? session.promptDeliveryResolution?.message ?? "Runs the crew for you")
                     .font(.system(size: 12.5))
-                    .foregroundStyle(session.promptDeliveryWarning == nil ? Style.textSecondary : Color.orange)
+                    .foregroundStyle(
+                        session.promptDeliveryWarning != nil
+                            ? Color.orange
+                            : session.promptDeliveryResolution != nil ? Style.successText : Style.textSecondary
+                    )
                     .lineLimit(2)
             }
 

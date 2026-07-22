@@ -6,7 +6,7 @@ import type { Task, TaskEvent, TaskEventKind, TaskEventSource, TaskPr } from "@p
 import Database from "better-sqlite3";
 import type { TaskDeliverable, TaskReviewFacts, TaskVerificationFacts } from "./taskPresentation.js";
 
-const LATEST_SCHEMA_VERSION = 12;
+const LATEST_SCHEMA_VERSION = 13;
 const LEGACY_TASK_IMPORT = "tasks-json-v1";
 
 const MIGRATIONS = [
@@ -466,6 +466,67 @@ const MIGRATIONS = [
       CREATE INDEX prompt_deliveries_task_idx
         ON prompt_deliveries(task_id, created_at);
     `
+  },
+  {
+    version: 13,
+    name: "distinguish-unsubmitted-prompts",
+    sql: `
+      DROP INDEX prompt_deliveries_session_state_idx;
+      DROP INDEX prompt_deliveries_task_idx;
+      ALTER TABLE prompt_deliveries RENAME TO prompt_deliveries_v12;
+
+      CREATE TABLE prompt_deliveries (
+        id TEXT PRIMARY KEY,
+        perch_session_id TEXT NOT NULL,
+        runtime_generation INTEGER,
+        task_id TEXT REFERENCES tasks(id) ON DELETE RESTRICT,
+        source TEXT NOT NULL CHECK (source IN ('human', 'agent')),
+        allow_late_receipt INTEGER NOT NULL DEFAULT 0 CHECK (allow_late_receipt IN (0, 1)),
+        state TEXT NOT NULL CHECK (state IN ('queued', 'typing', 'submitted', 'accepted', 'not_submitted', 'delivery_unknown')),
+        prompt_text TEXT NOT NULL,
+        prompt_hash TEXT NOT NULL,
+        receipt_kind TEXT CHECK (receipt_kind IN ('user_prompt_submit', 'transcript')),
+        receipt_id TEXT,
+        hook_receipt_at TEXT,
+        hook_receipt_id TEXT,
+        transcript_receipt_at TEXT,
+        transcript_receipt_id TEXT,
+        failure_reason TEXT,
+        created_at TEXT NOT NULL,
+        typing_at TEXT,
+        typing_order INTEGER,
+        submitted_at TEXT,
+        accepted_at TEXT,
+        accepted_order INTEGER,
+        unknown_at TEXT,
+        unknown_from_state TEXT CHECK (unknown_from_state IN ('queued', 'typing', 'submitted')),
+        unknown_notified_at TEXT,
+        accepted_notified_at TEXT,
+        updated_at TEXT NOT NULL
+      ) STRICT;
+
+      INSERT INTO prompt_deliveries(
+        id, perch_session_id, runtime_generation, task_id, source, allow_late_receipt,
+        state, prompt_text, prompt_hash, receipt_kind, receipt_id, hook_receipt_at,
+        hook_receipt_id, transcript_receipt_at, transcript_receipt_id, failure_reason,
+        created_at, typing_at, typing_order, submitted_at, accepted_at, accepted_order,
+        unknown_at, unknown_from_state, unknown_notified_at, accepted_notified_at, updated_at
+      )
+      SELECT
+        id, perch_session_id, runtime_generation, task_id, source, allow_late_receipt,
+        state, prompt_text, prompt_hash, receipt_kind, receipt_id, hook_receipt_at,
+        hook_receipt_id, transcript_receipt_at, transcript_receipt_id, failure_reason,
+        created_at, typing_at, typing_order, submitted_at, accepted_at, accepted_order,
+        unknown_at, unknown_from_state, unknown_notified_at, accepted_notified_at, updated_at
+      FROM prompt_deliveries_v12
+      ORDER BY rowid;
+
+      DROP TABLE prompt_deliveries_v12;
+      CREATE INDEX prompt_deliveries_session_state_idx
+        ON prompt_deliveries(perch_session_id, state, created_at);
+      CREATE INDEX prompt_deliveries_task_idx
+        ON prompt_deliveries(task_id, created_at);
+    `
   }
 ] as const;
 
@@ -702,7 +763,7 @@ export type ClaudeInboxDelta = {
   at: string;
 };
 
-export type PromptDeliveryState = "queued" | "typing" | "submitted" | "accepted" | "delivery_unknown";
+export type PromptDeliveryState = "queued" | "typing" | "submitted" | "accepted" | "not_submitted" | "delivery_unknown";
 
 export type PromptDeliveryRecord = {
   id: string;
@@ -2177,7 +2238,17 @@ export class PromptDeliveryRepository {
     const result = this.db.prepare(
       `UPDATE prompt_deliveries SET unknown_from_state = state, state = 'delivery_unknown',
        failure_reason = ?, unknown_at = ?, updated_at = ?
-       WHERE id = ? AND state IN ('queued', 'typing', 'submitted')`
+       WHERE id = ? AND state IN ('typing', 'submitted')`
+    ).run(reason, now, now, id);
+    return result.changes === 1 ? this.find(id) : undefined;
+  }
+
+  markNotSubmitted(id: string, reason: string, at?: string): PromptDeliveryRecord | undefined {
+    const now = this.nextTimestamp(at);
+    const result = this.db.prepare(
+      `UPDATE prompt_deliveries SET unknown_from_state = 'queued', state = 'not_submitted',
+       failure_reason = ?, unknown_at = ?, updated_at = ?
+       WHERE id = ? AND state = 'queued'`
     ).run(reason, now, now, id);
     return result.changes === 1 ? this.find(id) : undefined;
   }
@@ -2186,7 +2257,7 @@ export class PromptDeliveryRepository {
     const now = this.nextTimestamp(at);
     const result = this.db.prepare(
       `UPDATE prompt_deliveries SET unknown_notified_at = ?, updated_at = ?
-       WHERE id = ? AND state = 'delivery_unknown' AND unknown_notified_at IS NULL`
+       WHERE id = ? AND state IN ('not_submitted', 'delivery_unknown') AND unknown_notified_at IS NULL`
     ).run(now, now, id);
     return result.changes === 1 ? this.find(id) : undefined;
   }
@@ -2209,7 +2280,6 @@ export class PromptDeliveryRepository {
     observedAt?: string;
     now?: string;
   }): { delivery: PromptDeliveryRecord; newlyAccepted: boolean } | undefined {
-    const LATE_RECEIPT_WINDOW_MS = 10 * 60_000;
     const observedWasTruncated =
       input.allowObservedPrefix === true && input.promptText.trimEnd().endsWith("…");
     const observedText = observedWasTruncated
@@ -2230,15 +2300,7 @@ export class PromptDeliveryRepository {
     }
     const matches = rows.filter((row) => {
       if (row.state === "delivery_unknown" && row.unknown_from_state === "queued") return false;
-      // A hook has no per-turn identity or timestamp. Once a delivery is
-      // unknown, only transcript evidence with an ordered timestamp can
-      // safely reconcile it without claiming a later identical manual turn.
-      if (row.state === "delivery_unknown" && input.receiptKind !== "transcript") {
-        if (row.allow_late_receipt !== 1) return false;
-        const unknownAt = Date.parse(row.unknown_at ?? "");
-        const receiptAt = Date.parse(input.now ?? new Date().toISOString());
-        if (!Number.isFinite(unknownAt) || receiptAt > unknownAt + LATE_RECEIPT_WINDOW_MS) return false;
-      }
+      if (row.state === "delivery_unknown" && input.receiptKind !== "transcript") return false;
       if (input.receiptKind === "transcript") {
         const boundary = Date.parse(row.typing_at ?? row.created_at);
         // Transcript time must follow the moment Perch began typing. Durable
@@ -2246,8 +2308,7 @@ export class PromptDeliveryRepository {
         if (!Number.isFinite(boundary) || observedAt! < boundary) return false;
         if (row.state === "delivery_unknown") {
           const unknownAt = Date.parse(row.unknown_at ?? "");
-          const lateWindow = row.allow_late_receipt === 1 ? LATE_RECEIPT_WINDOW_MS : 2_000;
-          if (!Number.isFinite(unknownAt) || observedAt! > unknownAt + lateWindow) return false;
+          if (!Number.isFinite(unknownAt) || observedAt! > unknownAt) return false;
         }
       }
       const expected = normalizePrompt(row.prompt_text);

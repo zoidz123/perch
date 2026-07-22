@@ -22,7 +22,7 @@ test("fresh startup creates the versioned WAL database with foreign keys enabled
 
   assert.equal(state.path, join(root, "state.sqlite"));
   assert.equal(existsSync(state.path), true);
-  assert.equal(state.schemaVersion(), 12);
+  assert.equal(state.schemaVersion(), 13);
   assert.equal(state.journalMode(), "wal");
   assert.equal(state.foreignKeysEnabled(), true);
 
@@ -39,7 +39,8 @@ test("fresh startup creates the versioned WAL database with foreign keys enabled
     { version: 9, name: "claude-inbox-correlation-and-deltas" },
     { version: 10, name: "separate-task-pr-and-verification-facts" },
     { version: 11, name: "task-review-facts" },
-    { version: 12, name: "durable-prompt-deliveries" }
+    { version: 12, name: "durable-prompt-deliveries" },
+    { version: 13, name: "distinguish-unsubmitted-prompts" }
   ]);
   assert.deepEqual(
     inspect

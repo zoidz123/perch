@@ -504,21 +504,21 @@ const CLAUDE_SESSION_UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0
 // Pre-mint a fresh Claude launch's provider session id (`--session-id <uuid>`,
 // supported since well before the 2.1.x floor the hook installer already
 // requires) and derive its transcript path, so timeline attachment never
-// depends on a SessionStart hook arriving. Skipped for resumed/continued
-// sessions - those keep their provider identity and fork transcripts, which
-// followClaudeResume owns - and when the caller passed --session-id itself.
-// Mutates request: adopts/mints request.sessionId (the PTY adapter honors
-// pre-minted pty: ids, mirroring the codex --remote path) and appends the flag.
+// depends on a SessionStart hook arriving. Resumed, continued, and caller-
+// identified sessions keep their provider identity while still receiving a
+// pre-minted Perch session id. Mutates request and appends the provider flag
+// only for fresh sessions.
 function prepareClaudeIdentity(
   request: StartAgentRequest,
   cwd: string
 ): { agentSessionId: string; transcriptPath: string } | undefined {
   if (launchAgentKind(request.command, request.agent) !== "claude") return undefined;
   const args = request.args ?? [];
+  request.sessionId ??= `pty:${randomUUID()}`;
   if (args.includes("--resume") || args.includes("--continue") || args.includes("--session-id")) {
     return undefined;
   }
-  const sessionId = request.sessionId ?? `pty:${randomUUID()}`;
+  const sessionId = request.sessionId;
   const agentSessionId = sessionId.startsWith("pty:") ? sessionId.slice("pty:".length) : "";
   if (!CLAUDE_SESSION_UUID.test(agentSessionId)) return undefined;
   request.sessionId = sessionId;

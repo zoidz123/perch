@@ -27,6 +27,11 @@ struct CrewSessionRow: View {
                         .font(.system(size: 12.5))
                         .foregroundStyle(Style.warningText)
                         .lineLimit(2)
+                } else if let resolution = session.promptDeliveryResolution {
+                    Text(resolution.message)
+                        .font(.system(size: 12.5))
+                        .foregroundStyle(Style.successText)
+                        .lineLimit(2)
                 }
             }
 
@@ -157,6 +162,11 @@ struct TaskRow: View {
                     Text(warning.message)
                         .font(.system(size: 12.5))
                         .foregroundStyle(Style.warningText)
+                        .lineLimit(2)
+                } else if let resolution = session?.promptDeliveryResolution {
+                    Text(resolution.message)
+                        .font(.system(size: 12.5))
+                        .foregroundStyle(Style.successText)
                         .lineLimit(2)
                 }
 

@@ -278,6 +278,7 @@ struct AgentSession: Identifiable, Codable, Equatable {
     let tail: String?
     // Durable Claude prompt-delivery uncertainty, replayed on every fleet snapshot.
     let promptDeliveryWarning: PromptDeliveryWarning?
+    let promptDeliveryResolution: PromptDeliveryResolution?
     let desktop: DesktopContext?
     // Set while the agent is blocked on a permission prompt.
     let pendingApproval: PendingApproval?
@@ -294,6 +295,12 @@ struct AgentSession: Identifiable, Codable, Equatable {
 }
 
 struct PromptDeliveryWarning: Codable, Equatable {
+    let deliveryId: String
+    let message: String
+    let at: String
+}
+
+struct PromptDeliveryResolution: Codable, Equatable {
     let deliveryId: String
     let message: String
     let at: String

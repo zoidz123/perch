@@ -121,19 +121,30 @@ function monitor(adapter: AgentAdapter): FleetMonitor {
   });
 }
 
-test("durable prompt delivery warnings replay on every fleet snapshot", async () => {
+test("durable prompt delivery warnings and resolutions replay on every fleet snapshot", async () => {
   const adapter = new FakeAdapter([session("A", "terminal", "wsA")]);
   let warning: AgentSession["promptDeliveryWarning"] = {
     deliveryId: "delivery-1",
     message: "Delivery unknown",
     at: "2026-07-22T00:00:00.000Z"
   };
-  const hub = new FleetMonitor(adapter, { promptDeliveryWarning: () => warning });
+  let resolution: AgentSession["promptDeliveryResolution"];
+  const hub = new FleetMonitor(adapter, {
+    promptDeliveryWarning: () => warning,
+    promptDeliveryResolution: () => resolution
+  });
   after(() => hub.stop());
 
   assert.deepEqual(hub.withLiveState(await adapter.listSessions())[0]?.promptDeliveryWarning, warning);
   warning = undefined;
-  assert.equal(hub.withLiveState(await adapter.listSessions())[0]?.promptDeliveryWarning, undefined);
+  resolution = {
+    deliveryId: "delivery-1",
+    message: "Delivery confirmed",
+    at: "2026-07-22T00:00:10.000Z"
+  };
+  const reconnected = hub.withLiveState(await adapter.listSessions())[0];
+  assert.equal(reconnected?.promptDeliveryWarning, undefined);
+  assert.deepEqual(reconnected?.promptDeliveryResolution, resolution);
 });
 
 test("an adapter-reported session exit closes outstanding prompt deliveries", async () => {

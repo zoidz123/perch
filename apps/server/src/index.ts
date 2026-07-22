@@ -175,13 +175,17 @@ const promptDeliveries = new PromptDeliveryTracker(tasks.stateDb, {
       : tasks.list().find((candidate) => candidate.sessionId === delivery.perchSessionId);
     if (!task) return;
     if (task.state === "closed") return;
-    if (tasks.events(task.id).some((event) => event.data?.deliveryId === delivery.id && event.data?.reason === "prompt_delivery_unknown")) return;
+    const notSubmitted = delivery.state === "not_submitted";
+    const reason = notSubmitted ? "prompt_not_submitted" : "prompt_delivery_unknown";
+    if (tasks.events(task.id).some((event) => event.data?.deliveryId === delivery.id && event.data?.reason === reason)) return;
     tasks.recordEvent(task.id, {
       kind: "stalled",
       source: "system",
-      message: "Claude prompt delivery is unknown; Perch did not resend it",
+      message: notSubmitted
+        ? delivery.failureReason ?? "Claude prompt was not submitted; Perch did not send it"
+        : "Claude prompt delivery is unknown; Perch did not resend it",
       data: {
-        reason: "prompt_delivery_unknown",
+        reason,
         sessionId: delivery.perchSessionId,
         deliveryId: delivery.id
       }
@@ -219,17 +223,31 @@ const monitor = new FleetMonitor(adapter, {
     markTaskWorkingFromActivity({ tasks }, sessionId, { newTurn: true }),
   promptDeliveries,
   promptDeliveryWarning: (sessionId) => {
-    const unresolved = tasks.stateDb.promptDeliveries
-      .list(sessionId)
-      .filter((delivery) => delivery.state === "delivery_unknown" && delivery.unknownNotifiedAt)
-      .at(-1);
+    const unresolved = tasks.stateDb.promptDeliveries.list(sessionId).at(-1);
+    if (
+      !unresolved?.unknownNotifiedAt ||
+      (unresolved.state !== "not_submitted" && unresolved.state !== "delivery_unknown")
+    ) return undefined;
     return unresolved
       ? {
           deliveryId: unresolved.id,
-          message: "Claude prompt delivery is unknown; Perch did not resend it",
+          message: unresolved.state === "not_submitted"
+            ? unresolved.failureReason ?? "Claude prompt was not submitted; Perch did not send it"
+            : "Claude prompt delivery is unknown; Perch did not resend it",
           at: unresolved.unknownAt ?? unresolved.updatedAt
         }
       : undefined;
+  },
+  promptDeliveryResolution: (sessionId) => {
+    const resolved = tasks.stateDb.promptDeliveries.list(sessionId).at(-1);
+    if (resolved?.state !== "accepted" || !resolved.unknownNotifiedAt || !resolved.acceptedNotifiedAt) {
+      return undefined;
+    }
+    return {
+      deliveryId: resolved.id,
+      message: "Claude prompt delivery was confirmed after the earlier warning",
+      at: resolved.acceptedAt ?? resolved.updatedAt
+    };
   },
   onQueuedInputRejected: (sessionId, count, reason) => {
     const task = tasks.list().find((candidate) => candidate.sessionId === sessionId);

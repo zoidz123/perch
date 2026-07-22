@@ -51,6 +51,11 @@ export type AgentSession = {
     message: string;
     at: string;
   };
+  promptDeliveryResolution?: {
+    deliveryId: string;
+    message: string;
+    at: string;
+  };
   // App-server-owned Codex sessions only: the exact command a desktop human
   // runs to attach the real native TUI to this session's live thread
   // (`codex resume <threadId> --remote unix://<socket>`). Append-only;

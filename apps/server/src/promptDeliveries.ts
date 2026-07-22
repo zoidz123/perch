@@ -39,21 +39,31 @@ export class PromptDeliveryTracker {
         this.notifyAccepted(delivery);
         continue;
       }
+      if (delivery.state === "not_submitted" && !delivery.unknownNotifiedAt) {
+        this.notifyUnknown(delivery);
+        continue;
+      }
       if (delivery.state === "delivery_unknown" && !delivery.unknownNotifiedAt) {
-        if (delivery.unknownFromState === "queued") this.notifyUnknown(delivery);
-        else this.scheduleRestartFallback(delivery.id);
+        this.scheduleRestartFallback(delivery.id);
         continue;
       }
       if (delivery.state !== "queued" && delivery.state !== "typing" && delivery.state !== "submitted") {
         continue;
       }
-      this.stateDb.promptDeliveries.markUnknown(
-        delivery.id,
-        "server restarted before prompt acceptance was confirmed; not resent"
-      );
-      const unknown = this.stateDb.promptDeliveries.find(delivery.id);
-      if (unknown?.unknownFromState === "queued") this.notifyUnknown(unknown);
-      else if (unknown) this.scheduleRestartFallback(unknown.id);
+      if (delivery.state === "queued") {
+        const notSubmitted = this.stateDb.promptDeliveries.markNotSubmitted(
+          delivery.id,
+          "Claude prompt was not submitted before the server restarted; Perch did not send it"
+        );
+        if (notSubmitted) this.notifyUnknown(notSubmitted);
+      } else {
+        this.stateDb.promptDeliveries.markUnknown(
+          delivery.id,
+          "server restarted before prompt acceptance was confirmed; not resent"
+        );
+        const unknown = this.stateDb.promptDeliveries.find(delivery.id);
+        if (unknown) this.scheduleRestartFallback(unknown.id);
+      }
     }
   }
 
@@ -98,8 +108,13 @@ export class PromptDeliveryTracker {
 
   markUnknown(id: string, reason: string): void {
     this.clearTimer(id);
-    const delivery = this.stateDb.promptDeliveries.markUnknown(id, reason);
-    if (delivery?.state === "delivery_unknown") this.notifyUnknown(delivery);
+    const current = this.stateDb.promptDeliveries.find(id);
+    const delivery = current?.state === "queued"
+      ? this.stateDb.promptDeliveries.markNotSubmitted(id, reason)
+      : this.stateDb.promptDeliveries.markUnknown(id, reason);
+    if (delivery?.state === "not_submitted" || delivery?.state === "delivery_unknown") {
+      this.notifyUnknown(delivery);
+    }
   }
 
   acknowledgeHook(sessionId: string, prompt: string, receiptId?: string): PromptDeliveryRecord | undefined {
@@ -136,7 +151,12 @@ export class PromptDeliveryTracker {
   markSessionEnded(sessionId: string): void {
     for (const delivery of this.stateDb.promptDeliveries.list(sessionId)) {
       if (delivery.state === "queued" || delivery.state === "typing" || delivery.state === "submitted") {
-        this.markUnknown(delivery.id, "Claude session ended before prompt acceptance was confirmed; not resent");
+        this.markUnknown(
+          delivery.id,
+          delivery.state === "queued"
+            ? "Claude prompt was not submitted before the session ended; Perch did not send it"
+            : "Claude session ended before prompt acceptance was confirmed; not resent"
+        );
       }
     }
   }
@@ -148,7 +168,12 @@ export class PromptDeliveryTracker {
         !activeSessionIds.has(delivery.perchSessionId) &&
         (delivery.state === "queued" || delivery.state === "typing" || delivery.state === "submitted")
       ) {
-        this.markUnknown(delivery.id, "Claude session disappeared before prompt acceptance was confirmed; not resent");
+        this.markUnknown(
+          delivery.id,
+          delivery.state === "queued"
+            ? "Claude prompt was not submitted before the session disappeared; Perch did not send it"
+            : "Claude session disappeared before prompt acceptance was confirmed; not resent"
+        );
       }
     }
   }

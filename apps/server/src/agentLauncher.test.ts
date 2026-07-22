@@ -1080,7 +1080,7 @@ test("a Claude launch reinstalls perch hook entries clobbered by an external set
   }
 });
 
-test("resumed Claude launches keep their provider identity (no --session-id)", async () => {
+test("Claude kickoff variants keep provider identity and journal against a pre-minted Perch session", async () => {
   const fx = fixture();
   const repo = makeRepo();
   const baseUrl = await listen(fx.server, fx.options);
@@ -1089,13 +1089,58 @@ test("resumed Claude launches keep their provider identity (no --session-id)", a
     const resumed = await fetch(`${baseUrl}/agents/pty`, {
       ...authed,
       method: "POST",
-      body: JSON.stringify({ command: "claude", agent: "claude", cwd: repo, args: ["--resume", "abc-123"] })
+      body: JSON.stringify({
+        command: "claude",
+        agent: "claude",
+        cwd: repo,
+        args: ["--resume", "abc-123"],
+        initialPrompt: "resume kickoff"
+      })
     });
     assert.equal(resumed.status, 201, await resumed.text());
     assert.ok(
       !fx.adapter.requests[0]?.args?.includes("--session-id"),
       "a resume keeps the provider-owned session id"
     );
+    assert.match(fx.adapter.requests[0]?.sessionId ?? "", /^pty:/);
+
+    const continued = await fetch(`${baseUrl}/agents/pty`, {
+      ...authed,
+      method: "POST",
+      body: JSON.stringify({
+        command: "claude",
+        agent: "claude",
+        cwd: repo,
+        args: ["--continue"],
+        initialPrompt: "continue kickoff"
+      })
+    });
+    assert.equal(continued.status, 201, await continued.text());
+
+    const providerSessionId = randomUUID();
+    const callerIdentified = await fetch(`${baseUrl}/agents/pty`, {
+      ...authed,
+      method: "POST",
+      body: JSON.stringify({
+        command: "claude",
+        agent: "claude",
+        cwd: repo,
+        args: ["--session-id", providerSessionId],
+        initialPrompt: "caller session kickoff"
+      })
+    });
+    assert.equal(callerIdentified.status, 201, await callerIdentified.text());
+
+    const variantDeliveries = fx.options.tasks.stateDb.promptDeliveries.list();
+    assert.deepEqual(
+      variantDeliveries.map((delivery) => delivery.promptText),
+      ["resume kickoff", "continue kickoff", "caller session kickoff"]
+    );
+    assert.deepEqual(
+      variantDeliveries.map((delivery) => delivery.perchSessionId),
+      fx.adapter.requests.slice(0, 3).map((request) => request.sessionId)
+    );
+    assert.ok(variantDeliveries.every((delivery) => delivery.state === "submitted"));
 
     const fresh = await fetch(`${baseUrl}/agents/pty`, {
       ...authed,
@@ -1103,10 +1148,10 @@ test("resumed Claude launches keep their provider identity (no --session-id)", a
       body: JSON.stringify({ command: "claude", agent: "claude", cwd: repo })
     });
     assert.equal(fresh.status, 201, await fresh.text());
-    const args = fx.adapter.requests[1]?.args ?? [];
+    const args = fx.adapter.requests[3]?.args ?? [];
     const flagIndex = args.indexOf("--session-id");
     assert.ok(flagIndex >= 0, "a plain solo launch still pre-mints its session id");
-    assert.equal(`pty:${args[flagIndex + 1]}`, fx.adapter.sessions[1]?.id);
+    assert.equal(`pty:${args[flagIndex + 1]}`, fx.adapter.sessions[3]?.id);
   } finally {
     await fx.cleanup(repo);
   }

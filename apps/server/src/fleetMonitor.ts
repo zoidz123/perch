@@ -144,6 +144,7 @@ export type FleetMonitorOptions = {
   // recomputed for every fleet snapshot, so disconnected clients see it on
   // reconnect instead of depending on a one-shot WebSocket event.
   promptDeliveryWarning?: (sessionId: string) => AgentSession["promptDeliveryWarning"];
+  promptDeliveryResolution?: (sessionId: string) => AgentSession["promptDeliveryResolution"];
   // Durable task policy hook for accepted composer input that later becomes
   // undeliverable because the terminal ended or a queued flush failed.
   onQueuedInputRejected?: (sessionId: string, count: number, reason: string) => void;
@@ -223,6 +224,7 @@ export class FleetMonitor {
   private readonly onInputSubmitted?: (sessionId: string) => void;
   private readonly promptDeliveries?: PromptDeliveryTracker;
   private readonly promptDeliveryWarning?: (sessionId: string) => AgentSession["promptDeliveryWarning"];
+  private readonly promptDeliveryResolution?: (sessionId: string) => AgentSession["promptDeliveryResolution"];
   private readonly onQueuedInputRejected?: (sessionId: string, count: number, reason: string) => void;
   private readonly onApprovalNeeded?: (sessionId: string, approval: PendingApproval) => void;
   private readonly onApprovalResolved?: (sessionId: string, approval: PendingApproval) => void;
@@ -249,6 +251,7 @@ export class FleetMonitor {
     this.onInputSubmitted = options.onInputSubmitted;
     this.promptDeliveries = options.promptDeliveries;
     this.promptDeliveryWarning = options.promptDeliveryWarning;
+    this.promptDeliveryResolution = options.promptDeliveryResolution;
     this.onQueuedInputRejected = options.onQueuedInputRejected;
     this.onApprovalNeeded = options.onApprovalNeeded;
     this.onApprovalResolved = options.onApprovalResolved;
@@ -1234,6 +1237,8 @@ export class FleetMonitor {
       }
       const promptDeliveryWarning = this.promptDeliveryWarning?.(session.id);
       if (promptDeliveryWarning) result.promptDeliveryWarning = promptDeliveryWarning;
+      const promptDeliveryResolution = this.promptDeliveryResolution?.(session.id);
+      if (promptDeliveryResolution) result.promptDeliveryResolution = promptDeliveryResolution;
       const modelInfo = this.sessionModels.get(session.id);
       if (modelInfo) {
         if (modelInfo.model !== undefined) result.model = modelInfo.model;
