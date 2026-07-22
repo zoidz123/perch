@@ -417,9 +417,20 @@ test("a transient connection drop reconnects, resumes the thread, and replays hi
     f.fake.completeActiveTurn("thr_1", "first answer");
     await until(2_000, () => f.events.turnCompletes.length === 1);
     f.fake.thread("thr_1").turns[0]!.items.push(
-      { id: "cmd_1", type: "commandExecution", command: ["npm", "test"], aggregatedOutput: "all passed" },
+      {
+        id: "cmd_1",
+        type: "commandExecution",
+        command: ["npm", "test"],
+        aggregatedOutput: "all passed",
+        status: "completed"
+      },
       { id: "patch_1", type: "fileChange", status: "completed" },
-      { id: "cmd_live", type: "commandExecution", command: ["npm", "run", "build"], status: "inProgress" },
+      {
+        id: "cmd_live",
+        type: "commandExecution",
+        command: ["npm", "run", "build"],
+        aggregatedOutput: "partial output"
+      },
       { id: "patch_live", type: "fileChange", status: "inProgress" }
     );
 

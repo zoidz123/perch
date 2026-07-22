@@ -759,7 +759,7 @@ function historyItemToTimeline(sessionId: string, item: Record<string, unknown>)
       at,
       tool: { name: "shell", ...(command ? { input: command } : {}) }
     }];
-    if (isTerminalHistoryItem(item) || (typeof item.status !== "string" && "aggregatedOutput" in item)) {
+    if (isTerminalHistoryItem(item)) {
       items.push({ seq: 0, id: `cx-item-${id}:result`, sessionId, kind: "tool_result", text: output, at });
     }
     return items;
