@@ -124,19 +124,50 @@ export function detectUsageLimit(
   };
 }
 
-// Codex app-server v2 deliberately leaves these notifications extensible.  Do
-// not key on prose: accept only a provider-shaped type/code, then retain its
-// message/reset metadata for the task event.
+// Codex app-server reports ordinary quota-window telemetry and actual
+// exhaustion through the same rate-limit notification. Only semantic payload
+// fields prove exhaustion: a non-null rateLimitReachedType, or the documented
+// usageLimitExceeded error code. Notification method names and prose do not.
 export function usageLimitFromCodexAppServer(value: unknown): UsageLimit | undefined {
   const record = value && typeof value === "object" ? (value as Record<string, unknown>) : undefined;
   if (!record) return undefined;
-  const kind = [record.type, record.code, record.errorCode, record.reason]
+
+  const nestedError = record.error && typeof record.error === "object"
+    ? (record.error as Record<string, unknown>)
+    : undefined;
+  const rateLimits = record.rateLimits && typeof record.rateLimits === "object"
+    ? (record.rateLimits as Record<string, unknown>)
+    : undefined;
+  const reachedType = [record.rateLimitReachedType, rateLimits?.rateLimitReachedType]
+    .find((part): part is string => typeof part === "string" && part.trim().length > 0);
+  const kind = [
+    record.type,
+    record.code,
+    record.errorCode,
+    record.reason,
+    record.codexErrorInfo,
+    nestedError?.type,
+    nestedError?.code,
+    nestedError?.errorCode,
+    nestedError?.reason,
+    nestedError?.codexErrorInfo
+  ]
     .filter((part): part is string => typeof part === "string")
-    .join(" ");
-  if (!/(usage.?limit(?:exceeded)?|rate.?limit(?:ed)?|quota.?exceeded)/i.test(kind)) return undefined;
-  const message = [record.message, record.detail, record.error]
+    .find((part) => /^(?:usageLimitExceeded|rateLimitReached|rateLimitExceeded|quotaExceeded)$/i.test(part.replace(/[^a-z]/gi, "")));
+  if (!reachedType && !kind) return undefined;
+
+  const message = [record.message, record.detail, nestedError?.message, nestedError?.detail]
     .find((part): part is string => typeof part === "string" && part.trim().length > 0) ?? "Codex provider usage limit reached";
-  const retryAt = [record.retryAt, record.retry_at, record.resetAt, record.reset_at]
+  const retryAt = [
+    record.retryAt,
+    record.retry_at,
+    record.resetAt,
+    record.reset_at,
+    nestedError?.retryAt,
+    nestedError?.retry_at,
+    nestedError?.resetAt,
+    nestedError?.reset_at
+  ]
     .find((part): part is string => typeof part === "string" && part.trim().length > 0);
   return { provider: "codex", message: message.slice(0, 300), source: "app_server", ...(retryAt ? { retryAt } : {}) };
 }

@@ -1040,7 +1040,7 @@ export class CodexAppServerClient {
   // ─── Notifications (both protocols) ─────────────────────────
 
   private handleNotification(method: string, params: Record<string, unknown>): void {
-    const limit = usageLimitFromCodexAppServer({ type: method, ...params });
+    const limit = usageLimitFromCodexAppServer(params);
     if (limit) this.onUsageLimit?.(limit);
     // Legacy: `codex/event` or `codex/event/<type>` carrying { msg }.
     if (method === "codex/event" || method.startsWith("codex/event/")) {

@@ -1,6 +1,10 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { detectUsageLimit, usageLimitFromClaudeHook } from "./usageLimitDetect.js";
+import {
+  detectUsageLimit,
+  usageLimitFromClaudeHook,
+  usageLimitFromCodexAppServer
+} from "./usageLimitDetect.js";
 
 // The real codex out-of-credits line, as it prints it and then sits there.
 const CODEX_LIMIT =
@@ -108,4 +112,30 @@ test("Claude hook requires a structured usage-limit code", () => {
     { provider: "claude", message: "Claude limit reached", source: "hook", retryAt: "3pm" }
   );
   assert.equal(usageLimitFromClaudeHook({ notification_type: "idle_prompt", message: "usage limit reached" }), undefined);
+});
+
+test("Codex app-server routine rate-limit telemetry is not exhaustion", () => {
+  assert.equal(
+    usageLimitFromCodexAppServer({
+      type: "account/rateLimits/updated",
+      rateLimits: {
+        primary: { usedPercent: 12, windowDurationMins: 300, resetsAt: 1_777_534_802 },
+        rateLimitReachedType: null
+      }
+    }),
+    undefined
+  );
+});
+
+test("Codex app-server explicit exhaustion payloads are detected", () => {
+  assert.deepEqual(
+    usageLimitFromCodexAppServer({ rateLimits: { rateLimitReachedType: "rate_limit_reached" } }),
+    { provider: "codex", message: "Codex provider usage limit reached", source: "app_server" }
+  );
+  assert.deepEqual(
+    usageLimitFromCodexAppServer({
+      error: { message: "quota exhausted", codexErrorInfo: "usageLimitExceeded" }
+    }),
+    { provider: "codex", message: "quota exhausted", source: "app_server" }
+  );
 });
