@@ -11,6 +11,8 @@ import { AuditLog } from "./audit.js";
 import { FleetMonitor } from "./fleetMonitor.js";
 import { HookRegistry } from "./hooks.js";
 import { createControlServer } from "./http.js";
+import type { CodexAppServerAdapter } from "./adapters/codexAppServerAdapter.js";
+import { FakeCodexOwnedAdapter } from "./adapters/fakeCodexAppServer.js";
 import { seedMateHome } from "./mate.js";
 import { MATE_CLAUDE_FALLBACK_MODEL, MATE_CODEX_FALLBACK } from "./models.js";
 import { DeviceRegistry } from "./pairing.js";
@@ -61,11 +63,22 @@ class FakePtyAdapter implements AgentAdapter {
 function serverFixture(home: string) {
   const env = { PERCH_HOME: home } as NodeJS.ProcessEnv;
   const adapter = new FakePtyAdapter();
+  // A Codex mate routes to the app-server owning adapter; mirror its launches
+  // and sessions into the shared capture so mate assertions read one stream.
+  const codexOwned = new FakeCodexOwnedAdapter();
+  const originalStartOwned = codexOwned.startOwned.bind(codexOwned);
+  codexOwned.startOwned = async (request, opts) => {
+    adapter.requests.push(request as StartAgentRequest);
+    const session = await originalStartOwned(request, opts);
+    adapter.sessions.push(session as AgentSession);
+    return session;
+  };
   const tasks = new TaskStore(env);
   const timeline = new TimelineStore();
   const monitor = new FleetMonitor(adapter, { broadcastMs: 5 });
   const server = createControlServer({
     adapter,
+    codexOwned: codexOwned as unknown as CodexAppServerAdapter,
     auditLog: new AuditLog(join(home, "audit.jsonl")),
     authToken: "test-token",
     boxSecretKey: new Uint8Array(32),
