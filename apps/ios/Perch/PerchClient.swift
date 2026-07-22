@@ -1241,6 +1241,9 @@ final class PerchStore: ObservableObject {
             if isCancellation(error) {
                 return
             }
+            if (error as? PerchClientError)?.httpStatusCode == 404 {
+                return
+            }
             let refresh = WorkspaceGrouping.taskRefreshResult(
                 current: tasks,
                 result: Result<[AgentTask], Error>.failure(error)
