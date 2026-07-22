@@ -164,6 +164,23 @@ export class TimelineStore {
     };
   }
 
+  // Ingest a protocol-native timeline item directly (app-server-owned Codex
+  // sessions: thread/turn/item notifications own the timeline, no transcript
+  // tailer). Dedupe by item id makes resume-history replays idempotent
+  // against rows already ingested live. `live: false` (catch-up replay)
+  // populates the store without notifying listeners, mirroring the tailer's
+  // catch-up read - clients page history via GET /timeline instead. A user
+  // item without provenance resolves against recorded injections exactly like
+  // a tailed row, so mate steers and kickoffs keep their agent attribution.
+  ingest(item: TimelineItem, opts: { live?: boolean } = {}): void {
+    let resolved = item;
+    if (item.kind === "user" && !item.source && item.text) {
+      const source = this.resolveSource(item.sessionId, item.text);
+      if (source) resolved = { ...item, source };
+    }
+    this.append(resolved.sessionId, resolved, opts.live !== false);
+  }
+
   // Begin (or re-point) tailing a session's transcript. Called when the
   // SessionStart hook correlates a perch session to its transcript path.
   // `isPathAllowed` re-verifies containment every time the tailer opens the
