@@ -150,6 +150,30 @@ test("startOwned captures the thread id from the thread/start response and surfa
   }
 });
 
+test("startAgent translates one positional kickoff and rejects unsupported codex flags", async () => {
+  const f = await fixture("pxa-args-");
+  try {
+    await f.adapter.startAgent({
+      command: "codex",
+      agent: "codex",
+      cwd: f.dir,
+      sessionId: "pty:s1",
+      args: ["Fix this"]
+    });
+    const clientIds = userClientIds(f.fake.thread("thr_1").turns);
+    assert.equal(clientIds.length, 1);
+    assert.match(clientIds[0]!, /^perch:/);
+    const user = f.fake.thread("thr_1").turns[0]?.items[0];
+    assert.deepEqual(user?.content, [{ type: "text", text: "Fix this" }]);
+    await assert.rejects(
+      f.adapter.startAgent({ command: "codex", agent: "codex", cwd: f.dir, args: ["--sandbox", "read-only"] }),
+      /unsupported app-server-owned codex launch argument: --sandbox/
+    );
+  } finally {
+    await f.close();
+  }
+});
+
 test("the kickoff is one acknowledged turn/start: exactly one turn id, exactly one user message", async () => {
   const f = await fixture("pxa-kick-");
   try {
@@ -229,6 +253,7 @@ test("a rejected turn/start reports the provider's real error and is never retri
     );
     assert.equal(f.fake.requestLog.filter((entry) => entry.method === "turn/start").length, 1);
     assert.equal(userClientIds(f.fake.thread("thr_1").turns).length, 0);
+    assert.equal(f.events.timeline.filter((entry) => entry.item.kind === "user").length, 0);
   } finally {
     await f.close();
   }
@@ -383,6 +408,10 @@ test("a transient connection drop reconnects, resumes the thread, and replays hi
     await f.adapter.submitAcknowledgedTurn("pty:s1", "kick", { clientUserMessageId: "k1" });
     f.fake.completeActiveTurn("thr_1", "first answer");
     await until(2_000, () => f.events.turnCompletes.length === 1);
+    f.fake.thread("thr_1").turns[0]!.items.push(
+      { id: "cmd_1", type: "commandExecution", command: ["npm", "test"], aggregatedOutput: "all passed" },
+      { id: "patch_1", type: "fileChange", status: "completed" }
+    );
 
     await f.fake.restart();
     // Bounded backoff reconnect + thread/resume, no session death.
@@ -396,6 +425,21 @@ test("a transient connection drop reconnects, resumes the thread, and replays hi
       (entry) => entry.item.kind === "user" && entry.item.id === "cx-item-k1"
     );
     assert.ok(replayedUser.some((entry) => entry.live === false));
+    const replayedTools = f.events.timeline.filter((entry) => entry.live === false).map((entry) => entry.item);
+    assert.deepEqual(
+      replayedTools.filter((item) => item.id.startsWith("cx-item-cmd_1")).map((item) => [item.kind, item.text, item.tool]),
+      [
+        ["tool_call", undefined, { name: "shell", input: "npm test" }],
+        ["tool_result", "all passed", undefined]
+      ]
+    );
+    assert.deepEqual(
+      replayedTools.filter((item) => item.id.startsWith("cx-item-patch_1")).map((item) => [item.kind, item.text, item.tool]),
+      [
+        ["tool_call", undefined, { name: "apply_patch" }],
+        ["tool_result", "File change completed", undefined]
+      ]
+    );
 
     // The session still works: submit another turn.
     const { turnId } = await f.adapter.submitAcknowledgedTurn("pty:s1", "again", { clientUserMessageId: "k2" });

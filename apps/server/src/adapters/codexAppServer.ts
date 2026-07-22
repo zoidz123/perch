@@ -564,13 +564,10 @@ export class CodexAppServerClient {
     if (effort) params.effort = effort;
     this.pendingModelOverride = {};
 
-    // Echo the user turn into the timeline immediately (the protocol may not
-    // reflect it back promptly). Mirrors perch's human/agent provenance.
+    const result = (await this.request("turn/start", params)) as { turn?: { id?: string | null } };
     if (text.length > 0) {
       this.emitTimelineItem("user", text, undefined, opts?.source, opts?.clientUserMessageId);
     }
-
-    const result = (await this.request("turn/start", params)) as { turn?: { id?: string | null } };
     const turnId = typeof result?.turn?.id === "string" ? result.turn.id : null;
     if (turnId) {
       this._turnId = turnId;
@@ -594,10 +591,10 @@ export class CodexAppServerClient {
       input: [{ type: "text", text }]
     };
     if (opts.clientUserMessageId) params.clientUserMessageId = opts.clientUserMessageId;
+    await this.request("turn/steer", params);
     if (text.length > 0) {
       this.emitTimelineItem("user", text, undefined, opts.source, opts.clientUserMessageId);
     }
-    await this.request("turn/steer", params);
   }
 
   // Authoritative thread history (`thread/read` with includeTurns), rebuilt by

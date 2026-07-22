@@ -248,13 +248,18 @@ export class CodexAppServerAdapter implements AgentAdapter {
   }
 
   async startAgent(request: StartAgentRequest): Promise<AgentSession> {
-    // AgentAdapter-shaped entry: a `codex resume <threadId>` arg pair routes
-    // to the resume path; everything else starts a fresh thread. The launcher
-    // calls startOwned directly to carry a recorded socket.
-    const args = request.args ?? [];
-    const resumeIndex = args.indexOf("resume");
-    const threadId = resumeIndex >= 0 ? args[resumeIndex + 1] : undefined;
-    return this.startOwned(request, threadId ? { resume: { threadId } } : {});
+    const normalized = normalizeCodexLaunchRequest(request);
+    const session = await this.startOwned(
+      normalized.request,
+      normalized.resumeThreadId ? { resume: { threadId: normalized.resumeThreadId } } : {}
+    );
+    if (normalized.request.initialPrompt?.trim()) {
+      await this.submitAcknowledgedTurn(session.id, normalized.request.initialPrompt, {
+        clientUserMessageId: `perch:${randomUUID()}`,
+        source: "human"
+      });
+    }
+    return session;
   }
 
   async startOwned(request: StartAgentRequest, opts: StartOwnedOptions = {}): Promise<AgentSession> {
@@ -603,8 +608,9 @@ export class CodexAppServerAdapter implements AgentAdapter {
     if (!this.events.onTimelineItem) return;
     for (const turn of turns) {
       for (const item of turn.items ?? []) {
-        const timelineItem = historyItemToTimeline(session.id, item);
-        if (timelineItem) this.events.onTimelineItem(timelineItem, false);
+        for (const timelineItem of historyItemToTimeline(session.id, item)) {
+          this.events.onTimelineItem(timelineItem, false);
+        }
       }
       if (turn.status === "interrupted" && turn.id) {
         this.events.onTimelineItem(
@@ -709,41 +715,106 @@ export function findTurnByClientMessageId(
 // Project a thread/read (or resume-replayed) history item into perch's
 // timeline shape. Stable `cx-item-<protocol id>` ids make the replay
 // idempotent against rows already ingested live.
-function historyItemToTimeline(sessionId: string, item: Record<string, unknown>): TimelineItem | undefined {
+function historyItemToTimeline(sessionId: string, item: Record<string, unknown>): TimelineItem[] {
   const id = typeof item.id === "string" && item.id.length > 0 ? item.id : undefined;
   const type = typeof item.type === "string" ? item.type : "";
   const at = new Date().toISOString();
   if (type === "userMessage") {
     const text = userMessageText(item);
-    if (!text) return undefined;
+    if (!text) return [];
     const clientId = typeof item.clientId === "string" ? item.clientId : undefined;
-    return {
+    return [{
       seq: 0,
       id: `cx-item-${clientId ?? id ?? `user-${hashText(text)}`}`,
       sessionId,
       kind: "user",
       text,
       at
-    };
+    }];
   }
   if (type === "agentMessage") {
     const text = typeof item.text === "string" ? item.text : "";
-    if (!text || !id) return undefined;
-    return { seq: 0, id: `cx-item-${id}`, sessionId, kind: "assistant", text, at };
+    if (!text || !id) return [];
+    return [{ seq: 0, id: `cx-item-${id}`, sessionId, kind: "assistant", text, at }];
   }
   if (type === "commandExecution") {
-    if (!id) return undefined;
-    const command = typeof item.command === "string" ? item.command : undefined;
-    return {
-      seq: 0,
-      id: `cx-item-${id}:call`,
-      sessionId,
-      kind: "tool_call",
-      at,
-      tool: { name: "shell", ...(command ? { input: command } : {}) }
-    };
+    if (!id) return [];
+    const command = stringifyHistoryCommand(item.command);
+    const output = typeof item.aggregatedOutput === "string" ? item.aggregatedOutput : "";
+    return [
+      {
+        seq: 0,
+        id: `cx-item-${id}:call`,
+        sessionId,
+        kind: "tool_call",
+        at,
+        tool: { name: "shell", ...(command ? { input: command } : {}) }
+      },
+      { seq: 0, id: `cx-item-${id}:result`, sessionId, kind: "tool_result", text: output, at }
+    ];
   }
+  if (type === "fileChange") {
+    if (!id) return [];
+    const status = typeof item.status === "string" ? item.status : "completed";
+    return [
+      {
+        seq: 0,
+        id: `cx-item-${id}:call`,
+        sessionId,
+        kind: "tool_call",
+        at,
+        tool: { name: "apply_patch" }
+      },
+      {
+        seq: 0,
+        id: `cx-item-${id}:result`,
+        sessionId,
+        kind: "tool_result",
+        text: `File change ${status}`,
+        at
+      }
+    ];
+  }
+  return [];
+}
+
+function stringifyHistoryCommand(command: unknown): string | undefined {
+  if (typeof command === "string") return command;
+  if (Array.isArray(command)) return command.map(String).join(" ");
   return undefined;
+}
+
+export function normalizeCodexLaunchRequest(request: StartAgentRequest): {
+  request: StartAgentRequest;
+  resumeThreadId?: string;
+} {
+  const normalized: StartAgentRequest = {
+    ...request,
+    ...(request.args ? { args: [...request.args] } : {}),
+    ...(request.labels ? { labels: { ...request.labels } } : {})
+  };
+  const args = normalized.args ?? [];
+  if (args.length === 0) return { request: normalized };
+  if (args[0] === "resume") {
+    if (args.length !== 2 || !args[1]) {
+      throw new Error("app-server-owned codex resume requires exactly one thread id");
+    }
+    delete normalized.args;
+    return { request: normalized, resumeThreadId: args[1] };
+  }
+  const unsupported = args.find((arg) => arg.startsWith("-"));
+  if (unsupported) {
+    throw new Error(`unsupported app-server-owned codex launch argument: ${unsupported}`);
+  }
+  if (args.length !== 1) {
+    throw new Error("app-server-owned codex launch accepts one positional kickoff prompt");
+  }
+  if (normalized.initialPrompt !== undefined) {
+    throw new Error("codex launch cannot specify both args and initialPrompt");
+  }
+  normalized.initialPrompt = args[0];
+  delete normalized.args;
+  return { request: normalized };
 }
 
 function userMessageText(item: Record<string, unknown>): string {

@@ -13,6 +13,7 @@ import type {
 import type { AgentAdapter } from "./adapters/types.js";
 import {
   CodexDeliveryUnknownError,
+  normalizeCodexLaunchRequest,
   type CodexAppServerAdapter
 } from "./adapters/codexAppServerAdapter.js";
 import { isCodexRpcError } from "./adapters/codexAppServer.js";
@@ -177,6 +178,15 @@ export async function startManagedAgent(
   const request = cloneStartRequest(input.request);
   validateStartAgent(request);
   const isCodexLaunch = launchAgentKind(request.command, request.agent) === "codex";
+  let codexOwnedResume = input.codexOwnedResume;
+  if (isCodexLaunch) {
+    const normalized = normalizeCodexLaunchRequest(request);
+    Object.assign(request, normalized.request);
+    if (!normalized.request.args) delete request.args;
+    if (normalized.resumeThreadId && !codexOwnedResume) {
+      codexOwnedResume = { threadId: normalized.resumeThreadId };
+    }
+  }
   if (isCodexLaunch && !options.codexOwned) {
     throw new Error("codex sessions require the app-server owning adapter");
   }
@@ -265,7 +275,7 @@ export async function startManagedAgent(
       // authoritative thread id. There is no PTY and no keystroke path.
       session = await options.codexOwned.startOwned(
         request,
-        input.codexOwnedResume ? { resume: input.codexOwnedResume } : {}
+        codexOwnedResume ? { resume: codexOwnedResume } : {}
       );
     } else {
       session = await options.adapter.startAgent!(request);
@@ -390,7 +400,13 @@ export async function startManagedAgent(
         // ride the gate-aware composer path (which submits over the protocol
         // for owned sessions).
         if (input.taskId && input.initialPromptSource === "agent") {
-          void submitCodexKickoff(options, session.id, input.taskId, request.initialPrompt);
+          void submitCodexKickoff(options, session.id, input.taskId, request.initialPrompt).catch((error) => {
+            console.warn(
+              `codex: kickoff journal failed for ${session!.id.slice(0, 12)}: ${
+                error instanceof Error ? error.message : error
+              }`
+            );
+          });
         } else {
           const sessionId = session.id;
           const prompt = request.initialPrompt;
@@ -413,7 +429,7 @@ export async function startManagedAgent(
     // but never acknowledged (the previous life died in the window between
     // send and response, or between acceptance and persistence). Reconcile it
     // against authoritative thread history - never a blind resend.
-    if (isCodexLaunch && input.codexOwnedResume && input.taskId) {
+    if (isCodexLaunch && codexOwnedResume && input.taskId) {
       void reconcileCodexKickoff(options, session.id, input.taskId);
     }
 
@@ -552,16 +568,12 @@ export async function submitCodexKickoff(
 ): Promise<void> {
   if (!deps.codexOwned) return;
   const clientUserMessageId = codexKickoffClientMessageId(taskId);
-  try {
-    deps.tasks.recordEvent(taskId, {
-      kind: "note",
-      source: "system",
-      message: "codex kickoff submitted over the app-server protocol; acceptance pending",
-      data: { reason: "kickoff_submitted", sessionId, clientUserMessageId }
-    });
-  } catch {
-    // A ledger write failure must not leave the worker without its kickoff.
-  }
+  deps.tasks.recordEvent(taskId, {
+    kind: "note",
+    source: "system",
+    message: "codex kickoff submitted over the app-server protocol; acceptance pending",
+    data: { reason: "kickoff_submitted", sessionId, clientUserMessageId }
+  });
   try {
     const { turnId } = await deps.codexOwned.submitAcknowledgedTurn(sessionId, kickoff, {
       clientUserMessageId,

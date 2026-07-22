@@ -147,6 +147,23 @@ test("kickoff success journals intent before the send and the accepted turn id a
   }
 });
 
+test("a kickoff is not sent when its durable intent cannot be recorded", async () => {
+  const f = fixture("perch-kick-ledger-fail-");
+  try {
+    await f.codexOwned.startOwned({ sessionId: f.sessionId });
+    f.tasks.recordEvent = (() => {
+      throw new Error("ledger unavailable");
+    }) as typeof f.tasks.recordEvent;
+    await assert.rejects(
+      submitCodexKickoff(f.deps, f.sessionId, f.taskId, "go build it"),
+      /ledger unavailable/
+    );
+    assert.equal(f.codexOwned.submitted.length, 0);
+  } finally {
+    f.close();
+  }
+});
+
 test("a rejected kickoff parks the task blocked with the provider's real error and never retries", async () => {
   const f = fixture("perch-kick-reject-");
   try {
@@ -316,6 +333,27 @@ test("REGRESSION: a Codex dispatch launch reaches no PTY submission path at all"
     assert.deepEqual(f.pty.requests, []);
     assert.deepEqual(f.pty.ptyWrites, []);
     assert.deepEqual(f.queuedInitialPrompts, []);
+  } finally {
+    f.close();
+  }
+});
+
+test("a positional codex launch argument becomes one acknowledged kickoff", async () => {
+  const f = fixture("perch-kick-args-");
+  try {
+    await startManagedAgent(f.launcherOptions(), {
+      request: {
+        command: "codex",
+        agent: "codex",
+        sessionId: f.sessionId,
+        cwd: f.home,
+        args: ["Fix this"]
+      }
+    });
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    assert.equal(f.codexOwned.submitted.length, 1);
+    assert.equal(f.codexOwned.submitted[0]?.text, "Fix this");
+    assert.deepEqual(f.codexOwned.launches[0]?.request.args, undefined);
   } finally {
     f.close();
   }
