@@ -162,9 +162,20 @@ export class PrPoller {
         this.fastUntil.delete(taskId);
       }
     }
+    let hasAwaitingMerge = false;
+    for (let task of this.tasks.list()) {
+      if (task.state === "done" && task.pr?.mergeReady === true && !task.pr.merged) {
+        if (task.pr.awaitingMerge !== true) {
+          task = this.tasks.update(task.id, { pr: { ...task.pr, awaitingMerge: true } });
+        }
+        hasAwaitingMerge = true;
+      } else if (isAwaitingMerge(task)) {
+        hasAwaitingMerge = true;
+      }
+    }
     const include = (task: Task): boolean =>
       this.fastUntil.has(task.id) || isAwaitingMerge(task);
-    if (this.fastUntil.size === 0 && !this.tasks.list().some(isAwaitingMerge)) {
+    if (this.fastUntil.size === 0 && !hasAwaitingMerge) {
       return;
     }
     await this.poll(include, "fast");
