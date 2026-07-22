@@ -13,10 +13,42 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  validate:
-    name: Build, tests, package, and iOS
+  affected:
+    name: Public seed and affected paths
     runs-on: macos-26
-    timeout-minutes: 45
+    timeout-minutes: 10
+    outputs:
+      javascript: ${{ steps.affected.outputs.javascript }}
+      package: ${{ steps.affected.outputs.package }}
+      ios: ${{ steps.affected.outputs.ios }}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 24
+      - run: node --test scripts/ci-logic.test.mjs
+      - run: npm run check:public-seed
+      - name: Classify affected paths
+        id: affected
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          if [[ "$EVENT_NAME" == "pull_request" ]]; then
+            git diff --name-only -z "$BASE_SHA" "$HEAD_SHA" | node scripts/ci-affected.mjs --event "$EVENT_NAME"
+          else
+            node scripts/ci-affected.mjs --event "$EVENT_NAME" </dev/null
+          fi
+
+  javascript:
+    name: Workspace build and tests
+    needs: affected
+    if: needs.affected.outputs.javascript == 'true'
+    runs-on: macos-26
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v5
       - uses: actions/setup-node@v5
@@ -24,12 +56,33 @@ jobs:
           node-version: 24
           cache: npm
       - run: npm ci
-      - run: npm run check:public-seed
       - run: npm run build
-      - run: npm run typecheck
       - run: npm test -w @perch/server
       - run: npm test -w @perch/relay
+
+  package:
+    name: npm package smoke
+    needs: affected
+    if: needs.affected.outputs.package == 'true'
+    runs-on: macos-26
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 24
+          cache: npm
+      - run: npm ci
       - run: npm run test:package
+
+  ios:
+    name: Xcode simulator build
+    needs: affected
+    if: needs.affected.outputs.ios == 'true'
+    runs-on: macos-26
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v5
       - name: Build with Xcode 26
         run: >-
           xcodebuild
@@ -38,3 +91,19 @@ jobs:
           -destination 'platform=iOS Simulator,name=iPhone 17 Pro'
           -derivedDataPath "$RUNNER_TEMP/PerchDerivedData"
           build
+
+  validate:
+    name: Build, tests, package, and iOS
+    if: always()
+    needs: [affected, javascript, package, ios]
+    runs-on: macos-26
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v5
+      - name: Verify required results
+        run: >-
+          node scripts/ci-aggregate.mjs
+          "public-seed:required:${{ needs.affected.result }}"
+          "javascript:${{ needs.affected.outputs.javascript }}:${{ needs.javascript.result }}"
+          "package:${{ needs.affected.outputs.package }}:${{ needs.package.result }}"
+          "ios:${{ needs.affected.outputs.ios }}:${{ needs.ios.result }}"

@@ -1,0 +1,52 @@
+#!/usr/bin/env node
+
+import assert from "node:assert/strict";
+import test from "node:test";
+
+import { validateAggregate } from "./ci-aggregate.mjs";
+import { classifyAffectedPaths } from "./ci-affected.mjs";
+
+test("main pushes and uncertain diffs run every optional job", () => {
+  assert.deepEqual(classifyAffectedPaths(["docs/operations.md"], "push"), { javascript: true, package: true, ios: true });
+  assert.deepEqual(classifyAffectedPaths([], "pull_request"), { javascript: true, package: true, ios: true });
+  assert.deepEqual(classifyAffectedPaths(["new-area/file.txt"]), { javascript: true, package: true, ios: true });
+});
+
+test("root, lockfile, workflow, script, and shared changes fail open", () => {
+  for (const file of ["package.json", "package-lock.json", ".github/workflows/ci.yml", "scripts/check-public-seed.mjs", "packages/shared/src/index.ts"]) {
+    assert.deepEqual(classifyAffectedPaths([file]), { javascript: true, package: true, ios: true }, file);
+  }
+});
+
+test("known paths select only their substantive lanes", () => {
+  assert.deepEqual(classifyAffectedPaths(["apps/server/src/index.ts"]), { javascript: true, package: true, ios: false });
+  assert.deepEqual(classifyAffectedPaths(["packages/relay/src/client.ts"]), { javascript: true, package: true, ios: false });
+  assert.deepEqual(classifyAffectedPaths(["apps/ios/Perch/PerchApp.swift"]), { javascript: false, package: false, ios: true });
+  assert.deepEqual(classifyAffectedPaths(["vendor/no-mistakes/manifest.json"]), { javascript: false, package: true, ios: false });
+  assert.deepEqual(classifyAffectedPaths(["docs/operations.md", "design/mock.png", "public-seed.json"]), { javascript: false, package: false, ios: false });
+});
+
+test("mixed paths union lanes and any unknown path fails open", () => {
+  assert.deepEqual(classifyAffectedPaths(["apps/server/src/index.ts", "apps/ios/Perch/PerchApp.swift"]), { javascript: true, package: true, ios: true });
+  assert.deepEqual(classifyAffectedPaths(["apps/ios/Perch/PerchApp.swift", "unexpected.txt"]), { javascript: true, package: true, ios: true });
+});
+
+test("aggregate accepts successful selected jobs and skipped optional jobs", () => {
+  assert.deepEqual(validateAggregate([
+    { name: "public-seed", required: true, selected: false, status: "success" },
+    { name: "javascript", required: false, selected: true, status: "success" },
+    { name: "package", required: false, selected: false, status: "skipped" },
+    { name: "ios", required: false, selected: false, status: "skipped" }
+  ]), []);
+});
+
+test("aggregate rejects failed or cancelled required selections", () => {
+  assert.deepEqual(validateAggregate([
+    { name: "public-seed", required: true, selected: false, status: "success" },
+    { name: "javascript", required: false, selected: true, status: "failure" },
+    { name: "ios", required: false, selected: true, status: "cancelled" }
+  ]), ["javascript was selected but failure", "ios was selected but cancelled"]);
+  assert.deepEqual(validateAggregate([
+    { name: "public-seed", required: true, selected: false, status: "failure" }
+  ]), ["public-seed was failure"]);
+});
