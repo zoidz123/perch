@@ -76,10 +76,12 @@ struct CrewSessionRow: View {
     }
 }
 
-// A crew row: one tracked task joined with its worker session. The task
-// carries the meaning (verb state, PR progress); the session carries the
-// liveness (running / needs approval). Tap opens the worker's chat; the
-// context menu runs teardown through the server's landed-gate.
+// A crew row: one tracked task joined with its worker session when available.
+// The task carries the meaning (verb state, PR progress); the session carries
+// liveness (running / needs approval). Runtime identity lets a tap open the
+// worker detail before the session snapshot arrives; that shell stays
+// read-only until the snapshot catches up. The context menu runs teardown
+// through the server's landed-gate.
 struct TaskRow: View {
     @EnvironmentObject private var store: PerchStore
     @Environment(\.openURL) private var openURL
