@@ -48,7 +48,8 @@ curl -sf -X POST "${PERCH_HOOK_URL%/hooks}/charts" \
 Registration notifies the boss, and edits to the file refresh the open review live.
 Register each chart once.
 Re-registering the same path starts a new review identity so old worktree-slot charts keep their owner, snapshot, and status.
-Boss feedback arrives in your composer as a `[perch chart]` block.
+While your session is live, boss feedback arrives in your composer as a `[perch chart]` block.
+If your worker session has ended, the server routes that block only to the live parent Mate recorded when the chart was registered; if neither recipient is live, the review reports that delivery failed.
 Layout-audit warnings arrive the same way, marked as machine feedback - fix those before the boss is asked to review.
 
 ## Where charts live
