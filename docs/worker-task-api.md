@@ -166,9 +166,9 @@ Its body must contain an explicit `pr` URL, never a URL scraped from ordinary wo
 The server verifies it against the task identity, persists the PR fact and `pr_linked` event atomically, and immediately exposes it through task snapshots while lifecycle state remains unchanged.
 Repeating the same identity is harmless; a different PR is rejected.
 
-For a non-scout, non-`local-only` task, every `done` request must resolve to a valid pull request, including when the task already has an attached merged PR.
+For a non-scout, non-`local-only` task, every `done` request must re-resolve a valid pull request and validate its head commit against the task checkout `HEAD`, including when the task already has an attached merged PR.
 The worker may send `pr`, include the URL in `message`, or let the server discover the unique PR for the server-minted branch.
-The server requires the PR head commit to equal the task checkout `HEAD`, then attaches the PR before recording the completion request.
+The server attaches the validated PR before recording the completion request.
 For `no-mistakes` tasks, the standard worker brief therefore requires inspecting `branch_sync`, running exactly `no-mistakes axi sync` when `next_action.code` is `sync`, and confirming the event response reached `task.state == completion_requested`.
 
 ## What happens when a provider turn completes
