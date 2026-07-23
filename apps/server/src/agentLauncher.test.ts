@@ -435,6 +435,50 @@ test("invalid-repo dispatch records failure then auto-closes it out of the live 
   }
 });
 
+test("dispatch resolves a bare registered project name to its rootPath", async () => {
+  const fx = fixture();
+  const repo = makeRepo();
+  const baseUrl = await listen(fx.server, fx.options);
+  fx.options.projects.touch(repo, { name: "gym-app" });
+
+  try {
+    const response = await fetch(`${baseUrl}/tasks`, {
+      ...authed,
+      method: "POST",
+      body: JSON.stringify({ title: "bare name", project: "gym-app", dispatch: true, agent: "codex", prompt: "go" })
+    });
+    assert.equal(response.status, 201, await response.text());
+    const task = fx.options.tasks.list()[0]!;
+    // The stored project is the registered rootPath, not the bare name.
+    assert.equal(task.project, fx.options.projects.find(repo)!.rootPath);
+    const launch = fx.codexOwned.launches[0]?.request as { cwd?: string } | undefined;
+    assert.ok(launch?.cwd?.includes("/worktrees/"), `expected a pool worktree cwd, got ${launch?.cwd}`);
+  } finally {
+    await fx.cleanup(repo);
+  }
+});
+
+test("dispatch rejects an unregistered bare project name with a clear registry error", async () => {
+  const fx = fixture();
+  const baseUrl = await listen(fx.server, fx.options);
+
+  try {
+    const response = await fetch(`${baseUrl}/tasks`, {
+      ...authed,
+      method: "POST",
+      body: JSON.stringify({ title: "missing", project: "gym-app", dispatch: true, agent: "codex", prompt: "go" })
+    });
+    assert.equal(response.status, 400);
+    const body = (await response.json()) as { error: string };
+    assert.match(body.error, /gym-app.*not in the projects registry/);
+    // The bogus name never reaches dispatch, so no worker launches.
+    assert.equal(fx.codexOwned.launches.length, 0);
+    assert.deepEqual(fx.options.tasks.list(), []);
+  } finally {
+    await fx.cleanup();
+  }
+});
+
 test("durable dispatch adopts an after-launch crash and repeated idempotency keys return one worker", async () => {
   const fx = fixture("afterLaunch");
   const repo = makeRepo();

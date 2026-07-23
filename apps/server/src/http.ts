@@ -1,7 +1,7 @@
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
 import { randomUUID } from "node:crypto";
 import { accessSync, constants as fsConstants, readFileSync, realpathSync, statSync } from "node:fs";
-import { delimiter, extname, join as joinPath, resolve as resolvePath } from "node:path";
+import { delimiter, extname, isAbsolute, join as joinPath, resolve as resolvePath } from "node:path";
 import { WebSocketServer } from "ws";
 import type {
   AgentEvent,
@@ -2842,6 +2842,12 @@ async function handleCreateTask(
     writeJson(response, 400, { error: "project required" });
     return;
   }
+  const resolvedProject = resolveDispatchProjectRoot(options.projects, body.project.trim());
+  if ("error" in resolvedProject) {
+    writeJson(response, 400, { error: resolvedProject.error });
+    return;
+  }
+  body.project = resolvedProject.rootPath;
   const idempotencyError = idempotencyKeyError(body.idempotencyKey);
   if (idempotencyError) {
     writeJson(response, 400, { error: idempotencyError });
@@ -3227,6 +3233,11 @@ async function createTaskRpc(
   if (typeof body.project !== "string" || body.project.trim().length === 0) {
     return rpcError(400, "project required");
   }
+  const resolvedProject = resolveDispatchProjectRoot(options.projects, body.project.trim());
+  if ("error" in resolvedProject) {
+    return rpcError(400, resolvedProject.error);
+  }
+  body.project = resolvedProject.rootPath;
   const idempotencyError = idempotencyKeyError(body.idempotencyKey);
   if (idempotencyError) return rpcError(400, idempotencyError);
 
@@ -4256,6 +4267,27 @@ function resolveTrackedProject(projects: ProjectRegistry, ref: string): Project 
   }
   const byName = projects.list().filter((project) => project.name === ref);
   return byName.length === 1 ? byName[0] : undefined;
+}
+
+// Resolve a task-dispatch `project` reference to a concrete repository root.
+// A bare registered name (or a path matching a tracked project) resolves to
+// that project's registered rootPath; an absolute path with no registry match
+// is used as given (the unchanged legacy behavior). A bare name that matches no
+// tracked project is rejected here rather than silently path-joined against the
+// server's cwd - the join used to surface as a confusing "not a git repository"
+// from the worktree pool.
+function resolveDispatchProjectRoot(
+  projects: ProjectRegistry,
+  ref: string
+): { rootPath: string } | { error: string } {
+  const tracked = resolveTrackedProject(projects, ref);
+  if (tracked) {
+    return { rootPath: tracked.rootPath };
+  }
+  if (isAbsolute(ref)) {
+    return { rootPath: resolvePath(ref) };
+  }
+  return { error: `Unknown project: "${ref}" is not in the projects registry` };
 }
 
 async function registerChartCore(
