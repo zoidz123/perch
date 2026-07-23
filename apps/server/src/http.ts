@@ -4342,8 +4342,9 @@ async function registerChartCore(
 // Boss feedback on a chart -> one normalized block into the owning session's
 // composer through the queue-gated path (queues while a permission prompt is
 // open, exactly like any composer message - attention, never an approval
-// gate). A dead owning session is an explicit 409 naming the alternatives
-// (mate / fresh agent); feedback is never silently queued for a corpse.
+// gate). When a drawing worker has ended, the registration's server-captured
+// parent is the only permitted fallback. Feedback is never silently queued for
+// a corpse or redirected from a client-supplied session id.
 // The unified hub listing: every registered chart grouped by its owning project
 // (resolved through task linkage) with that project's committed docs/plans,
 // plus charts that resolve
@@ -4494,27 +4495,29 @@ async function chartFeedbackRpc(
     return rpcError(400, "feedback needs annotations or a message");
   }
   const sessions = options.monitor.withLiveState(await options.adapter.listSessions());
-  const owner = sessions.find((session) => session.id === chart.sessionId);
-  if (!owner || owner.status === "done" || owner.status === "error") {
-    const mate = sessions.find(
-      (session) =>
-        session.labels?.role === "mate" && session.status !== "done" && session.status !== "error"
-    );
+  const liveSession = (sessionId: string | undefined) =>
+    sessionId
+      ? sessions.find((session) => session.id === sessionId && session.status !== "done" && session.status !== "error")
+      : undefined;
+  const recipient = liveSession(chart.sessionId) ?? liveSession(chart.parentSessionId);
+  if (!recipient) {
+    const parentDetail = chart.parentSessionId
+      ? ` and its registered parent (${chart.parentSessionId}) are unavailable`
+      : " and it has no registered parent";
     return {
       status: 409,
       body: {
-        error: `The session that drew this chart is gone (${chart.sessionId}). Route the feedback to the mate or start a fresh agent with the chart as context.`,
+        error: `The session that drew this chart is gone (${chart.sessionId})${parentDetail}. Start a fresh agent with the chart as context.`,
         chartId: chart.id,
-        alternatives: ["mate", "new_agent"],
-        ...(mate ? { mateSessionId: mate.id } : {})
+        alternatives: ["new_agent"]
       }
     };
   }
   const block = formatChartFeedback(chart, { message, annotations });
-  const { queued } = await deliverInput(options, chart.sessionId, block, "human");
+  const { queued } = await deliverInput(options, recipient.id, block, "human");
   await audit(options.auditLog, {
     action: "chart_feedback",
-    sessionId: chart.sessionId,
+    sessionId: recipient.id,
     chartId: chart.id,
     ...(chart.taskId ? { taskId: chart.taskId } : {}),
     ...auditMeta,
