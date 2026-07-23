@@ -951,7 +951,7 @@ export function createArtifactSdk(
 
     shadow = host.attachShadow({ mode: "open" });
     const style = document.createElement("style");
-    style.textContent = `:host{all:initial;position:fixed;z-index:2147483647;left:0;top:0;color-scheme:dark;--ink-900:#0f1115;--ink-800:#11141a;--ink-700:#171a21;--ink-600:#1c212b;--steel-700:#2a2f3a;--steel-600:#303745;--steel-500:#3c4557;--steel-400:#8c96aa;--steel-300:#aeb6c6;--steel-200:#b9c0cf;--steel-100:#d8deea;--cream-50:#fffbf3;--cream-100:#f7f3ea;--cream-200:#e8e1cf;--brass-500:#f4c95d;--brass-400:#ffd877;--brass-ink:#17130a;--bg:var(--ink-900);--bg-panel:var(--ink-800);--bg-elevated:var(--ink-600);--fg:var(--cream-100);--fg-faint:var(--steel-300);--border:var(--steel-600);--accent:#f4c95d;--accent-hover:#ffd877;--font-sans:Geist,ui-sans-serif,system-ui,-apple-system,"Segoe UI",sans-serif;--font-mono:"Geist Mono",ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;--radius-md:10px;--radius-xl:14px;--shadow-floating:0 20px 70px rgba(0,0,0,.35);font-family:var(--font-sans)}*{box-sizing:border-box}:focus-visible{outline:2px solid var(--accent);outline-offset:2px}.lavish-text-highlight{position:fixed;pointer-events:none;background:rgba(244,201,93,.28);border-radius:2px;box-shadow:0 0 0 1px rgba(244,201,93,.45)}.lavish-annotation-card{position:fixed;width:min(320px,calc(100vw - 24px));padding:12px;border-radius:var(--radius-xl);background:var(--bg-panel);color:var(--fg);border:1px solid var(--accent);box-shadow:var(--shadow-floating);font:14px/1.4 var(--font-sans)}.lavish-heading{font-weight:700;margin-bottom:6px}.lavish-annotation-card textarea{width:100%;min-height:86px;resize:vertical;border-radius:var(--radius-md);border:1px solid var(--border);background:var(--bg);color:var(--fg);padding:9px;font:inherit;font-family:var(--font-sans)}.lavish-annotation-card textarea::placeholder{color:var(--fg-faint)}.lavish-annotation-card .lavish-hint{margin-top:6px;font-size:11px;color:var(--fg-faint)}.lavish-annotation-card .lavish-row{display:flex;gap:8px;justify-content:flex-end;margin-top:8px}.lavish-annotation-card button{border:0;border-radius:var(--radius-md);padding:8px 10px;font-family:var(--font-sans);font-size:13px;font-weight:700;cursor:pointer}.lavish-annotation-card button:active{opacity:.85}.lavish-annotation-card .lavish-send{background:var(--accent);color:var(--brass-ink)}.lavish-annotation-card .lavish-send:hover{background:var(--accent-hover)}.lavish-annotation-card .lavish-cancel{background:var(--steel-700);color:var(--fg)}`;
+    style.textContent = `:host{all:initial;position:fixed;z-index:2147483647;left:0;top:0;color-scheme:dark;--canvas:#0a0908;--panel:#141210;--panel-deep:#191613;--hairline:#2a251f;--hairline-strong:#3e372d;--text:#e9e2d0;--text-2:#a89f8c;--text-3:#6f685a;--gold:#c9a227;--gold-ink:#17130a;--sans:-apple-system,BlinkMacSystemFont,"SF Pro Text","Segoe UI",sans-serif;--mono:ui-monospace,"SF Mono",Menlo,Consolas,monospace;--shadow:0 16px 44px rgba(0,0,0,.45);font-family:var(--sans)}*{box-sizing:border-box}:focus-visible{outline:2px solid var(--gold);outline-offset:2px}.lavish-text-highlight{position:fixed;pointer-events:none;background:rgba(201,162,39,.2);border-radius:2px;box-shadow:inset 0 -2px 0 rgba(201,162,39,.75)}.lavish-annotation-card{position:fixed;width:min(296px,calc(100vw - 24px));padding:10px;border-radius:12px;background:var(--panel);color:var(--text);border:1px solid var(--hairline-strong);box-shadow:var(--shadow);font:14px/1.4 var(--sans)}.lavish-annotation-card::before{content:"";position:absolute;top:-5px;left:var(--perch-anchor-x,22px);width:9px;height:9px;background:var(--panel);border-left:1px solid var(--hairline-strong);border-top:1px solid var(--hairline-strong);transform:rotate(45deg)}.lavish-annotation-card[data-placement="above"]::before{top:auto;bottom:-5px;transform:rotate(225deg)}.lavish-card-kicker{color:var(--text-3);font:700 10px/1.2 var(--mono);letter-spacing:.1em;text-transform:uppercase}.lavish-heading{margin-top:3px;color:var(--text);font-weight:650;font-size:14px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.lavish-annotation-card textarea{width:100%;min-height:64px;resize:vertical;border:1px solid var(--hairline);border-radius:8px;background:var(--canvas);color:var(--text);padding:8px;font:inherit;font-family:var(--sans)}.lavish-annotation-card textarea:focus{outline:none;border-color:var(--gold);box-shadow:0 0 0 3px rgba(201,162,39,.11)}.lavish-annotation-card textarea::placeholder{color:var(--text-3)}.lavish-annotation-card .lavish-hint{margin-top:7px;color:var(--text-3);font:10px/1.35 var(--mono)}.lavish-annotation-card .lavish-row{display:flex;gap:7px;justify-content:flex-end;margin-top:8px}.lavish-annotation-card button{min-height:36px;border:0;border-radius:8px;padding:7px 10px;font-family:var(--sans);font-size:12px;font-weight:700;cursor:pointer}.lavish-annotation-card button:active{opacity:.85}.lavish-annotation-card .lavish-send{background:var(--gold);color:var(--gold-ink)}.lavish-annotation-card .lavish-send:hover{filter:brightness(1.1)}.lavish-annotation-card .lavish-cancel{background:transparent;border:1px solid var(--hairline);color:var(--text-2)}`;
     shadow.appendChild(style);
     return shadow;
   }
@@ -987,10 +987,10 @@ export function createArtifactSdk(
     const nodeLabel = c.tag === "mermaid-node" ? c.target?.label || c.text || "" : "";
     const heading =
       c.tag === "text"
-        ? "Annotate text"
+        ? "Selected text"
         : c.tag === "mermaid-node"
-          ? "Annotate node" + (nodeLabel ? ": " + escapeAnnotationText(nodeLabel) : "")
-          : "Annotate &lt;" + c.tag + "&gt;";
+          ? nodeLabel || "Diagram node"
+          : "&lt;" + c.tag + "&gt;";
     const placeholder =
       c.tag === "text"
         ? "Tell the agent what to change about this text..."
@@ -998,17 +998,21 @@ export function createArtifactSdk(
           ? "Tell the agent what to change about this diagram node..."
           : "Tell the agent what to change about this element...";
     card.innerHTML =
-      '<div class="lavish-heading">' +
+      '<div class="lavish-card-kicker">Marked for feedback</div><div class="lavish-heading">' +
       heading +
       '</div><textarea placeholder="' +
       placeholder +
-      '"></textarea><div class="lavish-hint">Enter to queue &middot; ' +
+      '"></textarea><div class="lavish-hint">Enter adds note &middot; ' +
       (/Mac|iP(hone|ad|od)/.test(navigator.platform) ? "⌘" : "Ctrl") +
-      '+Enter to send now</div><div class="lavish-row"><button class="lavish-cancel" type="button">Cancel</button><button class="lavish-send" type="button">Queue</button></div>';
+      '+Enter sends</div><div class="lavish-row"><button class="lavish-cancel" type="button">Cancel</button><button class="lavish-send" type="button">Add note</button></div>';
     root.appendChild(card);
 
     const left = Math.min(Math.max(12, rect.left), window.innerWidth - card.offsetWidth - 12);
-    const top = Math.min(Math.max(12, rect.bottom + 8), window.innerHeight - card.offsetHeight - 12);
+    const above = rect.bottom + 10 + card.offsetHeight > window.innerHeight - 12 && rect.top - card.offsetHeight - 10 >= 12;
+    const top = above ? rect.top - card.offsetHeight - 10 : Math.min(Math.max(12, rect.bottom + 10), window.innerHeight - card.offsetHeight - 12);
+    const anchorX = Math.min(Math.max(20, rect.left + rect.width / 2 - left), card.offsetWidth - 20);
+    card.dataset.placement = above ? "above" : "below";
+    card.style.setProperty("--perch-anchor-x", anchorX + "px");
     card.style.left = left + "px";
     card.style.top = top + "px";
 
