@@ -1,8 +1,8 @@
 # Release and version synchronization
 
 The canonical Perch package version is `package.json`.
-For this source tree it is `perchctl@0.1.10`.
-Release tag: `v0.1.10`.
+For this source tree it is `perchctl@0.1.11`.
+Release tag: `v0.1.11`.
 
 Workspace package manifests, `package-lock.json`, `perch --version`, installation documentation, and the expected release tag must match that source.
 `npm run check:version` rejects drift.
