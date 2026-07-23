@@ -19,6 +19,7 @@ import type {
   AgentSession,
   AgentSessionStatus,
   CodexReasoningEffort,
+  FleetEvent,
   PendingServerRequest,
   RecentEventsResult,
   ServerRequestResponse,
@@ -142,6 +143,7 @@ export class CodexAppServerAdapter implements AgentAdapter {
   private readonly sessionEnv?: (sessionId: string, request: StartAgentRequest) => Record<string, string>;
   private readonly createClient: CreateOwnedClient;
   private readonly reconnectDelaysMs: number[];
+  private readonly fleetHandlers = new Set<(event: FleetEvent) => void>();
   private events: CodexOwnedEventSink = {};
 
   constructor(options: CodexAppServerAdapterOptions) {
@@ -216,6 +218,11 @@ export class CodexAppServerAdapter implements AgentAdapter {
 
   async listSessions(): Promise<AgentSession[]> {
     return [...this.sessions.values()].map((session) => this.toAgentSession(session));
+  }
+
+  subscribeFleetEvents(handler: (event: FleetEvent) => void): () => void {
+    this.fleetHandlers.add(handler);
+    return () => this.fleetHandlers.delete(handler);
   }
 
   async readRecentEvents(): Promise<RecentEventsResult> {
@@ -338,6 +345,7 @@ export class CodexAppServerAdapter implements AgentAdapter {
     }
 
     this.sessions.set(sessionId, session);
+    this.invalidateTopology("codex.owned-session.added", sessionId);
     this.events.onThreadStarted?.(sessionId, session.threadId!, socketPath);
     if (session.model) this.events.onModelResolved?.(sessionId, session.model);
     return this.toAgentSession(session);
@@ -350,16 +358,19 @@ export class CodexAppServerAdapter implements AgentAdapter {
     await session.client.disconnect().catch(() => {});
     this.daemons.release(session.socketPath);
     this.sessions.delete(sessionId);
+    this.invalidateTopology("codex.owned-session.removed", sessionId);
     this.events.onSessionExit?.(sessionId, { status: "done" });
   }
 
   stop(opts: { keepDaemons?: boolean } = {}): void {
+    const hadSessions = this.sessions.size > 0;
     for (const session of this.sessions.values()) {
       session.stopped = true;
       void session.client.disconnect().catch(() => {});
       if (!opts.keepDaemons) this.daemons.release(session.socketPath);
     }
     this.sessions.clear();
+    if (hadSessions) this.invalidateTopology("codex.owned-session.cleared");
   }
 
   // ─── Codex-owned control surface (beyond AgentAdapter) ─────
@@ -626,6 +637,7 @@ export class CodexAppServerAdapter implements AgentAdapter {
         await session.client.disconnect().catch(() => {});
         this.daemons.release(session.socketPath);
         this.sessions.delete(session.id);
+        this.invalidateTopology("codex.owned-session.disconnect-error", session.id);
         this.events.onSessionExit?.(session.id, {
           status: "error",
           tail: "codex app-server connection lost and reconnect attempts were exhausted"
@@ -693,6 +705,17 @@ export class CodexAppServerAdapter implements AgentAdapter {
       onUsageLimit: (limit) => this.events.onUsageLimit?.(session.id, limit),
       onDisconnected: () => this.handleDisconnect(session)
     };
+  }
+
+  private invalidateTopology(name: string, sessionId?: string): void {
+    const event: FleetEvent = {
+      kind: "topology",
+      at: new Date().toISOString(),
+      agent: "codex",
+      name,
+      ...(sessionId ? { sessionId } : {})
+    };
+    for (const handler of this.fleetHandlers) handler(event);
   }
 
   private toAgentSession(session: OwnedSession): AgentSession {
