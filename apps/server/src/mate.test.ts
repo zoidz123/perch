@@ -160,6 +160,10 @@ test("POST /mate/start seeds the mate home and spawns the labeled mate; a live m
     assert.equal(adapter.requests[0]?.cwd, mateHome);
     const spec = readFileSync(join(mateHome, "AGENTS.md"), "utf8");
     assert.ok(spec.length > 0);
+    assert.doesNotMatch(spec, /yolo/i);
+    assert.match(spec, /\*\*direct-PR\*\*/, "mate policy keeps direct-PR semantics");
+    assert.match(spec, /\*\*no-mistakes\*\*/, "mate policy keeps no-mistakes semantics");
+    assert.match(spec, /\*\*local-only\*\*/, "mate policy keeps local-only semantics");
     assert.ok(lstatSync(join(mateHome, "CLAUDE.md")).isSymbolicLink());
 
     // The mate home is infrastructure, never a registered project: the app

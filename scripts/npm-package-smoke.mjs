@@ -86,6 +86,13 @@ try {
   const localBin = join(localPrefix, "node_modules/.bin/perch");
   chmodSync(localBin, 0o755);
   command(localBin, ["--help"]);
+  const projectHelp = command(localBin, ["project", "--help"]);
+  assert.match(projectHelp, /direct-PR\|no-mistakes\|local-only/);
+  assert.doesNotMatch(projectHelp, /yolo/i);
+  assert.doesNotMatch(
+    readFileSync(join(localPrefix, "node_modules/perchctl/apps/server/assets/mate/AGENTS.md"), "utf8"),
+    /yolo/i
+  );
   assert.equal(command(localBin, ["--version"]).trim(), pack.version);
   npm(["exec", "--prefix", localPrefix, "--", "perch", "--help"]);
   command(process.execPath, ["-e", `import(${JSON.stringify(pathToFileURL(join(localPrefix, "node_modules/perchctl/packages/shared/dist/index.js")).href)})`]);

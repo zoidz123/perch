@@ -43,7 +43,7 @@ type Fixture = {
   home: string;
   tasks: TaskStore;
   projects: ProjectRegistry;
-  rpc: (method: "GET" | "POST" | "DELETE", path: string, body?: unknown) => ReturnType<typeof handleWebSocketRpcRequest>;
+  rpc: (method: "GET" | "POST" | "PATCH" | "DELETE", path: string, body?: unknown) => ReturnType<typeof handleWebSocketRpcRequest>;
 };
 
 async function withServer(run: (ctx: Fixture) => Promise<void>): Promise<void> {
@@ -100,7 +100,7 @@ function call(port: number, method: string, body?: unknown): Promise<Response> {
   });
 }
 
-test("POST /projects registers a real directory and rejects nonexistent paths with 400", async () => {
+test("POST /projects registers a real directory and rejects nonexistent or removed fields with 400", async () => {
   await withServer(async ({ port, home }) => {
     const dir = join(home, "repo");
     mkdirSync(dir);
@@ -110,11 +110,31 @@ test("POST /projects registers a real directory and rejects nonexistent paths wi
     const { project } = (await ok.json()) as { project: { rootPath: string; mode?: string } };
     assert.equal(project.rootPath, dir);
     assert.equal(project.mode, "direct-PR");
+    assert.equal(Object.hasOwn(project, "yolo"), false);
+
+    const removed = await call(port, "POST", { rootPath: dir, yolo: true });
+    assert.equal(removed.status, 400);
+    const removedBody = (await removed.json()) as { error: string };
+    assert.equal(removedBody.error, "unknown project config key: yolo");
 
     const missing = await call(port, "POST", { rootPath: join(home, "nope") });
     assert.equal(missing.status, 400);
     const body = (await missing.json()) as { error: string };
     assert.match(body.error, /Not a directory/);
+  });
+});
+
+test("PATCH /projects rejects the removed field without changing delivery mode", async () => {
+  await withServer(async ({ port, home, projects }) => {
+    const dir = join(home, "repo");
+    mkdirSync(dir);
+    projects.touch(dir, { mode: "direct-PR" });
+
+    const removed = await call(port, "PATCH", { rootPath: dir, yolo: false });
+    assert.equal(removed.status, 400);
+    const body = (await removed.json()) as { error: string };
+    assert.equal(body.error, "unknown project config key: yolo");
+    assert.equal(projects.find(dir)?.mode, "direct-PR");
   });
 });
 
@@ -176,6 +196,16 @@ test("the RPC surface (relay path) mirrors POST and DELETE /projects", async () 
 
     const badAdd = await rpc("POST", "/projects", { rootPath: join(home, "nope") });
     assert.equal(badAdd.status, 400);
+
+    const removedAdd = await rpc("POST", "/projects", { rootPath: dir, yolo: true });
+    assert.equal(removedAdd.status, 400);
+    assert.equal(removedAdd.ok, false);
+    assert.equal(removedAdd.error, "unknown project config key: yolo");
+
+    const removedPatch = await rpc("PATCH", "/projects", { rootPath: dir, yolo: false });
+    assert.equal(removedPatch.status, 400);
+    assert.equal(removedPatch.ok, false);
+    assert.equal(removedPatch.error, "unknown project config key: yolo");
 
     const task = tasks.create({ title: "live work", project: dir });
     const refused = await rpc("DELETE", "/projects", { rootPath: dir });

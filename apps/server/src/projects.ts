@@ -12,8 +12,6 @@ export type Project = {
   name: string;
   // Delivery mode for tasks in this project (M1+): how work ships.
   mode?: "direct-PR" | "no-mistakes" | "local-only";
-  // Self-approval for green work (M2); destructive actions always escalate.
-  yolo?: boolean;
   addedAt: string;
   lastUsedAt: string;
 };
@@ -40,7 +38,7 @@ export class ProjectRegistry {
 
   // Record usage of a directory (called on every session start). Registers
   // unknown paths and bumps lastUsedAt on known ones.
-  touch(rootPath: string, fields: Partial<Pick<Project, "mode" | "yolo" | "name">> = {}): Project {
+  touch(rootPath: string, fields: Partial<Pick<Project, "mode" | "name">> = {}): Project {
     const root = resolve(rootPath);
     const projects = this.load();
     const now = new Date().toISOString();
@@ -67,9 +65,6 @@ export class ProjectRegistry {
     if (fields.mode) {
       project.mode = fields.mode;
     }
-    if (fields.yolo !== undefined) {
-      project.yolo = fields.yolo;
-    }
     this.persist(projects);
     return { ...project };
   }
@@ -82,7 +77,7 @@ export class ProjectRegistry {
 
   configure(
     rootPath: string,
-    fields: { mode?: Project["mode"] | null; yolo?: boolean | null }
+    fields: { mode?: Project["mode"] | null }
   ): Project {
     const root = resolve(rootPath);
     const existing = this.find(root);
@@ -92,8 +87,6 @@ export class ProjectRegistry {
     if (!target) throw new Error(`Unknown project: ${root}`);
     if (fields.mode === null) delete target.mode;
     else if (fields.mode !== undefined) target.mode = fields.mode;
-    if (fields.yolo === null) delete target.yolo;
-    else if (fields.yolo !== undefined) target.yolo = fields.yolo;
     target.lastUsedAt = new Date().toISOString();
     this.persist(projects);
     return { ...target };
@@ -118,7 +111,16 @@ export class ProjectRegistry {
         return this.cache.projects;
       }
       const parsed = JSON.parse(readFileSync(this.path, "utf8")) as ProjectsFile;
-      const projects = Array.isArray(parsed.projects) ? parsed.projects : [];
+      const projects = Array.isArray(parsed.projects)
+        ? parsed.projects.map((project) => {
+            if (!project || typeof project !== "object" || Array.isArray(project)) return project;
+            // Legacy registry rows can carry the removed field. Drop it from
+            // the in-memory view without writing on startup; a later ordinary
+            // registry mutation persists this normalized shape.
+            const { yolo: _legacyYolo, ...current } = project as Project & { yolo?: unknown };
+            return current as Project;
+          })
+        : [];
       this.cache = { projects, mtimeMs };
       return projects;
     } catch {

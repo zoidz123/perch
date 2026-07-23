@@ -48,9 +48,9 @@ Its compact table shows the task and project, server-derived lifecycle state, wo
 ```text
 perch project [list|ls]
 perch project ls
-perch project add <path> [--mode direct-PR|no-mistakes|local-only] [--yolo] [--yes]
+perch project add <path> [--mode direct-PR|no-mistakes|local-only] [--yes]
 perch project show <path>
-perch project set <path> [--mode direct-PR|no-mistakes|local-only] [--yolo|--no-yolo] [--yes]
+perch project set <path> --mode direct-PR|no-mistakes|local-only [--yes]
 perch project remove <path>
 perch project rm <path>
 ```
@@ -73,7 +73,7 @@ perch config validate [--global] [--effective] [--json]
 ```
 
 Dotted-key mutations require explicit `--global`.
-Project delivery settings moved to `perch project show|set <path>`; a `task.mode` or `task.yolo` mutation fails with the equivalent `perch project set` command.
+Project delivery mode moved to `perch project show|set <path>`; a `task.mode` mutation fails with the equivalent `perch project set` command.
 The mate and dispatch model commands are global by definition and resolve the model to one agent before writing the complete agent, model, and effort tuple atomically.
 An omitted effort uses the selected model's registry default.
 Unknown models report closest matches, unsupported efforts report the valid levels, and ambiguous cross-agent ids require an interactive choice or `--agent`.
@@ -112,11 +112,10 @@ Copy these commands to inspect and change delivery settings for one project:
 ```sh
 perch project list
 perch project show /path/to/project
-perch project set /path/to/project --mode no-mistakes --yolo --yes
+perch project set /path/to/project --mode no-mistakes --yes
 ```
 
 Task mode precedence is explicit task mode, then the project registry value, then built-in `direct-PR`.
-Project yolo is an orthogonal boolean and defaults to `false`.
 `perch project set ... --mode no-mistakes` validates the bundled runtime and preserves the prior mode if activation fails.
 
 Effective output includes `effectiveValue`, `source`, `scope`, `storedValue`, `defaultValue`, and `overriddenBy` for every key.

@@ -23,7 +23,8 @@ const PERCH_BIN = fileURLToPath(new URL("../../../bin/perch.mjs", import.meta.ur
 type StubState = {
   defaults: Record<string, string>;
   mateDefaults: Record<string, string>;
-  project: { mode?: string; yolo?: boolean };
+  project: { mode?: string };
+  projects: Array<{ rootPath: string; name: string; mode?: string; addedAt: string; lastUsedAt: string }>;
   patches: unknown[];
   registry: Record<string, unknown>;
 };
@@ -33,6 +34,7 @@ async function withStubServer(run: (serverUrl: string, state: StubState) => Prom
     defaults: {},
     mateDefaults: {},
     project: {},
+    projects: [],
     patches: [],
     registry: stubRegistry()
   };
@@ -48,6 +50,10 @@ async function withStubServer(run: (serverUrl: string, state: StubState) => Prom
     }
     if (request.url?.startsWith("/models") && request.method === "GET") {
       response.end(JSON.stringify(state.registry));
+      return;
+    }
+    if (request.url?.startsWith("/projects") && request.method === "GET") {
+      response.end(JSON.stringify({ projects: state.projects }));
       return;
     }
     if (request.url?.startsWith("/config") && request.method === "PATCH") {
@@ -75,12 +81,10 @@ async function withStubServer(run: (serverUrl: string, state: StubState) => Prom
       let raw = "";
       request.on("data", (chunk) => (raw += chunk));
       request.on("end", () => {
-        const body = JSON.parse(raw) as { mode?: string | null; yolo?: boolean | null };
+        const body = JSON.parse(raw) as { rootPath?: string; mode?: string | null };
         state.patches.push(body);
         if (body.mode === null) delete state.project.mode;
         else if (body.mode !== undefined) state.project.mode = body.mode;
-        if (body.yolo === null) delete state.project.yolo;
-        else if (body.yolo !== undefined) state.project.yolo = body.yolo;
         response.end(JSON.stringify({ project: state.project }));
       });
       return;
@@ -178,14 +182,6 @@ function stubConfig(state: StubState) {
     defaultValue: "direct-PR",
     overriddenBy: null
   };
-  entries["task.yolo"] = {
-    effectiveValue: state.project.yolo ?? false,
-    source: state.project.yolo === undefined ? "built-in" : "project",
-    scope: "project",
-    storedValue: state.project.yolo ?? null,
-    defaultValue: false,
-    overriddenBy: null
-  };
   entries["provider.token"] = {
     effectiveValue: "server-secret",
     source: "environment",
@@ -250,6 +246,7 @@ test("wrapper help covers top-level and nested commands without starting the ser
     const alias = await runCli(unreachable, home, ["help", "config"]);
     assert.equal(alias.code, 0, alias.stderr);
     assert.match(alias.stdout, /Runtime keys are read-only provenance/);
+    assert.doesNotMatch(alias.stdout, /yolo/i);
   } finally {
     rmSync(home, { recursive: true, force: true });
   }
@@ -472,7 +469,7 @@ test("config set validates client-side: bad agent and unknown key never reach th
   }
 });
 
-test("config rejects project policy keys after they move to perch project", async () => {
+test("config moves only task.mode to perch project and rejects the removed key", async () => {
   const home = mkdtempSync(join(tmpdir(), "perch-config-home-"));
   try {
     await withStubServer(async (serverUrl, state) => {
@@ -480,9 +477,9 @@ test("config rejects project policy keys after they move to perch project", asyn
       assert.equal(moved.code, 1);
       assert.match(moved.stderr, /task\.mode moved to the project registry; use `perch project set \/repo --mode no-mistakes`/);
 
-      const yolo = await runConfig(serverUrl, home, ["set", "--project", "/repo", "task.yolo", "true"]);
-      assert.equal(yolo.code, 1);
-      assert.match(yolo.stderr, /task\.yolo moved to the project registry; use `perch project set \/repo --yolo`/);
+      const removed = await runConfig(serverUrl, home, ["set", "--project", "/repo", "task.yolo", "true"]);
+      assert.equal(removed.code, 1);
+      assert.match(removed.stderr, /unknown config key: task\.yolo/);
       assert.deepEqual(state.patches, []);
     });
   } finally {
@@ -500,7 +497,7 @@ test("config validate passes on the global view and runtime owns bundled provena
 
       const show = await runConfig(serverUrl, home, ["show"]);
       assert.equal(show.code, 0, show.stderr);
-      assert.doesNotMatch(show.stdout, /runtime\.no-mistakes|task\.mode|task\.yolo/);
+      assert.doesNotMatch(show.stdout, /runtime\.no-mistakes|task\.mode|yolo/i);
 
       const runtime = await runCli(serverUrl, home, ["runtime", "validate"]);
       assert.equal(runtime.code, 0, runtime.stderr);
@@ -510,6 +507,48 @@ test("config validate passes on the global view and runtime owns bundled provena
       assert.equal(runtimeJson.code, 0, runtimeJson.stderr);
       const body = JSON.parse(runtimeJson.stdout) as Record<string, { effectiveValue: unknown }>;
       assert.equal(body["runtime.no-mistakes.source"]?.effectiveValue, "bundled");
+    });
+  } finally {
+    rmSync(home, { recursive: true, force: true });
+  }
+});
+
+test("project CLI lists only delivery mode, accepts every supported mode, and rejects removed flags", async () => {
+  const home = mkdtempSync(join(tmpdir(), "perch-config-home-"));
+  try {
+    await withStubServer(async (serverUrl, state) => {
+      state.projects.push({
+        rootPath: "/repo",
+        name: "repo",
+        mode: "direct-PR",
+        addedAt: "2026-07-20T00:00:00.000Z",
+        lastUsedAt: "2026-07-20T00:00:00.000Z"
+      });
+      const list = await runCli(serverUrl, home, ["project", "list"]);
+      assert.equal(list.code, 0, list.stderr);
+      assert.match(list.stdout, /NAME\s+MODE\s+LAST USED\s+PATH/);
+      assert.doesNotMatch(list.stdout, /yolo/i);
+
+      const show = await runCli(serverUrl, home, ["project", "show", "/repo"]);
+      assert.equal(show.code, 0, show.stderr);
+      assert.match(show.stdout, /MODE     direct-PR/);
+      assert.doesNotMatch(show.stdout, /yolo/i);
+
+      for (const mode of ["direct-PR", "local-only", "no-mistakes"]) {
+        const set = await runCli(serverUrl, home, ["project", "set", "/repo", "--mode", mode, "--yes"]);
+        assert.equal(set.code, 0, set.stderr);
+      }
+      assert.deepEqual(state.patches.slice(-3), [
+        { rootPath: "/repo", mode: "direct-PR" },
+        { rootPath: "/repo", mode: "local-only" },
+        { rootPath: "/repo", mode: "no-mistakes" }
+      ]);
+
+      for (const [action, flag] of [["add", "--yolo"], ["set", "--no-yolo"]] as const) {
+        const removed = await runCli(serverUrl, home, ["project", action, "/repo", flag]);
+        assert.equal(removed.code, 1);
+        assert.match(removed.stderr, new RegExp(`unknown option for project ${action}: ${flag}`));
+      }
     });
   } finally {
     rmSync(home, { recursive: true, force: true });
