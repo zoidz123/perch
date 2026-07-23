@@ -31,6 +31,8 @@ test("no-mistakes mode brief carries the gate driving section and the structured
   assert.match(brief, /tasks\/ship-the-thing-a1b2\/events/);
   assert.match(brief, /"data":\{"noMistakes":\{"step":"review","findings":/);
   assert.match(brief, /no-mistakes axi respond/);
+  assert.match(brief, /As soon as no-mistakes creates or prints its PR URL/);
+  assert.match(brief, /"kind":"pr_linked"/);
   assert.match(brief, /inspect `branch_sync`/);
   assert.match(brief, /if `next_action\.code` is `sync`, run exactly `no-mistakes axi sync`/);
   assert.match(brief, /POST kind `done` with the explicit PR URL/);
@@ -51,17 +53,22 @@ test("every brief carries the never-end-a-turn-silently reporting clause", () =>
 
 test("completion examples require PR URLs only for remote ship modes", () => {
   for (const mode of ["direct-PR", "no-mistakes"] as const) {
-    assert.match(dispatchBrief(task({ mode }), undefined), /what you did; include the explicit PR URL/);
+    const brief = dispatchBrief(task({ mode }), undefined);
+    assert.match(brief, /what you did; include the explicit PR URL/);
+    assert.match(brief, /PR opened or discovered: immediately link it before continuing/);
+    assert.match(brief, /"kind":"pr_linked","pr":"<canonical GitHub PR URL>"/);
   }
 
   const local = dispatchBrief(task({ mode: "local-only" }), undefined);
   assert.match(local, /what you did; no PR was opened/);
   assert.ok(!local.includes("what you did; include the explicit PR URL"));
+  assert.ok(!local.includes("\"kind\":\"pr_linked\""));
 
   for (const mode of ["direct-PR", "no-mistakes", "local-only"] as const) {
     const scout = dispatchBrief(task({ kind: "scout", mode }), undefined);
     assert.match(scout, /what you found; no PR is required/);
     assert.ok(!scout.includes("what you did; include the explicit PR URL"));
+    assert.ok(!scout.includes("\"kind\":\"pr_linked\""));
   }
 });
 

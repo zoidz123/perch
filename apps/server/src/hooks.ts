@@ -158,7 +158,7 @@ export const CHART_CAPABILITY_NOTE = [
   '  curl -sf -X POST "${PERCH_HOOK_URL%/hooks}/charts" \\',
   '    -H "x-perch-session: $PERCH_SESSION_ID" -H "x-perch-token: $PERCH_HOOK_TOKEN" \\',
   "    -H \"content-type: application/json\" -d '{\"file\":\"<absolute path to the .html file>\"}'",
-  "Registration notifies the boss; edits to the file refresh an open review live; feedback delivery follows the authoring guide."
+  "Registration notifies the boss; edits to the file refresh an open review live; feedback arrives here as a [perch chart] block."
 ].join("\n");
 
 // Hook events perch listens to. PreToolUse doubles as a cheap "running"

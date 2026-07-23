@@ -11,6 +11,7 @@ import type { TaskStore } from "./tasks.js";
 // mate but never pushes the phone.
 export const BOSS_EVENT_KINDS = new Set([
   "chart_ready",
+  "pr_linked",
   "needs_decision",
   "blocked",
   "completion_requested",

@@ -3856,7 +3856,8 @@ async function runModelSwitchSteps(
 }
 
 // The verbs a worker (or the phone) reports. Hook-token requests are pinned
-// to the task's own session; a done verb carrying a PR URL arms the poller.
+// to the task's own session; pr_linked records PR identity without claiming
+// completion, while done carrying a PR URL retains the compatibility path.
 // Upper bound on a task event's structured data payload (~32 KB): plenty for
 // a findings table, small enough that event rows stay cheap to store and read.
 const MAX_TASK_EVENT_DATA_BYTES = 32 * 1024;
@@ -3903,7 +3904,7 @@ async function handleTaskEvent(
   }
 
   const body = await readJson<TaskEventRequest>(request);
-  const allowed: TaskEventKind[] = ["working", "needs_decision", "blocked", "done", "failed", "note"];
+  const allowed: TaskEventKind[] = ["working", "pr_linked", "needs_decision", "blocked", "done", "failed", "note"];
   if (!allowed.includes(body.kind)) {
     writeJson(response, 400, { error: `kind must be one of ${allowed.join(", ")}` });
     return;
@@ -3920,11 +3921,23 @@ async function handleTaskEvent(
       return;
     }
   }
-  let prUrl = typeof body.pr === "string" ? body.pr : extractPrUrl(message);
+  let prUrl = typeof body.pr === "string" ? body.pr.trim() : body.kind === "done" ? extractPrUrl(message) : undefined;
   let pr: TaskPr | undefined;
   // Scouts deliver reports, and local-only tasks deliberately have no remote
   // delivery contract. Only remote ship modes discover and validate PRs.
   const requiresPr = task.kind !== "scout" && task.mode !== "local-only";
+  if (body.kind === "pr_linked" && source !== "worker") {
+    writeJson(response, 401, { error: "pr_linked requires task-session credentials" });
+    return;
+  }
+  if (body.kind === "pr_linked" && !requiresPr) {
+    writeJson(response, 409, { error: "PR links are only valid for remote ship tasks" });
+    return;
+  }
+  if (body.kind === "pr_linked" && !prUrl) {
+    writeJson(response, 400, { error: "pr is required for pr_linked" });
+    return;
+  }
   if (body.kind === "done" && requiresPr && !prUrl && !task.pr?.merged && task.branch) {
     const discovered = await options.prPoller.discoverTaskPr(task);
     if (!discovered.ok) {
@@ -3932,6 +3945,15 @@ async function handleTaskEvent(
       return;
     }
     prUrl = discovered.prUrl;
+  }
+  if (body.kind === "pr_linked" && prUrl) {
+    const checkoutPath = (task.worktreeId ? options.worktrees.find(task.worktreeId)?.path : undefined) ?? task.project;
+    const attachment = await options.prPoller.resolveLinkedTaskPr(task, prUrl, checkoutPath);
+    if (!attachment.ok) {
+      writeJson(response, 409, { error: attachment.reason });
+      return;
+    }
+    pr = attachment.pr;
   }
   if (body.kind === "done" && requiresPr && prUrl && !task.pr?.merged) {
     const checkoutPath = (task.worktreeId ? options.worktrees.find(task.worktreeId)?.path : undefined) ?? task.project;
@@ -3962,7 +3984,45 @@ async function handleTaskEvent(
     data = body.data;
   }
 
-  let updated;
+  let linked = false;
+  let updated: Task | undefined;
+  if (pr && !task.pr?.merged) {
+    try {
+      const result = options.tasks.linkPr(taskId, pr, {
+        source,
+        message: pr.url,
+        data: {
+          ...(data ?? {}),
+          pr: {
+            url: pr.url,
+            ...(pr.number !== undefined ? { number: pr.number } : {}),
+            ...(pr.repo ? { repo: pr.repo } : {}),
+            ...(pr.headRepo ? { headRepo: pr.headRepo } : {}),
+            ...(pr.head ? { head: pr.head } : {}),
+            ...(pr.headOid ? { headOid: pr.headOid } : {})
+          }
+        }
+      });
+      updated = result.task;
+      linked = result.linked;
+    } catch (error) {
+      writeJson(response, 409, { error: error instanceof Error ? error.message : String(error) });
+      return;
+    }
+  }
+
+  if (linked) {
+    // PR identity is useful before completion. Start tracking the newly
+    // durable fact immediately, then let polling update only PR observations.
+    options.prPoller.armFast(taskId);
+    void options.prPoller.tick().catch(() => {});
+  }
+
+  if (body.kind === "pr_linked") {
+    writeJson(response, 200, { task: updated ?? options.tasks.find(taskId) ?? task });
+    return;
+  }
+
   try {
     // Keep the worker's long-standing `done` wire verb, but interpret every
     // report as a completion claim. Trusted done is created only by the mate's
@@ -3989,16 +4049,6 @@ async function handleTaskEvent(
   } catch (error) {
     writeJson(response, 409, { error: error instanceof Error ? error.message : String(error) });
     return;
-  }
-
-  // A finished worker naming its PR arms the reconcile loop: one eager poll
-  // now, plus a fast window while the fresh PR's checks are expected to move.
-  // The attachment lands only after the event proved a legal transition, so a
-  // rejected report leaves the task untouched.
-  if (pr && !updated.pr?.merged) {
-    updated = options.tasks.update(taskId, { pr: { ...updated.pr, ...pr } });
-    options.prPoller.armFast(taskId);
-    void options.prPoller.tick().catch(() => {});
   }
 
   writeJson(response, 200, { task: updated });

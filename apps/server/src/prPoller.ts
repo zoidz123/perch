@@ -6,8 +6,8 @@ import type { TaskStore } from "./tasks.js";
 
 const execFileAsync = promisify(execFile);
 
-// Reconcile completion-requested and done tasks against GitHub: any task with a PR
-// URL gets `gh pr view` polled until it merges (or the task closes). Emits
+// Reconcile every live task with an attached PR against GitHub until it merges
+// (or the task closes). Emits
 // checks_green when the status rollup goes green, merge_ready when GitHub says
 // the PR is policy-ready to merge, and merged when the PR lands. gh handles
 // auth; failures are silent and retried next tick (offline is normal).
@@ -192,7 +192,16 @@ export class PrPoller {
   // branch) can still report done. Only when the checkout HEAD cannot be read
   // do we fall back to the deterministic task-branch binding, so an arbitrary
   // or foreign PR URL is never accepted blind.
-  async resolveTaskPr(task: Task, prUrl: string, checkoutPath = task.project): Promise<TaskPrAttachment> {
+  async resolveTaskPr(
+    task: Task,
+    prUrl: string,
+    checkoutPath = task.project,
+    options: { allowTaskBranchWhenHeadDiff?: boolean } = {}
+  ): Promise<TaskPrAttachment> {
+    const canonical = canonicalGithubPr(prUrl);
+    if (!canonical) {
+      return { ok: false, reason: `not a GitHub pull request URL: ${prUrl}` };
+    }
     const view = await this.runGh(prUrl);
     if (!view) {
       return { ok: false, reason: `could not inspect PR: ${prUrl}` };
@@ -208,16 +217,17 @@ export class PrPoller {
     } catch {
       expectedRepo = undefined;
     }
-    const identity = validateTaskPrIdentity(task, prUrl, view, expectedRepo);
+    const identity = validateTaskPrIdentity(task, canonical.url, view, expectedRepo);
     if (!identity.ok) {
       return identity;
     }
     const expectedOid = await this.resolveHead(checkoutPath).catch(() => undefined);
+    const branchMatches = !!task.branch?.trim() && identity.actual.head === task.branch.trim();
     if (expectedOid) {
       // The PR head commit must be exactly the worker's checkout HEAD. This both
       // admits reused branches (whatever their name) and refuses a stale PR that
       // is missing the worker's latest commits.
-      if (view.headRefOid !== expectedOid) {
+      if (view.headRefOid !== expectedOid && !(options.allowTaskBranchWhenHeadDiff && branchMatches)) {
         return {
           ok: false,
           reason: view.headRefOid
@@ -229,7 +239,7 @@ export class PrPoller {
       // No readable checkout HEAD to prove the PR carries the worker's commits:
       // fall back to the deterministic task-branch binding.
       const branch = task.branch?.trim();
-      if (!branch || identity.actual.head !== branch) {
+      if (!branchMatches) {
         return {
           ok: false,
           reason: identity.actual.head
@@ -241,13 +251,24 @@ export class PrPoller {
     return {
       ok: true,
       pr: {
-        url: prUrl,
+        url: canonical.url,
+        number: canonical.number,
         repo: identity.expected.repo,
         headRepo: identity.actual.headRepo,
         ...(identity.actual.head ? { head: identity.actual.head } : {}),
         ...(view.headRefOid ? { headOid: view.headRefOid } : {})
       }
     };
+  }
+
+  // no-mistakes creates its PR from the task's server-minted branch, then can
+  // advance that remote head with gate-owned commits before `branch_sync`
+  // moves the worker checkout. The branch is still an exact durable identity;
+  // completion later reuses the strict checkout-head proof above.
+  async resolveLinkedTaskPr(task: Task, prUrl: string, checkoutPath = task.project): Promise<TaskPrAttachment> {
+    return this.resolveTaskPr(task, prUrl, checkoutPath, {
+      allowTaskBranchWhenHeadDiff: task.mode === "no-mistakes"
+    });
   }
 
   // A dispatched task has a server-minted branch, so it never needs to rely
@@ -367,7 +388,16 @@ export class PrPoller {
     if (!shouldDiscover(current) || parkWins(current)) {
       return current;
     }
-    const attached = this.tasks.update(current.id, { pr: attachment.pr });
+    let attached: Task;
+    try {
+      attached = this.tasks.linkPr(current.id, attachment.pr, {
+        source: "poller",
+        message: attachment.pr.url,
+        data: { evidence: "independent_pr_discovery", pr: prIdentity(attachment.pr) }
+      }).task;
+    } catch {
+      return this.tasks.find(current.id) ?? current;
+    }
     return this.finishAttached(attached);
   }
 
@@ -499,7 +529,11 @@ export class PrPoller {
 
 function shouldPoll(task: Task): boolean {
   return (
-    (task.state === "completion_requested" || task.state === "done") &&
+    (task.state === "working" ||
+      task.state === "needs_you" ||
+      task.state === "blocked" ||
+      task.state === "completion_requested" ||
+      task.state === "done") &&
     !!task.pr?.url &&
     !task.pr.merged
   );
@@ -701,6 +735,32 @@ async function findGithubPrByBranch(repo: string, branch: string): Promise<strin
 // The first https://github.com/.../pull/N URL in a worker's done message.
 export function extractPrUrl(text: string | undefined): string | undefined {
   return text?.match(/https:\/\/github\.com\/[^\s/]+\/[^\s/]+\/pull\/\d+/)?.[0];
+}
+
+function canonicalGithubPr(prUrl: string): { url: string; repo: string; number: number } | undefined {
+  try {
+    const parsed = new URL(prUrl);
+    if (parsed.hostname.toLowerCase() !== "github.com") return undefined;
+    const parts = parsed.pathname.split("/").filter(Boolean);
+    if (parts.length !== 4 || parts[2]?.toLowerCase() !== "pull" || !/^\d+$/.test(parts[3] ?? "")) return undefined;
+    const repo = normalizeGithubRepo(parts[0], parts[1]);
+    const number = Number(parts[3]);
+    if (!repo || !Number.isSafeInteger(number) || number < 1) return undefined;
+    return { url: `https://github.com/${repo}/pull/${number}`, repo, number };
+  } catch {
+    return undefined;
+  }
+}
+
+function prIdentity(pr: TaskPr): Record<string, unknown> {
+  return {
+    url: pr.url,
+    ...(pr.number !== undefined ? { number: pr.number } : {}),
+    ...(pr.repo ? { repo: pr.repo } : {}),
+    ...(pr.headRepo ? { headRepo: pr.headRepo } : {}),
+    ...(pr.head ? { head: pr.head } : {}),
+    ...(pr.headOid ? { headOid: pr.headOid } : {})
+  };
 }
 
 // Repo/head-repo identity of a PR against the task's project repo, with an

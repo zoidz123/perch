@@ -136,7 +136,7 @@ The request body is:
 
 ```json
 {
-  "kind": "working | needs_decision | blocked | done | failed | note",
+  "kind": "working | pr_linked | needs_decision | blocked | done | failed | note",
   "message": "optional human-readable evidence",
   "pr": "optional pull request URL",
   "data": { "optional": "structured evidence" }
@@ -150,6 +150,7 @@ The successful response is `{ "task": <updated-task> }`.
 | Worker wire verb | Durable event | Resulting task state | Meaning |
 | --- | --- | --- | --- |
 | `working` | `working` | `working` | The worker started or resumed meaningful work. |
+| `pr_linked` | `pr_linked` | unchanged | A remote ship task authenticated its canonical PR identity. The server validates and records the URL, repo, number, head branch, and head commit, then begins polling it without requesting completion. |
 | `needs_decision` | `needs_decision` | `needs_you` | Work is parked on a human or Mate decision. |
 | `blocked` | `blocked` | `blocked` | Work is parked on an external dependency. |
 | `done` | `completion_requested` | `completion_requested` | The worker claims the definition of done is met and asks Mate to verify it. |
@@ -158,6 +159,11 @@ The successful response is `{ "task": <updated-task> }`.
 
 The `done` name is retained as the worker wire verb for compatibility.
 It never directly creates trusted `done` state.
+
+For remote ship tasks, report `pr_linked` as soon as the worker or no-mistakes pipeline creates or discovers the PR.
+Its body must contain an explicit `pr` URL, never a URL scraped from ordinary working text.
+The server verifies it against the task identity, persists the PR fact and `pr_linked` event atomically, and immediately exposes it through task snapshots while lifecycle state remains unchanged.
+Repeating the same identity is harmless; a different PR is rejected.
 
 For a non-scout, non-`local-only` task, a `done` request must resolve to a valid pull request unless the attached task PR is already merged.
 The worker may send `pr`, include the URL in `message`, or let the server discover the unique PR for the server-minted branch.

@@ -7,6 +7,7 @@ import type { AgentSession, RecentEventsResult } from "@perch/shared";
 import type { AgentAdapter } from "./adapters/types.js";
 import { FleetMonitor } from "./fleetMonitor.js";
 import { wireMateWake } from "./mateWake.js";
+import { PrPoller, type GhPrView } from "./prPoller.js";
 import { TaskCompletionReconciler } from "./taskCompletion.js";
 import { TaskStore } from "./tasks.js";
 
@@ -35,6 +36,65 @@ class LifecycleAdapter implements AgentAdapter {
 }
 
 const wait = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
+
+test("early PR link keeps a reviewing task active while checks advance before completion", async () => {
+  const home = mkdtempSync(join(tmpdir(), "perch-pr-link-e2e-"));
+  const tasks = new TaskStore({ PERCH_HOME: home } as NodeJS.ProcessEnv);
+  let phase: "pending" | "passing" = "pending";
+  const view = (): GhPrView => ({
+    state: "OPEN",
+    headRefName: "perch/early-pr",
+    headRefOid: "head-a",
+    headRepository: { nameWithOwner: "o/r" },
+    statusCheckRollup: [{ name: "server", conclusion: phase === "passing" ? "SUCCESS" : "" }]
+  });
+  const poller = new PrPoller(tasks, async () => view(), { resolveLocalRepo: async () => "o/r" });
+
+  try {
+    const task = tasks.create({ title: "link PR before verification", project: "/tmp/repo", mode: "no-mistakes" });
+    tasks.recordEvent(task.id, { kind: "working", source: "worker" });
+    tasks.recordEvent(task.id, {
+      kind: "note",
+      source: "system",
+      data: { noMistakesAuthorization: { allowed: true, operation: "run", reason: "authorized" } }
+    });
+    const linked = tasks.linkPr(task.id, {
+      url: "https://github.com/o/r/pull/62",
+      number: 62,
+      repo: "o/r",
+      headRepo: "o/r",
+      head: "perch/early-pr",
+      headOid: "head-a"
+    }, { source: "worker", message: "https://github.com/o/r/pull/62" });
+    assert.equal(linked.task.state, "working");
+    assert.equal(linked.task.presentation?.state, "reviewing");
+    assert.equal(linked.task.pr?.number, 62);
+    assert.equal(tasks.events(task.id).at(-1)?.kind, "pr_linked");
+
+    poller.armFast(task.id);
+    await poller.fastTick();
+    assert.equal(tasks.find(task.id)?.state, "working");
+    assert.equal(tasks.find(task.id)?.presentation?.state, "reviewing");
+    assert.equal(tasks.find(task.id)?.pr?.checks, "pending");
+
+    phase = "passing";
+    await poller.fastTick();
+    assert.equal(tasks.find(task.id)?.pr?.checks, "passing");
+    assert.equal(tasks.find(task.id)?.state, "working");
+    assert.equal(tasks.find(task.id)?.presentation?.state, "reviewing");
+
+    tasks.recordEvent(task.id, {
+      kind: "completion_requested",
+      source: "worker",
+      data: { deliverable: { kind: "pr", headOid: "head-a" } }
+    });
+    assert.equal(tasks.find(task.id)?.state, "completion_requested");
+    assert.equal(tasks.events(task.id).filter((event) => event.kind === "pr_linked").length, 1);
+  } finally {
+    tasks.close();
+    rmSync(home, { recursive: true, force: true });
+  }
+});
 
 test("artifact plus provider turn completion without a task outcome wakes mate and recovers without false done", async () => {
   const home = mkdtempSync(join(tmpdir(), "perch-completion-e2e-"));

@@ -84,6 +84,52 @@ test("update merges linkage fields without touching state", () => {
   rmSync(home, { recursive: true, force: true });
 });
 
+test("PR links persist a single immutable fact and receipt without changing lifecycle state", () => {
+  const { store: tasks, home } = store();
+  const task = tasks.create({ title: "show the PR badge", project: "/tmp/repo" });
+  tasks.recordEvent(task.id, { kind: "working", source: "worker" });
+  const pr = {
+    url: "https://github.com/o/r/pull/62",
+    number: 62,
+    repo: "o/r",
+    headRepo: "o/r",
+    head: "perch/show-pr-badge",
+    headOid: "abc123"
+  };
+
+  const linked = tasks.linkPr(task.id, pr, {
+    source: "worker",
+    message: pr.url,
+    data: { pr }
+  });
+  assert.equal(linked.linked, true);
+  assert.equal(linked.task.state, "working");
+  assert.equal(linked.task.presentation?.state, "working");
+  assert.deepEqual(tasks.stateDb.tasks.prFacts(task.id), pr);
+  const linkEvent = tasks.events(task.id).at(-1)!;
+  assert.equal(linkEvent.kind, "pr_linked");
+  assert.deepEqual((linkEvent.data?.pr as typeof pr), pr);
+  assert.deepEqual(
+    tasks.stateDb.outbox.forTaskEvent(task.id, linkEvent.seq).map((intent) => intent.channel).sort(),
+    ["mate", "push"]
+  );
+
+  const duplicate = tasks.linkPr(task.id, pr, { source: "worker", message: pr.url, data: { pr } });
+  assert.equal(duplicate.linked, false);
+  assert.equal(tasks.events(task.id).filter((event) => event.kind === "pr_linked").length, 1);
+  assert.throws(
+    () => tasks.linkPr(task.id, { ...pr, url: "https://github.com/o/r/pull/63", number: 63 }, { source: "worker" }),
+    /already linked/
+  );
+
+  tasks.close();
+  const restarted = new TaskStore({ PERCH_HOME: home } as NodeJS.ProcessEnv);
+  assert.deepEqual(restarted.find(task.id)?.pr, pr);
+  assert.deepEqual(restarted.stateDb.tasks.prFacts(task.id), pr);
+  restarted.close();
+  rmSync(home, { recursive: true, force: true });
+});
+
 test("worker names are unique concurrently, stable across restart, and released only when closed", () => {
   const { store: tasks, home } = store();
   const first = tasks.create({ title: "first concurrent job", project: "/tmp/repo" });
