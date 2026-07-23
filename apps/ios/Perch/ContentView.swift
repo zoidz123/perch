@@ -444,13 +444,14 @@ struct HomeView: View {
         store.tasks.filter { ($0.presentation?.state ?? $0.state) != "closed" }
     }
 
-    // Sessions not owned by a live task keep their plain rows; the mate is
-    // pinned above everything, never listed here.
+    // Sessions not linked to any live or terminal task keep their plain rows;
+    // the mate is pinned above everything, never listed here.
     private var otherSessions: [AgentSession] {
         let otherIds = Set(WorkspaceGrouping.otherSessionIds(
             sessions: store.agentSessions,
-            tasks: liveTasks,
-            mateSessionId: store.mateSession?.id
+            tasks: store.tasks,
+            mateSessionId: store.mateSession?.id,
+            terminalTaskLinks: store.terminalTaskLinks
         ))
         return store.agentSessions.filter { otherIds.contains($0.id) }
     }
@@ -461,10 +462,11 @@ struct HomeView: View {
     // copy; the list is the information.
     private var projectSections: [WorkspaceProjectSectionModel] {
         WorkspaceGrouping.projectSections(
-            tasks: liveTasks,
+            tasks: store.tasks,
             sessions: store.agentSessions,
             mateSessionId: store.mateSession?.id,
-            knownProjects: store.projects.map(\.rootPath)
+            knownProjects: store.projects.map(\.rootPath),
+            terminalTaskLinks: store.terminalTaskLinks
         )
     }
 

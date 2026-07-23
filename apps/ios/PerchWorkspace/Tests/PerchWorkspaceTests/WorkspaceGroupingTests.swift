@@ -10,6 +10,8 @@ private struct FixtureTask: WorkspaceTaskLike, Codable {
     let createdAt: String
     let updatedAt: String
     let sessionId: String?
+    let runtimeSessionId: String?
+    let presentationState: String?
 
     init(
         id: String = "task",
@@ -19,7 +21,9 @@ private struct FixtureTask: WorkspaceTaskLike, Codable {
         state: String,
         createdAt: String = "2026-07-06T00:00:00Z",
         updatedAt: String,
-        sessionId: String?
+        sessionId: String?,
+        runtimeSessionId: String? = nil,
+        presentationState: String? = nil
     ) {
         self.id = id
         self.title = title
@@ -29,6 +33,8 @@ private struct FixtureTask: WorkspaceTaskLike, Codable {
         self.createdAt = createdAt
         self.updatedAt = updatedAt
         self.sessionId = sessionId
+        self.runtimeSessionId = runtimeSessionId
+        self.presentationState = presentationState
     }
 }
 
@@ -205,8 +211,9 @@ final class WorkspaceGroupingTests: XCTestCase {
             mateSessionId: "pty:mate"
         )
         // The tasked worker nests under its project and the mate is pinned
-        // above everything; a closed task no longer owns its session.
-        XCTAssertEqual(others, ["pty:closed-worker", "pty:manual"])
+        // above everything; a terminal task also suppresses its still-live
+        // worker session instead of letting it fall back into Solo agents.
+        XCTAssertEqual(others, ["pty:manual"])
     }
 
     func testCrewSessionMetadataKeepsWorkerOutOfSoloAndLinksItToTask() throws {
@@ -269,6 +276,236 @@ final class WorkspaceGroupingTests: XCTestCase {
             createdAt: nil,
             updatedAt: "2026-07-20T19:04:23Z"
         )])
+    }
+
+    func testTerminalLinkedTasksDoNotProduceFallbackRows() {
+        let terminalTasks = [
+            FixtureTask(
+                id: "landed-worker",
+                project: "/p/app",
+                state: "landed",
+                updatedAt: "t",
+                sessionId: "pty:landed"
+            ),
+            FixtureTask(
+                id: "presentation-closed-worker",
+                project: "/p/app",
+                state: "working",
+                updatedAt: "t",
+                sessionId: "pty:presentation-closed",
+                presentationState: "closed"
+            ),
+            FixtureTask(
+                id: "raw-closed-worker",
+                project: "/p/app",
+                state: "closed",
+                updatedAt: "t",
+                sessionId: nil,
+                runtimeSessionId: "pty:raw-closed"
+            )
+        ]
+        let mate = FixtureSession(id: "pty:mate", workerName: nil, taskId: nil, parentSessionId: nil)
+        let workers = [
+            FixtureSession(id: "pty:landed", workerName: "Alder", cwd: "/p/app", taskId: "landed-worker", parentSessionId: mate.id, status: "idle"),
+            FixtureSession(id: "pty:presentation-closed", workerName: "Alder", cwd: "/p/app", taskId: "presentation-closed-worker", parentSessionId: mate.id, status: "idle"),
+            FixtureSession(id: "pty:raw-closed", workerName: "Alder", cwd: "/p/app", taskId: "raw-closed-worker", parentSessionId: mate.id, status: "idle")
+        ]
+        let runtimeLinkedWithoutTaskLabel = FixtureSession(
+            id: "pty:raw-closed",
+            workerName: "Alder",
+            cwd: "/p/app",
+            taskId: nil,
+            parentSessionId: nil,
+            status: "idle"
+        )
+        let sections = WorkspaceGrouping.projectSections(
+            tasks: terminalTasks,
+            sessions: [mate] + workers,
+            mateSessionId: mate.id,
+            knownProjects: ["/p/app"]
+        )
+
+        XCTAssertTrue(sections.allSatisfy { $0.rows.isEmpty })
+        XCTAssertTrue(WorkspaceGrouping.otherSessionIds(
+            sessions: [mate] + workers + [runtimeLinkedWithoutTaskLabel],
+            tasks: terminalTasks,
+            mateSessionId: mate.id
+        ).isEmpty)
+    }
+
+    func testWorkingTaskLinkSurvivesRawClosedCacheRemoval() {
+        let previouslyLive = FixtureTask(
+            id: "raw-closed-worker",
+            project: "/p/app",
+            state: "working",
+            updatedAt: "t",
+            sessionId: "task-session",
+            runtimeSessionId: "pty:raw-closed"
+        )
+        let mate = FixtureSession(id: "pty:mate", workerName: nil, taskId: nil, parentSessionId: nil)
+        let taskLinkedWorker = FixtureSession(
+            id: "fleet-session",
+            workerName: "Alder",
+            cwd: "/p/app",
+            taskId: previouslyLive.id,
+            parentSessionId: mate.id
+        )
+        let runtimeLinkedWorker = FixtureSession(
+            id: "pty:raw-closed",
+            workerName: "Alder",
+            cwd: "/p/app",
+            taskId: nil,
+            parentSessionId: nil
+        )
+        let tombstones = WorkspaceGrouping.terminalTaskLinks(
+            existing: [],
+            previousTasks: [previouslyLive],
+            refreshedTasks: [FixtureTask]()
+        )
+
+        XCTAssertEqual(tombstones.count, 1)
+        XCTAssertEqual(tombstones[0].taskId, previouslyLive.id)
+        XCTAssertEqual(tombstones[0].sessionIds, ["task-session", "pty:raw-closed"])
+        XCTAssertTrue(WorkspaceGrouping.projectSections(
+            tasks: [FixtureTask](),
+            sessions: [mate, taskLinkedWorker],
+            mateSessionId: mate.id,
+            knownProjects: [previouslyLive.project],
+            terminalTaskLinks: tombstones
+        ).allSatisfy { $0.rows.isEmpty })
+        XCTAssertTrue(WorkspaceGrouping.otherSessionIds(
+            sessions: [mate, taskLinkedWorker, runtimeLinkedWorker],
+            tasks: [FixtureTask](),
+            mateSessionId: mate.id,
+            terminalTaskLinks: tombstones
+        ).isEmpty)
+    }
+
+    func testTerminalTaskLinksAreBoundedAndPrunedAfterSessionStops() {
+        let closedTasks = (0..<130).map { index in
+            FixtureTask(
+                id: "closed-\(index)",
+                project: "/p/app",
+                state: "closed",
+                updatedAt: "t",
+                sessionId: "pty:\(index)"
+            )
+        }
+        let tombstones = WorkspaceGrouping.terminalTaskLinks(
+            existing: [],
+            previousTasks: closedTasks,
+            refreshedTasks: [FixtureTask]()
+        )
+        let lastWorker = FixtureSession(
+            id: "pty:129",
+            workerName: "Alder",
+            taskId: "closed-129",
+            parentSessionId: "pty:mate"
+        )
+
+        XCTAssertEqual(tombstones.count, 128)
+        XCTAssertEqual(tombstones.first?.taskId, "closed-2")
+        XCTAssertEqual(
+            WorkspaceGrouping.activeTerminalTaskLinks(tombstones, sessions: [lastWorker]),
+            [tombstones.last!]
+        )
+        XCTAssertTrue(
+            WorkspaceGrouping.activeTerminalTaskLinks(tombstones, sessions: [FixtureSession]()).isEmpty
+        )
+    }
+
+    func testActiveLinkedWorkerStaysVisibleAndNavigable() {
+        let task = FixtureTask(
+            id: "active-worker",
+            project: "/p/app",
+            state: "working",
+            updatedAt: "t",
+            sessionId: "pty:worker"
+        )
+        let mate = FixtureSession(id: "pty:mate", workerName: nil, taskId: nil, parentSessionId: nil)
+        let worker = FixtureSession(
+            id: "pty:worker",
+            title: "codex - active work",
+            workerName: "Alder",
+            cwd: task.project,
+            taskId: task.id,
+            parentSessionId: mate.id,
+            status: "running"
+        )
+
+        let sections = WorkspaceGrouping.projectSections(
+            tasks: [task],
+            sessions: [mate, worker],
+            mateSessionId: mate.id,
+            knownProjects: [task.project]
+        )
+
+        XCTAssertEqual(sections[0].rows.map(\.id), ["task:active-worker"])
+        XCTAssertEqual(WorkspaceGrouping.sessionId(
+            forTaskId: task.id,
+            linkedSessionId: task.sessionId,
+            sessions: [mate, worker]
+        ), worker.id)
+        XCTAssertTrue(WorkspaceGrouping.otherSessionIds(
+            sessions: [mate, worker],
+            tasks: [task],
+            mateSessionId: mate.id
+        ).isEmpty)
+    }
+
+    func testUnlinkedIdleSessionRemainsVisibleOutsideCrew() {
+        let mate = FixtureSession(id: "pty:mate", workerName: nil, taskId: nil, parentSessionId: nil)
+        let idle = FixtureSession(
+            id: "pty:untracked",
+            title: "codex - landed work",
+            workerName: "Alder",
+            cwd: "/p/app",
+            taskId: nil,
+            parentSessionId: nil,
+            status: "idle"
+        )
+
+        XCTAssertEqual(WorkspaceGrouping.otherSessionIds(
+            sessions: [mate, idle],
+            tasks: [FixtureTask](),
+            mateSessionId: mate.id
+        ), [idle.id])
+    }
+
+    func testTaskSnapshotReplacesCrewFallbackAfterFleetCacheArrives() {
+        let task = FixtureTask(
+            id: "active-worker",
+            project: "/p/app",
+            state: "working",
+            updatedAt: "t",
+            sessionId: "pty:worker"
+        )
+        let mate = FixtureSession(id: "pty:mate", workerName: nil, taskId: nil, parentSessionId: nil)
+        let worker = FixtureSession(
+            id: "pty:worker",
+            title: "codex - active work",
+            workerName: "Alder",
+            cwd: task.project,
+            taskId: task.id,
+            parentSessionId: mate.id,
+            status: "idle"
+        )
+
+        let beforeTaskCache = WorkspaceGrouping.projectSections(
+            tasks: [FixtureTask](),
+            sessions: [mate, worker],
+            mateSessionId: mate.id,
+            knownProjects: [task.project]
+        )
+        let afterTaskCache = WorkspaceGrouping.projectSections(
+            tasks: [task],
+            sessions: [mate, worker],
+            mateSessionId: mate.id,
+            knownProjects: [task.project]
+        )
+
+        XCTAssertEqual(beforeTaskCache[0].rows.map(\.id), ["session:pty:worker"])
+        XCTAssertEqual(afterTaskCache[0].rows.map(\.id), ["task:active-worker"])
     }
 
     func testProjectSectionRowsHoldDispatchOrderWhileWorkersChurn() {

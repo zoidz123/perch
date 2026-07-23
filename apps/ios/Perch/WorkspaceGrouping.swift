@@ -15,6 +15,8 @@ protocol WorkspaceTaskLike {
     var createdAt: String { get }
     var updatedAt: String { get }
     var sessionId: String? { get }
+    var runtimeSessionId: String? { get }
+    var presentationState: String? { get }
 }
 
 protocol WorkspaceSessionLike {
@@ -73,6 +75,11 @@ struct WorkspaceProjectSectionModel: Identifiable, Equatable {
     let rows: [WorkspaceCrewRowModel]
 }
 
+struct WorkspaceTerminalTaskLink: Equatable {
+    let taskId: String
+    let sessionIds: Set<String>
+}
+
 enum WorkspaceGrouping {
     static func taskRefreshResult<Task>(
         current: [Task],
@@ -128,6 +135,51 @@ enum WorkspaceGrouping {
         }
     }
 
+    // A landed worker is closed presentation even while its live runtime is
+    // still stopping. Use ledger/session identity only - never session text.
+    private static func isClosedForPresentation<T: WorkspaceTaskLike>(_ task: T) -> Bool {
+        task.state == "landed" || task.state == "closed" || task.presentationState == "closed"
+    }
+
+    private static func linkedSessionIds<T: WorkspaceTaskLike>(for tasks: [T]) -> Set<String> {
+        Set(tasks.compactMap(\.sessionId) + tasks.compactMap(\.runtimeSessionId))
+    }
+
+    static func terminalTaskLinks<T: WorkspaceTaskLike>(
+        existing: [WorkspaceTerminalTaskLink],
+        previousTasks: [T],
+        refreshedTasks: [T],
+        limit: Int = 128
+    ) -> [WorkspaceTerminalTaskLink] {
+        guard limit > 0 else { return [] }
+
+        let refreshedTaskIds = Set(refreshedTasks.map(\.id))
+        let refreshedLiveTaskIds = Set(refreshedTasks.filter { !isClosedForPresentation($0) }.map(\.id))
+        var links = existing.filter { !refreshedLiveTaskIds.contains($0.taskId) }
+        let newlyTerminalTasks = previousTasks.filter {
+            isClosedForPresentation($0) || !refreshedTaskIds.contains($0.id)
+        } + refreshedTasks.filter(isClosedForPresentation)
+        for task in newlyTerminalTasks {
+            links.removeAll { $0.taskId == task.id }
+            links.append(WorkspaceTerminalTaskLink(
+                taskId: task.id,
+                sessionIds: Set([task.sessionId, task.runtimeSessionId].compactMap { $0 })
+            ))
+        }
+        return Array(links.suffix(limit))
+    }
+
+    static func activeTerminalTaskLinks<S: WorkspaceSessionLike>(
+        _ links: [WorkspaceTerminalTaskLink],
+        sessions: [S]
+    ) -> [WorkspaceTerminalTaskLink] {
+        links.filter { link in
+            sessions.contains { session in
+                session.taskId == link.taskId || link.sessionIds.contains(session.id)
+            }
+        }
+    }
+
     // Live tasks define the project groups (a task-less project never
     // renders). Rows within a group and the groups themselves use the stable
     // order above: a group sits at the position of its oldest live task
@@ -135,7 +187,7 @@ enum WorkspaceGrouping {
     // while workers run.
     static func projectGroups<T: WorkspaceTaskLike>(_ tasks: [T]) -> [WorkspaceProjectGroup<T>] {
         var byProject: [String: [T]] = [:]
-        for task in tasks where task.state != "closed" {
+        for task in tasks where !isClosedForPresentation(task) {
             byProject[task.project, default: []].append(task)
         }
         let groups = byProject.map { project, grouped in
@@ -174,18 +226,25 @@ enum WorkspaceGrouping {
         tasks: [T],
         sessions: [S],
         mateSessionId: String?,
-        knownProjects: [String]
+        knownProjects: [String],
+        terminalTaskLinks: [WorkspaceTerminalTaskLink] = []
     ) -> [WorkspaceProjectSectionModel] {
         guard let mateSessionId else { return [] }
 
-        let liveTasks = tasks.filter { $0.state != "closed" }
+        let liveTasks = tasks.filter { !isClosedForPresentation($0) }
         let liveTaskIds = Set(liveTasks.map(\.id))
-        let liveTaskSessionIds = Set(liveTasks.compactMap(\.sessionId))
+        let liveTaskSessionIds = linkedSessionIds(for: liveTasks)
+        let closedTaskIds = Set(tasks.filter(isClosedForPresentation).map(\.id))
+            .union(terminalTaskLinks.map(\.taskId))
+        let closedTaskSessionIds = linkedSessionIds(for: tasks.filter(isClosedForPresentation))
+            .union(terminalTaskLinks.flatMap(\.sessionIds))
         var rowsByProject: [String: [WorkspaceCrewRowModel]] = [:]
 
         for task in liveTasks {
             let linkedSession = sessions.first { session in
-                session.taskId == task.id || session.id == task.sessionId
+                session.taskId == task.id
+                    || session.id == task.sessionId
+                    || session.id == task.runtimeSessionId
             }
             let projectName = displayName(forProject: task.project)
             rowsByProject[task.project, default: []].append(WorkspaceCrewRowModel(
@@ -204,6 +263,7 @@ enum WorkspaceGrouping {
         for session in sessions {
             guard session.parentSessionId == mateSessionId, let taskId = session.taskId else { continue }
             guard !liveTaskIds.contains(taskId), !liveTaskSessionIds.contains(session.id) else { continue }
+            guard !closedTaskIds.contains(taskId), !closedTaskSessionIds.contains(session.id) else { continue }
             let project = projectForCrewSession(session.cwd, knownProjects: knownProjects)
             let taskTitle = taskTitle(fromSessionTitle: session.title)
             rowsByProject[project, default: []].append(WorkspaceCrewRowModel(
@@ -316,25 +376,31 @@ enum WorkspaceGrouping {
     }
 
     // Orphans: sessions owned by no live task and not parented to the mate.
-    // Crew labels keep a worker out of "Solo agents" even while the task
-    // snapshot catches up to the fleet snapshot.
+    // A terminal durable task also keeps its still-stopping session out of
+    // every fallback list. Crew labels keep an active worker out of "Solo
+    // agents" while the task snapshot catches up to the fleet snapshot.
     static func otherSessionIds<T: WorkspaceTaskLike, S: WorkspaceSessionLike>(
         sessions: [S],
         tasks: [T],
-        mateSessionId: String?
+        mateSessionId: String?,
+        terminalTaskLinks: [WorkspaceTerminalTaskLink] = []
     ) -> [String] {
-        let liveTasks = tasks.filter { $0.state != "closed" }
-        let taskSessionIds = Set(liveTasks.compactMap(\.sessionId))
+        let liveTasks = tasks.filter { !isClosedForPresentation($0) }
+        let taskSessionIds = linkedSessionIds(for: liveTasks)
         let taskIds = Set(liveTasks.map(\.id))
-        let closedTaskIds = Set(tasks.filter { $0.state == "closed" }.map(\.id))
+        let closedTaskIds = Set(tasks.filter(isClosedForPresentation).map(\.id))
+            .union(terminalTaskLinks.map(\.taskId))
+        let closedTaskSessionIds = linkedSessionIds(for: tasks.filter(isClosedForPresentation))
+            .union(terminalTaskLinks.flatMap(\.sessionIds))
         return sessions.compactMap { session in
             let isTaskWorker = taskSessionIds.contains(session.id)
                 || session.taskId.map(taskIds.contains) == true
             let belongsToClosedTask = session.taskId.map(closedTaskIds.contains) == true
+                || closedTaskSessionIds.contains(session.id)
             let isMateChild = mateSessionId != nil
                 && session.parentSessionId == mateSessionId
                 && !belongsToClosedTask
-            return !isTaskWorker && !isMateChild && session.id != mateSessionId ? session.id : nil
+            return !isTaskWorker && !belongsToClosedTask && !isMateChild && session.id != mateSessionId ? session.id : nil
         }
     }
 
