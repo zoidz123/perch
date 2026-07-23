@@ -627,6 +627,52 @@ test("done with a reused-branch PR that lacks the worker's commits is still reje
   );
 });
 
+test("no-mistakes done rejects a pipeline-owned newer PR head until guarded sync advances the checkout", async () => {
+  let pipelineHead = "";
+  await withServer(
+    async ({ home, port, tasks, hooks }) => {
+      const { project, head: workerHead } = makeProjectWithCommit(home);
+      execFileSync("git", ["-C", project, "commit", "-q", "--allow-empty", "-m", "pipeline review fix"], {
+        stdio: "pipe"
+      });
+      pipelineHead = execFileSync("git", ["-C", project, "rev-parse", "HEAD"], { encoding: "utf8" }).trim();
+      execFileSync("git", ["-C", project, "reset", "--hard", workerHead], { stdio: "pipe" });
+
+      const task = tasks.create({ title: "ship through no-mistakes", project, mode: "no-mistakes" });
+      const { token } = hooks.register("pty:worker");
+      const headers = { "x-perch-session": "pty:worker", "x-perch-token": token };
+      const done = { kind: "done", message: "green checks https://github.com/o/r/pull/50" };
+      tasks.update(task.id, { sessionId: "pty:worker", branch: "perch/gated" });
+      tasks.recordEvent(task.id, { kind: "working", source: "worker" });
+
+      const stale = await post(port, task.id, headers, done);
+      assert.equal(stale.status, 409);
+      const staleBody = (await stale.json()) as { error: string };
+      assert.match(staleBody.error, new RegExp(`PR head commit ${pipelineHead} does not match checkout HEAD ${workerHead}`));
+      assert.equal(tasks.find(task.id)?.state, "working");
+      assert.equal(tasks.find(task.id)?.pr, undefined);
+
+      // Simulate the guarded `no-mistakes axi sync` advancing the checkout to
+      // the pipeline-owned PR head without weakening the endpoint's OID check.
+      execFileSync("git", ["-C", project, "reset", "--hard", pipelineHead], { stdio: "pipe" });
+
+      const accepted = await post(port, task.id, headers, done);
+      assert.equal(accepted.status, 200);
+      const acceptedBody = (await accepted.json()) as { task: { state: string } };
+      assert.equal(acceptedBody.task.state, "completion_requested");
+      assert.equal(tasks.find(task.id)?.state, "completion_requested");
+      assert.equal(tasks.find(task.id)?.pr?.headOid, pipelineHead);
+      assert.equal(tasks.events(task.id).at(-1)?.kind, "completion_requested");
+    },
+    async () => ({
+      state: "OPEN",
+      headRefName: "perch/gated",
+      headRefOid: pipelineHead,
+      headRepository: { nameWithOwner: "o/r" }
+    })
+  );
+});
+
 test("URL-less done deterministically binds the task branch before arming PR polling", async () => {
   await withServer(
     async ({ home, port, tasks, hooks }) => {

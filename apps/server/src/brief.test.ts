@@ -31,6 +31,14 @@ test("no-mistakes mode brief carries the gate driving section and the structured
   assert.match(brief, /tasks\/ship-the-thing-a1b2\/events/);
   assert.match(brief, /"data":\{"noMistakes":\{"step":"review","findings":/);
   assert.match(brief, /no-mistakes axi respond/);
+  assert.match(brief, /inspect `branch_sync`/);
+  assert.match(brief, /if `next_action\.code` is `sync`, run exactly `no-mistakes axi sync`/);
+  assert.match(brief, /POST kind `done` with the explicit PR URL/);
+  assert.match(brief, /Do not emit final prose until the response confirms `task\.state == completion_requested`/);
+  assert.match(brief, /If sync or the POST fails, report `blocked` or `failed` accurately/);
+  assert.match(brief, /curl --silent --show-error --fail-with-body/);
+  assert.match(brief, /response\.task\?\.state !== "completion_requested"/);
+  assert.match(brief, /expected task\.state == completion_requested/);
 });
 
 test("every brief carries the never-end-a-turn-silently reporting clause", () => {

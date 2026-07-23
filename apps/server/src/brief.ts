@@ -22,9 +22,12 @@ export function dispatchBrief(
   agent?: AgentKind
 ): string {
   const verb = (kind: string, example: string) =>
-    `curl -sf -X POST "\${PERCH_HOOK_URL%/hooks}/tasks/${task.id}/events" \\\n` +
+    `curl --silent --show-error --fail-with-body -X POST "\${PERCH_HOOK_URL%/hooks}/tasks/${task.id}/events" \\\n` +
     `  -H "x-perch-session: $PERCH_SESSION_ID" -H "x-perch-token: $PERCH_HOOK_TOKEN" \\\n` +
     `  -H "content-type: application/json" -d '{"kind":"${kind}","message":"${example}"}'`;
+  const doneVerb =
+    `${verb("done", "what you did; include the explicit PR URL")} \\\n` +
+    `  | node -e 'let body=""; process.stdin.setEncoding("utf8"); process.stdin.on("data", chunk => body += chunk); process.stdin.on("end", () => { console.log(body); const response = JSON.parse(body); if (response.task?.state !== "completion_requested") { console.error("done report was not accepted: expected task.state == completion_requested"); process.exitCode = 1; } });'`;
 
   const location = worktreePath
     ? `You are working in an isolated worktree at ${worktreePath}. Verify with pwd before changing anything; never cd outside it.`
@@ -68,7 +71,7 @@ export function dispatchBrief(
   // boss as structured data on the needs_decision verb, copied verbatim from
   // the gate's table - perch never parses pipeline output itself.
   const askUserExample =
-    `curl -sf -X POST "\${PERCH_HOOK_URL%/hooks}/tasks/${task.id}/events" \\\n` +
+    `curl --silent --show-error --fail-with-body -X POST "\${PERCH_HOOK_URL%/hooks}/tasks/${task.id}/events" \\\n` +
     `  -H "x-perch-session: $PERCH_SESSION_ID" -H "x-perch-token: $PERCH_HOOK_TOKEN" \\\n` +
     `  -H "content-type: application/json" \\\n` +
     `  -d '{"kind":"needs_decision","message":"review gate: 2 findings need you","data":{"noMistakes":{"step":"review","findings":[{"id":"r1","severity":"error","file":"src/app.ts","line":42,"action":"ask-user","description":"the finding text, copied in full"}]}}}'`;
@@ -81,7 +84,11 @@ export function dispatchBrief(
           "- Run gate pushes unsandboxed: sandboxed Bash breaks the gate's post-receive hook.",
           "- When a gate parks the run with ask-user findings, never answer or bypass them yourself. Report needs_decision with message = a one-line summary and the findings table copied VERBATIM into data.noMistakes - every finding's id, severity, file, line, action, and description exactly as the gate printed them, no paraphrasing, no dropped findings:",
           askUserExample,
-          "- The answer arrives as a message in your chat; resume the parked run with `no-mistakes axi respond`."
+          "- The answer arrives as a message in your chat; resume the parked run with `no-mistakes axi respond`.",
+          "- After checks pass, inspect `branch_sync`; if `next_action.code` is `sync`, run exactly `no-mistakes axi sync` to advance the checkout to the PR head.",
+          "- Then POST kind `done` with the explicit PR URL.",
+          "- Do not emit final prose until the response confirms `task.state == completion_requested`.",
+          "- If sync or the POST fails, report `blocked` or `failed` accurately - never end silently."
         ]
       : [];
 
@@ -117,7 +124,7 @@ export function dispatchBrief(
     `- started working:\n${verb("working", "short note on your approach")}`,
     `- need a human decision:\n${verb("needs_decision", "the question, with options")}`,
     `- blocked on something external:\n${verb("blocked", "what blocks you")}`,
-    `- request completion verification:\n${verb("done", "what you did; include the PR URL if any")}`,
+    `- request completion verification (the command fails unless Perch acknowledges task.state == completion_requested):\n${doneVerb}`,
     `- cannot complete:\n${verb("failed", "why")}`,
     "",
     "Drawing charts: when something you hand the boss is easier reviewed visually than as prose - a plan, a comparison, findings - draw a chart: one HTML file the boss annotates from desktop or phone.",
