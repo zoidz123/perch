@@ -74,7 +74,8 @@ See [Worker task API and turn lifecycle](worker-task-api.md) for the endpoint co
 Losing a runtime records `runtime_interrupted` without changing the task's semantic state.
 Dispatch and recovery operations use durable leases and idempotency keys so a server restart can resume work without intentionally launching duplicates.
 
-Worktree leases remain bound to managed tasks until the landed gate authorizes teardown.
+Worktree leases remain bound to launched managed tasks until the landed gate authorizes teardown.
+Dispatch preparation failures release their lease only under the resource-free predicate documented in [Worker task API and turn lifecycle](worker-task-api.md#post-tasks).
 Perch refuses ordinary release of dirty trees, unlanded commits, and live holders.
 
 ## Recovery
