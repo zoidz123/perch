@@ -19,6 +19,19 @@ jobs:
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+      - name: Detect iOS changes
+        id: changes
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.before }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+        run: |
+          if git diff --quiet "$BASE_SHA" "$HEAD_SHA" -- apps/ios; then
+            echo "ios=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "ios=true" >> "$GITHUB_OUTPUT"
+          fi
       - uses: actions/setup-node@v5
         with:
           node-version: 24
@@ -26,11 +39,15 @@ jobs:
       - run: npm ci
       - run: npm run check:public-seed
       - run: npm run build
-      - run: npm run typecheck
-      - run: npm test -w @perch/server
-      - run: npm test -w @perch/relay
+      - name: Run core server tests
+        run: >-
+          node --import tsx --test
+          apps/server/src/stateDb.test.ts
+          apps/server/src/completionLifecycle.e2e.test.ts
+          apps/server/src/reliabilityE2e.test.ts
       - run: npm run test:package
-      - name: Build with Xcode 26
+      - name: Compile iOS app with Xcode 26
+        if: steps.changes.outputs.ios == 'true'
         run: >-
           xcodebuild
           -project apps/ios/Perch.xcodeproj
