@@ -464,17 +464,32 @@ function taskEventNotificationIntents(
 }
 
 function samePrIdentity(existing: TaskPr, incoming: TaskPr): boolean {
-  return (
-    existing.url === incoming.url &&
-    optionalIdentityFieldMatches(existing.number, incoming.number) &&
-    optionalIdentityFieldMatches(existing.repo, incoming.repo) &&
-    optionalIdentityFieldMatches(existing.headRepo, incoming.headRepo) &&
-    optionalIdentityFieldMatches(existing.head, incoming.head)
-  );
+  const existingIdentity = githubPrIdentity(existing.url);
+  const incomingIdentity = githubPrIdentity(incoming.url);
+  if (existingIdentity && incomingIdentity) {
+    return existingIdentity.repo === incomingIdentity.repo && existingIdentity.number === incomingIdentity.number;
+  }
+  return existing.url === incoming.url;
 }
 
-function optionalIdentityFieldMatches<T>(existing: T | undefined, incoming: T | undefined): boolean {
-  return existing === undefined || incoming === undefined || existing === incoming;
+function githubPrIdentity(url: string): { repo: string; number: number } | undefined {
+  try {
+    const parsed = new URL(url);
+    if (parsed.hostname.toLowerCase() !== "github.com") {
+      return undefined;
+    }
+    const parts = parsed.pathname.split("/").filter(Boolean);
+    if (parts.length !== 4 || parts[2]?.toLowerCase() !== "pull" || !/^\d+$/.test(parts[3] ?? "")) {
+      return undefined;
+    }
+    const number = Number(parts[3]);
+    if (!Number.isSafeInteger(number) || number < 1) {
+      return undefined;
+    }
+    return { repo: `${parts[0]}/${parts[1]}`.toLowerCase(), number };
+  } catch {
+    return undefined;
+  }
 }
 
 function prObservationChanged(existing: TaskPr, incoming: TaskPr): boolean {

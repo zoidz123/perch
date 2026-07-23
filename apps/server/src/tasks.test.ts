@@ -130,6 +130,23 @@ test("PR links persist one identity receipt while refreshing the observed head",
     /already linked/
   );
 
+  const legacy = tasks.create({ title: "complete a legacy PR link", project: "/tmp/repo" });
+  tasks.update(legacy.id, {
+    pr: {
+      url: "https://github.com/O/R/pull/62/?legacy=1",
+      head: "old-head",
+      headOid: "old-oid"
+    }
+  });
+  const normalized = tasks.linkPr(
+    legacy.id,
+    pr,
+    { source: "worker", message: pr.url, data: { pr } }
+  );
+  assert.equal(normalized.linked, false);
+  assert.deepEqual(normalized.task.pr, pr);
+  assert.equal(tasks.events(legacy.id).filter((event) => event.kind === "pr_linked").length, 0);
+
   tasks.close();
   const restarted = new TaskStore({ PERCH_HOME: home } as NodeJS.ProcessEnv);
   assert.deepEqual(restarted.find(task.id)?.pr, { ...pr, headOid: "def456" });
