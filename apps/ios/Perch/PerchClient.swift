@@ -9,9 +9,14 @@ final class PerchStore: ObservableObject {
     @Published var sessions: [AgentSession] = [] {
         didSet {
             sessionsById = Dictionary(sessions.map { ($0.id, $0) }, uniquingKeysWith: { _, last in last })
+            terminalTaskLinks = WorkspaceGrouping.activeTerminalTaskLinks(
+                terminalTaskLinks,
+                sessions: sessions
+            )
         }
     }
     @Published private(set) var sessionsById: [String: AgentSession] = [:]
+    @Published private(set) var terminalTaskLinks: [WorkspaceTerminalTaskLink] = []
     @Published var tasks: [AgentTask] = [] {
         didSet {
             // A live authoritative generation settles any local recovery
@@ -1231,6 +1236,11 @@ final class PerchStore: ObservableObject {
     private func refreshTaskSnapshot() async {
         do {
             let response: TasksResult = try await request(path: "/tasks")
+            terminalTaskLinks = WorkspaceGrouping.terminalTaskLinks(
+                existing: terminalTaskLinks,
+                previousTasks: tasks,
+                refreshedTasks: response.tasks
+            )
             let refresh = WorkspaceGrouping.taskRefreshResult(
                 current: tasks,
                 result: Result<[AgentTask], Error>.success(response.tasks)

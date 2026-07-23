@@ -75,6 +75,11 @@ struct WorkspaceProjectSectionModel: Identifiable, Equatable {
     let rows: [WorkspaceCrewRowModel]
 }
 
+struct WorkspaceTerminalTaskLink: Equatable {
+    let taskId: String
+    let sessionIds: Set<String>
+}
+
 enum WorkspaceGrouping {
     static func taskRefreshResult<Task>(
         current: [Task],
@@ -140,6 +145,39 @@ enum WorkspaceGrouping {
         Set(tasks.compactMap(\.sessionId) + tasks.compactMap(\.runtimeSessionId))
     }
 
+    static func terminalTaskLinks<T: WorkspaceTaskLike>(
+        existing: [WorkspaceTerminalTaskLink],
+        previousTasks: [T],
+        refreshedTasks: [T],
+        limit: Int = 128
+    ) -> [WorkspaceTerminalTaskLink] {
+        guard limit > 0 else { return [] }
+
+        let refreshedLiveTaskIds = Set(
+            refreshedTasks.filter { !isClosedForPresentation($0) }.map(\.id)
+        )
+        var links = existing.filter { !refreshedLiveTaskIds.contains($0.taskId) }
+        for task in previousTasks + refreshedTasks where isClosedForPresentation(task) {
+            links.removeAll { $0.taskId == task.id }
+            links.append(WorkspaceTerminalTaskLink(
+                taskId: task.id,
+                sessionIds: Set([task.sessionId, task.runtimeSessionId].compactMap { $0 })
+            ))
+        }
+        return Array(links.suffix(limit))
+    }
+
+    static func activeTerminalTaskLinks<S: WorkspaceSessionLike>(
+        _ links: [WorkspaceTerminalTaskLink],
+        sessions: [S]
+    ) -> [WorkspaceTerminalTaskLink] {
+        links.filter { link in
+            sessions.contains { session in
+                session.taskId == link.taskId || link.sessionIds.contains(session.id)
+            }
+        }
+    }
+
     // Live tasks define the project groups (a task-less project never
     // renders). Rows within a group and the groups themselves use the stable
     // order above: a group sits at the position of its oldest live task
@@ -186,7 +224,8 @@ enum WorkspaceGrouping {
         tasks: [T],
         sessions: [S],
         mateSessionId: String?,
-        knownProjects: [String]
+        knownProjects: [String],
+        terminalTaskLinks: [WorkspaceTerminalTaskLink] = []
     ) -> [WorkspaceProjectSectionModel] {
         guard let mateSessionId else { return [] }
 
@@ -194,7 +233,9 @@ enum WorkspaceGrouping {
         let liveTaskIds = Set(liveTasks.map(\.id))
         let liveTaskSessionIds = linkedSessionIds(for: liveTasks)
         let closedTaskIds = Set(tasks.filter(isClosedForPresentation).map(\.id))
+            .union(terminalTaskLinks.map(\.taskId))
         let closedTaskSessionIds = linkedSessionIds(for: tasks.filter(isClosedForPresentation))
+            .union(terminalTaskLinks.flatMap(\.sessionIds))
         var rowsByProject: [String: [WorkspaceCrewRowModel]] = [:]
 
         for task in liveTasks {
@@ -339,13 +380,16 @@ enum WorkspaceGrouping {
     static func otherSessionIds<T: WorkspaceTaskLike, S: WorkspaceSessionLike>(
         sessions: [S],
         tasks: [T],
-        mateSessionId: String?
+        mateSessionId: String?,
+        terminalTaskLinks: [WorkspaceTerminalTaskLink] = []
     ) -> [String] {
         let liveTasks = tasks.filter { !isClosedForPresentation($0) }
         let taskSessionIds = linkedSessionIds(for: liveTasks)
         let taskIds = Set(liveTasks.map(\.id))
         let closedTaskIds = Set(tasks.filter(isClosedForPresentation).map(\.id))
+            .union(terminalTaskLinks.map(\.taskId))
         let closedTaskSessionIds = linkedSessionIds(for: tasks.filter(isClosedForPresentation))
+            .union(terminalTaskLinks.flatMap(\.sessionIds))
         return sessions.compactMap { session in
             let isTaskWorker = taskSessionIds.contains(session.id)
                 || session.taskId.map(taskIds.contains) == true

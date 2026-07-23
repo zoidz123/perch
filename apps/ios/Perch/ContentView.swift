@@ -450,7 +450,8 @@ struct HomeView: View {
         let otherIds = Set(WorkspaceGrouping.otherSessionIds(
             sessions: store.agentSessions,
             tasks: store.tasks,
-            mateSessionId: store.mateSession?.id
+            mateSessionId: store.mateSession?.id,
+            terminalTaskLinks: store.terminalTaskLinks
         ))
         return store.agentSessions.filter { otherIds.contains($0.id) }
     }
@@ -464,7 +465,8 @@ struct HomeView: View {
             tasks: store.tasks,
             sessions: store.agentSessions,
             mateSessionId: store.mateSession?.id,
-            knownProjects: store.projects.map(\.rootPath)
+            knownProjects: store.projects.map(\.rootPath),
+            terminalTaskLinks: store.terminalTaskLinks
         )
     }
 
