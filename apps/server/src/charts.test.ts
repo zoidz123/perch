@@ -752,7 +752,30 @@ test("GET /charts/authoring serves the authoring guide as markdown WITHOUT auth"
     const markdown = await response.text();
     assert.match(markdown, /# Drawing charts/);
     assert.match(markdown, /chart\.css/);
+    assert.match(markdown, /Verdict \/ Answer/);
+    assert.match(markdown, /Problem \/ Findings/);
+    assert.match(markdown, /Fix \/ Recommendation/);
+    assert.match(markdown, /one screen/);
+    assert.match(markdown, /15 seconds/);
+    assert.match(markdown, /Narrative prose paragraphs/);
+    assert.match(markdown, /Restated background or context/);
+    assert.match(markdown, /Evidence dumps/);
+    assert.match(markdown, /ELI5 explanations or analogies/);
   });
+});
+
+test("chart reference demonstrates the terse verdict-findings-fix format", () => {
+  const html = readFileSync(new URL("../assets/charts/reference.html", import.meta.url), "utf8");
+  const verdict = html.indexOf("<h1>Charts must deliver the answer in 15 seconds</h1>");
+  const findings = html.indexOf("<h2>Problem / Findings</h2>");
+  const fix = html.indexOf("<h2>Fix / Recommendation</h2>");
+  assert.ok(verdict >= 0 && verdict < findings && findings < fix);
+
+  const findingsList = html.slice(findings, fix);
+  const fixList = html.slice(fix);
+  assert.equal([...findingsList.matchAll(/<li>/g)].length, 4);
+  assert.equal([...fixList.matchAll(/<li>/g)].length, 4);
+  assert.doesNotMatch(html, /<style\b|style=/);
 });
 
 test("POST /hooks answers SessionStart and Claude Stop records turn completion evidence", async () => {

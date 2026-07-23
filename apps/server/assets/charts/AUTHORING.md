@@ -33,7 +33,7 @@ Start every chart like this:
 When the chart is served by perch, the relative `chart.css` link resolves to the server's own copy automatically.
 Copy `apps/server/assets/charts/chart.css` next to your chart file only if the file must also open directly from disk.
 
-`reference.html` in this directory is a complete example exercising every class; read it once before writing your first chart.
+`reference.html` in this directory is a complete terse example; read it once before writing your first chart.
 
 ## Register and iterate
 
@@ -209,16 +209,31 @@ To render, include this snippet once at the end of `<body>` (this exact snippet 
 
 ## Content shapes
 
-A chart is a review surface: make the thing you want a decision on its own annotatable element.
+A chart is a 15-second review surface.
+Make the answer obvious without scrolling.
 
-- **Plan** - open with the goal, the current state, and the desired behavior; then the approach as high-level decisions; end with risks and open questions.
-  When a question is resolved, fold the answer into the content and delete the question.
-- **Comparison** - name the decision in the title block; show concrete behavior for each option, not abstract pros and cons; make each option's cost as visible as its benefit; recommend only when the evidence supports one.
-- **Diagram** - lead with the question the diagram answers; keep the first diagram to the core relationship and put dense detail below it; several small diagrams beat one crammed one.
-- **Table** - open with one line saying what the rows prove; make the primary status readable without scanning every cell; never use color as the only signal.
+Use this order:
+
+1. **Verdict / Answer** - put one decisive line at the very top.
+2. **Problem / Findings** - use at most four short bullets.
+3. **Fix / Recommendation** - use at most four short bullets.
+4. **Open question / Decision** - optionally end with one short line.
+
+Keep the entire chart to one screen.
+Cut content until a reader can get the point in about 15 seconds.
+
+Do not include:
+
+- Narrative prose paragraphs.
+- Restated background or context.
+- Evidence dumps; link the evidence or drop it.
+- ELI5 explanations or analogies unless the boss explicitly asks for them.
+
+Prefer bullets, short cards, and tables over paragraphs.
+Reserve `<blockquote>` for one key line only.
 
 ## Layout discipline
 
 - The page must never scroll horizontally; wide things (tables, code, diagrams) scroll inside their own wrapper.
-- Keep charts one column and under roughly two screens of content; a chart is a review surface, not documentation.
+- Keep charts one column and to one screen of content; a chart is a review surface, not documentation.
 - Use tone colors to mean something (state, risk), never for decoration.
