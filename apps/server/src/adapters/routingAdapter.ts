@@ -118,7 +118,27 @@ export class RoutingAgentAdapter implements AgentAdapter {
   }
 
   subscribeFleetEvents(handler: (event: FleetEvent) => void): () => void {
-    return this.pty.subscribeFleetEvents?.(handler) ?? (() => {});
+    let closed = false;
+    let topologyPending = false;
+    const forward = (event: FleetEvent): void => {
+      if (event.kind !== "topology") {
+        handler(event);
+        return;
+      }
+      if (topologyPending) return;
+      topologyPending = true;
+      queueMicrotask(() => {
+        topologyPending = false;
+        if (!closed) handler(event);
+      });
+    };
+    const unsubscribePty = this.pty.subscribeFleetEvents?.(forward);
+    const unsubscribeCodex = this.codexOwned.subscribeFleetEvents?.(forward);
+    return () => {
+      closed = true;
+      unsubscribePty?.();
+      unsubscribeCodex?.();
+    };
   }
 
   subscribeAgentEvents(handler: (event: AgentEvent) => void): () => void {
