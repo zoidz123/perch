@@ -837,6 +837,9 @@ test("chartReviewHtml escapes chart names and the session JSON", () => {
   assert.ok(!html.includes("<map>"));
   // JSON blob escapes < so a name can never close the script tag early.
   assert.ok(html.includes('"name":"road\\u003cmap> \\"v1\\""'));
+  assert.ok(html.includes('aria-keyshortcuts="Enter"'));
+  assert.ok(html.includes('<kbd aria-hidden="true">↵</kbd>'));
+  assert.ok(html.includes('<span class="composer-guide">Enter to send</span>'));
 });
 
 test("chart statics (chart.css + review chrome) serve WITHOUT auth as subresources", async () => {
