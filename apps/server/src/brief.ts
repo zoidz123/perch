@@ -25,8 +25,14 @@ export function dispatchBrief(
     `curl --silent --show-error --fail-with-body -X POST "\${PERCH_HOOK_URL%/hooks}/tasks/${task.id}/events" \\\n` +
     `  -H "x-perch-session: $PERCH_SESSION_ID" -H "x-perch-token: $PERCH_HOOK_TOKEN" \\\n` +
     `  -H "content-type: application/json" -d '{"kind":"${kind}","message":"${example}"}'`;
+  const doneExample =
+    task.kind === "scout"
+      ? "what you found; no PR is required"
+      : task.mode === "local-only"
+        ? "what you did; no PR was opened"
+        : "what you did; include the explicit PR URL";
   const doneVerb =
-    `${verb("done", "what you did; include the explicit PR URL")} \\\n` +
+    `${verb("done", doneExample)} \\\n` +
     `  | node -e 'let body=""; process.stdin.setEncoding("utf8"); process.stdin.on("data", chunk => body += chunk); process.stdin.on("end", () => { console.log(body); const response = JSON.parse(body); if (response.task?.state !== "completion_requested") { console.error("done report was not accepted: expected task.state == completion_requested"); process.exitCode = 1; } });'`;
 
   const location = worktreePath

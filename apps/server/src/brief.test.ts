@@ -49,6 +49,22 @@ test("every brief carries the never-end-a-turn-silently reporting clause", () =>
   }
 });
 
+test("completion examples require PR URLs only for remote ship modes", () => {
+  for (const mode of ["direct-PR", "no-mistakes"] as const) {
+    assert.match(dispatchBrief(task({ mode }), undefined), /what you did; include the explicit PR URL/);
+  }
+
+  const local = dispatchBrief(task({ mode: "local-only" }), undefined);
+  assert.match(local, /what you did; no PR was opened/);
+  assert.ok(!local.includes("what you did; include the explicit PR URL"));
+
+  for (const mode of ["direct-PR", "no-mistakes", "local-only"] as const) {
+    const scout = dispatchBrief(task({ kind: "scout", mode }), undefined);
+    assert.match(scout, /what you found; no PR is required/);
+    assert.ok(!scout.includes("what you did; include the explicit PR URL"));
+  }
+});
+
 test("a planId stamps the brief with the plan it builds from and the first-commit convention", () => {
   const brief = dispatchBrief(task({ planId: "docs/plans/2026-07-08-hub.md" }), "/tmp/wt");
   assert.match(brief, /builds from the finalized plan `docs\/plans\/2026-07-08-hub\.md`/);
