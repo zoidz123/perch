@@ -752,15 +752,28 @@ test("GET /charts/authoring serves the authoring guide as markdown WITHOUT auth"
     const markdown = await response.text();
     assert.match(markdown, /# Drawing charts/);
     assert.match(markdown, /chart\.css/);
-    assert.match(markdown, /Verdict \/ Answer/);
-    assert.match(markdown, /Problem \/ Findings/);
-    assert.match(markdown, /Fix \/ Recommendation/);
-    assert.match(markdown, /one screen/);
-    assert.match(markdown, /15 seconds/);
-    assert.match(markdown, /Narrative prose paragraphs/);
-    assert.match(markdown, /Restated background or context/);
-    assert.match(markdown, /Evidence dumps/);
-    assert.match(markdown, /ELI5 explanations or analogies/);
+    const mandates = [
+      "**Verdict / Answer** - put one decisive line at the very top.",
+      "**Problem / Findings** - use at most four short bullets.",
+      "**Fix / Recommendation** - use at most four short bullets.",
+      "**Open question / Decision** - optionally end with one short line.",
+      "Keep the entire chart to one screen.",
+      "Cut content until a reader can get the point in about 15 seconds.",
+      "Prefer bullets, short cards, and tables over paragraphs.",
+      "Reserve `<blockquote>` for one key line only."
+    ];
+    const bans = [
+      "Narrative prose paragraphs.",
+      "Restated background or context.",
+      "Evidence dumps; link the evidence or drop it.",
+      "ELI5 explanations or analogies unless the boss explicitly asks for them."
+    ];
+    for (const mandate of mandates) {
+      assert.ok(markdown.includes(mandate), `missing authoring mandate: ${mandate}`);
+    }
+    for (const ban of bans) {
+      assert.ok(markdown.includes(ban), `missing authoring ban: ${ban}`);
+    }
   });
 });
 
