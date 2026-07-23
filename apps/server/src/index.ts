@@ -16,6 +16,10 @@ import {
 import { ChartRegistry, wireChartArchive } from "./charts.js";
 import { claudeStateFilePath } from "./claudeTrust.js";
 import { readConfig } from "./config.js";
+import {
+  handleDispatchOperationFailure,
+  repairVerifiedPrelaunchDispatchFailures
+} from "./dispatchFailures.js";
 import { FleetMonitor } from "./fleetMonitor.js";
 import { removeAttachments, removePidFile, writePidFile } from "./home.js";
 import { HookRegistry, installClaudeHooks, installCodexHooks } from "./hooks.js";
@@ -120,23 +124,11 @@ const ownerManager = new OwnerManager(tasks);
 tasks.claimLegacyActiveWorkerNames();
 runtimeManager.bootstrapLegacyTasks();
 runtimeManager.repairLegacySessionGoneArtifacts();
+repairVerifiedPrelaunchDispatchFailures({ tasks, worktrees });
 const taskScheduler = new TaskScheduler({
   stateDb: tasks.stateDb,
   operationKinds: ["dispatch", "recovery", "continuation"],
-  onFailure: async (operation, error) => {
-    if (operation.kind !== "dispatch") return;
-    const task = tasks.find(operation.taskId);
-    if (!task || task.state === "failed") return;
-    if (operation.payload?.launchStarted !== true) {
-      const lease = worktrees.findByHolder(task.id);
-      if (lease) await worktrees.release(lease.id, { force: true }).catch(() => {});
-    }
-    tasks.recordEvent(task.id, {
-      kind: "failed",
-      source: "system",
-      message: `dispatch failed: ${error instanceof Error ? error.message : String(error)}`
-    });
-  }
+  onFailure: (operation, error) => handleDispatchOperationFailure(operation, error, { tasks, worktrees })
 });
 let taskWatchdog: TaskWatchdog | undefined;
 const prPoller = new PrPoller(tasks, undefined, {

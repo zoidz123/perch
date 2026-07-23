@@ -20,6 +20,7 @@ import { HookRegistry, installClaudeHooks, perchHookPath } from "./hooks.js";
 import { RuntimeManager } from "./runtimeManager.js";
 import { createControlServer, handleWebSocketRpcRequest } from "./http.js";
 import { DeviceRegistry } from "./pairing.js";
+import { handleDispatchOperationFailure } from "./dispatchFailures.js";
 import { PrPoller } from "./prPoller.js";
 import { PromptDeliveryTracker } from "./promptDeliveries.js";
 import { ProjectRegistry } from "./projects.js";
@@ -128,6 +129,7 @@ function fixture(durableBoundary?: "afterLaunch" | "durable") {
   );
   const auditLog = new AuditLog(join(home, "audit.jsonl"));
   const tasks = new TaskStore(env);
+  const worktrees = new WorktreePool({ env });
   const timeline = new TimelineStore();
   const promptDeliveries = new PromptDeliveryTracker(tasks.stateDb, { receiptTimeoutMs: 5_000 });
   const monitor = new FleetMonitor(routing, {
@@ -155,16 +157,8 @@ function fixture(durableBoundary?: "afterLaunch" | "durable") {
             throw new InjectedCrash(name);
           }
         },
-        onFailure: (operation, error) => {
-          const task = tasks.find(operation.taskId);
-          if (task && task.state !== "failed") {
-            tasks.recordEvent(task.id, {
-              kind: "failed",
-              source: "system",
-              message: `dispatch failed: ${error instanceof Error ? error.message : String(error)}`
-            });
-          }
-        }
+        onFailure: (operation, error) =>
+          handleDispatchOperationFailure(operation, error, { tasks, worktrees })
       })
     : undefined;
   const options = {
@@ -178,7 +172,7 @@ function fixture(durableBoundary?: "afterLaunch" | "durable") {
     hooks: new HookRegistry(),
     timeline,
     projects: new ProjectRegistry(env),
-    worktrees: new WorktreePool({ env }),
+    worktrees,
     // Trust seeding targets a scratch state file, never the real ~/.claude.json.
     claudeStateFile: join(home, ".claude.json"),
     tasks,
@@ -412,6 +406,35 @@ test("task dispatch keeps task worktree behavior while launching through the sha
   }
 });
 
+test("invalid-repo dispatch records failure then auto-closes it out of the live ledger", async () => {
+  const fx = fixture("durable");
+  const project = mkdtempSync(join(tmpdir(), "perch-invalid-project-"));
+  const baseUrl = await listen(fx.server, fx.options);
+
+  try {
+    const response = await fetch(`${baseUrl}/tasks`, {
+      ...authed,
+      method: "POST",
+      body: JSON.stringify({ title: "invalid repo", project, dispatch: true, agent: "codex", prompt: "go" })
+    });
+    assert.equal(response.status, 500);
+
+    const task = fx.options.tasks.list()[0]!;
+    assert.equal(task.state, "closed");
+    assert.deepEqual(fx.options.tasks.events(task.id).map((event) => event.kind), ["created", "failed", "closed"]);
+    assert.equal(fx.options.tasks.stateDb.operations.latestForTask(task.id, "dispatch")?.state, "failed");
+
+    const live = (await (await fetch(`${baseUrl}/tasks`, authed)).json()) as { tasks: Array<{ id: string }> };
+    assert.deepEqual(live.tasks, []);
+    const ledger = (await (await fetch(`${baseUrl}/tasks?includeClosed=1`, authed)).json()) as {
+      tasks: Array<{ id: string; state: string }>;
+    };
+    assert.deepEqual(ledger.tasks.map((candidate) => [candidate.id, candidate.state]), [[task.id, "closed"]]);
+  } finally {
+    await fx.cleanup(project);
+  }
+});
+
 test("durable dispatch adopts an after-launch crash and repeated idempotency keys return one worker", async () => {
   const fx = fixture("afterLaunch");
   const repo = makeRepo();
@@ -489,6 +512,8 @@ test("replaying a durably failed idempotency key returns the failed task without
       fx.options.tasks.stateDb.operations.findByIdempotencyKey("dispatch:request:phone-request-2")?.state,
       "failed"
     );
+    const live = (await (await fetch(`${baseUrl}/tasks`, authed)).json()) as { tasks: Array<{ id: string }> };
+    assert.ok(live.tasks.some((candidate) => candidate.id === task.id), "post-launch failure stays visible");
   } finally {
     await fx.cleanup(repo);
   }
