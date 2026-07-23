@@ -251,10 +251,10 @@ export class TaskStore {
     return this.withPresentation({ ...task });
   }
 
-  // Attach the immutable PR identity and its ledger receipt in one SQLite
+  // Attach the stable PR identity and its ledger receipt in one SQLite
   // transaction. A link is evidence only: it never moves the task lifecycle.
-  // Replaying the same report is a no-op; replacing a different task PR is
-  // refused so a stale worker cannot silently retarget the task.
+  // Replaying the same report refreshes mutable observations without another
+  // receipt; replacing a different task PR is refused.
   linkPr(
     id: string,
     pr: TaskPr,
@@ -264,6 +264,12 @@ export class TaskStore {
     if (task.pr) {
       if (!samePrIdentity(task.pr, pr)) {
         throw new Error(`task is already linked to ${task.pr.url}`);
+      }
+      const refreshed = { ...task.pr, ...pr };
+      if (prObservationChanged(task.pr, refreshed)) {
+        task.pr = refreshed;
+        task.updatedAt = nextTimestamp(task.updatedAt);
+        this.stateDb.tasks.save(withoutDerived(task));
       }
       return { task: this.withPresentation({ ...task }), linked: false };
     }
@@ -463,13 +469,18 @@ function samePrIdentity(existing: TaskPr, incoming: TaskPr): boolean {
     optionalIdentityFieldMatches(existing.number, incoming.number) &&
     optionalIdentityFieldMatches(existing.repo, incoming.repo) &&
     optionalIdentityFieldMatches(existing.headRepo, incoming.headRepo) &&
-    optionalIdentityFieldMatches(existing.head, incoming.head) &&
-    optionalIdentityFieldMatches(existing.headOid, incoming.headOid)
+    optionalIdentityFieldMatches(existing.head, incoming.head)
   );
 }
 
 function optionalIdentityFieldMatches<T>(existing: T | undefined, incoming: T | undefined): boolean {
   return existing === undefined || incoming === undefined || existing === incoming;
+}
+
+function prObservationChanged(existing: TaskPr, incoming: TaskPr): boolean {
+  return Object.entries(incoming).some(
+    ([key, value]) => existing[key as keyof TaskPr] !== value
+  );
 }
 
 // "fix the flaky auth test" -> "fix-the-flaky-auth-a1b2" - readable slug plus

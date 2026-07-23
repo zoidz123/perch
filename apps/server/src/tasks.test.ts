@@ -84,7 +84,7 @@ test("update merges linkage fields without touching state", () => {
   rmSync(home, { recursive: true, force: true });
 });
 
-test("PR links persist a single immutable fact and receipt without changing lifecycle state", () => {
+test("PR links persist one identity receipt while refreshing the observed head", () => {
   const { store: tasks, home } = store();
   const task = tasks.create({ title: "show the PR badge", project: "/tmp/repo" });
   tasks.recordEvent(task.id, { kind: "working", source: "worker" });
@@ -117,6 +117,14 @@ test("PR links persist a single immutable fact and receipt without changing life
   const duplicate = tasks.linkPr(task.id, pr, { source: "worker", message: pr.url, data: { pr } });
   assert.equal(duplicate.linked, false);
   assert.equal(tasks.events(task.id).filter((event) => event.kind === "pr_linked").length, 1);
+  const advanced = tasks.linkPr(
+    task.id,
+    { ...pr, headOid: "def456" },
+    { source: "worker", message: pr.url, data: { pr: { ...pr, headOid: "def456" } } }
+  );
+  assert.equal(advanced.linked, false);
+  assert.equal(advanced.task.pr?.headOid, "def456");
+  assert.equal(tasks.events(task.id).filter((event) => event.kind === "pr_linked").length, 1);
   assert.throws(
     () => tasks.linkPr(task.id, { ...pr, url: "https://github.com/o/r/pull/63", number: 63 }, { source: "worker" }),
     /already linked/
@@ -124,8 +132,8 @@ test("PR links persist a single immutable fact and receipt without changing life
 
   tasks.close();
   const restarted = new TaskStore({ PERCH_HOME: home } as NodeJS.ProcessEnv);
-  assert.deepEqual(restarted.find(task.id)?.pr, pr);
-  assert.deepEqual(restarted.stateDb.tasks.prFacts(task.id), pr);
+  assert.deepEqual(restarted.find(task.id)?.pr, { ...pr, headOid: "def456" });
+  assert.deepEqual(restarted.stateDb.tasks.prFacts(task.id), { ...pr, headOid: "def456" });
   restarted.close();
   rmSync(home, { recursive: true, force: true });
 });

@@ -608,6 +608,7 @@ test("worker pr_linked persists a canonical fact before completion, exposes it i
 });
 
 test("no-mistakes pr_linked accepts the task branch before branch_sync but completion remains head-pinned", async () => {
+  let prHead = "pipeline-head";
   await withServer(
     async ({ home, port, tasks, hooks }) => {
       const { project } = makeProjectWithCommit(home);
@@ -626,11 +627,55 @@ test("no-mistakes pr_linked accepts the task branch before branch_sync but compl
       assert.equal(prematureDone.status, 409);
       assert.match((await prematureDone.json() as { error: string }).error, /does not match checkout HEAD/);
       assert.equal(tasks.find(task.id)?.state, "working");
+
+      execFileSync("git", ["-C", project, "commit", "-q", "--allow-empty", "-m", "branch sync"], { stdio: "pipe" });
+      prHead = execFileSync("git", ["-C", project, "rev-parse", "HEAD"], { encoding: "utf8" }).trim();
+
+      const completed = await post(port, task.id, headers, { kind: "done" });
+      assert.equal(completed.status, 200);
+      assert.equal(tasks.find(task.id)?.state, "completion_requested");
+      assert.equal(tasks.find(task.id)?.pr?.headOid, prHead);
+      assert.equal(tasks.events(task.id).filter((event) => event.kind === "pr_linked").length, 1);
     },
     async () => ({
       state: "OPEN",
       headRefName: "perch/link-gate-pr-early",
-      headRefOid: "pipeline-head",
+      headRefOid: prHead,
+      headRepository: { nameWithOwner: "o/r" }
+    })
+  );
+});
+
+test("done revalidates an early-linked PR after it has merged", async () => {
+  let checkoutHead = "";
+  await withServer(
+    async ({ home, port, tasks, hooks }) => {
+      const { project, head } = makeProjectWithCommit(home);
+      checkoutHead = head;
+      const task = tasks.create({ title: "validate merged linked PR", project, mode: "no-mistakes" });
+      const { token } = hooks.register("pty:worker");
+      const headers = { "x-perch-session": "pty:worker", "x-perch-token": token };
+      tasks.update(task.id, { sessionId: "pty:worker", branch: "perch/validate-merged" });
+      tasks.recordEvent(task.id, { kind: "working", source: "worker" });
+
+      const linked = await post(port, task.id, headers, {
+        kind: "pr_linked",
+        pr: "https://github.com/o/r/pull/65"
+      });
+      assert.equal(linked.status, 200);
+      tasks.update(task.id, { pr: { ...tasks.find(task.id)!.pr!, merged: true } });
+      execFileSync("git", ["-C", project, "commit", "-q", "--allow-empty", "-m", "unpublished work"], { stdio: "pipe" });
+
+      const refused = await post(port, task.id, headers, { kind: "done" });
+      assert.equal(refused.status, 409);
+      assert.match((await refused.json() as { error: string }).error, /does not match checkout HEAD/);
+      assert.equal(tasks.find(task.id)?.state, "working");
+    },
+    async () => ({
+      state: "MERGED",
+      mergedAt: "2026-07-23T00:00:00Z",
+      headRefName: "perch/validate-merged",
+      headRefOid: checkoutHead,
       headRepository: { nameWithOwner: "o/r" }
     })
   );

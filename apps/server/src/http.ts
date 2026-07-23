@@ -3938,13 +3938,17 @@ async function handleTaskEvent(
     writeJson(response, 400, { error: "pr is required for pr_linked" });
     return;
   }
-  if (body.kind === "done" && requiresPr && !prUrl && !task.pr?.merged && task.branch) {
-    const discovered = await options.prPoller.discoverTaskPr(task);
-    if (!discovered.ok) {
-      writeJson(response, 409, { error: discovered.reason });
-      return;
+  if (body.kind === "done" && requiresPr && !prUrl) {
+    if (task.pr?.url) {
+      prUrl = task.pr.url;
+    } else if (task.branch) {
+      const discovered = await options.prPoller.discoverTaskPr(task);
+      if (!discovered.ok) {
+        writeJson(response, 409, { error: discovered.reason });
+        return;
+      }
+      prUrl = discovered.prUrl;
     }
-    prUrl = discovered.prUrl;
   }
   if (body.kind === "pr_linked" && prUrl) {
     const checkoutPath = (task.worktreeId ? options.worktrees.find(task.worktreeId)?.path : undefined) ?? task.project;
@@ -3955,7 +3959,7 @@ async function handleTaskEvent(
     }
     pr = attachment.pr;
   }
-  if (body.kind === "done" && requiresPr && prUrl && !task.pr?.merged) {
+  if (body.kind === "done" && requiresPr && prUrl) {
     const checkoutPath = (task.worktreeId ? options.worktrees.find(task.worktreeId)?.path : undefined) ?? task.project;
     const attachment = await options.prPoller.resolveTaskPr(task, prUrl, checkoutPath);
     if (!attachment.ok) {
@@ -3986,7 +3990,7 @@ async function handleTaskEvent(
 
   let linked = false;
   let updated: Task | undefined;
-  if (pr && !task.pr?.merged) {
+  if (pr) {
     try {
       const result = options.tasks.linkPr(taskId, pr, {
         source,
