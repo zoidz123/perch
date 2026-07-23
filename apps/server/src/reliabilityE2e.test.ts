@@ -66,8 +66,8 @@ test("E2E: a real managed worker PTY can disappear without changing task meaning
     const launched = await startManagedAgent(h.launcher, {
       taskId: task.id,
       request: {
-        command: "sleep",
-        args: ["300"],
+        command: process.execPath,
+        args: ["-e", "setTimeout(() => {}, 300_000)", "--"],
         agent: "claude",
         sessionId: "pty:runtime-e2e-worker",
         cwd: home,
@@ -120,8 +120,8 @@ test("E2E: private-home server restart reconciles ownership and preserves reconn
   const launched = await startManagedAgent(first.launcher, {
     taskId: task.id,
     request: {
-      command: "sleep",
-      args: ["300"],
+      command: process.execPath,
+      args: ["-e", "setTimeout(() => {}, 300_000)", "--"],
       agent: "claude",
       sessionId: "pty:restart-e2e-worker",
       cwd: home,
