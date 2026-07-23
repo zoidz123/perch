@@ -1,5 +1,6 @@
 import SwiftUI
 import PhotosUI
+import PerchSessionNavigation
 
 // Design language (reference: minimal dark chat apps): near-black canvas,
 // plain rows with hairline separators instead of heavy cards, one big bold
@@ -1403,8 +1404,16 @@ struct SessionDetailView: View {
     // The task this session is the worker for (dispatched crew work).
     private var sessionTask: AgentTask? {
         store.tasks.first { task in
-            task.sessionId == sessionId || session?.taskId == task.id
+            task.sessionId == sessionId || task.runtime?.ptySessionId == sessionId || session?.taskId == task.id
         }
+    }
+
+    private var detailPresentation: SessionDetailPresentation {
+        SessionNavigationPresentation.detailPresentation(
+            hasSessionSnapshot: session != nil,
+            taskState: sessionTask?.state,
+            runtimeState: sessionTask?.runtime?.state
+        )
     }
 
     // The mate's own chat: the Charts hub button lives on this composer, where
@@ -1428,7 +1437,11 @@ struct SessionDetailView: View {
                 .padding(.bottom, 10)
                 .background(Style.canvas)
 
-            if hasChatSource {
+            if detailPresentation == .launching {
+                LaunchingSessionShell(task: sessionTask)
+            } else if detailPresentation == .unavailable {
+                UnavailableSessionShell(task: sessionTask)
+            } else if hasChatSource {
                 TimelineChatView(sessionId: sessionId)
                     .environmentObject(store)
             } else {
@@ -1486,7 +1499,7 @@ struct SessionDetailView: View {
             Spacer()
 
             VStack(spacing: 1) {
-                Text(session.map { titleFor($0) } ?? "Agent")
+                Text(session.map { titleFor($0) } ?? sessionTask?.workerName ?? "Agent")
                     .font(.system(size: 18, weight: .semibold))
                     .lineLimit(1)
                 if let session, let description = workDescriptionFor(session) {
@@ -1501,28 +1514,42 @@ struct SessionDetailView: View {
                         .foregroundStyle(Style.textFaint)
                         .lineLimit(1)
                         .truncationMode(.head)
+                } else if detailPresentation == .launching {
+                    Text("Launching on your Mac")
+                        .font(.system(size: 12))
+                        .foregroundStyle(Style.textSecondary)
+                        .lineLimit(1)
+                } else if let task = sessionTask {
+                    Text(unavailableDetail(for: task))
+                        .font(.system(size: 12))
+                        .foregroundStyle(Style.textSecondary)
+                        .lineLimit(1)
                 }
             }
 
             Spacer()
 
-            Menu {
-                Button {
-                    Task { await store.interrupt(sessionId) }
-                } label: {
-                    Label("Interrupt (Ctrl+C)", systemImage: "stop.circle")
-                }
-                Button(role: .destructive) {
-                    Task {
-                        if await store.stopSession(sessionId) {
-                            dismiss()
+            if detailPresentation.permitsActions {
+                Menu {
+                    Button {
+                        Task { await store.interrupt(sessionId) }
+                    } label: {
+                        Label("Interrupt (Ctrl+C)", systemImage: "stop.circle")
+                    }
+                    Button(role: .destructive) {
+                        Task {
+                            if await store.stopSession(sessionId) {
+                                dismiss()
+                            }
                         }
+                    } label: {
+                        Label("Stop session", systemImage: "xmark.octagon")
                     }
                 } label: {
-                    Label("Stop session", systemImage: "xmark.octagon")
+                    RoundIcon(systemName: "ellipsis")
                 }
-            } label: {
-                RoundIcon(systemName: "ellipsis")
+            } else {
+                Color.clear.frame(width: 44, height: 44)
             }
         }
     }
@@ -1545,107 +1572,123 @@ struct SessionDetailView: View {
 
     @ViewBuilder
     private var bottomArea: some View {
-        VStack(spacing: 8) {
-            if let request = session?.pendingServerRequest {
-                StructuredRequestCard(request: request) { decision, content in
-                    await store.respondToServerRequest(
-                        sessionId,
-                        request: request,
-                        decision: decision,
-                        content: content
-                    )
-                }
-                .padding(.horizontal, 12)
-            } else if let approval = session?.pendingApproval {
-                ApprovalCard(approval: approval) { decision in
-                    await store.approve(sessionId, decision: decision, approvalId: approval.id)
-                }
-                .padding(.horizontal, 12)
-            }
-
-            // A parked no-mistakes gate renders as a native decision card while
-            // the task needs the boss; answered from this phone, it collapses
-            // to what was sent until the worker resumes; answered elsewhere
-            // (the mate, another phone), no card. Non-no-mistakes
-            // needs_decision moments keep today's rendering (no gate data,
-            // no card).
-            if let task = sessionTask, task.state == "needs_you",
-               let pending = pendingGate, pending.taskId == task.id {
-                if let summary = store.sentDecisions[pending.sentKey] {
-                    SentDecisionChip(summary: summary)
-                        .padding(.horizontal, 12)
-                } else if !pending.answered {
-                    DecisionChip(pending: pending) { action, findingIds, instructions in
-                        let error = await store.decideTask(
-                            task.id,
-                            action: action,
-                            findingIds: findingIds,
-                            instructions: instructions
+        if detailPresentation.permitsActions {
+            VStack(spacing: 8) {
+                if let request = session?.pendingServerRequest {
+                    StructuredRequestCard(request: request) { decision, content in
+                        await store.respondToServerRequest(
+                            sessionId,
+                            request: request,
+                            decision: decision,
+                            content: content
                         )
-                        if error == nil {
-                            store.sentDecisions[pending.sentKey] = decisionSummaryLabel(
-                                action: action,
-                                findingIds: findingIds
-                            )
-                        }
-                        return error
+                    }
+                    .padding(.horizontal, 12)
+                } else if let approval = session?.pendingApproval {
+                    ApprovalCard(approval: approval) { decision in
+                        await store.approve(sessionId, decision: decision, approvalId: approval.id)
                     }
                     .padding(.horizontal, 12)
                 }
-            }
 
-            if let question = session?.pendingQuestion {
-                QuestionChip(question: question) { selections, customAnswers in
-                    await store.answer(sessionId, questionId: question.id, selections: selections, customAnswers: customAnswers)
+                // A parked no-mistakes gate renders as a native decision card while
+                // the task needs the boss; answered from this phone, it collapses
+                // to what was sent until the worker resumes; answered elsewhere
+                // (the mate, another phone), no card. Non-no-mistakes
+                // needs_decision moments keep today's rendering (no gate data,
+                // no card).
+                if let task = sessionTask, task.state == "needs_you",
+                   let pending = pendingGate, pending.taskId == task.id {
+                    if let summary = store.sentDecisions[pending.sentKey] {
+                        SentDecisionChip(summary: summary)
+                            .padding(.horizontal, 12)
+                    } else if !pending.answered {
+                        DecisionChip(pending: pending) { action, findingIds, instructions in
+                            let error = await store.decideTask(
+                                task.id,
+                                action: action,
+                                findingIds: findingIds,
+                                instructions: instructions
+                            )
+                            if error == nil {
+                                store.sentDecisions[pending.sentKey] = decisionSummaryLabel(
+                                    action: action,
+                                    findingIds: findingIds
+                                )
+                            }
+                            return error
+                        }
+                        .padding(.horizontal, 12)
+                    }
                 }
-                .padding(.horizontal, 12)
-            } else if let answered = store.answeredQuestions[sessionId],
-                      (store.chatItems(sessionId).last(where: { $0.seq > 0 })?.seq ?? 0) <= answered.anchorSeq {
-                // Just answered: the chip collapses to the chosen answers and
-                // retires once the agent moves the conversation on.
-                AnsweredQuestionChip(answered: answered)
+
+                if let question = session?.pendingQuestion {
+                    QuestionChip(question: question) { selections, customAnswers in
+                        await store.answer(sessionId, questionId: question.id, selections: selections, customAnswers: customAnswers)
+                    }
                     .padding(.horizontal, 12)
-            }
-
-            if let interaction = session?.pendingClaudeInteraction {
-                ClaudeInteractionCard(interaction: interaction) { action, content in
-                    await store.respondToClaudeInteraction(sessionId, interactionId: interaction.id, action: action, content: content)
+                } else if let answered = store.answeredQuestions[sessionId],
+                          (store.chatItems(sessionId).last(where: { $0.seq > 0 })?.seq ?? 0) <= answered.anchorSeq {
+                    // Just answered: the chip collapses to the chosen answers and
+                    // retires once the agent moves the conversation on.
+                    AnsweredQuestionChip(answered: answered)
+                        .padding(.horizontal, 12)
                 }
-                .padding(.horizontal, 12)
-            }
 
-            if store.lastSubmitQueued || (session?.queuedCount ?? 0) > 0 {
-                HStack(spacing: 6) {
-                    Image(systemName: "clock")
-                        .font(.system(size: 11, weight: .semibold))
-                    Text("Queued - sends when the agent is free")
-                        .font(.system(size: 12, weight: .medium))
+                if let interaction = session?.pendingClaudeInteraction {
+                    ClaudeInteractionCard(interaction: interaction) { action, content in
+                        await store.respondToClaudeInteraction(sessionId, interactionId: interaction.id, action: action, content: content)
+                    }
+                    .padding(.horizontal, 12)
                 }
-                .foregroundStyle(Style.warningText)
-                .frame(maxWidth: .infinity, alignment: .leading)
-                .padding(.horizontal, Style.pageInset)
-            }
 
-            // The switch already happened; this only warns that the agent is
-            // reloading its context. Advisory, self-retiring, never a gate.
-            if let hint = store.modelSwitchHintBySession[sessionId] {
-                HStack(spacing: 6) {
-                    Image(systemName: "hourglass")
-                        .font(.system(size: 11, weight: .semibold))
-                    Text(hint)
-                        .font(.system(size: 12, weight: .medium))
+                if store.lastSubmitQueued || (session?.queuedCount ?? 0) > 0 {
+                    HStack(spacing: 6) {
+                        Image(systemName: "clock")
+                            .font(.system(size: 11, weight: .semibold))
+                        Text("Queued - sends when the agent is free")
+                            .font(.system(size: 12, weight: .medium))
+                    }
+                    .foregroundStyle(Style.warningText)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .padding(.horizontal, Style.pageInset)
                 }
-                .foregroundStyle(Style.textSecondary)
-                .frame(maxWidth: .infinity, alignment: .leading)
-                .padding(.horizontal, Style.pageInset)
-                .transition(.opacity)
-            }
 
-            composer
-                .padding(.horizontal, 12)
-                .padding(.bottom, 8)
+                // The switch already happened; this only warns that the agent is
+                // reloading its context. Advisory, self-retiring, never a gate.
+                if let hint = store.modelSwitchHintBySession[sessionId] {
+                    HStack(spacing: 6) {
+                        Image(systemName: "hourglass")
+                            .font(.system(size: 11, weight: .semibold))
+                        Text(hint)
+                            .font(.system(size: 12, weight: .medium))
+                    }
+                    .foregroundStyle(Style.textSecondary)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .padding(.horizontal, Style.pageInset)
+                    .transition(.opacity)
+                }
+
+                composer
+                    .padding(.horizontal, 12)
+                    .padding(.bottom, 8)
+            }
+            .padding(.top, 6)
         }
-        .padding(.top, 6)
+    }
+
+    private func unavailableDetail(for task: AgentTask) -> String {
+        if task.state == "failed" {
+            return "Worker failed"
+        }
+        switch task.runtime?.state {
+        case "recoverable":
+            return task.runtime?.recoveryAvailable == true ? "Worker can be recovered" : "Worker recovery is unavailable"
+        case "ended":
+            return "Worker ended"
+        default:
+            return "Session is unavailable"
+        }
     }
 
     private var composer: some View {
