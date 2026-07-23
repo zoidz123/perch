@@ -12,7 +12,8 @@ They do not make an inbox item processed.
 Do not use a provider's normal user-input path as the default wake mechanism.
 Codex `turn/start` and `turn/steer` create visible user messages, and the current Claude path types text into the interactive composer.
 Neither is a verified silent, durable processing-receipt API.
-Until a provider proves a non-user-message inbox signal with an item-specific receipt, the safe fallback is the persistent Perch inbox plus WebSocket and APNs attention, with no literal wake text injected into a human composer.
+Until a provider proves a non-user-message inbox signal with an item-specific receipt, the phase-one fallback is the persistent Perch inbox plus REST and WebSocket connected-client attention, with no literal wake text injected into a human composer.
+Any original-event APNs push remains separate best-effort notification semantics and is never evidence of Mate processing.
 
 ## Problem statement
 
@@ -67,7 +68,7 @@ An inbox item is the processing obligation.
 | `submitting` | `MateAttentionWorker` through the inbox-fence compare-and-swap | The worker revalidated channel eligibility, installed the attempt as the inbox's current in-flight handoff, and may perform exactly one reconcilable external submission with the persisted idempotency key. |
 | `delivered` | `MateAttentionWorker` after the notifier returns and persists a structured item-specific provider acceptance receipt | The selected provider durably accepted the attention signal for this inbox item. Local process-memory queuing does not qualify. It never means Mate processing, boss visibility, or human observation. |
 | `pending` with a later `available_at` | `MateAttentionWorker` retry path | A transient notifier failure released the claim and scheduled retry. |
-| `failed` | `MateAttentionWorker` after the retry budget or immediately for `terminal_failure` or `unsupported` | The provider-wake attempt is terminal. `unsupported` stores structured reason `unsupported_provider_capability` and never retries. The same transaction inserts the idempotent `push_manual_attention` attempt. The inbox item remains pending and is never failed or removed because an attention attempt failed. |
+| `failed` | `MateAttentionWorker` after the retry budget or immediately for `terminal_failure` or `unsupported` | The provider-wake attempt is terminal. `unsupported` stores structured reason `unsupported_provider_capability` and never retries. The inbox item remains pending and is never failed or removed because an attention attempt failed. |
 | `superseded` | `MateAttentionWorker`, acknowledgment, or owner handoff transaction | The item was processed or the attempt no longer matches the current assignment. Store structured reason `superseded`, clear its lease, never retry it, and never create a manual-attention attempt from this transition. |
 
 The UI must call this state `wake submitting`, `wake submitted`, `wake retrying`, `wake failed`, `manual attention required`, or `manual reconciliation required` as applicable.
@@ -136,8 +137,8 @@ The item row is the fast projection, and the receipt table is the audit trail.
 
 Add a dedicated table for provider attention so every assignment epoch has immutable history without changing or rebuilding `notification_outbox`.
 Each row has `id`, `inbox_item_id`, `assignment_epoch`, `recipient_generation`, `channel`, `state`, `intent_json`, `notifier_idempotency_key`, `claim_token`, `claimed_at`, `claim_expires_at`, `submission_fence_token`, `submitting_at`, `submission_fence_expires_at`, `attempts`, `available_at`, `delivered_at`, `provider`, `provider_receipt_type`, `provider_receipt_id`, `provider_accepted_at`, `provider_receipt_version`, `provider_receipt_json`, `last_error_json`, and `created_at`.
-The initial channel is `provider_wake`.
-The failure-escalation channel is `push_manual_attention`, and its `intent_json` includes the immutable `triggerAttemptId`.
+The phase-one channel is `provider_wake`.
+The channel column remains part of the uniqueness key so a future reconcilable delivery channel can add its own attempt without rewriting history.
 Use `UNIQUE(inbox_item_id, assignment_epoch, channel)`.
 The attempt id, inbox item, assignment epoch, recipient generation, channel, intent, and creation time never change.
 Delivery state, claim and submission-fence fields, retry count, availability, delivered time, and structured error fields advance through compare-and-swap transitions.
@@ -146,21 +147,18 @@ Initial assignment and every recovery reassignment or audited adoption insert a 
 Never reset, retarget, or overwrite an earlier attempt to trigger another wake.
 `MateAttentionWorker` copies the existing `OutboxWorker` lease, retry, backoff, and idempotent notifier mechanics but claims only this table.
 For `provider_wake`, it calls the provider notifier.
-For `push_manual_attention`, it calls APNs with the compact text `Manual attention required` and no task payload.
 
 The claim transaction joins the due attempt to `mate_inbox_items` and OwnerManager's durable runtime record before changing state.
 `provider_wake` may claim only when the inbox item is unprocessed, the attempt assignment epoch and recipient generation equal the item's current assignment, and that exact OwnerManager Mate generation is `live`.
 While the matching runtime is `starting`, the attempt remains `pending` without incrementing attempts and becomes eligible from the owner-live lifecycle signal or the next bounded poll.
 If the item is processed or the assignment no longer matches, the transaction changes the attempt to `superseded` instead of claiming it.
-`push_manual_attention` may claim only when the item is unprocessed, its assignment epoch is current, and its `triggerAttemptId` names a `provider_wake` attempt in terminal `failed` state with an unsupported, terminal-failure, or retry-exhausted reason.
-If the item was processed or its assignment epoch is stale, the push attempt becomes `superseded` without APNs delivery.
-Immediately before either external call, one immediate transaction rechecks the claim token and channel eligibility, changes the attempt from `claimed` to `submitting` with a unique submission-fence token and expiry, and writes the same attempt id, token, and expiry into the inbox item's attention-fence columns.
+Immediately before the external provider call, one immediate transaction rechecks the claim token and channel eligibility, changes the attempt from `claimed` to `submitting` with a unique submission-fence token and expiry, and writes the same attempt id, token, and expiry into the inbox item's attention-fence columns.
 The compare-and-swap requires all inbox fence columns to be null, so one inbox item has at most one in-flight external handoff.
 Only after that transaction commits may the worker submit with the already persisted notifier idempotency key and fence token.
 Claim, processing start, processing lease renewal, acknowledgment, reassignment, adoption, and supersession compare-and-swaps require the inbox fence columns to be null.
 If a fence is active, those operations return a retryable conflict and cannot commit during the network call.
 The worker handles a submitted, retryable, terminal, or unsupported result in one immediate transaction guarded by both fence tokens.
-That transaction persists the provider receipt or terminal outcome, performs any idempotent manual-attention insertion, changes the attempt state, and clears the attempt and inbox fence fields together.
+That transaction persists the provider receipt or terminal outcome, changes the attempt state, updates the inbox's manual-attention projection when required, and clears the attempt and inbox fence fields together.
 Owner handoff and acknowledgment transactions mark every nonterminal obsolete attention attempt `superseded` only after any fence has cleared, before exposing the new assignment or processed state.
 
 An expired submission fence is ambiguous external state, not permission to resend or reassign.
@@ -169,7 +167,7 @@ Confirmed acceptance commits the receipt fields and `delivered`; a definitive no
 An unavailable or inconclusive reconciliation keeps the fence and surfaces `Manual reconciliation required`.
 It does not clear the fence, resend, acknowledge, process, or reassign.
 Autonomous submission is enabled only for a provider or channel that can reconcile an ambiguous fenced handoff by idempotency key after restart.
-If Codex, Claude, APNs, or another channel cannot prove that capability, Perch does not enter `submitting` for it and leaves the attempt pending while desktop, iOS connected state, and operator UI show manual attention.
+If Codex, Claude, or another provider cannot prove that capability, Perch does not enter `submitting` for it and leaves the attempt pending while desktop, iOS connected state, and operator UI show manual attention.
 
 Keep `notification_outbox` and its inline `UNIQUE(task_event_id, channel)` constraint unchanged.
 It continues to carry push delivery and the temporary legacy Mate wake during compatibility rollout.
@@ -224,7 +222,8 @@ This prevents a stale or unrelated Mate from acknowledging another generation's 
 The item is still created and visible immediately.
 No code writes wake text into a focused permission dialog or a human composer.
 If a verified silent notifier can safely queue an item-specific signal, it may submit it while the Mate is busy.
-Otherwise the item stays pending, the inbox count remains visible, and APNs uses the normal attention policy.
+Otherwise the item stays pending and the inbox count remains visible through REST, WebSocket, desktop, and connected iOS state.
+An independently eligible original-event APNs push may still use the existing best-effort notification policy.
 Processing begins only after the Mate claims it.
 
 ### Five simultaneous worker events
@@ -233,7 +232,6 @@ Five concurrent task-event commits create five different source event ids and fi
 With a registered Mate generation, each transaction has its own attention attempt and only push-eligible events have push outbox intents.
 The inbox claim query orders the five items by `global_order`, so one Mate processes a stable sequence across their tasks.
 Duplicate callbacks or attention-worker retries can create duplicate attention signals, but the unique inbox key and acknowledgment idempotency key prevent duplicate processing receipts.
-Duplicate attention-worker callbacks cannot create another manual push because the failure transaction uses the attempt table's `(inbox_item_id, assignment_epoch, channel)` uniqueness.
 
 ### Server crash boundaries
 
@@ -252,7 +250,8 @@ Duplicate attention-worker callbacks cannot create another manual push because t
 
 The notifier records the rejection in `mate_inbox_attention_attempts.last_error_json`, retries retryable failures with the established policy, and marks only that attempt `failed` after its budget or immediately for terminal and unsupported results.
 The inbox item remains pending.
-Desktop and iOS show a clear `wake failed, inbox retained` state and continue normal APNs or connected-client attention without exposing provider error text in a push payload.
+Desktop and iOS show a clear `wake failed, inbox retained` state and continue connected-client attention.
+Any independently eligible original-event APNs notification remains best effort and does not carry provider error text.
 
 ### Mate restart and recovery
 
@@ -293,7 +292,8 @@ It receives only the inbox reference and a short, non-sensitive summary.
 It never gets permission to acknowledge or process an item.
 
 The stable `notifier_idempotency_key` is persisted when the attention-attempt row is created, before any claim or provider submission, and every submission carries it together with the active submission-fence token.
-After restart, the attention worker reconciles every claimed or ambiguously submitted attempt against the provider timeline or protocol by persisted receipt id when present, otherwise by that stable request key.
+After restart, the attention worker reconciles only attempts in `submitting` state or with an active inbox fence against the provider timeline or protocol by persisted receipt id when present, otherwise by that stable request key.
+An ordinary `claimed` attempt has not crossed the submission fence or made an external call, so its claim lease expires and it reclaims directly without provider reconciliation.
 If reconciliation by that key finds the acceptance, it recovers the provider receipt and atomically commits every validated receipt field plus `delivered`.
 If the provider or channel cannot expose a durable item-specific acceptance id and restart reconciliation by receipt id or request key, autonomous submission for that capability remains disabled and the inbox item and attempt stay pending for manual attention.
 
@@ -324,11 +324,11 @@ Only enable a Claude notifier after the provider offers and Perch verifies a ses
 When the provider capability is unsupported, `mate_inbox_attention_attempts` records the unsupported attention attempt truthfully and the inbox remains pending.
 `MateAttentionWorker` maps `unsupported` directly to terminal `failed` without retry and stores a structured `unsupported_provider_capability` reason in the attempt error payload.
 It also appends a `provider_attention_failed` receipt with that reason.
-In the same immediate transaction, it inserts the distinct `push_manual_attention` attempt with `INSERT OR IGNORE`, keyed by inbox item, assignment epoch, and channel.
-Terminal provider failure and exhausted provider retries perform the same insert with their structured failure reason.
-The push attempt is independent of the original task-event `notification_outbox` push row and therefore does not conflict with `UNIQUE(task_event_id, channel)`.
-The attention worker delivers that attempt through APNs with `Manual attention required`, retries APNs failures normally, and never creates another manual-push attempt when the failing channel is already `push_manual_attention`.
-Perch surfaces the same state through desktop and iOS persistent inbox cards, unread counts, and connected-client updates without retrying the unsupported provider path.
+The same transaction updates the inbox projection to `Manual attention required`.
+REST snapshots and WebSocket updates expose that state, unread count, and item id to persistent desktop and connected iOS cards without retrying the unsupported provider path.
+The existing task-event `notification_outbox` push row remains an independent best-effort original-event notification and never proves Mate attention or processing.
+Phase one creates no `push_manual_attention` attempt and promises no second APNs escalation after provider failure.
+Any future durable APNs escalation requires a `PushSender` replacement or server-side gateway that accepts a stable idempotency key, returns an item-specific acceptance receipt, and supports restart query or reconciliation before the channel may enter `submitting`.
 The Mate's durable operating instructions and recovery path must poll the inbox API before declaring itself idle and after reconnecting.
 This is a latency fallback, not a false claim of automatic provider wakeup.
 
@@ -375,7 +375,7 @@ It is server-backed, not a reconstructed chat message list.
 - Show a badge with unassigned or pending unread count, processing count, and wake-failed count.
 - Sort by the server's `global_order`, preserve task title, worker name, task state, source event kind, and creation time, and deduplicate by inbox item id.
 - Use clear states: `Awaiting Mate launch`, `Awaiting Mate`, `Mate processing`, `Mate processed`, `Wake submitting`, `Wake retrying`, `Manual attention required`, `Manual reconciliation required`, and `Needs reassignment`.
-- Send APNs for new attention-worthy inbox items using an opaque inbox item id and compact title only. The app fetches full content after authenticated launch.
+- Preserve the existing best-effort APNs policy for independently eligible original task events using an opaque inbox item id and compact title only. The app fetches full content after authenticated launch, and the push never proves Mate attention or processing.
 - Push and WebSocket are wakeup paths, while REST and relay RPC hydrate the authoritative list. LAN and relay must render the same records, counts, and action availability.
 - Preserve a processed item in history for the retention period so a boss can audit the Mate's receipt.
 - Keep merge and no-mistakes approval cards durable and visible until their separate decision action and subsequent resolution occur. A Mate acknowledgment may mark the inbox item processed but must never dismiss a pending approval card.
@@ -455,14 +455,14 @@ Use opaque random claim tokens, bounded summaries, payload-size limits, rate lim
 | Recovery generation | Recover a Mate with verified provider identity and attempt old-generation calls afterward. | Unprocessed items move with an audit receipt; stale generation is rejected. |
 | Provider-wake assignment race | Pause a pending or claimed old-epoch attempt, complete recovery reassignment, then release the worker. | The old attempt settles `superseded` without provider submission, retry, or manual escalation; only the new epoch may claim. |
 | Starting-to-live race | Create an assigned attempt while its exact OwnerManager generation is `starting`, poll the worker, then mark the runtime `live`. | The attempt remains pending with no attempt increment before live and becomes claimable only after the live transition. |
-| Manual-push processing race | Pause `push_manual_attention`, acknowledge the inbox item or reassign it, then release the worker. | The push attempt settles `superseded`, sends no APNs alert, and creates no replacement alert. |
 | Ack after final recheck | Pause immediately after the fence transaction commits and attempt processing start, renewal, and acknowledgment before releasing the provider call. | Every inbox mutation receives a retryable fence conflict; none commits until the fenced result is persisted and the fence clears. |
 | Recovery after final recheck | Pause immediately after the fence transaction commits and attempt verified recovery before releasing the provider call. | Recovery cannot reassign or supersede the item while fenced and retries only after fenced-result reconciliation clears it. |
-| Mutation during provider call | Hold the provider or APNs request open while concurrently attempting acknowledgment, processing, adoption, and recovery. | The fence remains the current inbox handoff and every competing mutation is refused without stale submission or state change. |
+| Mutation during provider call | Hold the provider request open while concurrently attempting acknowledgment, processing, adoption, and recovery. | The fence remains the current inbox handoff and every competing mutation is refused without stale submission or state change. |
 | Acceptance before receipt commit | Accept the provider request, pause before the result transaction, and attempt acknowledgment and recovery. | Both remain blocked; the receipt fields, delivered state, and fence clear commit atomically before either lifecycle mutation can retry. |
 | Fence crash or lease expiry | Crash after fencing at each point before response persistence, expire the fence, and restart with positive, definitive-negative, and ambiguous reconciliation results. | Positive and definitive-negative results settle and clear atomically; ambiguous results retain the fence and require manual reconciliation; no case blindly resends or reassigns. |
 | Fresh Mate | Start a non-recovery Mate while old work is unacknowledged. | Items remain visible as reassignment-required until an explicit audited adoption. |
-| Provider rejection | Return retryable, terminal, and unsupported notifier results and replay the failure callback. | Retryable failures back off, terminal failures settle, unsupported settles immediately with `unsupported_provider_capability` and no provider retry, one `push_manual_attention` attempt exists, the inbox stays pending, and desktop, iOS, and APNs say manual attention is required. |
+| Provider rejection | Return retryable, terminal, and unsupported notifier results and replay the failure callback. | Retryable failures back off, terminal failures settle, unsupported settles immediately with `unsupported_provider_capability` and no provider retry, the inbox stays pending, and REST, WebSocket, desktop, and connected iOS state say manual attention is required without creating a second APNs attempt. |
+| Future APNs escalation gate | Probe a proposed `PushSender` or server-side gateway with crash-after-acceptance and restart reconciliation cases. | The durable APNs channel remains disabled unless it supports a stable idempotency key, item-specific acceptance receipt, and restart query or reconciliation. |
 | Composer safety | Attach a human desktop client and exercise busy, idle, and permission-gated Mate states. | Default inbox delivery creates no provider user message and changes no composer or approval focus. |
 | Codex capability probe | Run the version-pinned app-server probe for any future silent notifier. | Capability remains disabled unless it proves non-user-message, item receipt, restart reconciliation, and busy-turn safety. |
 | Claude capability probe | Run an equivalent interactive-provider probe. | Capability remains disabled unless it proves the same safety properties. |
@@ -485,7 +485,7 @@ Add cutover backfill for unresolved tasks and explicit migration receipts.
 ### PR 2 - attention routing and observability
 
 Add the immutable attention-attempt table and worker without changing `notification_outbox` or its uniqueness constraint.
-Add the inbox submission fence, structured notifier result, durable provider-receipt reconciliation, default unsupported behavior, idempotent manual-attention push path, provider-safe probe harnesses, metrics, and wake status projections.
+Add the inbox submission fence, structured notifier result, durable provider-receipt reconciliation, default unsupported behavior, persistent UI and connected-client fallback, provider-safe probe harnesses, metrics, and wake status projections.
 Keep any legacy visible wake behind an explicit compatibility mode only.
 
 ### PR 3 - Mate protocol and recovery
