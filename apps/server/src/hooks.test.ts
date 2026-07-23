@@ -18,6 +18,7 @@ import {
   perchHookPath,
   planPerchUninstall
 } from "./hooks.js";
+import { recoveryE2eEnv } from "./recoveryE2eEnv.js";
 
 function makeEnv(settings?: object): NodeJS.ProcessEnv {
   const dir = mkdtempSync(join(tmpdir(), "perch-hooks-"));
@@ -68,6 +69,32 @@ test("installs hook entries for every event, idempotently, preserving user hooks
   rmSync(env.CLAUDE_CONFIG_DIR as string, { recursive: true, force: true });
 });
 
+test("recovery E2E config homes are isolated across PERCH_HOME", () => {
+  const root = mkdtempSync(join(tmpdir(), "perch-recovery-config-isolation-"));
+  const globalClaude = join(root, "global-claude");
+  const globalCodex = join(root, "global-codex");
+  const home = join(root, "e2e-home");
+  mkdirSync(globalClaude, { recursive: true });
+  mkdirSync(globalCodex, { recursive: true });
+  const claudeOriginal = '{"hooks":{"Stop":[{"hooks":[{"type":"command","command":"cmux hook"}]}]}}\n';
+  const codexOriginal = '{"hooks":{"Stop":[{"hooks":[{"type":"command","command":"cmux hook"}]}]}}\n';
+  writeFileSync(join(globalClaude, "settings.json"), claudeOriginal);
+  writeFileSync(join(globalCodex, "hooks.json"), codexOriginal);
+
+  const env = recoveryE2eEnv(home, {
+    CLAUDE_CONFIG_DIR: globalClaude,
+    CODEX_HOME: globalCodex
+  });
+  assert.equal(installClaudeHooks(env), true);
+  assert.equal(installCodexHooks(env), true);
+
+  assert.equal(readFileSync(join(globalClaude, "settings.json"), "utf8"), claudeOriginal);
+  assert.equal(readFileSync(join(globalCodex, "hooks.json"), "utf8"), codexOriginal);
+  assert.ok(existsSync(join(env.CLAUDE_CONFIG_DIR as string, "settings.json")));
+  assert.ok(existsSync(join(env.CODEX_HOME as string, "hooks.json")));
+  rmSync(root, { recursive: true, force: true });
+});
+
 test("migrates inline commands to a shim that preserves event semantics", () => {
   // A pre-existing install with the old shared command (which discarded the
   // /hooks response body for every event, SessionStart included).
@@ -89,13 +116,13 @@ test("migrates inline commands to a shim that preserves event semantics", () => 
   );
   assert.equal(perchStart.length, 1);
   const startCommand: string = perchStart[0].hooks[0].command;
-  assert.match(startCommand, /perch-hook' session-start$/);
+  assert.match(startCommand, /perch-hook' session-start # perch-managed-hook$/);
   const perchStop = settings.hooks.Stop.filter((entry: { hooks: Array<{ command: string }> }) =>
     entry.hooks.some((hook) => hook.command.includes(perchHookPath(env)))
   );
   assert.equal(perchStop.length, 1);
   const stopCommand: string = perchStop[0].hooks[0].command;
-  assert.match(stopCommand, /perch-hook' stop$/);
+  assert.match(stopCommand, /perch-hook' stop # perch-managed-hook$/);
 
   // Telemetry hooks keep discarding output.
   for (const event of ["UserPromptSubmit", "SessionEnd"]) {
@@ -103,7 +130,7 @@ test("migrates inline commands to a shim that preserves event semantics", () => 
       entry.hooks.some((hook) => hook.command.includes(perchHookPath(env)))
     );
     assert.equal(perch.length, 1, event);
-    assert.match(perch[0].hooks[0].command, /perch-hook'/, event);
+    assert.match(perch[0].hooks[0].command, /perch-hook'.*# perch-managed-hook$/, event);
   }
 
   const preTool = settings.hooks.PreToolUse.filter((entry: { hooks: Array<{ command: string }> }) =>
@@ -111,17 +138,17 @@ test("migrates inline commands to a shim that preserves event semantics", () => 
   );
   assert.equal(preTool.length, 3);
   assert.deepEqual(preTool.map((entry: { matcher?: string }) => entry.matcher), [undefined, "AskUserQuestion", "ExitPlanMode"]);
-  assert.match(preTool[0].hooks[0].command, /pre-tool-observer$/);
+  assert.match(preTool[0].hooks[0].command, /pre-tool-observer # perch-managed-hook$/);
   for (const entry of preTool.slice(1)) {
     assert.equal(entry.hooks[0].timeout, 600);
-    assert.match(entry.hooks[0].command, /(question|plan-decision)$/);
+    assert.match(entry.hooks[0].command, /(question|plan-decision) # perch-managed-hook$/);
   }
   for (const event of ["PermissionRequest", "Elicitation", "ElicitationResult"]) {
     const entry = settings.hooks[event].find((candidate: { hooks: Array<{ command: string }> }) =>
       candidate.hooks.some((hook) => hook.command.includes(perchHookPath(env)))
     );
     assert.equal(entry.hooks[0].timeout, 600);
-    assert.match(entry.hooks[0].command, /(permission-request|elicitation|elicitation-result)$/);
+    assert.match(entry.hooks[0].command, /(permission-request|elicitation|elicitation-result) # perch-managed-hook$/);
   }
 
   const shim = readFileSync(perchHookPath(env), "utf8");
@@ -151,6 +178,50 @@ test("rewriting settings preserves the original file mode", () => {
   assert.equal(statSync(claudeSettingsPath(env)).mode & 0o777, 0o600);
 
   rmSync(env.CLAUDE_CONFIG_DIR as string, { recursive: true, force: true });
+});
+
+test("installers clean stale legacy perch hooks and preserve live stable and non-perch hooks", () => {
+  const root = mkdtempSync(join(tmpdir(), "perch-hook-cleanup-"));
+  const claudeHome = join(root, "claude");
+  const codexRoot = join(root, "codex");
+  const currentHome = join(root, "current");
+  const stableHook = join(root, ".perch", "bin", "perch-hook");
+  const devHook = join(root, ".perch-dev", "bin", "perch-hook");
+  mkdirSync(claudeHome, { recursive: true });
+  mkdirSync(codexRoot, { recursive: true });
+  mkdirSync(join(stableHook, ".."), { recursive: true });
+  mkdirSync(join(devHook, ".."), { recursive: true });
+  writeFileSync(stableHook, "#!/bin/sh\n");
+  writeFileSync(devHook, "#!/bin/sh\n");
+  const entries = [
+    { hooks: [{ type: "command", command: "cmux hook" }] },
+    { hooks: [{ type: "command", command: `'${stableHook}' stop` }] },
+    { hooks: [{ type: "command", command: `'${devHook}' stop # perch-managed-hook` }] },
+    { hooks: [{ type: "command", command: "'/private/tmp/perch-e2e-gone/bin/perch-hook' stop" }] },
+    { hooks: [{ type: "command", command: "'/var/folders/zz/abc/T/perch-mate-e2e-gone/bin/perch-hook' stop" }] }
+  ];
+  const original = { hooks: { Stop: entries, LegacyEvent: entries } };
+  writeFileSync(join(claudeHome, "settings.json"), JSON.stringify(original));
+  writeFileSync(join(codexRoot, "hooks.json"), JSON.stringify(original));
+  const env = {
+    CLAUDE_CONFIG_DIR: claudeHome,
+    CODEX_HOME: codexRoot,
+    PERCH_HOME: currentHome
+  } as NodeJS.ProcessEnv;
+
+  assert.equal(installClaudeHooks(env), true);
+  assert.equal(installCodexHooks(env), true);
+  for (const path of [join(claudeHome, "settings.json"), join(codexRoot, "hooks.json")]) {
+    const commands = Object.values(JSON.parse(readFileSync(path, "utf8")).hooks as Record<string, Array<{ hooks: Array<{ command: string }> }>>)
+      .flatMap((eventEntries) => eventEntries.flatMap((entry) => entry.hooks.map((hook) => hook.command)));
+    assert.ok(commands.includes("cmux hook"), path);
+    assert.ok(commands.some((command) => command.includes(stableHook)), path);
+    assert.ok(commands.some((command) => command.includes(devHook)), path);
+    assert.ok(!commands.some((command) => command.includes("/private/tmp/perch-e2e-gone")), path);
+    assert.ok(!commands.some((command) => command.includes("/var/folders/zz/abc/T/perch-mate-e2e-gone")), path);
+  }
+
+  rmSync(root, { recursive: true, force: true });
 });
 
 test("updating only shim logic does not rewrite Claude settings", () => {
@@ -466,7 +537,7 @@ test("codex SessionStart uses the echo shim and writes its matching trust hash",
   const installed = JSON.parse(first);
   const sessionStartCommand = installed.hooks.SessionStart[0].hooks[0].command as string;
   const telemetryCommand = installed.hooks.UserPromptSubmit[0].hooks[0].command as string;
-  assert.equal(sessionStartCommand, `'${perchHookPath(env)}' session-start`);
+  assert.equal(sessionStartCommand, `'${perchHookPath(env)}' session-start # perch-managed-hook`);
   assert.match(telemetryCommand, />\/dev\/null 2>&1/);
   assert.notEqual(sessionStartCommand, telemetryCommand);
   assert.equal(readFileSync(perchHookPath(env), "utf8"), perchHookShimContent());
@@ -593,4 +664,3 @@ test("codex hook payloads normalize through the nested envelope", () => {
   assert.equal(permission.approval?.command, "rm -rf /tmp/x");
   assert.equal(normalizeHookEvent({ hook_event: { event_type: "stop" } }).status, "idle");
 });
-

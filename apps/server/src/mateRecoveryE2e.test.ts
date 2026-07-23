@@ -6,6 +6,7 @@ import { homedir, tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { test } from "node:test";
 import type { AgentSession, Task } from "@perch/shared";
+import { recoveryE2eEnv } from "./recoveryE2eEnv.js";
 
 const repoRoot = resolve(import.meta.dirname, "../../..");
 const serverEntry = join(repoRoot, "apps/server/dist/index.js");
@@ -133,8 +134,7 @@ function startServer(home: string, port: number): ChildProcess {
   const child = spawn(process.execPath, [serverEntry], {
     cwd: repoRoot,
     env: {
-      ...process.env,
-      PERCH_HOME: home,
+      ...recoveryE2eEnv(home),
       PORT: String(port),
       PERCH_RELAY_URL: "off",
       PERCH_RECOVERY_IDENTITY_TIMEOUT_MS: "30000"
