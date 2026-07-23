@@ -158,7 +158,7 @@ Only after that transaction commits may the worker submit with the already persi
 Claim, processing start, processing lease renewal, acknowledgment, reassignment, adoption, and supersession compare-and-swaps require the inbox fence columns to be null.
 If a fence is active, those operations return a retryable conflict and cannot commit during the network call.
 The worker handles a submitted, retryable, terminal, or unsupported result in one immediate transaction guarded by both fence tokens.
-That transaction persists the provider receipt or terminal outcome, changes the attempt state, updates the inbox's manual-attention projection when required, and clears the attempt and inbox fence fields together.
+That transaction persists the provider receipt or terminal outcome, changes the attempt state, and clears the attempt and inbox fence fields together.
 Owner handoff and acknowledgment transactions mark every nonterminal obsolete attention attempt `superseded` only after any fence has cleared, before exposing the new assignment or processed state.
 
 An expired submission fence is ambiguous external state, not permission to resend or reassign.
@@ -324,8 +324,10 @@ Only enable a Claude notifier after the provider offers and Perch verifies a ses
 When the provider capability is unsupported, `mate_inbox_attention_attempts` records the unsupported attention attempt truthfully and the inbox remains pending.
 `MateAttentionWorker` maps `unsupported` directly to terminal `failed` without retry and stores a structured `unsupported_provider_capability` reason in the attempt error payload.
 It also appends a `provider_attention_failed` receipt with that reason.
-The same transaction updates the inbox projection to `Manual attention required`.
-REST snapshots and WebSocket updates expose that state, unread count, and item id to persistent desktop and connected iOS cards without retrying the unsupported provider path.
+Do not add a mutable manual-attention column to `mate_inbox_items`.
+The shared inbox read service derives `manualAttentionRequired` only while the item is unprocessed and a `provider_wake` attempt with the same `inbox_item_id`, current `assignment_epoch`, and current `recipient_generation` is terminal `failed`.
+REST snapshots, relay RPC, WebSocket updates, unread counts, and desktop and connected iOS cards must all use that derivation.
+Because reassignment increments `assignment_epoch`, an earlier epoch's failure stops matching automatically and cannot leave stale manual-attention state.
 The existing task-event `notification_outbox` push row remains an independent best-effort original-event notification and never proves Mate attention or processing.
 Phase one creates no `push_manual_attention` attempt and promises no second APNs escalation after provider failure.
 Any future durable APNs escalation requires a `PushSender` replacement or server-side gateway that accepts a stable idempotency key, returns an item-specific acceptance receipt, and supports restart query or reconciliation before the channel may enter `submitting`.
@@ -462,6 +464,7 @@ Use opaque random claim tokens, bounded summaries, payload-size limits, rate lim
 | Fence crash or lease expiry | Crash after fencing at each point before response persistence, expire the fence, and restart with positive, definitive-negative, and ambiguous reconciliation results. | Positive and definitive-negative results settle and clear atomically; ambiguous results retain the fence and require manual reconciliation; no case blindly resends or reassigns. |
 | Fresh Mate | Start a non-recovery Mate while old work is unacknowledged. | Items remain visible as reassignment-required until an explicit audited adoption. |
 | Provider rejection | Return retryable, terminal, and unsupported notifier results and replay the failure callback. | Retryable failures back off, terminal failures settle, unsupported settles immediately with `unsupported_provider_capability` and no provider retry, the inbox stays pending, and REST, WebSocket, desktop, and connected iOS state say manual attention is required without creating a second APNs attempt. |
+| Manual-attention epoch derivation | Fail a `provider_wake` attempt, reassign the item, then fail the new epoch's attempt and finally process the item. | Manual attention appears for the failed current epoch, clears on reassignment without an inbox-row mutation, reappears only for the new current-epoch failure, and clears when processed across REST, relay RPC, WebSocket, desktop, and connected iOS. |
 | Future APNs escalation gate | Probe a proposed `PushSender` or server-side gateway with crash-after-acceptance and restart reconciliation cases. | The durable APNs channel remains disabled unless it supports a stable idempotency key, item-specific acceptance receipt, and restart query or reconciliation. |
 | Composer safety | Attach a human desktop client and exercise busy, idle, and permission-gated Mate states. | Default inbox delivery creates no provider user message and changes no composer or approval focus. |
 | Codex capability probe | Run the version-pinned app-server probe for any future silent notifier. | Capability remains disabled unless it proves non-user-message, item receipt, restart reconciliation, and busy-turn safety. |
