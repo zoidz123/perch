@@ -153,11 +153,13 @@ enum WorkspaceGrouping {
     ) -> [WorkspaceTerminalTaskLink] {
         guard limit > 0 else { return [] }
 
-        let refreshedLiveTaskIds = Set(
-            refreshedTasks.filter { !isClosedForPresentation($0) }.map(\.id)
-        )
+        let refreshedTaskIds = Set(refreshedTasks.map(\.id))
+        let refreshedLiveTaskIds = Set(refreshedTasks.filter { !isClosedForPresentation($0) }.map(\.id))
         var links = existing.filter { !refreshedLiveTaskIds.contains($0.taskId) }
-        for task in previousTasks + refreshedTasks where isClosedForPresentation(task) {
+        let newlyTerminalTasks = previousTasks.filter {
+            isClosedForPresentation($0) || !refreshedTaskIds.contains($0.id)
+        } + refreshedTasks.filter(isClosedForPresentation)
+        for task in newlyTerminalTasks {
             links.removeAll { $0.taskId == task.id }
             links.append(WorkspaceTerminalTaskLink(
                 taskId: task.id,

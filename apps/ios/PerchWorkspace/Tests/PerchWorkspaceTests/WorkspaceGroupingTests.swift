@@ -333,11 +333,11 @@ final class WorkspaceGroupingTests: XCTestCase {
         ).isEmpty)
     }
 
-    func testRawClosedTaskLinkSurvivesAuthoritativeCacheRemoval() {
-        let rawClosed = FixtureTask(
+    func testWorkingTaskLinkSurvivesRawClosedCacheRemoval() {
+        let previouslyLive = FixtureTask(
             id: "raw-closed-worker",
             project: "/p/app",
-            state: "closed",
+            state: "working",
             updatedAt: "t",
             sessionId: "task-session",
             runtimeSessionId: "pty:raw-closed"
@@ -347,7 +347,7 @@ final class WorkspaceGroupingTests: XCTestCase {
             id: "fleet-session",
             workerName: "Alder",
             cwd: "/p/app",
-            taskId: rawClosed.id,
+            taskId: previouslyLive.id,
             parentSessionId: mate.id
         )
         let runtimeLinkedWorker = FixtureSession(
@@ -359,18 +359,18 @@ final class WorkspaceGroupingTests: XCTestCase {
         )
         let tombstones = WorkspaceGrouping.terminalTaskLinks(
             existing: [],
-            previousTasks: [rawClosed],
+            previousTasks: [previouslyLive],
             refreshedTasks: [FixtureTask]()
         )
 
         XCTAssertEqual(tombstones.count, 1)
-        XCTAssertEqual(tombstones[0].taskId, rawClosed.id)
+        XCTAssertEqual(tombstones[0].taskId, previouslyLive.id)
         XCTAssertEqual(tombstones[0].sessionIds, ["task-session", "pty:raw-closed"])
         XCTAssertTrue(WorkspaceGrouping.projectSections(
             tasks: [FixtureTask](),
             sessions: [mate, taskLinkedWorker],
             mateSessionId: mate.id,
-            knownProjects: [rawClosed.project],
+            knownProjects: [previouslyLive.project],
             terminalTaskLinks: tombstones
         ).allSatisfy { $0.rows.isEmpty })
         XCTAssertTrue(WorkspaceGrouping.otherSessionIds(
