@@ -444,8 +444,8 @@ struct HomeView: View {
         store.tasks.filter { ($0.presentation?.state ?? $0.state) != "closed" }
     }
 
-    // Sessions not owned by a live task keep their plain rows; the mate is
-    // pinned above everything, never listed here.
+    // Sessions not linked to any live or terminal task keep their plain rows;
+    // the mate is pinned above everything, never listed here.
     private var otherSessions: [AgentSession] {
         let otherIds = Set(WorkspaceGrouping.otherSessionIds(
             sessions: store.agentSessions,
