@@ -7,6 +7,7 @@ import { homedir } from "node:os";
 import { join, resolve } from "node:path";
 import { test } from "node:test";
 import type { Task } from "@perch/shared";
+import { recoveryE2eEnv } from "./recoveryE2eEnv.js";
 
 // Real-codex end-to-end for the app-server-owned topology (opt-in:
 // PERCH_REAL_CODEX_E2E=1, requires a signed-in codex install and network).
@@ -155,8 +156,7 @@ function startServer(home: string, port: number): ChildProcess {
   const child = spawn(process.execPath, [serverEntry], {
     cwd: repoRoot,
     env: {
-      ...process.env,
-      PERCH_HOME: home,
+      ...recoveryE2eEnv(home),
       PORT: String(port),
       PERCH_RELAY_URL: "off",
       PERCH_RECOVERY_IDENTITY_TIMEOUT_MS: "30000"
