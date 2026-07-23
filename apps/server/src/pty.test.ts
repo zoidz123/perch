@@ -161,6 +161,46 @@ test("PTY adapter starts sessions and streams coalesced raw deltas", async () =>
   adapter.stop();
 });
 
+test("PTY adapter drops inherited NO_COLOR but preserves a Claude session override", async () => {
+  const spawnEnvs: NodeJS.ProcessEnv[] = [];
+  const adapter = new PtyAgentAdapter(
+    (_command, _args, options) => {
+      spawnEnvs.push(options.env);
+      return new FakePtyProcess();
+    },
+    {
+      sessionEnv: (_id, request) => ({
+        ...(request.title === "explicit override" ? { NO_COLOR: "session" } : {}),
+        COLORTERM: "truecolor",
+        PERCH_SESSION_ID: "pty:test"
+      })
+    }
+  );
+  const saved = process.env.NO_COLOR;
+  try {
+    process.env.NO_COLOR = "1";
+    await adapter.startAgent({
+      command: "claude",
+      cwd: "/tmp/perch-test"
+    });
+    await adapter.startAgent({
+      command: "claude",
+      cwd: "/tmp/perch-test",
+      title: "explicit override"
+    });
+
+    assert.equal(spawnEnvs[0]?.NO_COLOR, undefined);
+    assert.equal(spawnEnvs[0]?.TERM, "xterm-256color");
+    assert.equal(spawnEnvs[0]?.COLORTERM, "truecolor");
+    assert.equal(spawnEnvs[0]?.PERCH_SESSION_ID, "pty:test");
+    assert.equal(spawnEnvs[1]?.NO_COLOR, "session");
+  } finally {
+    if (saved === undefined) delete process.env.NO_COLOR;
+    else process.env.NO_COLOR = saved;
+    adapter.stop();
+  }
+});
+
 test("spawned sessions default the no-mistakes telemetry opt-out; a user export wins", async () => {
   let spawnEnv: NodeJS.ProcessEnv | undefined;
   const spawn: SpawnPty = (_command, _args, options) => {

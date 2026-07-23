@@ -549,16 +549,22 @@ export class PtyAgentAdapter implements AgentAdapter {
       ...(desktop ? { desktop } : {})
     };
 
+    const inheritedEnv = sanitizeSpawnEnv(process.env);
+    if (agent === "claude") {
+      delete inheritedEnv.NO_COLOR;
+    }
+    const env: NodeJS.ProcessEnv = {
+      ...inheritedEnv,
+      TERM: "xterm-256color",
+      ...(this.options.sessionEnv?.(id, request) ?? {})
+    };
+
     const child = this.spawnPty(command, args, {
       name: "xterm-256color",
       cols,
       rows,
       cwd,
-      env: {
-        ...sanitizeSpawnEnv(process.env),
-        TERM: "xterm-256color",
-        ...(this.options.sessionEnv?.(id, request) ?? {})
-      }
+      env
     });
 
     const terminal = new HeadlessTerminalCtor({
