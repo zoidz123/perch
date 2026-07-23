@@ -3,8 +3,9 @@
 ## Decision
 
 Add a server-owned, durable Mate inbox that is separate from `notification_outbox`.
-Every boss-relevant worker task event will create one immutable inbox item for the registered Mate owner generation in the same SQLite transaction as the task event.
-The inbox item remains until that Mate generation, or a generation that OwnerManager has explicitly recovered from it, claims and acknowledges it.
+Every boss-relevant worker task event will create one immutable inbox item for the logical Mate owner in the same SQLite transaction as the task event.
+The item is explicitly unassigned when no Mate generation exists, otherwise it is assigned to the current registered generation.
+It remains until that generation, or a generation that OwnerManager has explicitly recovered or adopted it into, claims and acknowledges it.
 Provider wakeups, WebSocket updates, APNs, and desktop cards are attention signals only.
 They do not make an inbox item processed.
 
@@ -40,7 +41,8 @@ Both existing wake paths can create provider user input, pollute the transcript,
 
 ## Target invariant
 
-For every boss-relevant worker task event committed after this feature is enabled, exactly one durable inbox item exists for the logical Mate owner and its registered generation.
+For every boss-relevant worker task event committed after this feature is enabled, exactly one durable inbox item exists for the logical Mate owner.
+The item has either an explicit unassigned state with no recipient generation or an assignment to a real generation registered by OwnerManager.
 That item remains present and actionable until a generation authorized by OwnerManager claims it and commits an idempotent processing acknowledgment.
 No concurrent burst, server restart, provider restart, duplicate provider submission, duplicate Mate request, or Mate recovery may delete or silently mark the item processed.
 
@@ -71,11 +73,12 @@ It must not label it `delivered` without the qualifying provider wording.
 
 ### Mate inbox processing state
 
-`mate_inbox_items.state` will be `pending`, `claimed`, `processing`, `processed`, or `reassignment_required`.
+`mate_inbox_items.state` will be `unassigned`, `pending`, `claimed`, `processing`, `processed`, or `reassignment_required`.
 `processing` is optional in the first implementation if a claim lease is sufficient, but the storage shape reserves it so a Mate can explicitly start long work without extending an opaque claim forever.
 
 | Transition | Writer | Preconditions and meaning |
 | --- | --- | --- |
+| `unassigned` | Task-event transaction | The logical Mate owner exists, but OwnerManager has no registered runtime generation. The item is durable and visible but cannot be claimed or receive provider-specific attention. |
 | `pending` | Task-event transaction, lease expiry, or recovered assignment | The item is durable and awaiting the authorized Mate generation. |
 | `claimed` | Mate inbox claim endpoint | Owner id, generation, runtime identity, and compare-and-swap all match. The endpoint returns an opaque lease token. |
 | `processing` | Mate inbox start endpoint | The same unexpired lease token states that the Mate has begun triage. |
@@ -95,24 +98,25 @@ The inbox needs owner-generation authorization, processing leases, independent r
 
 ### `mate_inbox_items`
 
-Create one row per `(task_event_id, owner_id, recipient_generation)`.
+Create one row per `(task_event_id, owner_id)`.
 
 | Column | Purpose |
 | --- | --- |
 | `id TEXT PRIMARY KEY` | Stable UUID used by API, WebSocket, UI, and notifier payloads. |
 | `task_event_id INTEGER NOT NULL REFERENCES task_events(id) ON DELETE RESTRICT` | Canonical immutable source fact. |
 | `owner_id TEXT NOT NULL REFERENCES durable_owners(id) ON DELETE RESTRICT` | Initially the existing logical Mate owner id. |
-| `recipient_generation INTEGER NOT NULL` | Owner generation registered when the item was created or explicitly recovered. |
+| `recipient_generation INTEGER` | Current real OwnerManager generation, or `NULL` only while `state = 'unassigned'`. Never fabricate a generation to populate this field. |
+| `assignment_epoch INTEGER NOT NULL` | Starts at `0` for an unassigned item or `1` for an initially assigned item and increments on every atomic assignment, recovery reassignment, or audited adoption. |
 | `global_order INTEGER NOT NULL` | The immutable `task_events.id` value, used for total cross-task FIFO ordering. |
 | `task_id TEXT NOT NULL`, `task_seq INTEGER NOT NULL` | Indexed copies for task filtering and per-task display order. |
 | `kind TEXT NOT NULL`, `payload_version INTEGER NOT NULL`, `payload_json TEXT NOT NULL` | Versioned, rendered-independent event snapshot. Payload contains no provider-specific wake text. |
-| `state TEXT NOT NULL` | `pending`, `claimed`, `processing`, `processed`, or `reassignment_required`. |
+| `state TEXT NOT NULL` | `unassigned`, `pending`, `claimed`, `processing`, `processed`, or `reassignment_required`, with a check constraint that only `unassigned` may have a null recipient generation. |
 | `claim_token TEXT`, `claimed_at TEXT`, `claim_expires_at TEXT` | Opaque lease state, copied from the established executor-claim pattern. |
 | `attempts INTEGER NOT NULL`, `last_error TEXT` | Claim and processing attempt observability, not a reason to drop the item. |
 | `processed_at TEXT`, `processed_by_generation INTEGER`, `processing_summary TEXT` | Durable processing receipt. |
 | `created_at TEXT NOT NULL`, `updated_at TEXT NOT NULL`, `retained_until TEXT` | Audit, retention, and pruning boundaries. |
 
-Use `UNIQUE(task_event_id, owner_id, recipient_generation)` for duplicate-safe creation.
+Use `UNIQUE(task_event_id, owner_id)` for duplicate-safe creation independent of assignment.
 Use an index on `(owner_id, recipient_generation, state, global_order)` for claims and presentation.
 Use an index on `(state, claim_expires_at)` for lease recovery.
 Store the source event's primary key, task id, task sequence, and event kind in the payload so presentation can survive normal task projection changes without duplicating the entire task record.
@@ -122,14 +126,17 @@ Store the source event's primary key, task id, task sequence, and event kind in 
 Add an append-only receipt table rather than overwriting the only evidence of a claim, recovery, or acknowledgment.
 Each row has `id`, `inbox_item_id`, `receipt_kind`, `actor_owner_id`, `actor_generation`, `idempotency_key`, `payload_json`, and `created_at`.
 Use `UNIQUE(inbox_item_id, idempotency_key)`.
-Receipt kinds are `created`, `claimed`, `processing_started`, `lease_expired`, `acknowledged`, `reassigned`, and `provider_attention_failed`.
+Receipt kinds are `created`, `assigned`, `claimed`, `processing_started`, `lease_expired`, `acknowledged`, `reassigned`, and `provider_attention_failed`.
 The item row is the fast projection, and the receipt table is the audit trail.
 
 ### Reuse of `notification_outbox`
 
-Keep the existing `mate` outbox row as the one provider-attention attempt for an inbox item.
-Change its `intent_json` payload to `{ version, inboxItemId, ownerId, recipientGeneration, notificationKind }`.
-The existing `(task_event_id, channel)` uniqueness rule then ensures one initial provider-attention intent per source event.
+Treat each linked `notification_outbox` row as one immutable provider-attention attempt for one inbox assignment epoch.
+Add nullable `inbox_item_id` and `assignment_epoch` columns, and change linked intent payloads to `{ version, inboxItemId, ownerId, recipientGeneration, assignmentEpoch, notificationKind }`.
+Preserve legacy rows during migration, replace the table-level `(task_event_id, channel)` constraint with a partial unique index on `(task_event_id, channel)` for legacy and push rows that have no inbox item, and add a partial unique index on `(inbox_item_id, assignment_epoch, channel)` for linked Mate attempts.
+The attempt identity, inbox item, assignment epoch, generation, and channel are immutable after insertion, while the existing delivery state and lease columns advance normally.
+Initial assignment and every recovery reassignment or audited adoption insert a new Mate attempt for the new epoch.
+Never reset, retarget, or overwrite an earlier attempt to trigger another wake.
 Use the existing claim token, claim expiry, attempts, backoff, and delivery timestamp instead of duplicating provider-delivery records in the inbox.
 
 ### Atomic writes
@@ -137,9 +144,9 @@ Use the existing claim token, claim expiry, attempts, backoff, and delivery time
 For a boss-relevant event, use one SQLite immediate transaction to:
 
 1. Append the immutable `task_events` row and its current task projection update.
-2. Insert the `mate_inbox_items` row with `pending` state and source-derived ordering fields.
+2. Insert the `mate_inbox_items` row with source-derived ordering fields and either `pending` plus the current registered generation or `unassigned` plus a null generation.
 3. Insert its `created` receipt.
-4. Insert the existing `notification_outbox` `mate` intent referencing that inbox item.
+4. If the item was assigned, insert its epoch-specific `notification_outbox` `mate` intent.
 5. Insert the existing eligible `push` intent.
 
 If the transaction fails, none of the event, inbox item, or delivery intent becomes visible.
@@ -155,7 +162,11 @@ The server assigns `global_order = task_events.id` and claims the smallest unpro
 This gives a deterministic total order across multiple tasks while preserving each task's `task_seq` order.
 Attention priority may affect APNs and card styling, but it must not silently reorder the Mate claim queue in the first release.
 
+At Mate launch, the OwnerManager transaction that creates the runtime generation must also assign every `unassigned` item to that real generation, increment its assignment epoch, change it to `pending`, insert an `assigned` receipt, and insert the epoch-specific Mate attention attempt.
+The assignment commits as one unit with generation creation, and no placeholder generation is created when Mate is absent.
+
 When OwnerManager verifies provider identity during recovery, its generation handoff transaction must atomically create the successor runtime and move each unprocessed item from the recovering generation to the successor generation.
+Each move clears any old lease, increments the assignment epoch, inserts a new epoch-specific Mate attention attempt, and leaves every earlier attempt unchanged.
 Each move inserts a `reassigned` receipt that names both generations.
 An intentional fresh Mate that is not a verified recovery leaves older items in `reassignment_required` until an explicit server-owned adoption action records why the new generation may take them.
 This prevents a stale or unrelated Mate from acknowledging another generation's work.
@@ -207,7 +218,8 @@ Desktop and iOS show a clear `wake failed, inbox retained` state and continue no
 ### Mate restart and recovery
 
 If the current generation is recoverable, OwnerManager verifies the provider identity before recovery.
-The server atomically reassigns unprocessed items to the verified successor generation and emits a fresh attention intent for each item only when necessary.
+The server atomically reassigns unprocessed items to the verified successor generation, increments each assignment epoch, and inserts a fresh attention attempt for that epoch.
+Earlier attention-attempt rows remain immutable delivery history.
 The recovered Mate resumes by claiming the oldest unacknowledged item.
 An expired claim from the old runtime cannot acknowledge because its token and generation no longer match.
 
@@ -262,7 +274,9 @@ Only enable a Claude notifier after the provider offers and Perch verifies a ses
 ### Safe fallback
 
 When the provider capability is unsupported, `notification_outbox` records the unsupported attention attempt truthfully and the inbox remains pending.
-Perch surfaces the item through desktop and iOS persistent inbox cards, unread counts, connected-client updates, and APNs attention.
+`OutboxWorker` maps `unsupported` directly to terminal `failed` without retry and stores a structured `unsupported_provider_capability` reason in the attempt error payload.
+It also appends a `provider_attention_failed` receipt with that reason.
+Perch surfaces `Manual attention required` through desktop and iOS persistent inbox cards, unread counts, connected-client updates, and APNs attention without retrying the unsupported provider path.
 The Mate's durable operating instructions and recovery path must poll the inbox API before declaring itself idle and after reconnecting.
 This is a latency fallback, not a false claim of automatic provider wakeup.
 
@@ -283,10 +297,13 @@ The REST and relay handlers must share one service implementation and one author
 | Acknowledge | `POST /mate/inbox/:id/ack` with `claimToken`, `idempotencyKey`, `outcome`, and bounded summary | Commits `processed` plus the idempotent receipt. |
 | Adoption | Server-owned OwnerManager operation only | Reassigns unprocessed work after verified recovery or an explicitly audited fresh-Mate adoption. |
 
-The service authenticates the caller as the live `durable_owners` Mate runtime.
-It must require the logical owner id, exact runtime generation, and server-recognized session and provider identity from OwnerManager.
-It rejects generic device tokens, worker hook tokens, stale Mate generations, ended sessions, and a pty session that no longer matches the owner runtime.
-The owner-generation lookup and claim or acknowledgment compare-and-swap occur in the same database transaction.
+The service authenticates the caller with the active per-session hook credential, not ordinary bearer authentication.
+OwnerManager binds that credential's canonical session id to the exact live `owner:mate` runtime generation and trusted provider identity.
+Launch and recovery mint a fresh credential with `HookRegistry.register`, revoke every token associated with the prior Mate session or generation, and persist only the new active binding.
+A recovered Codex session id may resolve through `HookRegistry.resolveAlias` only when the alias is server-created during verified recovery, targets the canonical session bound to the current live Mate generation, and is presented with that generation's active credential.
+An alias never makes a revoked pre-recovery token valid.
+The handler first verifies the presented session and credential, resolves an allowed recovery alias, and then performs the owner role, live state, exact generation, canonical session, and trusted provider checks in the same transaction as the claim or acknowledgment compare-and-swap.
+It rejects device bearer tokens, worker hook credentials, revoked Mate credentials, stale generations, ended sessions, unbound aliases, and a pty session that no longer matches the owner runtime.
 
 One generation processes one claimed item at a time in the first release.
 This preserves deterministic global ordering and keeps a Mate's narrative coherent.
@@ -302,9 +319,9 @@ It never represents a boss decision, a GitHub merge, an APNs receipt, or a human
 Add a persistent `Mate inbox` surface to both products.
 It is server-backed, not a reconstructed chat message list.
 
-- Show a badge with unread pending count, processing count, and wake-failed count.
+- Show a badge with unassigned or pending unread count, processing count, and wake-failed count.
 - Sort by the server's `global_order`, preserve task title, worker name, task state, source event kind, and creation time, and deduplicate by inbox item id.
-- Use clear states: `Awaiting Mate`, `Mate processing`, `Mate processed`, `Wake retrying`, `Wake failed, inbox retained`, and `Needs reassignment`.
+- Use clear states: `Awaiting Mate launch`, `Awaiting Mate`, `Mate processing`, `Mate processed`, `Wake retrying`, `Manual attention required`, and `Needs reassignment`.
 - Send APNs for new attention-worthy inbox items using an opaque inbox item id and compact title only. The app fetches full content after authenticated launch.
 - Push and WebSocket are wakeup paths, while REST and relay RPC hydrate the authoritative list. LAN and relay must render the same records, counts, and action availability.
 - Preserve a processed item in history for the retention period so a boss can audit the Mate's receipt.
@@ -362,7 +379,8 @@ The pruning job must verify no unprocessed item references the candidate rows an
 Treat inbox payloads as task-event-derived sensitive content.
 Reuse state database file protections, authenticated device transport, and relay encryption.
 Do not place task findings, commands, or payload bodies in APNs text.
-Bind every claim and acknowledgment to OwnerManager's current owner, generation, session, and trusted provider identity.
+Bind every claim and acknowledgment to the active per-session hook credential and OwnerManager's current owner, generation, canonical session, and trusted provider identity.
+Rotate the credential at launch and verified recovery, revoke prior-generation tokens, reject device bearer authentication, and allow a recovery alias only when the server binds it to that exact current generation.
 Use opaque random claim tokens, bounded summaries, payload-size limits, rate limits, and audit records for claim, acknowledgment, reassignment, and privileged resolution.
 
 ## Verification matrix and acceptance criteria
@@ -372,13 +390,13 @@ Use opaque random claim tokens, bounded summaries, payload-size limits, rate lim
 | Creation transaction | Inject failure after each write in task event, inbox, receipt, and outbox creation. | After restart, all four records exist together or none exist. |
 | Five-worker burst | Concurrently append five boss-relevant events from different tasks. | Five source events, five unique inbox ids, five outbox intents, stable global ordering, and no missing item. |
 | Per-task ordering | Append multiple eligible events from one task with another task interleaved. | Each task's sequence and global event-id order are preserved by claims. |
-| Duplicate event and submission | Replay the event writer, outbox delivery callback, claim, and acknowledgment. | Unique inbox row and one processed receipt per idempotency key. |
+| Duplicate inbox creation and submission | Replay inbox creation and outbox delivery for the same already-committed `task_event_id`, then replay claim and acknowledgment. | One inbox row for that source event, one attention attempt per assignment epoch and channel, and one processed receipt per acknowledgment idempotency key. A separate ledger event remains a separate inbox item. |
 | Outbox crash windows | Crash before submit, after submit before `delivered`, and after `delivered` before claim. | Retry or duplicate attention is possible, but the inbox remains once and pending until acknowledgement. |
 | Mate crash windows | Crash after claim, after processing start, and after acknowledgment commit before response. | Expired leases reappear, processed receipt remains idempotent, and no stale token can acknowledge. |
 | Server and provider restart | Restart SQLite server, Codex daemon, and Claude process at every handoff. | Unacknowledged items resume from durable state with no in-memory queue dependency. |
 | Recovery generation | Recover a Mate with verified provider identity and attempt old-generation calls afterward. | Unprocessed items move with an audit receipt; stale generation is rejected. |
 | Fresh Mate | Start a non-recovery Mate while old work is unacknowledged. | Items remain visible as reassignment-required until an explicit audited adoption. |
-| Provider rejection | Return retryable, terminal, and unsupported notifier results. | Outbox state reflects the failure, inbox stays pending, and the UI says inbox retained. |
+| Provider rejection | Return retryable, terminal, and unsupported notifier results. | Retryable failures back off, terminal failures settle, unsupported settles immediately with `unsupported_provider_capability` and no retry, the inbox stays pending, and desktop, iOS, and APNs say manual attention is required. |
 | Composer safety | Attach a human desktop client and exercise busy, idle, and permission-gated Mate states. | Default inbox delivery creates no provider user message and changes no composer or approval focus. |
 | Codex capability probe | Run the version-pinned app-server probe for any future silent notifier. | Capability remains disabled unless it proves non-user-message, item receipt, restart reconciliation, and busy-turn safety. |
 | Claude capability probe | Run an equivalent interactive-provider probe. | Capability remains disabled unless it proves the same safety properties. |
@@ -388,6 +406,7 @@ Use opaque random claim tokens, bounded summaries, payload-size limits, rate lim
 
 The feature is accepted only when the five-event burst and every crash boundary preserve an unacknowledged inbox item until a generation-authorized idempotent acknowledgment commits.
 It is also accepted only when a default Codex or Claude wake cannot write literal text into a human composer.
+Source-event idempotency is future scope because separate `recordEvent` calls intentionally append separate immutable ledger events.
 
 ## Implementation sequence
 
