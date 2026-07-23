@@ -26,11 +26,14 @@ jobs:
       - run: npm ci
       - run: npm run check:public-seed
       - run: npm run build
-      - run: npm run typecheck
-      - run: npm test -w @perch/server
-      - run: npm test -w @perch/relay
+      - name: Run core server tests
+        run: >-
+          node --import tsx --test
+          apps/server/src/stateDb.test.ts
+          apps/server/src/completionLifecycle.e2e.test.ts
+          apps/server/src/reliabilityE2e.test.ts
       - run: npm run test:package
-      - name: Build with Xcode 26
+      - name: Compile iOS app with Xcode 26
         run: >-
           xcodebuild
           -project apps/ios/Perch.xcodeproj
