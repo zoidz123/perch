@@ -237,6 +237,11 @@ export class OwnerManager {
     return this.tasks.stateDb.ownerRuntimes.latest(MATE_OWNER_ID);
   }
 
+  liveMateSessionId(): string | undefined {
+    const runtime = this.latestMate();
+    return runtime?.state === "live" ? runtime.ptySessionId : undefined;
+  }
+
   snapshot(): MateOwnerSnapshot | undefined {
     const runtime = this.latestMate();
     if (!runtime) return undefined;

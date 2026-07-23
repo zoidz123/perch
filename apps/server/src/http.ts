@@ -4307,16 +4307,8 @@ async function registerChartCore(
   const task = options.tasks
     .list()
     .find((candidate) => candidate.sessionId === owningSessionId && candidate.state !== "closed");
-  // Crew parentage: the owning session's supervising session (normally the
-  // mate), captured now so the chart surfaces up the chain after the worker
-  // session is gone.
-  let parentSessionId: string | undefined;
-  try {
-    const sessions = await options.adapter.listSessions();
-    parentSessionId = sessions.find((session) => session.id === owningSessionId)?.labels?.parent;
-  } catch {
-    // Parentage is best-effort; registration must not fail on a fleet hiccup.
-  }
+  const liveMateSessionId = options.ownerManager?.liveMateSessionId();
+  const parentSessionId = task?.parentSessionId === liveMateSessionId ? liveMateSessionId : undefined;
   let chart: Chart;
   try {
     chart = options.charts.register(file, {
@@ -4342,8 +4334,9 @@ async function registerChartCore(
 // Boss feedback on a chart -> one normalized block into the owning session's
 // composer through the queue-gated path (queues while a permission prompt is
 // open, exactly like any composer message - attention, never an approval
-// gate). A dead owning session is an explicit 409 naming the alternatives
-// (mate / fresh agent); feedback is never silently queued for a corpse.
+// gate). When a drawing worker has ended, the registration's server-captured
+// parent is the only permitted fallback. Feedback is never silently queued for
+// a corpse or redirected from a client-supplied session id.
 // The unified hub listing: every registered chart grouped by its owning project
 // (resolved through task linkage) with that project's committed docs/plans,
 // plus charts that resolve
@@ -4494,27 +4487,54 @@ async function chartFeedbackRpc(
     return rpcError(400, "feedback needs annotations or a message");
   }
   const sessions = options.monitor.withLiveState(await options.adapter.listSessions());
-  const owner = sessions.find((session) => session.id === chart.sessionId);
-  if (!owner || owner.status === "done" || owner.status === "error") {
-    const mate = sessions.find(
-      (session) =>
-        session.labels?.role === "mate" && session.status !== "done" && session.status !== "error"
-    );
-    return {
-      status: 409,
-      body: {
-        error: `The session that drew this chart is gone (${chart.sessionId}). Route the feedback to the mate or start a fresh agent with the chart as context.`,
-        chartId: chart.id,
-        alternatives: ["mate", "new_agent"],
-        ...(mate ? { mateSessionId: mate.id } : {})
-      }
-    };
+  const liveSession = (sessionId: string | undefined) =>
+    sessionId
+      ? sessions.find((session) => session.id === sessionId && session.status !== "done" && session.status !== "error")
+      : undefined;
+  const owner = liveSession(chart.sessionId);
+  const liveMateSessionId = options.ownerManager?.liveMateSessionId();
+  const parent = chart.parentSessionId === liveMateSessionId ? liveSession(liveMateSessionId) : undefined;
+  const recipient = owner ?? parent;
+  if (!recipient) {
+    return chartFeedbackUnavailable(chart);
   }
   const block = formatChartFeedback(chart, { message, annotations });
-  const { queued } = await deliverInput(options, chart.sessionId, block, "human");
+  let queued: boolean;
+  let deliveredRecipient = recipient;
+  try {
+    ({ queued } = await deliverInput(options, recipient.id, block, "human"));
+  } catch (error) {
+    if (!isUnavailableSessionError(error)) {
+      throw error;
+    }
+    if (recipient.id !== chart.sessionId) {
+      return chartFeedbackUnavailable(chart);
+    }
+    const refreshedMateSessionId = options.ownerManager?.liveMateSessionId();
+    const refreshedSessions = options.monitor.withLiveState(await options.adapter.listSessions());
+    const refreshedParent =
+      chart.parentSessionId === refreshedMateSessionId
+        ? refreshedSessions.find(
+            (session) =>
+              session.id === refreshedMateSessionId && session.status !== "done" && session.status !== "error"
+          )
+        : undefined;
+    if (!refreshedParent) {
+      return chartFeedbackUnavailable(chart);
+    }
+    try {
+      ({ queued } = await deliverInput(options, refreshedParent.id, block, "human"));
+      deliveredRecipient = refreshedParent;
+    } catch (fallbackError) {
+      if (isUnavailableSessionError(fallbackError)) {
+        return chartFeedbackUnavailable(chart);
+      }
+      throw fallbackError;
+    }
+  }
   await audit(options.auditLog, {
     action: "chart_feedback",
-    sessionId: chart.sessionId,
+    sessionId: deliveredRecipient.id,
     chartId: chart.id,
     ...(chart.taskId ? { taskId: chart.taskId } : {}),
     ...auditMeta,
@@ -4522,6 +4542,30 @@ async function chartFeedbackRpc(
   });
   const responseBody: ChartFeedbackResponse = { ok: true, queued };
   return rpcOk(202, responseBody);
+}
+
+function isUnavailableSessionError(error: unknown): boolean {
+  if (!(error instanceof Error)) return false;
+  return (
+    error.message === "worker session has ended; follow-up input was not accepted" ||
+    error.message.startsWith("Unknown PTY session:") ||
+    /^Session .+ has ended$/.test(error.message) ||
+    error.message.startsWith("unknown codex app-server session:")
+  );
+}
+
+function chartFeedbackUnavailable(chart: Chart): RpcResult {
+  const parentDetail = chart.parentSessionId
+    ? ` and its registered parent (${chart.parentSessionId}) are unavailable`
+    : " and it has no registered parent";
+  return {
+    status: 409,
+    body: {
+      error: `The session that drew this chart is gone (${chart.sessionId})${parentDetail}. Start a fresh agent with the chart as context.`,
+      chartId: chart.id,
+      alternatives: ["new_agent"]
+    }
+  };
 }
 
 // Layout-audit findings from the injected SDK, delivered to the drawing agent
