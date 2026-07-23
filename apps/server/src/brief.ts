@@ -138,7 +138,7 @@ export function dispatchBrief(
     "Write the file to .charts/<slug>.html in your workspace (keep it out of commits) and register it once:",
     chartVerb,
     "Registration notifies the boss; edits to the file refresh an open review live; boss feedback arrives in your session as a [perch chart] block.",
-    "Content: lead with the decision the chart answers; show concrete behavior, not abstract pros and cons; end a plan with its risks and open questions; keep it under roughly two screens.",
+    "Content: keep the chart to one screen. Lead with a one-line verdict, then Problem / Findings with at most four short bullets, then Fix / Recommendation with at most four short bullets. Risks and open questions are optional; include at most one short open-question or decision line.",
     "Charts are working documents: on registration the server keeps the canonical copy under ~/.perch/charts/, so the chart outlives your worktree. When the boss approves a chart as a plan, approval is the promotion: the worker implementing it converts the approved chart's content into a markdown plan doc committed to the target project's repo (docs/plans/<date>-<name>.md, or that project's docs convention) as the first commit of the implementation branch, then builds against it. Scratchpad centrally, canon per-repo.",
     "",
     "Report sparsely: one working: when you start, then only on real state changes.",

@@ -9,7 +9,7 @@ You write content against the small class vocabulary below and nothing else.
 - **No `<style>` blocks.** Ever.
 - **No `style=` attributes.** Ever.
 - **No external design systems.** No Tailwind, no DaisyUI, no font CDNs, no icon sets.
-- Do not invent classes; if the vocabulary below cannot express something, write it as plain prose instead.
+- Do not invent classes; if the vocabulary below cannot express something, use the closest semantic HTML element instead.
 - Gold is rationed.
   The stylesheet already spends it (title rule, links); never add more gold yourself.
   If a chart shows more than a few gold elements, something is wrong.
@@ -33,7 +33,7 @@ Start every chart like this:
 When the chart is served by perch, the relative `chart.css` link resolves to the server's own copy automatically.
 Copy `apps/server/assets/charts/chart.css` next to your chart file only if the file must also open directly from disk.
 
-`reference.html` in this directory is a complete example exercising every class; read it once before writing your first chart.
+`reference.html` in this directory is a complete terse example; read it once before writing your first chart.
 
 ## Register and iterate
 
@@ -65,20 +65,18 @@ Open the body with a `.chart-header`:
 
 ```html
 <header class="chart-header">
-  <span class="eyebrow">Perch · Chart</span>
-  <h1>The title</h1>
-  <p class="subtitle">One italic line of framing.</p>
+  <h1>One decisive verdict</h1>
   <p class="meta">
     <span class="badge good">Active</span>
-    <span>Drawn 2026-07-07</span>
-    <span>task <code>my-task-id</code></span>
+    <span>One supporting fact</span>
   </p>
 </header>
 ```
 
-- `.eyebrow` - small uppercase kicker above the title.
-- `.subtitle` - one italic serif line under the title.
-- `.meta` - a wrapping row of small facts (date, task id, badges), separated visually by gaps.
+- The `<h1>` is the chart's required decisive top line.
+- `.eyebrow` - optional small uppercase kicker when the boss asks for one.
+- `.subtitle` - optional italic serif line when the boss asks for framing.
+- `.meta` - optional wrapping row of short facts or badges, separated visually by gaps.
 
 ## Prose
 
@@ -86,7 +84,8 @@ Plain elements are already styled; no classes needed.
 
 - `<h2>` starts a new section (it draws its own hairline rule above).
 - `<h3>` is a subsection heading; `<h4>` is a small uppercase label heading.
-- `<p>`, `<ul>`, `<ol>`, `<strong>`, `<em>`, `<a>` as usual.
+- `<p>` only for a required single-line decision or open question; never use it for narrative.
+- `<ul>`, `<ol>`, `<strong>`, `<em>`, `<a>` as usual.
 - `<blockquote>` for the one line you want the reader to remember.
 - `<hr>` is a short centered divider for a hard break in the document.
 
@@ -99,11 +98,11 @@ Use for facts that read side by side: components, risks, options.
 <div class="cards">
   <div class="card">
     <h4>Registry</h4>
-    <p>One or two sentences.</p>
+    <ul><li>One short finding.</li></ul>
   </div>
   <div class="card warn">
     <h4>A risk</h4>
-    <p>Why it bites and what holds the line.</p>
+    <ul><li>One short recommendation.</li></ul>
   </div>
 </div>
 ```
@@ -209,16 +208,31 @@ To render, include this snippet once at the end of `<body>` (this exact snippet 
 
 ## Content shapes
 
-A chart is a review surface: make the thing you want a decision on its own annotatable element.
+A chart is a 15-second review surface.
+Make the answer obvious without scrolling.
 
-- **Plan** - open with the goal, the current state, and the desired behavior; then the approach as high-level decisions; end with risks and open questions.
-  When a question is resolved, fold the answer into the content and delete the question.
-- **Comparison** - name the decision in the title block; show concrete behavior for each option, not abstract pros and cons; make each option's cost as visible as its benefit; recommend only when the evidence supports one.
-- **Diagram** - lead with the question the diagram answers; keep the first diagram to the core relationship and put dense detail below it; several small diagrams beat one crammed one.
-- **Table** - open with one line saying what the rows prove; make the primary status readable without scanning every cell; never use color as the only signal.
+Use this order:
+
+1. **Verdict / Answer** - put one decisive line at the very top.
+2. **Problem / Findings** - use at most four short bullets.
+3. **Fix / Recommendation** - use at most four short bullets.
+4. **Open question / Decision** - optionally end with one short line.
+
+Keep the entire chart to one screen.
+Cut content until a reader can get the point in about 15 seconds.
+
+Do not include:
+
+- Narrative prose paragraphs.
+- Restated background or context.
+- Evidence dumps; link the evidence or drop it.
+- ELI5 explanations or analogies unless the boss explicitly asks for them.
+
+Prefer bullets, short cards, and tables over paragraphs.
+Reserve `<blockquote>` for one key line only.
 
 ## Layout discipline
 
 - The page must never scroll horizontally; wide things (tables, code, diagrams) scroll inside their own wrapper.
-- Keep charts one column and under roughly two screens of content; a chart is a review surface, not documentation.
+- Keep charts one column and to one screen of content; a chart is a review surface, not documentation.
 - Use tone colors to mean something (state, risk), never for decoration.

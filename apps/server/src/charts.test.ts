@@ -752,7 +752,43 @@ test("GET /charts/authoring serves the authoring guide as markdown WITHOUT auth"
     const markdown = await response.text();
     assert.match(markdown, /# Drawing charts/);
     assert.match(markdown, /chart\.css/);
+    const mandates = [
+      "**Verdict / Answer** - put one decisive line at the very top.",
+      "**Problem / Findings** - use at most four short bullets.",
+      "**Fix / Recommendation** - use at most four short bullets.",
+      "**Open question / Decision** - optionally end with one short line.",
+      "Keep the entire chart to one screen.",
+      "Cut content until a reader can get the point in about 15 seconds.",
+      "Prefer bullets, short cards, and tables over paragraphs.",
+      "Reserve `<blockquote>` for one key line only."
+    ];
+    const bans = [
+      "Narrative prose paragraphs.",
+      "Restated background or context.",
+      "Evidence dumps; link the evidence or drop it.",
+      "ELI5 explanations or analogies unless the boss explicitly asks for them."
+    ];
+    for (const mandate of mandates) {
+      assert.ok(markdown.includes(mandate), `missing authoring mandate: ${mandate}`);
+    }
+    for (const ban of bans) {
+      assert.ok(markdown.includes(ban), `missing authoring ban: ${ban}`);
+    }
   });
+});
+
+test("chart reference demonstrates the terse verdict-findings-fix format", () => {
+  const html = readFileSync(new URL("../assets/charts/reference.html", import.meta.url), "utf8");
+  const verdict = html.indexOf("<h1>Charts must deliver the answer in 15 seconds</h1>");
+  const findings = html.indexOf("<h2>Problem / Findings</h2>");
+  const fix = html.indexOf("<h2>Fix / Recommendation</h2>");
+  assert.ok(verdict >= 0 && verdict < findings && findings < fix);
+
+  const findingsList = html.slice(findings, fix);
+  const fixList = html.slice(fix);
+  assert.equal([...findingsList.matchAll(/<li>/g)].length, 4);
+  assert.equal([...fixList.matchAll(/<li>/g)].length, 4);
+  assert.doesNotMatch(html, /<style\b|style=/);
 });
 
 test("POST /hooks answers SessionStart and Claude Stop records turn completion evidence", async () => {
