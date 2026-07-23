@@ -33,6 +33,7 @@ type IdentityExpectation = {
   provider: string;
   providerSessionId: string;
   payload?: HookEventPayload;
+  recordSession: (sessionId: string) => void;
   resolve: () => void;
   reject: (error: Error) => void;
 };
@@ -60,10 +61,18 @@ export class MateRecoveryCoordinator {
     const valid = provider === expected.provider && providerSessionId === expected.providerSessionId && (
       !driver?.verifySessionStart || Boolean(payload && driver.verifySessionStart(providerSessionId, payload))
     );
-    if (valid) expected.resolve();
-    else expected.reject(new Error(
-      `mate recovery provider identity mismatch: expected ${expected.provider}/${expected.providerSessionId}, got ${provider}/${providerSessionId}`
-    ));
+    if (!valid) {
+      expected.reject(new Error(
+        `mate recovery provider identity mismatch: expected ${expected.provider}/${expected.providerSessionId}, got ${provider}/${providerSessionId}`
+      ));
+      return;
+    }
+    try {
+      expected.recordSession(sessionId);
+      expected.resolve();
+    } catch (error) {
+      expected.reject(error instanceof Error ? error : new Error(String(error)));
+    }
   }
 
   recover(runtime: OwnerRuntimeRecord): Promise<MateFleetRecoveryResult> {
@@ -119,8 +128,9 @@ export class MateRecoveryCoordinator {
       throw new Error("mate provider session identity is missing or untrusted; use `perch mate --new`");
     }
     await this.assertOldProcessGone(runtime);
-    const claimed = this.options.ownerManager.claimMateRecovery(runtime.generation);
-    if (!claimed) throw new Error(`mate recovery conflict at generation ${runtime.generation}`);
+    const initialClaim = this.options.ownerManager.claimMateRecovery(runtime.generation);
+    if (!initialClaim) throw new Error(`mate recovery conflict at generation ${runtime.generation}`);
+    let claimed = initialClaim;
 
     let sessionId = "";
     let launchedSessionId = "";
@@ -134,7 +144,9 @@ export class MateRecoveryCoordinator {
       prepared.request.labels = { ...prepared.request.labels, role: "mate" };
       sessionId = prepared.request.sessionId!;
       launchedSessionId = sessionId;
-      const identity = this.expectIdentity(sessionId, claimed.provider, providerSessionId);
+      const identity = this.expectIdentity(sessionId, claimed.provider, providerSessionId, (candidateSessionId) => {
+        claimed = this.options.ownerManager.recordRecoverySession(claimed, candidateSessionId);
+      });
       unsubscribe = this.options.adapter.subscribeAgentEvents?.((event) => {
         if (event.sessionId === launchedSessionId && event.type === "terminal_output") {
           const text = event.text ?? event.raw;
@@ -295,7 +307,12 @@ export class MateRecoveryCoordinator {
     return result;
   }
 
-  private expectIdentity(sessionId: string, provider: string, providerSessionId: string): Promise<void> {
+  private expectIdentity(
+    sessionId: string,
+    provider: string,
+    providerSessionId: string,
+    recordSession: (sessionId: string) => void
+  ): Promise<void> {
     const identity = new Promise<void>((resolve, reject) => {
       const timer = setTimeout(
         () => reject(new Error(`timed out waiting for verified ${provider} mate identity`)),
@@ -305,6 +322,7 @@ export class MateRecoveryCoordinator {
       this.expectations.set(sessionId, {
         provider,
         providerSessionId,
+        recordSession,
         resolve: () => { clearTimeout(timer); resolve(); },
         reject: (error) => { clearTimeout(timer); reject(error); }
       });

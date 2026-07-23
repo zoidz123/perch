@@ -1,4 +1,4 @@
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { chmodSync, existsSync, mkdirSync, readFileSync, readdirSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
@@ -6,7 +6,7 @@ import type { Task, TaskEvent, TaskEventKind, TaskEventSource, TaskPr } from "@p
 import Database from "better-sqlite3";
 import type { TaskDeliverable, TaskReviewFacts, TaskVerificationFacts } from "./taskPresentation.js";
 
-const LATEST_SCHEMA_VERSION = 11;
+const LATEST_SCHEMA_VERSION = 13;
 const LEGACY_TASK_IMPORT = "tasks-json-v1";
 
 const MIGRATIONS = [
@@ -427,6 +427,106 @@ const MIGRATIONS = [
           WHERE w.task_id = e.task_id AND w.kind IN ('working', 'completion_rejected')
         ), 0);
     `
+  },
+  {
+    version: 12,
+    name: "durable-prompt-deliveries",
+    sql: `
+      CREATE TABLE prompt_deliveries (
+        id TEXT PRIMARY KEY,
+        perch_session_id TEXT NOT NULL,
+        runtime_generation INTEGER,
+        task_id TEXT REFERENCES tasks(id) ON DELETE RESTRICT,
+        source TEXT NOT NULL CHECK (source IN ('human', 'agent')),
+        allow_late_receipt INTEGER NOT NULL DEFAULT 0 CHECK (allow_late_receipt IN (0, 1)),
+        state TEXT NOT NULL CHECK (state IN ('queued', 'typing', 'submitted', 'accepted', 'delivery_unknown')),
+        prompt_text TEXT NOT NULL,
+        prompt_hash TEXT NOT NULL,
+        receipt_kind TEXT CHECK (receipt_kind IN ('user_prompt_submit', 'transcript')),
+        receipt_id TEXT,
+        hook_receipt_at TEXT,
+        hook_receipt_id TEXT,
+        transcript_receipt_at TEXT,
+        transcript_receipt_id TEXT,
+        failure_reason TEXT,
+        created_at TEXT NOT NULL,
+        typing_at TEXT,
+        typing_order INTEGER,
+        submitted_at TEXT,
+        accepted_at TEXT,
+        accepted_order INTEGER,
+        unknown_at TEXT,
+        unknown_from_state TEXT CHECK (unknown_from_state IN ('queued', 'typing', 'submitted')),
+        unknown_notified_at TEXT,
+        accepted_notified_at TEXT,
+        updated_at TEXT NOT NULL
+      ) STRICT;
+      CREATE INDEX prompt_deliveries_session_state_idx
+        ON prompt_deliveries(perch_session_id, state, created_at);
+      CREATE INDEX prompt_deliveries_task_idx
+        ON prompt_deliveries(task_id, created_at);
+    `
+  },
+  {
+    version: 13,
+    name: "distinguish-unsubmitted-prompts",
+    sql: `
+      DROP INDEX prompt_deliveries_session_state_idx;
+      DROP INDEX prompt_deliveries_task_idx;
+      ALTER TABLE prompt_deliveries RENAME TO prompt_deliveries_v12;
+
+      CREATE TABLE prompt_deliveries (
+        id TEXT PRIMARY KEY,
+        perch_session_id TEXT NOT NULL,
+        runtime_generation INTEGER,
+        task_id TEXT REFERENCES tasks(id) ON DELETE RESTRICT,
+        source TEXT NOT NULL CHECK (source IN ('human', 'agent')),
+        allow_late_receipt INTEGER NOT NULL DEFAULT 0 CHECK (allow_late_receipt IN (0, 1)),
+        state TEXT NOT NULL CHECK (state IN ('queued', 'typing', 'submitted', 'accepted', 'not_submitted', 'delivery_unknown')),
+        prompt_text TEXT NOT NULL,
+        prompt_hash TEXT NOT NULL,
+        receipt_kind TEXT CHECK (receipt_kind IN ('user_prompt_submit', 'transcript')),
+        receipt_id TEXT,
+        hook_receipt_at TEXT,
+        hook_receipt_id TEXT,
+        transcript_receipt_at TEXT,
+        transcript_receipt_id TEXT,
+        failure_reason TEXT,
+        created_at TEXT NOT NULL,
+        typing_at TEXT,
+        typing_order INTEGER,
+        submitted_at TEXT,
+        accepted_at TEXT,
+        accepted_order INTEGER,
+        unknown_at TEXT,
+        unknown_from_state TEXT CHECK (unknown_from_state IN ('queued', 'typing', 'submitted')),
+        unknown_notified_at TEXT,
+        accepted_notified_at TEXT,
+        updated_at TEXT NOT NULL
+      ) STRICT;
+
+      INSERT INTO prompt_deliveries(
+        id, perch_session_id, runtime_generation, task_id, source, allow_late_receipt,
+        state, prompt_text, prompt_hash, receipt_kind, receipt_id, hook_receipt_at,
+        hook_receipt_id, transcript_receipt_at, transcript_receipt_id, failure_reason,
+        created_at, typing_at, typing_order, submitted_at, accepted_at, accepted_order,
+        unknown_at, unknown_from_state, unknown_notified_at, accepted_notified_at, updated_at
+      )
+      SELECT
+        id, perch_session_id, runtime_generation, task_id, source, allow_late_receipt,
+        state, prompt_text, prompt_hash, receipt_kind, receipt_id, hook_receipt_at,
+        hook_receipt_id, transcript_receipt_at, transcript_receipt_id, failure_reason,
+        created_at, typing_at, typing_order, submitted_at, accepted_at, accepted_order,
+        unknown_at, unknown_from_state, unknown_notified_at, accepted_notified_at, updated_at
+      FROM prompt_deliveries_v12
+      ORDER BY rowid;
+
+      DROP TABLE prompt_deliveries_v12;
+      CREATE INDEX prompt_deliveries_session_state_idx
+        ON prompt_deliveries(perch_session_id, state, created_at);
+      CREATE INDEX prompt_deliveries_task_idx
+        ON prompt_deliveries(task_id, created_at);
+    `
   }
 ] as const;
 
@@ -663,6 +763,65 @@ export type ClaudeInboxDelta = {
   at: string;
 };
 
+export type PromptDeliveryState = "queued" | "typing" | "submitted" | "accepted" | "not_submitted" | "delivery_unknown";
+
+export type PromptDeliveryRecord = {
+  id: string;
+  perchSessionId: string;
+  runtimeGeneration?: number;
+  taskId?: string;
+  source: "human" | "agent";
+  allowLateReceipt?: boolean;
+  state: PromptDeliveryState;
+  promptText: string;
+  promptHash: string;
+  receiptKind?: "user_prompt_submit" | "transcript";
+  receiptId?: string;
+  hookReceiptAt?: string;
+  hookReceiptId?: string;
+  transcriptReceiptAt?: string;
+  transcriptReceiptId?: string;
+  failureReason?: string;
+  createdAt: string;
+  typingAt?: string;
+  submittedAt?: string;
+  acceptedAt?: string;
+  unknownAt?: string;
+  unknownFromState?: "queued" | "typing" | "submitted";
+  unknownNotifiedAt?: string;
+  acceptedNotifiedAt?: string;
+  updatedAt: string;
+};
+
+export type PromptDeliverySurfaceRecord = Pick<
+  PromptDeliveryRecord,
+  | "id"
+  | "state"
+  | "failureReason"
+  | "unknownAt"
+  | "unknownNotifiedAt"
+  | "acceptedAt"
+  | "acceptedNotifiedAt"
+  | "updatedAt"
+>;
+
+const PROMPT_DELIVERY_LINEAGE_SCOPE_SQL = `(
+  pd.perch_session_id = @sessionId
+  OR pd.task_id IN (
+    SELECT task_id FROM runtimes
+    WHERE pty_session_id = @sessionId
+       OR json_extract(metadata_json, '$.recoverySessionId') = @sessionId
+  )
+  OR pd.perch_session_id IN (
+    SELECT history.pty_session_id
+    FROM owner_runtimes current
+    JOIN owner_runtimes history ON history.owner_id = current.owner_id
+    WHERE (current.pty_session_id = @sessionId
+       OR json_extract(current.metadata_json, '$.recoverySessionId') = @sessionId)
+      AND history.pty_session_id IS NOT NULL
+  )
+)`;
+
 type TaskEventInput = {
   kind: TaskEventKind;
   message?: string;
@@ -701,6 +860,7 @@ export class StateDb {
   readonly claudeInteractions: ClaudeInteractionRepository;
   readonly claudeToolOccurrences: ClaudeToolOccurrenceRepository;
   readonly claudeInbox: ClaudeInboxRepository;
+  readonly promptDeliveries: PromptDeliveryRepository;
   private readonly db: Database.Database;
 
   constructor(env: NodeJS.ProcessEnv = process.env) {
@@ -723,6 +883,7 @@ export class StateDb {
     this.claudeInteractions = new ClaudeInteractionRepository(this.db);
     this.claudeToolOccurrences = new ClaudeToolOccurrenceRepository(this.db);
     this.claudeInbox = new ClaudeInboxRepository(this.db);
+    this.promptDeliveries = new PromptDeliveryRepository(this.db);
     this.importLegacyTasks(join(home, "tasks"));
   }
 
@@ -2008,6 +2169,323 @@ export class ClaudeInboxRepository {
   }
 }
 
+export class PromptDeliveryRepository {
+  constructor(private readonly db: Database.Database) {}
+
+  private nextTimestamp(provided?: string): string {
+    return provided ?? new Date().toISOString();
+  }
+
+  private nextMutationOrder(): number {
+    return Number(
+      this.db.prepare(
+        `SELECT coalesce(max(value), 0) + 1 FROM (
+          SELECT typing_order AS value FROM prompt_deliveries
+          UNION ALL SELECT accepted_order AS value FROM prompt_deliveries
+        )`
+      ).pluck().get()
+    );
+  }
+
+  create(input: {
+    perchSessionId: string;
+    promptText: string;
+    source: "human" | "agent";
+    allowLateReceipt?: boolean;
+    runtimeGeneration?: number;
+    taskId?: string;
+  }): PromptDeliveryRecord {
+    const now = this.nextTimestamp();
+    const normalized = normalizePrompt(input.promptText);
+    const record: PromptDeliveryRecord = {
+      id: randomUUID(),
+      perchSessionId: input.perchSessionId,
+      ...(input.runtimeGeneration !== undefined ? { runtimeGeneration: input.runtimeGeneration } : {}),
+      ...(input.taskId ? { taskId: input.taskId } : {}),
+      source: input.source,
+      ...(input.allowLateReceipt ? { allowLateReceipt: true } : {}),
+      state: "queued",
+      promptText: input.promptText,
+      promptHash: createHash("sha256").update(normalized).digest("hex"),
+      createdAt: now,
+      updatedAt: now
+    };
+    this.db.prepare(
+      `INSERT INTO prompt_deliveries(
+        id, perch_session_id, runtime_generation, task_id, source, allow_late_receipt,
+        state, prompt_text, prompt_hash, created_at, updated_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+    ).run(
+      record.id,
+      record.perchSessionId,
+      record.runtimeGeneration ?? null,
+      record.taskId ?? null,
+      record.source,
+      record.allowLateReceipt ? 1 : 0,
+      record.state,
+      record.promptText,
+      record.promptHash,
+      record.createdAt,
+      record.updatedAt
+    );
+    return record;
+  }
+
+  find(id: string): PromptDeliveryRecord | undefined {
+    const row = this.db.prepare("SELECT * FROM prompt_deliveries WHERE id = ?").get(id) as PromptDeliveryRow | undefined;
+    return row ? promptDeliveryFromRow(row) : undefined;
+  }
+
+  list(sessionId?: string): PromptDeliveryRecord[] {
+    const rows = sessionId
+      ? this.db.prepare("SELECT * FROM prompt_deliveries WHERE perch_session_id = ? ORDER BY created_at, id").all(sessionId)
+      : this.db.prepare("SELECT * FROM prompt_deliveries ORDER BY created_at, id").all();
+    return (rows as PromptDeliveryRow[]).map(promptDeliveryFromRow);
+  }
+
+  surfaceCandidates(sessionId: string): PromptDeliverySurfaceRecord[] {
+    const rows = this.db.prepare(
+      `WITH scoped AS (
+         SELECT pd.id, pd.state, pd.failure_reason, pd.unknown_at, pd.unknown_notified_at,
+                pd.accepted_at, pd.accepted_notified_at, pd.updated_at, pd.created_at
+         FROM prompt_deliveries pd
+         WHERE ${PROMPT_DELIVERY_LINEAGE_SCOPE_SQL}
+       ), unresolved AS (
+         SELECT * FROM scoped
+         WHERE state IN ('not_submitted', 'delivery_unknown') AND unknown_notified_at IS NOT NULL
+         ORDER BY created_at DESC, id DESC LIMIT 1
+       ), resolved AS (
+         SELECT * FROM scoped
+         WHERE state = 'accepted' AND unknown_notified_at IS NOT NULL AND accepted_notified_at IS NOT NULL
+         ORDER BY created_at DESC, id DESC LIMIT 1
+       )
+       SELECT * FROM unresolved
+       UNION ALL
+       SELECT * FROM resolved`
+    ).all({ sessionId }) as PromptDeliverySurfaceRow[];
+    return rows.map(promptDeliverySurfaceFromRow);
+  }
+
+  markTyping(id: string, at?: string): PromptDeliveryRecord | undefined {
+    const now = this.nextTimestamp(at);
+    const order = this.nextMutationOrder();
+    this.db.prepare(
+      `UPDATE prompt_deliveries SET state = 'typing', typing_at = ?, typing_order = ?, updated_at = ?
+       WHERE id = ? AND state = 'queued'`
+    ).run(now, order, now, id);
+    return this.find(id);
+  }
+
+  markSubmitted(id: string, at?: string): PromptDeliveryRecord | undefined {
+    const now = this.nextTimestamp(at);
+    this.db.prepare(
+      `UPDATE prompt_deliveries SET state = 'submitted', submitted_at = ?, updated_at = ?
+       WHERE id = ? AND state IN ('queued', 'typing')`
+    ).run(now, now, id);
+    return this.find(id);
+  }
+
+  markUnknown(id: string, reason: string, at?: string): PromptDeliveryRecord | undefined {
+    const now = this.nextTimestamp(at);
+    const result = this.db.prepare(
+      `UPDATE prompt_deliveries SET unknown_from_state = state, state = 'delivery_unknown',
+       failure_reason = ?, unknown_at = ?, updated_at = ?
+       WHERE id = ? AND state IN ('typing', 'submitted')`
+    ).run(reason, now, now, id);
+    return result.changes === 1 ? this.find(id) : undefined;
+  }
+
+  markNotSubmitted(id: string, reason: string, at?: string): PromptDeliveryRecord | undefined {
+    const now = this.nextTimestamp(at);
+    const result = this.db.prepare(
+      `UPDATE prompt_deliveries SET unknown_from_state = 'queued', state = 'not_submitted',
+       failure_reason = ?, unknown_at = ?, updated_at = ?
+       WHERE id = ? AND state = 'queued'`
+    ).run(reason, now, now, id);
+    return result.changes === 1 ? this.find(id) : undefined;
+  }
+
+  markUnknownNotified(id: string, at?: string): PromptDeliveryRecord | undefined {
+    const now = this.nextTimestamp(at);
+    const result = this.db.prepare(
+      `UPDATE prompt_deliveries SET unknown_notified_at = ?, updated_at = ?
+       WHERE id = ? AND state IN ('not_submitted', 'delivery_unknown') AND unknown_notified_at IS NULL`
+    ).run(now, now, id);
+    return result.changes === 1 ? this.find(id) : undefined;
+  }
+
+  markAcceptedNotified(id: string, at?: string): PromptDeliveryRecord | undefined {
+    const now = this.nextTimestamp(at);
+    const result = this.db.prepare(
+      `UPDATE prompt_deliveries SET accepted_notified_at = ?, updated_at = ?
+       WHERE id = ? AND state = 'accepted' AND accepted_notified_at IS NULL`
+    ).run(now, now, id);
+    return result.changes === 1 ? this.find(id) : undefined;
+  }
+
+  acceptMatch(input: {
+    perchSessionId: string;
+    promptText: string;
+    receiptKind: "user_prompt_submit" | "transcript";
+    receiptId?: string;
+    allowObservedPrefix?: boolean;
+    observedAt?: string;
+    now?: string;
+  }): { delivery: PromptDeliveryRecord; newlyAccepted: boolean } | undefined {
+    const observedWasTruncated =
+      input.allowObservedPrefix === true && input.promptText.trimEnd().endsWith("…");
+    const observedText = observedWasTruncated
+      ? input.promptText.trimEnd().slice(0, -1)
+      : input.promptText;
+    const observed = normalizePrompt(observedText);
+    if (!observed) return undefined;
+    const observedAt = input.receiptKind === "transcript" ? Date.parse(input.observedAt ?? "") : undefined;
+    if (input.receiptKind === "transcript" && !Number.isFinite(observedAt)) return undefined;
+    const deliveryScope = input.receiptKind === "transcript"
+      ? PROMPT_DELIVERY_LINEAGE_SCOPE_SQL
+      : "pd.perch_session_id = @sessionId";
+    const rows = this.db.prepare(
+      `SELECT pd.*, pd.rowid AS delivery_ordinal FROM prompt_deliveries pd
+       WHERE ${deliveryScope} AND pd.state IN ('typing', 'submitted', 'accepted', 'delivery_unknown')
+       ORDER BY rowid`
+    ).all({ sessionId: input.perchSessionId }) as PromptDeliveryRow[];
+    if (input.receiptKind === "transcript" && input.receiptId) {
+      const replayed = rows.find((row) => row.transcript_receipt_id === input.receiptId);
+      if (replayed) return { delivery: promptDeliveryFromRow(replayed), newlyAccepted: false };
+    }
+    const matchableRows = input.receiptKind === "transcript"
+      ? rows.filter(
+          (row) => row.perch_session_id === input.perchSessionId || row.state === "delivery_unknown"
+        )
+      : rows;
+    const matches = matchableRows.filter((row) => {
+      if (row.state === "delivery_unknown" && row.unknown_from_state === "queued") return false;
+      if (row.state === "delivery_unknown" && input.receiptKind !== "transcript") return false;
+      if (input.receiptKind === "transcript") {
+        const boundary = Date.parse(row.typing_at ?? row.created_at);
+        // Transcript time must follow the moment Perch began typing. Durable
+        // mutation order below handles receipt ordering without clock skew.
+        if (!Number.isFinite(boundary) || observedAt! < boundary) return false;
+        if (row.state === "delivery_unknown") {
+          const unknownAt = Date.parse(row.unknown_at ?? "");
+          if (!Number.isFinite(unknownAt) || observedAt! >= unknownAt) return false;
+        }
+      }
+      const expected = normalizePrompt(row.prompt_text);
+      return expected === observed ||
+        (input.allowObservedPrefix === true && observedWasTruncated && expected.startsWith(observed));
+    });
+    const active = matches.filter((row) => row.state === "typing" || row.state === "submitted");
+    if (input.receiptKind === "user_prompt_submit") {
+      const unmatchedAcceptedHook = matches
+        .filter((row) => row.state === "accepted" && row.hook_receipt_at === null)
+        .at(-1);
+      if (unmatchedAcceptedHook) {
+        return active.length === 0
+          ? this.recordCounterpartReceipt(unmatchedAcceptedHook, input)
+          : undefined;
+      }
+      const acceptedWithoutTranscript = matches
+        .filter((row) => row.state === "accepted" && row.transcript_receipt_at === null)
+        .at(-1);
+      if (acceptedWithoutTranscript && active.length > 0) {
+        return { delivery: promptDeliveryFromRow(acceptedWithoutTranscript), newlyAccepted: false };
+      }
+    }
+    const activeBoundary = active.length > 0
+      ? Math.min(...active.map((row) => row.typing_order ?? Number.MAX_SAFE_INTEGER))
+      : undefined;
+    const recentAccepted = matches
+      .filter(
+        (row) =>
+          row.state === "accepted" &&
+          (activeBoundary === undefined || (row.accepted_order ?? 0) > activeBoundary)
+      )
+      .at(-1);
+    if (recentAccepted) {
+      const missingCounterpart = input.receiptKind === "transcript"
+        ? recentAccepted.transcript_receipt_at === null
+        : recentAccepted.hook_receipt_at === null;
+      if (missingCounterpart) return this.recordCounterpartReceipt(recentAccepted, input);
+      // Hooks have no per-turn receipt id, so another identical hook while a
+      // newer identical delivery was already active is conservatively a
+      // replay. Transcript rows do have stable ids: an unseen id may advance
+      // the next delivery once the prior delivery already owns a transcript.
+      if (input.receiptKind === "user_prompt_submit") {
+        return { delivery: promptDeliveryFromRow(recentAccepted), newlyAccepted: false };
+      }
+    }
+
+    if (observedWasTruncated && active.length > 1) return undefined;
+    const matchedActive = active[0];
+    if (matchedActive) return this.acceptRow(matchedActive, input);
+
+    const unknown = matches.filter((row) => row.state === "delivery_unknown").at(-1);
+    const accepted = matches.filter((row) => row.state === "accepted").at(-1);
+    if (accepted && (!unknown || accepted.delivery_ordinal > unknown.delivery_ordinal)) {
+      return { delivery: promptDeliveryFromRow(accepted), newlyAccepted: false };
+    }
+    if (observedWasTruncated && matches.filter((row) => row.state === "delivery_unknown").length > 1) {
+      return undefined;
+    }
+    if (unknown) return this.acceptRow(unknown, input);
+    return accepted ? { delivery: promptDeliveryFromRow(accepted), newlyAccepted: false } : undefined;
+  }
+
+  private acceptRow(
+    matched: PromptDeliveryRow,
+    input: {
+      receiptKind: "user_prompt_submit" | "transcript";
+      receiptId?: string;
+      now?: string;
+    }
+  ): { delivery: PromptDeliveryRecord; newlyAccepted: boolean } | undefined {
+    const now = this.nextTimestamp(input.now);
+    const acceptedOrder = this.nextMutationOrder();
+    const hookReceiptAt = input.receiptKind === "user_prompt_submit" ? now : null;
+    const hookReceiptId = input.receiptKind === "user_prompt_submit" ? input.receiptId ?? null : null;
+    const transcriptReceiptAt = input.receiptKind === "transcript" ? now : null;
+    const transcriptReceiptId = input.receiptKind === "transcript" ? input.receiptId ?? null : null;
+    const result = this.db.prepare(
+      `UPDATE prompt_deliveries SET state = 'accepted', receipt_kind = ?, receipt_id = ?,
+       hook_receipt_at = coalesce(hook_receipt_at, ?),
+       hook_receipt_id = coalesce(hook_receipt_id, ?),
+       transcript_receipt_at = coalesce(transcript_receipt_at, ?),
+       transcript_receipt_id = coalesce(transcript_receipt_id, ?),
+       accepted_at = ?, accepted_order = ?, failure_reason = NULL, updated_at = ?
+       WHERE id = ? AND state IN ('typing', 'submitted', 'delivery_unknown')`
+    ).run(
+      input.receiptKind,
+      input.receiptId ?? null,
+      hookReceiptAt,
+      hookReceiptId,
+      transcriptReceiptAt,
+      transcriptReceiptId,
+      now,
+      acceptedOrder,
+      now,
+      matched.id
+    );
+    const delivery = result.changes === 1 ? this.find(matched.id) : undefined;
+    return delivery ? { delivery, newlyAccepted: true } : undefined;
+  }
+
+  private recordCounterpartReceipt(
+    matched: PromptDeliveryRow,
+    input: { receiptKind: "user_prompt_submit" | "transcript"; receiptId?: string; now?: string }
+  ): { delivery: PromptDeliveryRecord; newlyAccepted: boolean } | undefined {
+    const now = this.nextTimestamp(input.now);
+    const column = input.receiptKind === "transcript" ? "transcript_receipt_at" : "hook_receipt_at";
+    const idColumn = input.receiptKind === "transcript" ? "transcript_receipt_id" : "hook_receipt_id";
+    const result = this.db.prepare(
+      `UPDATE prompt_deliveries SET ${column} = ?, ${idColumn} = coalesce(${idColumn}, ?), updated_at = ?
+       WHERE id = ? AND state = 'accepted' AND ${column} IS NULL`
+    ).run(now, input.receiptId ?? null, now, matched.id);
+    const delivery = result.changes === 1 ? this.find(matched.id) : undefined;
+    return delivery ? { delivery, newlyAccepted: false } : undefined;
+  }
+}
+
 type RuntimeRow = {
   id: string;
   task_id: string;
@@ -2198,6 +2676,49 @@ type ClaudeInboxDeltaRow = {
   seq: number; request_type: ClaudeInboxDelta["requestType"]; request_id: string;
   state: string; snapshot_json: string; at: string;
 };
+
+type PromptDeliveryRow = {
+  delivery_ordinal: number;
+  id: string;
+  perch_session_id: string;
+  runtime_generation: number | null;
+  task_id: string | null;
+  source: "human" | "agent";
+  allow_late_receipt: 0 | 1;
+  state: PromptDeliveryState;
+  prompt_text: string;
+  prompt_hash: string;
+  receipt_kind: "user_prompt_submit" | "transcript" | null;
+  receipt_id: string | null;
+  hook_receipt_at: string | null;
+  hook_receipt_id: string | null;
+  transcript_receipt_at: string | null;
+  transcript_receipt_id: string | null;
+  failure_reason: string | null;
+  created_at: string;
+  typing_at: string | null;
+  typing_order: number | null;
+  submitted_at: string | null;
+  accepted_at: string | null;
+  accepted_order: number | null;
+  unknown_at: string | null;
+  unknown_from_state: "queued" | "typing" | "submitted" | null;
+  unknown_notified_at: string | null;
+  accepted_notified_at: string | null;
+  updated_at: string;
+};
+
+type PromptDeliverySurfaceRow = Pick<
+  PromptDeliveryRow,
+  | "id"
+  | "state"
+  | "failure_reason"
+  | "unknown_at"
+  | "unknown_notified_at"
+  | "accepted_at"
+  | "accepted_notified_at"
+  | "updated_at"
+>;
 
 function taskEventFromRow(row: TaskEventRow): TaskEvent {
   return {
@@ -2426,6 +2947,53 @@ function claudeToolOccurrenceFromRow(row: ClaudeToolOccurrenceRow): ClaudeToolOc
     ...(row.runtime_generation !== null ? { runtimeGeneration: row.runtime_generation } : {}),
     occurrence: row.occurrence, ...(row.consumed_at ? { consumedAt: row.consumed_at } : {}), createdAt: row.created_at
   };
+}
+
+function promptDeliveryFromRow(row: PromptDeliveryRow): PromptDeliveryRecord {
+  return {
+    id: row.id,
+    perchSessionId: row.perch_session_id,
+    ...(row.runtime_generation !== null ? { runtimeGeneration: row.runtime_generation } : {}),
+    ...(row.task_id ? { taskId: row.task_id } : {}),
+    source: row.source,
+    ...(row.allow_late_receipt === 1 ? { allowLateReceipt: true } : {}),
+    state: row.state,
+    promptText: row.prompt_text,
+    promptHash: row.prompt_hash,
+    ...(row.receipt_kind ? { receiptKind: row.receipt_kind } : {}),
+    ...(row.receipt_id ? { receiptId: row.receipt_id } : {}),
+    ...(row.hook_receipt_at ? { hookReceiptAt: row.hook_receipt_at } : {}),
+    ...(row.hook_receipt_id ? { hookReceiptId: row.hook_receipt_id } : {}),
+    ...(row.transcript_receipt_at ? { transcriptReceiptAt: row.transcript_receipt_at } : {}),
+    ...(row.transcript_receipt_id ? { transcriptReceiptId: row.transcript_receipt_id } : {}),
+    ...(row.failure_reason ? { failureReason: row.failure_reason } : {}),
+    createdAt: row.created_at,
+    ...(row.typing_at ? { typingAt: row.typing_at } : {}),
+    ...(row.submitted_at ? { submittedAt: row.submitted_at } : {}),
+    ...(row.accepted_at ? { acceptedAt: row.accepted_at } : {}),
+    ...(row.unknown_at ? { unknownAt: row.unknown_at } : {}),
+    ...(row.unknown_from_state ? { unknownFromState: row.unknown_from_state } : {}),
+    ...(row.unknown_notified_at ? { unknownNotifiedAt: row.unknown_notified_at } : {}),
+    ...(row.accepted_notified_at ? { acceptedNotifiedAt: row.accepted_notified_at } : {}),
+    updatedAt: row.updated_at
+  };
+}
+
+function promptDeliverySurfaceFromRow(row: PromptDeliverySurfaceRow): PromptDeliverySurfaceRecord {
+  return {
+    id: row.id,
+    state: row.state,
+    ...(row.failure_reason ? { failureReason: row.failure_reason } : {}),
+    ...(row.unknown_at ? { unknownAt: row.unknown_at } : {}),
+    ...(row.unknown_notified_at ? { unknownNotifiedAt: row.unknown_notified_at } : {}),
+    ...(row.accepted_at ? { acceptedAt: row.accepted_at } : {}),
+    ...(row.accepted_notified_at ? { acceptedNotifiedAt: row.accepted_notified_at } : {}),
+    updatedAt: row.updated_at
+  };
+}
+
+function normalizePrompt(text: string): string {
+  return text.replace(/\s+/g, " ").trim();
 }
 
 function isImportableTask(task: Task | null | undefined, id: string): task is Task {

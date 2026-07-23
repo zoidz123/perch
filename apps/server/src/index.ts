@@ -44,6 +44,7 @@ import { TaskScheduler } from "./taskScheduler.js";
 import { OutboxWorker } from "./outboxWorker.js";
 import { RuntimeManager } from "./runtimeManager.js";
 import { OwnerManager } from "./ownerManager.js";
+import { PromptDeliveryTracker, promptDeliverySurface } from "./promptDeliveries.js";
 
 const config = readConfig();
 const hooks = new HookRegistry(process.env);
@@ -147,6 +148,54 @@ const taskCompletion = new TaskCompletionReconciler({
   tasks,
   lastAssistantText: (sessionId) => timeline.lastAssistantText(sessionId)
 });
+const promptDeliveries = new PromptDeliveryTracker(tasks.stateDb, {
+  onAccepted: (delivery) => {
+    markTaskWorkingFromActivity({ tasks }, delivery.perchSessionId, { newTurn: true });
+    if (!delivery.unknownNotifiedAt) return;
+    const task = delivery.taskId
+      ? tasks.find(delivery.taskId)
+      : tasks.list().find((candidate) => candidate.sessionId === delivery.perchSessionId);
+    if (!task) return;
+    if (task.state === "closed") return;
+    if (tasks.events(task.id).some((event) => event.data?.deliveryId === delivery.id && event.data?.reason === "prompt_delivery_resolved")) return;
+    tasks.recordEvent(task.id, {
+      kind: "note",
+      source: "system",
+      message: "Claude prompt delivery was confirmed after the earlier delivery-unknown warning",
+      data: {
+        reason: "prompt_delivery_resolved",
+        sessionId: delivery.perchSessionId,
+        deliveryId: delivery.id
+      }
+    });
+  },
+  onUnknown: (delivery) => {
+    const task = delivery.taskId
+      ? tasks.find(delivery.taskId)
+      : tasks.list().find((candidate) => candidate.sessionId === delivery.perchSessionId);
+    if (!task) return;
+    if (task.state === "closed") return;
+    const notSubmitted = delivery.state === "not_submitted";
+    const reason = notSubmitted ? "prompt_not_submitted" : "prompt_delivery_unknown";
+    if (tasks.events(task.id).some((event) => event.data?.deliveryId === delivery.id && event.data?.reason === reason)) return;
+    tasks.recordEvent(task.id, {
+      kind: "stalled",
+      source: "system",
+      message: notSubmitted
+        ? delivery.failureReason ?? "Claude prompt was not submitted; Perch did not send it"
+        : "Claude prompt delivery is unknown; Perch did not resend it",
+      data: {
+        reason,
+        sessionId: delivery.perchSessionId,
+        deliveryId: delivery.id
+      }
+    });
+  }
+});
+timeline.observe((item) =>
+  promptDeliveries.acknowledgeTimeline(item, timeline.hasAuthenticTranscriptTimestamp(item))
+);
+timeline.observeCatchUp((sessionId) => promptDeliveries.finishRestartCatchUp(sessionId));
 prPoller.start();
 const apnsConfig = apnsConfigFromEnv();
 const apnsPush = apnsConfig ? new ApnsPushSender(apnsConfig, () => devices.pushTokens()) : undefined;
@@ -172,6 +221,9 @@ const monitor = new FleetMonitor(adapter, {
   // flush. Merely placing text behind an approval gate does not resume it.
   onInputSubmitted: (sessionId) =>
     markTaskWorkingFromActivity({ tasks }, sessionId, { newTurn: true }),
+  promptDeliveries,
+  promptDeliverySurface: (sessionId) =>
+    promptDeliverySurface(tasks.stateDb.promptDeliveries.surfaceCandidates(sessionId)),
   onQueuedInputRejected: (sessionId, count, reason) => {
     const task = tasks.list().find((candidate) => candidate.sessionId === sessionId);
     if (!task || task.state === "closed") return;
@@ -541,6 +593,7 @@ const server = createControlServer({
     }
   },
   taskCompletion,
+  promptDeliveries,
   metrics,
   charts,
   settings,
@@ -629,6 +682,7 @@ async function shutdown(): Promise<void> {
   // bounded rather than open-ended.
   await withTimeout(Promise.all([taskScheduler.stop(), outboxWorker.stop()]), 10_000);
   timeline.stop();
+  promptDeliveries.stop();
   prPoller.stop();
   reconciler.stop();
   taskWatchdog?.stop();

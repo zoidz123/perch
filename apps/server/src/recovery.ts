@@ -54,6 +54,7 @@ type RecoveryPayload = {
 type IdentityExpectation = {
   provider: string;
   providerSessionId: string;
+  recordSession: (sessionId: string) => void;
   resolve: () => void;
   reject: (error: Error) => void;
 };
@@ -90,7 +91,12 @@ export class RecoveryCoordinator {
       );
       return;
     }
-    expected.resolve();
+    try {
+      expected.recordSession(sessionId);
+      expected.resolve();
+    } catch (error) {
+      expected.reject(error instanceof Error ? error : new Error(String(error)));
+    }
   }
 
   async execute(operation: OperationRecord, context: OperationExecutionContext): Promise<void> {
@@ -100,8 +106,9 @@ export class RecoveryCoordinator {
     }
     const task = this.options.tasks.find(operation.taskId);
     if (!task) throw new Error(`Unknown task: ${operation.taskId}`);
-    let runtime = this.options.tasks.stateDb.runtimes.latestForTask(task.id);
-    if (!runtime) throw new Error(`task ${task.id} has no durable runtime`);
+    const currentRuntime = this.options.tasks.stateDb.runtimes.latestForTask(task.id);
+    if (!currentRuntime) throw new Error(`task ${task.id} has no durable runtime`);
+    let runtime = currentRuntime;
 
     if (runtime.state === "live" && runtime.generation === payload.expectedGeneration + 1) return;
     if (runtime.generation !== payload.expectedGeneration) {
@@ -185,7 +192,11 @@ export class RecoveryCoordinator {
       throw new Error(`recovery worktree lease disappeared: ${leaseId}`);
     }
 
-    const identity = this.expectIdentity(sessionId, driver.provider, providerSessionId);
+    const identity = this.expectIdentity(sessionId, driver.provider, providerSessionId, (candidateSessionId) => {
+      const linked = this.options.runtimeManager?.recordRecoverySession(runtime, candidateSessionId);
+      if (!linked) throw new Error("runtime manager is unavailable during recovery");
+      runtime = linked;
+    });
     let launchedSessionId = sessionId;
     let launched = false;
     try {
@@ -297,7 +308,12 @@ export class RecoveryCoordinator {
     }
   }
 
-  private expectIdentity(sessionId: string, provider: string, providerSessionId: string): Promise<void> {
+  private expectIdentity(
+    sessionId: string,
+    provider: string,
+    providerSessionId: string,
+    recordSession: (sessionId: string) => void
+  ): Promise<void> {
     const identity = new Promise<void>((resolve, reject) => {
       const timer = setTimeout(
         () => reject(new Error(`timed out waiting for verified SessionStart for ${provider} recovery`)),
@@ -307,6 +323,7 @@ export class RecoveryCoordinator {
       this.expectations.set(sessionId, {
         provider,
         providerSessionId,
+        recordSession,
         resolve: () => {
           clearTimeout(timer);
           resolve();

@@ -25,6 +25,7 @@ export type SessionModel = {
 };
 import type { RawData } from "ws";
 import type { AgentAdapter } from "./adapters/types.js";
+import type { PromptDeliverySource, PromptDeliverySurface, PromptDeliveryTracker } from "./promptDeliveries.js";
 import type { AuditLog } from "./audit.js";
 import { detectPrompt, type DetectedPrompt } from "./promptDetect.js";
 import type { PushRouter } from "./pushRouter.js";
@@ -135,6 +136,14 @@ export type FleetMonitorOptions = {
   // flush succeeds, so task state can follow real turn submission rather than
   // merely accepting input into Perch's queue.
   onInputSubmitted?: (sessionId: string) => void;
+  // Claude PTY submissions cross a semantic boundary that process.write
+  // cannot acknowledge. This tracker journals intent before typing and closes
+  // it only from a provider hook or matching transcript row.
+  promptDeliveries?: PromptDeliveryTracker;
+  // Durable warning text derived from the prompt-delivery ledger. It is
+  // recomputed for every fleet snapshot, so disconnected clients see it on
+  // reconnect instead of depending on a one-shot WebSocket event.
+  promptDeliverySurface?: (sessionId: string) => PromptDeliverySurface;
   // Durable task policy hook for accepted composer input that later becomes
   // undeliverable because the terminal ended or a queued flush failed.
   onQueuedInputRejected?: (sessionId: string, count: number, reason: string) => void;
@@ -165,7 +174,7 @@ export class FleetMonitor {
   // gate the composer so typed text never lands in the focused widget.
   private readonly pendingQuestions = new Map<string, PendingQuestion>();
   private readonly pendingClaudeInteractions = new Map<string, PendingClaudeInteraction>();
-  private readonly queuedInputs = new Map<string, string[]>();
+  private readonly queuedInputs = new Map<string, Array<{ text: string; deliveryId?: string }>>();
   // Prompts raised off the rendered screen rather than a hook, by session ->
   // prompt id. No hook will ever resolve one, so the detector retracts it when
   // the dialog leaves the screen; the id also keeps a redraw from re-raising it.
@@ -212,6 +221,8 @@ export class FleetMonitor {
     limit: UsageLimit
   ) => void;
   private readonly onInputSubmitted?: (sessionId: string) => void;
+  private readonly promptDeliveries?: PromptDeliveryTracker;
+  private readonly promptDeliverySurface?: (sessionId: string) => PromptDeliverySurface;
   private readonly onQueuedInputRejected?: (sessionId: string, count: number, reason: string) => void;
   private readonly onApprovalNeeded?: (sessionId: string, approval: PendingApproval) => void;
   private readonly onApprovalResolved?: (sessionId: string, approval: PendingApproval) => void;
@@ -236,6 +247,8 @@ export class FleetMonitor {
     this.startAgentLauncher = options.startAgent;
     this.onUsageLimit = options.onUsageLimit;
     this.onInputSubmitted = options.onInputSubmitted;
+    this.promptDeliveries = options.promptDeliveries;
+    this.promptDeliverySurface = options.promptDeliverySurface;
     this.onQueuedInputRejected = options.onQueuedInputRejected;
     this.onApprovalNeeded = options.onApprovalNeeded;
     this.onApprovalResolved = options.onApprovalResolved;
@@ -380,8 +393,8 @@ export class FleetMonitor {
       // Question resolved on the desktop (or the turn/session ended).
     }
     if (status === "done" || status === "error") {
-      const rejected = this.queuedInputs.get(canonical)?.length ?? 0;
-      this.rejectQueuedInputs(canonical, rejected, `worker session ended with status ${status}`);
+      this.promptDeliveries?.markSessionEnded(canonical);
+      this.rejectQueuedInputs(canonical, `worker session ended with status ${status}`);
     }
     if (status === "idle" || status === "running" || status === "waiting") {
       void this.flushQueuedInputs(canonical);
@@ -615,7 +628,7 @@ export class FleetMonitor {
   async queueOrSubmit(
     sessionId: string,
     text: string,
-    options: { queueIfGated?: boolean } = {}
+    options: { queueIfGated?: boolean; source?: PromptDeliverySource } = {}
   ): Promise<{ queued: boolean; gated?: boolean }> {
     const canonical = this.canonicalSessionId(sessionId);
     const status =
@@ -627,14 +640,26 @@ export class FleetMonitor {
 
     if (this.inputGated(canonical)) {
       if (options.queueIfGated === false) return { queued: false, gated: true };
+      const agent =
+        this.sessions.find((session) => session.id === canonical)?.agent ??
+        (await this.adapter.listSessions()).find((session) => session.id === canonical)?.agent;
+      const delivery = agent === "claude"
+        ? this.promptDeliveries?.create(canonical, text, options.source ?? "agent")
+        : undefined;
       const queue = this.queuedInputs.get(canonical) ?? [];
-      queue.push(text);
+      queue.push({ text, ...(delivery ? { deliveryId: delivery.id } : {}) });
       this.queuedInputs.set(canonical, queue);
       this.scheduleBroadcast();
       return { queued: true };
     }
 
-    await this.submitToAdapter(canonical, text);
+    const agent =
+      this.sessions.find((session) => session.id === canonical)?.agent ??
+      (await this.adapter.listSessions()).find((session) => session.id === canonical)?.agent;
+    const delivery = agent === "claude"
+      ? this.promptDeliveries?.create(canonical, text, options.source ?? "agent")
+      : undefined;
+    await this.submitToAdapter(canonical, text, delivery?.id);
     return { queued: false };
   }
 
@@ -644,7 +669,7 @@ export class FleetMonitor {
   queueInitialPrompt(sessionId: string, text: string): void {
     const canonical = this.canonicalSessionId(sessionId);
     const queue = this.queuedInputs.get(canonical) ?? [];
-    queue.push(text);
+    queue.push({ text });
     this.queuedInputs.set(canonical, queue);
     this.scheduleBroadcast();
 
@@ -666,7 +691,7 @@ export class FleetMonitor {
       return;
     }
     this.queuedInputs.delete(sessionId);
-    for (const [index, text] of queue.entries()) {
+    for (const [index, input] of queue.entries()) {
       if (this.inputGated(sessionId)) {
         // Put the unsent remainder back, ahead of anything queued since.
         const requeued = queue.slice(index).concat(this.queuedInputs.get(sessionId) ?? []);
@@ -674,19 +699,33 @@ export class FleetMonitor {
         break;
       }
       try {
-        await this.submitToAdapter(sessionId, text);
+        await this.submitToAdapter(sessionId, input.text, input.deliveryId);
       } catch {
-        this.rejectQueuedInputs(sessionId, queue.length - index, "queued follow-up could not be submitted");
+        for (const pending of queue.slice(index + 1)) {
+          if (pending.deliveryId) {
+            this.promptDeliveries?.markUnknown(
+              pending.deliveryId,
+              "queued prompt was abandoned after an earlier submission failed; not resent"
+            );
+          }
+        }
+        this.queuedInputs.set(sessionId, queue.slice(index));
+        this.rejectQueuedInputs(sessionId, "queued follow-up could not be submitted");
         break;
       }
     }
     this.scheduleBroadcast();
   }
 
-  private rejectQueuedInputs(sessionId: string, count: number, reason: string): void {
+  private rejectQueuedInputs(sessionId: string, reason: string): void {
+    let untrackedCount = 0;
+    for (const input of this.queuedInputs.get(sessionId) ?? []) {
+      if (input.deliveryId) this.promptDeliveries?.markUnknown(input.deliveryId, `${reason}; not resent`);
+      else untrackedCount += 1;
+    }
     this.queuedInputs.delete(sessionId);
-    if (count > 0) {
-      this.onQueuedInputRejected?.(sessionId, count, reason);
+    if (untrackedCount > 0) {
+      this.onQueuedInputRejected?.(sessionId, untrackedCount, reason);
     }
   }
 
@@ -711,15 +750,31 @@ export class FleetMonitor {
     );
   }
 
-  private async submitToAdapter(sessionId: string, text: string): Promise<void> {
-    if (this.adapter.submitInput) {
-      await this.adapter.submitInput(sessionId, text);
-    } else {
-      await this.adapter.sendInput(sessionId, text);
-      await this.adapter.sendEnter(sessionId);
-    }
+  private async submitToAdapter(sessionId: string, text: string, deliveryId?: string): Promise<void> {
+    if (deliveryId) this.promptDeliveries?.markTyping(deliveryId);
     try {
-      this.onInputSubmitted?.(sessionId);
+      if (this.adapter.submitInput) {
+        await this.adapter.submitInput(sessionId, text);
+      } else {
+        await this.adapter.sendInput(sessionId, text);
+        await this.adapter.sendEnter(sessionId);
+      }
+    } catch (error) {
+      if (deliveryId) {
+        this.promptDeliveries?.markUnknown(
+          deliveryId,
+          `prompt submission failed before acceptance could be confirmed: ${
+            error instanceof Error ? error.message : String(error)
+          }; not resent`
+        );
+      }
+      throw error;
+    }
+    if (deliveryId) this.promptDeliveries?.markSubmitted(deliveryId);
+    try {
+      // Tracked Claude input becomes task activity only after its hook or
+      // transcript receipt. Other providers retain their existing boundary.
+      if (!deliveryId) this.onInputSubmitted?.(sessionId);
     } catch {
       // Ledger observation must never turn a successful agent submission into
       // an HTTP/input failure.
@@ -1027,13 +1082,13 @@ export class FleetMonitor {
         // The process is gone: an open approval/question card would be
         // actionable against nothing, and queued composer text can never be
         // delivered.
+        this.promptDeliveries?.markSessionEnded(event.sessionId);
         this.pendingApprovals.delete(event.sessionId);
         this.pendingQuestions.delete(event.sessionId);
         this.pendingClaudeInteractions.delete(event.sessionId);
         this.screenPrompts.delete(event.sessionId);
         this.usageLimits.delete(event.sessionId);
-        const rejected = this.queuedInputs.get(event.sessionId)?.length ?? 0;
-        this.rejectQueuedInputs(event.sessionId, rejected, `worker session ended with status ${event.status}`);
+        this.rejectQueuedInputs(event.sessionId, `worker session ended with status ${event.status}`);
       }
       this.scheduleTailCapture(event.sessionId);
       if (!hasDirectAgentDetail(event)) {
@@ -1071,6 +1126,7 @@ export class FleetMonitor {
       return;
     }
 
+    const previousSessionIds = new Set(this.sessions.map((session) => session.id));
     try {
       this.sessions = await this.adapter.listSessions();
     } catch (error) {
@@ -1085,14 +1141,15 @@ export class FleetMonitor {
       return;
     }
 
-    this.pruneSessionState();
+    this.pruneSessionState(previousSessionIds);
     this.scheduleBroadcast();
   }
 
   // Purged sessions must not leak per-session state (queued composer text is
   // the sensitive case) for the lifetime of a long-running server.
-  private pruneSessionState(): void {
+  private pruneSessionState(previousSessionIds = new Set<string>()): void {
     const active = new Set(this.sessions.map((session) => session.id));
+    this.promptDeliveries?.reconcileActiveSessions(previousSessionIds, active);
     const maps = [
       this.sessionState,
       this.pendingApprovals,
@@ -1114,8 +1171,7 @@ export class FleetMonitor {
     }
     for (const sessionId of this.queuedInputs.keys()) {
       if (!active.has(sessionId)) {
-        const rejected = this.queuedInputs.get(sessionId)?.length ?? 0;
-        this.rejectQueuedInputs(sessionId, rejected, "worker session disappeared before queued follow-up delivery");
+        this.rejectQueuedInputs(sessionId, "worker session disappeared before queued follow-up delivery");
       }
     }
     for (const timers of [this.tailTimers, this.detailTimers]) {
@@ -1175,6 +1231,13 @@ export class FleetMonitor {
       }
       if (tail !== undefined) {
         result.tail = tail;
+      }
+      const deliverySurface = this.promptDeliverySurface?.(session.id);
+      if (deliverySurface?.promptDeliveryWarning) {
+        result.promptDeliveryWarning = deliverySurface.promptDeliveryWarning;
+      }
+      if (deliverySurface?.promptDeliveryResolution) {
+        result.promptDeliveryResolution = deliverySurface.promptDeliveryResolution;
       }
       const modelInfo = this.sessionModels.get(session.id);
       if (modelInfo) {

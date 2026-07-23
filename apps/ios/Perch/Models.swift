@@ -276,6 +276,9 @@ struct AgentSession: Identifiable, Codable, Equatable {
     let lastActivityAt: String
     // Small last-lines preview from the fleet overview tier (terminal surfaces only).
     let tail: String?
+    // Durable Claude prompt-delivery uncertainty, replayed on every fleet snapshot.
+    let promptDeliveryWarning: PromptDeliveryWarning?
+    let promptDeliveryResolution: PromptDeliveryResolution?
     let desktop: DesktopContext?
     // Set while the agent is blocked on a permission prompt.
     let pendingApproval: PendingApproval?
@@ -289,6 +292,18 @@ struct AgentSession: Identifiable, Codable, Equatable {
     // Durable logical-worker identity. This remains meaningful when its PTY
     // session is absent and is never inferred from WebSocket connectivity.
     let runtime: RuntimeSnapshotModel?
+}
+
+struct PromptDeliveryWarning: Codable, Equatable {
+    let deliveryId: String
+    let message: String
+    let at: String
+}
+
+struct PromptDeliveryResolution: Codable, Equatable {
+    let deliveryId: String
+    let message: String
+    let at: String
 }
 
 struct PendingApproval: Codable, Equatable {

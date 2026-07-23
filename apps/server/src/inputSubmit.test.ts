@@ -15,6 +15,7 @@ import { HookRegistry } from "./hooks.js";
 import { createControlServer } from "./http.js";
 import { DeviceRegistry } from "./pairing.js";
 import { PrPoller } from "./prPoller.js";
+import { PromptDeliveryTracker } from "./promptDeliveries.js";
 import { ProjectRegistry } from "./projects.js";
 import { TaskStore } from "./tasks.js";
 import { TimelineStore } from "./timeline.js";
@@ -107,20 +108,24 @@ async function withServer(
     monitor: FleetMonitor;
     tasks: TaskStore;
     hooks: HookRegistry;
+    promptDeliveries: PromptDeliveryTracker;
   }) => Promise<void>
 ): Promise<void> {
   const home = mkdtempSync(join(tmpdir(), "perch-input-home-"));
   const env = { PERCH_HOME: home } as NodeJS.ProcessEnv;
   const adapter = new RecordingAdapter();
   const tasks = new TaskStore(env);
+  const promptDeliveries = new PromptDeliveryTracker(tasks.stateDb, { receiptTimeoutMs: 5_000 });
   const monitor = new FleetMonitor(adapter, {
     broadcastMs: 5,
     tailThrottleMs: 1,
     onApprovalNeeded: (sessionId, approval) => surfaceApprovalToTask(tasks, sessionId, approval),
-    onApprovalResolved: (sessionId, approval) => resolveApprovalForTask(tasks, sessionId, approval)
+    onApprovalResolved: (sessionId, approval) => resolveApprovalForTask(tasks, sessionId, approval),
+    promptDeliveries
   });
   const hooks = new HookRegistry();
   const timeline = new TimelineStore();
+  timeline.observe((item) => promptDeliveries.acknowledgeTimeline(item));
   const server = createControlServer({
     adapter,
     auditLog: new AuditLog(join(home, "audit.jsonl")),
@@ -136,13 +141,15 @@ async function withServer(
     tasks,
     prPoller: new PrPoller(tasks, async () => {
       throw new Error("gh disabled in tests");
-    })
+    }),
+    promptDeliveries
   });
   await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
   const port = (server.address() as AddressInfo).port;
   try {
-    await run({ port, adapter, monitor, tasks, hooks });
+    await run({ port, adapter, monitor, tasks, hooks, promptDeliveries });
   } finally {
+    promptDeliveries.stop();
     timeline.stop();
     server.closeAllConnections?.();
     await new Promise<void>((resolve) => server.close(() => resolve()));
@@ -190,6 +197,39 @@ test("a single POST /sessions/:id/input submits: the text write, then a distinct
     assert.equal(response.status, 202);
     assert.deepEqual((await response.json()) as object, { ok: true, queued: false });
     assert.deepEqual(adapter.writes, ["please also update the tests\n", "\r"]);
+  });
+});
+
+test("Claude PTY input stays submitted until its matching hook receipt accepts it", async () => {
+  await withServer(async ({ port, adapter, tasks, hooks }) => {
+    const prompt = "please report the exact test result";
+    const response = await postInput(port, prompt);
+    assert.equal(response.status, 202);
+
+    const [submitted] = tasks.stateDb.promptDeliveries.list(SESSION_ID);
+    assert.equal(submitted?.state, "submitted");
+    assert.deepEqual(adapter.writes, [prompt, "\r"]);
+
+    const { token } = hooks.register(SESSION_ID);
+    const receipt = await fetch(`http://127.0.0.1:${port}/hooks`, {
+      method: "POST",
+      headers: {
+        "x-perch-session": SESSION_ID,
+        "x-perch-token": token,
+        "content-type": "application/json"
+      },
+      body: JSON.stringify({
+        hook_event_name: "UserPromptSubmit",
+        session_id: "claude-session-1",
+        prompt
+      })
+    });
+    assert.equal(receipt.status, 200);
+
+    const accepted = tasks.stateDb.promptDeliveries.find(submitted!.id);
+    assert.equal(accepted?.state, "accepted");
+    assert.equal(accepted?.receiptKind, "user_prompt_submit");
+    assert.deepEqual(adapter.writes, [prompt, "\r"], "receipt handling never resends the prompt");
   });
 });
 

@@ -185,6 +185,22 @@ test("spawned sessions default the no-mistakes telemetry opt-out; a user export 
   }
 });
 
+test("an explicit live PTY session id is rejected instead of silently replaced", async () => {
+  const adapter = new PtyAgentAdapter(() => new FakePtyProcess());
+  const sessionId = "pty:11111111-1111-4111-8111-111111111111";
+  try {
+    const first = await adapter.startAgent({ command: "claude", sessionId });
+    assert.equal(first.id, sessionId);
+    await assert.rejects(
+      adapter.startAgent({ command: "claude", sessionId }),
+      /PTY session already exists/
+    );
+    assert.equal((await adapter.listSessions()).length, 1);
+  } finally {
+    adapter.stop();
+  }
+});
+
 test("PTY adapter renders control sequences for the on-demand text path", async () => {
   let child: FakePtyProcess | undefined;
   const spawn: SpawnPty = () => {

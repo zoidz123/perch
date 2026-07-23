@@ -193,8 +193,19 @@ test("one duplicate-safe mate operation resumes the exact conversation and its r
         session_id: providerSessionId,
         transcript_path: join(transcriptDir, `${providerSessionId}.jsonl`)
       };
-      if (request.labels?.role === "mate") mateRecovery.observeSessionStart(session.id, "claude", providerSessionId, payload);
-      else childRecovery.observeSessionStart(session.id, "claude", providerSessionId, payload);
+      if (request.labels?.role === "mate") {
+        mateRecovery.observeSessionStart(session.id, "claude", providerSessionId, payload);
+        assert.equal(
+          tasks.stateDb.ownerRuntimes.latest("owner:mate")?.metadata?.recoverySessionId,
+          session.id
+        );
+      } else {
+        childRecovery.observeSessionStart(session.id, "claude", providerSessionId, payload);
+        assert.equal(
+          tasks.stateDb.runtimes.latestForTask(String(request.labels?.task))?.metadata?.recoverySessionId,
+          session.id
+        );
+      }
     };
 
     await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));

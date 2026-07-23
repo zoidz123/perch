@@ -21,6 +21,7 @@ import { RuntimeManager } from "./runtimeManager.js";
 import { createControlServer, handleWebSocketRpcRequest } from "./http.js";
 import { DeviceRegistry } from "./pairing.js";
 import { PrPoller } from "./prPoller.js";
+import { PromptDeliveryTracker } from "./promptDeliveries.js";
 import { ProjectRegistry } from "./projects.js";
 import { FleetSettings } from "./settings.js";
 import { TaskStore } from "./tasks.js";
@@ -128,7 +129,15 @@ function fixture(durableBoundary?: "afterLaunch" | "durable") {
   const auditLog = new AuditLog(join(home, "audit.jsonl"));
   const tasks = new TaskStore(env);
   const timeline = new TimelineStore();
-  const monitor = new FleetMonitor(routing, { auditLog, broadcastMs: 5, tailThrottleMs: 1, detailThrottleMs: 1 });
+  const promptDeliveries = new PromptDeliveryTracker(tasks.stateDb, { receiptTimeoutMs: 5_000 });
+  const monitor = new FleetMonitor(routing, {
+    auditLog,
+    broadcastMs: 5,
+    tailThrottleMs: 1,
+    detailThrottleMs: 1,
+    promptDeliveries
+  });
+  timeline.observe((item) => promptDeliveries.acknowledgeTimeline(item));
   // Mirror the index.ts wiring the approval pipeline depends on.
   codexOwned.wireEvents({
     onServerRequest: (sessionId, request) => surfaceCodexServerRequest({ monitor, tasks }, sessionId, request),
@@ -183,6 +192,7 @@ function fixture(durableBoundary?: "afterLaunch" | "durable") {
     // ledger and no hook reinstall side effects.
     runtimeManager: undefined as RuntimeManager | undefined,
     installHooks: undefined as ((agent: AgentKind) => void) | undefined,
+    promptDeliveries,
     ...(taskScheduler ? { taskScheduler } : {})
   };
   const server = createControlServer(options);
@@ -195,6 +205,7 @@ function fixture(durableBoundary?: "afterLaunch" | "durable") {
     server,
     cleanup: async (...extra: string[]) => {
       timeline.stop();
+      promptDeliveries.stop();
       monitor.stop();
       await taskScheduler?.stop();
       server.closeAllConnections?.();
@@ -867,6 +878,10 @@ test("dispatching a Claude worker seeds folder trust for the pool worktree", asy
     const state = JSON.parse(readFileSync(join(fx.home, ".claude.json"), "utf8"));
     const entry = state.projects[realpathSync(worktree!)];
     assert.deepEqual(entry, { hasTrustDialogAccepted: true });
+    const [kickoff] = fx.options.tasks.stateDb.promptDeliveries.list();
+    assert.equal(kickoff?.state, "submitted");
+    assert.match(kickoff?.promptText ?? "", /PERCH TASK BRIEF/);
+    assert.equal(fx.adapter.requests[0]?.args?.filter((arg) => arg === kickoff?.promptText).length, 1);
   } finally {
     await fx.cleanup(repo);
   }
@@ -1065,7 +1080,7 @@ test("a Claude launch reinstalls perch hook entries clobbered by an external set
   }
 });
 
-test("resumed Claude launches keep their provider identity (no --session-id)", async () => {
+test("Claude kickoff variants keep provider identity and journal against a pre-minted Perch session", async () => {
   const fx = fixture();
   const repo = makeRepo();
   const baseUrl = await listen(fx.server, fx.options);
@@ -1074,13 +1089,61 @@ test("resumed Claude launches keep their provider identity (no --session-id)", a
     const resumed = await fetch(`${baseUrl}/agents/pty`, {
       ...authed,
       method: "POST",
-      body: JSON.stringify({ command: "claude", agent: "claude", cwd: repo, args: ["--resume", "abc-123"] })
+      body: JSON.stringify({
+        command: "claude",
+        agent: "claude",
+        cwd: repo,
+        args: ["--resume", "abc-123"],
+        sessionId: "malformed",
+        initialPrompt: "resume kickoff"
+      })
     });
     assert.equal(resumed.status, 201, await resumed.text());
     assert.ok(
       !fx.adapter.requests[0]?.args?.includes("--session-id"),
       "a resume keeps the provider-owned session id"
     );
+    assert.match(fx.adapter.requests[0]?.sessionId ?? "", /^pty:[0-9a-f-]{36}$/);
+
+    const continued = await fetch(`${baseUrl}/agents/pty`, {
+      ...authed,
+      method: "POST",
+      body: JSON.stringify({
+        command: "claude",
+        agent: "claude",
+        cwd: repo,
+        args: ["--continue"],
+        sessionId: fx.adapter.requests[0]?.sessionId,
+        initialPrompt: "continue kickoff"
+      })
+    });
+    assert.equal(continued.status, 201, await continued.text());
+    assert.notEqual(fx.adapter.requests[1]?.sessionId, fx.adapter.requests[0]?.sessionId);
+
+    const providerSessionId = randomUUID();
+    const callerIdentified = await fetch(`${baseUrl}/agents/pty`, {
+      ...authed,
+      method: "POST",
+      body: JSON.stringify({
+        command: "claude",
+        agent: "claude",
+        cwd: repo,
+        args: ["--session-id", providerSessionId],
+        initialPrompt: "caller session kickoff"
+      })
+    });
+    assert.equal(callerIdentified.status, 201, await callerIdentified.text());
+
+    const variantDeliveries = fx.options.tasks.stateDb.promptDeliveries.list();
+    assert.deepEqual(
+      variantDeliveries.map((delivery) => delivery.promptText),
+      ["resume kickoff", "continue kickoff", "caller session kickoff"]
+    );
+    assert.deepEqual(
+      variantDeliveries.map((delivery) => delivery.perchSessionId),
+      fx.adapter.requests.slice(0, 3).map((request) => request.sessionId)
+    );
+    assert.ok(variantDeliveries.every((delivery) => delivery.state === "submitted"));
 
     const fresh = await fetch(`${baseUrl}/agents/pty`, {
       ...authed,
@@ -1088,10 +1151,10 @@ test("resumed Claude launches keep their provider identity (no --session-id)", a
       body: JSON.stringify({ command: "claude", agent: "claude", cwd: repo })
     });
     assert.equal(fresh.status, 201, await fresh.text());
-    const args = fx.adapter.requests[1]?.args ?? [];
+    const args = fx.adapter.requests[3]?.args ?? [];
     const flagIndex = args.indexOf("--session-id");
     assert.ok(flagIndex >= 0, "a plain solo launch still pre-mints its session id");
-    assert.equal(`pty:${args[flagIndex + 1]}`, fx.adapter.sessions[1]?.id);
+    assert.equal(`pty:${args[flagIndex + 1]}`, fx.adapter.sessions[3]?.id);
   } finally {
     await fx.cleanup(repo);
   }

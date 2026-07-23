@@ -29,6 +29,7 @@ import type { TaskCompletionReconciler } from "./taskCompletion.js";
 import type { RuntimeManager } from "./runtimeManager.js";
 import type { RecoveryCoordinator } from "./recovery.js";
 import type { OwnerManager } from "./ownerManager.js";
+import type { PromptDeliveryTracker } from "./promptDeliveries.js";
 import type { MateRecoveryCoordinator } from "./mateRecovery.js";
 import type { TimelineStore } from "./timeline.js";
 import type { WorktreeLease, WorktreePool } from "./worktrees.js";
@@ -63,6 +64,7 @@ export type ManagedAgentLauncherOptions = {
   recoveryCoordinator?: RecoveryCoordinator;
   ownerManager?: OwnerManager;
   mateRecoveryCoordinator?: MateRecoveryCoordinator;
+  promptDeliveries?: PromptDeliveryTracker;
 };
 
 export type StartManagedAgentInput = {
@@ -244,7 +246,7 @@ export async function startManagedAgent(
 
   // Hook-independent Claude session identity: mint the provider session id
   // ourselves so the transcript location is known before the process exists.
-  const claudeIdentity = prepareClaudeIdentity(request, cwd);
+  const claudeIdentity = await prepareClaudeIdentity(options.adapter, request, cwd);
 
   // Claude's initial kickoff rides the spawn argv as the CLI's positional
   // query (interactive TUI, prompt submitted natively at boot) - never typed
@@ -268,6 +270,16 @@ export async function startManagedAgent(
   const ownerRuntime = request.labels?.role === "mate" && input.trackOwner !== false
     ? options.ownerManager?.beginMateLaunch(request, input.intentionalNewMate === true)
     : undefined;
+  const claudeKickoffDelivery =
+    claudeKickoffInArgs && request.sessionId && typeof request.initialPrompt === "string"
+        ? options.promptDeliveries?.create(
+          request.sessionId,
+          request.initialPrompt,
+          input.initialPromptSource ?? "human",
+          { allowLateReceipt: true }
+        )
+      : undefined;
+  if (claudeKickoffDelivery) options.promptDeliveries?.markTyping(claudeKickoffDelivery.id);
   let session: AgentSession | undefined;
   try {
     if (isCodexLaunch && options.codexOwned) {
@@ -284,6 +296,10 @@ export async function startManagedAgent(
     } else {
       session = await options.adapter.startAgent!(request);
     }
+    // Startup gates can delay the positional prompt substantially. Bound the
+    // uncertainty without resending; this kickoff remains eligible for a
+    // later genuine receipt that resolves the warning.
+    if (claudeKickoffDelivery) options.promptDeliveries?.markSubmitted(claudeKickoffDelivery.id, 120_000);
 
     if (request.sessionId && session.id !== request.sessionId) {
       // The adapter refused the pre-minted id: drop the stale id's hook
@@ -447,6 +463,14 @@ export async function startManagedAgent(
       ...(lease ? { worktreeId: lease.id } : {})
     };
   } catch (error) {
+    if (claudeKickoffDelivery) {
+      options.promptDeliveries?.markUnknown(
+        claudeKickoffDelivery.id,
+        `Claude launch failed before kickoff acceptance could be confirmed: ${
+          error instanceof Error ? error.message : String(error)
+        }; not resent`
+      );
+    }
     if (runtime) options.runtimeManager?.markLaunchFailed(runtime);
     if (ownerRuntime) options.ownerManager?.markLaunchFailed(ownerRuntime);
     if (session?.id) {
@@ -480,21 +504,32 @@ const CLAUDE_SESSION_UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0
 // Pre-mint a fresh Claude launch's provider session id (`--session-id <uuid>`,
 // supported since well before the 2.1.x floor the hook installer already
 // requires) and derive its transcript path, so timeline attachment never
-// depends on a SessionStart hook arriving. Skipped for resumed/continued
-// sessions - those keep their provider identity and fork transcripts, which
-// followClaudeResume owns - and when the caller passed --session-id itself.
-// Mutates request: adopts/mints request.sessionId (the PTY adapter honors
-// pre-minted pty: ids, mirroring the codex --remote path) and appends the flag.
-function prepareClaudeIdentity(
+// depends on a SessionStart hook arriving. Resumed, continued, and caller-
+// identified sessions keep their provider identity while still receiving a
+// pre-minted Perch session id. Mutates request and appends the provider flag
+// only for fresh sessions.
+async function prepareClaudeIdentity(
+  adapter: AgentAdapter,
   request: StartAgentRequest,
   cwd: string
-): { agentSessionId: string; transcriptPath: string } | undefined {
+): Promise<{ agentSessionId: string; transcriptPath: string } | undefined> {
   if (launchAgentKind(request.command, request.agent) !== "claude") return undefined;
   const args = request.args ?? [];
+  const liveSessionIds = new Set((await adapter.listSessions()).map((session) => session.id));
+  if (
+    !request.sessionId ||
+    !request.sessionId.startsWith("pty:") ||
+    !CLAUDE_SESSION_UUID.test(request.sessionId.slice("pty:".length)) ||
+    liveSessionIds.has(request.sessionId)
+  ) {
+    do {
+      request.sessionId = `pty:${randomUUID()}`;
+    } while (liveSessionIds.has(request.sessionId));
+  }
   if (args.includes("--resume") || args.includes("--continue") || args.includes("--session-id")) {
     return undefined;
   }
-  const sessionId = request.sessionId ?? `pty:${randomUUID()}`;
+  const sessionId = request.sessionId;
   const agentSessionId = sessionId.startsWith("pty:") ? sessionId.slice("pty:".length) : "";
   if (!CLAUDE_SESSION_UUID.test(agentSessionId)) return undefined;
   request.sessionId = sessionId;

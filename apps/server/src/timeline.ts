@@ -21,7 +21,7 @@ import type { CodexReasoningEffort, TimelineItem, TimelineItemKind, TimelineItem
 
 const MAX_ITEMS_PER_SESSION = 2000;
 const MAX_SEEN_IDS_PER_SESSION = MAX_ITEMS_PER_SESSION * 2;
-const MAX_TEXT_LENGTH = 20_000;
+export const TIMELINE_TEXT_MAX_LENGTH = 20_000;
 const POLL_MS = 1000;
 // How long a recorded injection stays eligible to claim a tailed user row.
 // The transcript row lands within milliseconds-to-seconds of injection; a
@@ -30,6 +30,7 @@ const POLL_MS = 1000;
 const SOURCE_TTL_MS = 60_000;
 
 export type TimelineListener = (item: TimelineItem) => void;
+export type TimelineCatchUpListener = (sessionId: string) => void;
 
 // Observed live model for a session, read off the transcript itself: claude
 // stamps every assistant row with the model that produced it, which is the
@@ -135,6 +136,12 @@ export class TimelineStore {
   // session's tailer in detach/prune/stop.
   private readonly resumeResolvers = new Map<string, ClaudeResumeResolver>();
   private readonly listeners = new Set<TimelineListener>();
+  // Internal observers see both catch-up and live rows. Unlike subscribers,
+  // they do not imply client fan-out; prompt receipt reconciliation needs the
+  // row written just before a server restart as much as a newly appended row.
+  private readonly observers = new Set<TimelineListener>();
+  private readonly catchUpListeners = new Set<TimelineCatchUpListener>();
+  private readonly authenticTranscriptTimestamps = new Map<string, Set<string>>();
   private readonly modelListeners = new Set<ModelListener>();
   private readonly codexThreadSettingsListeners = new Set<CodexThreadSettingsListener>();
   // Per-session buffer of agent injections awaiting their transcript row.
@@ -145,6 +152,24 @@ export class TimelineStore {
     return () => {
       this.listeners.delete(listener);
     };
+  }
+
+  observe(listener: TimelineListener): () => void {
+    this.observers.add(listener);
+    return () => {
+      this.observers.delete(listener);
+    };
+  }
+
+  observeCatchUp(listener: TimelineCatchUpListener): () => void {
+    this.catchUpListeners.add(listener);
+    return () => {
+      this.catchUpListeners.delete(listener);
+    };
+  }
+
+  hasAuthenticTranscriptTimestamp(item: TimelineItem): boolean {
+    return this.authenticTranscriptTimestamps.get(item.sessionId)?.has(item.id) === true;
   }
 
   // Observe transcript-reported models (see ModelListener). Fires on catch-up
@@ -233,10 +258,23 @@ export class TimelineStore {
           }
         }
         for (const item of normalizeRow(sessionId, row, () => 0, resolveSource)) {
+          if (typeof row.timestamp === "string" && Number.isFinite(Date.parse(row.timestamp))) {
+            const authentic = this.authenticTranscriptTimestamps.get(sessionId) ?? new Set<string>();
+            authentic.add(item.id);
+            while (authentic.size > MAX_SEEN_IDS_PER_SESSION) {
+              const oldest = authentic.values().next().value as string | undefined;
+              if (oldest === undefined) break;
+              authentic.delete(oldest);
+            }
+            this.authenticTranscriptTimestamps.set(sessionId, authentic);
+          }
           this.append(sessionId, item, live);
         }
       },
-      isPathAllowed
+      isPathAllowed,
+      () => {
+        for (const listener of this.catchUpListeners) listener(sessionId);
+      }
     );
     this.tailers.set(sessionId, tailer);
     tailer.start();
@@ -270,6 +308,7 @@ export class TimelineStore {
     this.resumeResolvers.delete(sessionId);
     this.tailers.get(sessionId)?.stop();
     this.tailers.delete(sessionId);
+    this.authenticTranscriptTimestamps.delete(sessionId);
   }
 
   // Record a non-human prompt at the moment the server injects it, so the
@@ -425,6 +464,9 @@ export class TimelineStore {
       list.splice(0, list.length - MAX_ITEMS_PER_SESSION);
     }
     this.items.set(sessionId, list);
+    for (const observer of this.observers) {
+      observer(sequenced);
+    }
     if (!notify) {
       return;
     }
@@ -452,11 +494,13 @@ class JsonlTailer {
   // after the SessionStart hook, and its full history must not fan out as
   // live frames.
   private caughtUp = false;
+  private catchUpReported = false;
 
   constructor(
     readonly path: string,
     private readonly onRow: (row: Record<string, unknown>, live: boolean) => void,
-    private readonly isPathAllowed?: (path: string) => boolean
+    private readonly isPathAllowed?: (path: string) => boolean,
+    private readonly onCaughtUp?: () => void
   ) {}
 
   start(): void {
@@ -524,7 +568,7 @@ class JsonlTailer {
         this.decoder = new StringDecoder("utf8");
       }
       if (size === this.offset) {
-        this.caughtUp = true;
+        this.reportCaughtUp();
         return;
       }
 
@@ -556,12 +600,20 @@ class JsonlTailer {
       } finally {
         closeSync(fd);
       }
-      this.caughtUp = true;
+      this.reportCaughtUp();
     } catch {
       // Transient fs errors: the next poll retries.
     } finally {
       this.reading = false;
     }
+  }
+
+  private reportCaughtUp(): void {
+    if (this.partial.length > 0) return;
+    this.caughtUp = true;
+    if (this.catchUpReported) return;
+    this.catchUpReported = true;
+    this.onCaughtUp?.();
   }
 }
 
@@ -924,7 +976,7 @@ function summarizeToolInput(input: unknown): string | undefined {
   return json === "{}" ? undefined : truncate(json, 300);
 }
 
-function truncate(text: string, max = MAX_TEXT_LENGTH): string {
+function truncate(text: string, max = TIMELINE_TEXT_MAX_LENGTH): string {
   return text.length > max ? `${text.slice(0, max)}…` : text;
 }
 
