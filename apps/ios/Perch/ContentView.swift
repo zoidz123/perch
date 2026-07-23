@@ -1,5 +1,6 @@
 import SwiftUI
 import PhotosUI
+import PerchSessionNavigation
 
 // Design language (reference: minimal dark chat apps): near-black canvas,
 // plain rows with hairline separators instead of heavy cards, one big bold
@@ -1403,8 +1404,16 @@ struct SessionDetailView: View {
     // The task this session is the worker for (dispatched crew work).
     private var sessionTask: AgentTask? {
         store.tasks.first { task in
-            task.sessionId == sessionId || session?.taskId == task.id
+            task.sessionId == sessionId || task.runtime?.ptySessionId == sessionId || session?.taskId == task.id
         }
+    }
+
+    private var detailPresentation: SessionDetailPresentation {
+        SessionNavigationPresentation.detailPresentation(
+            hasSessionSnapshot: session != nil,
+            taskState: sessionTask?.state,
+            runtimeState: sessionTask?.runtime?.state
+        )
     }
 
     // The mate's own chat: the Charts hub button lives on this composer, where
@@ -1428,7 +1437,11 @@ struct SessionDetailView: View {
                 .padding(.bottom, 10)
                 .background(Style.canvas)
 
-            if hasChatSource {
+            if detailPresentation == .launching {
+                LaunchingSessionShell(task: sessionTask)
+            } else if detailPresentation == .unavailable {
+                UnavailableSessionShell(task: sessionTask)
+            } else if hasChatSource {
                 TimelineChatView(sessionId: sessionId)
                     .environmentObject(store)
             } else {
@@ -1486,7 +1499,7 @@ struct SessionDetailView: View {
             Spacer()
 
             VStack(spacing: 1) {
-                Text(session.map { titleFor($0) } ?? "Agent")
+                Text(session.map { titleFor($0) } ?? sessionTask?.workerName ?? "Agent")
                     .font(.system(size: 18, weight: .semibold))
                     .lineLimit(1)
                 if let session, let description = workDescriptionFor(session) {
@@ -1501,28 +1514,42 @@ struct SessionDetailView: View {
                         .foregroundStyle(Style.textFaint)
                         .lineLimit(1)
                         .truncationMode(.head)
+                } else if detailPresentation == .launching {
+                    Text("Launching on your Mac")
+                        .font(.system(size: 12))
+                        .foregroundStyle(Style.textSecondary)
+                        .lineLimit(1)
+                } else if let task = sessionTask {
+                    Text(unavailableDetail(for: task))
+                        .font(.system(size: 12))
+                        .foregroundStyle(Style.textSecondary)
+                        .lineLimit(1)
                 }
             }
 
             Spacer()
 
-            Menu {
-                Button {
-                    Task { await store.interrupt(sessionId) }
-                } label: {
-                    Label("Interrupt (Ctrl+C)", systemImage: "stop.circle")
-                }
-                Button(role: .destructive) {
-                    Task {
-                        if await store.stopSession(sessionId) {
-                            dismiss()
+            if detailPresentation.permitsActions {
+                Menu {
+                    Button {
+                        Task { await store.interrupt(sessionId) }
+                    } label: {
+                        Label("Interrupt (Ctrl+C)", systemImage: "stop.circle")
+                    }
+                    Button(role: .destructive) {
+                        Task {
+                            if await store.stopSession(sessionId) {
+                                dismiss()
+                            }
                         }
+                    } label: {
+                        Label("Stop session", systemImage: "xmark.octagon")
                     }
                 } label: {
-                    Label("Stop session", systemImage: "xmark.octagon")
+                    RoundIcon(systemName: "ellipsis")
                 }
-            } label: {
-                RoundIcon(systemName: "ellipsis")
+            } else {
+                Color.clear.frame(width: 44, height: 44)
             }
         }
     }
@@ -1545,7 +1572,8 @@ struct SessionDetailView: View {
 
     @ViewBuilder
     private var bottomArea: some View {
-        VStack(spacing: 8) {
+        if detailPresentation.permitsActions {
+            VStack(spacing: 8) {
             if let request = session?.pendingServerRequest {
                 StructuredRequestCard(request: request) { decision, content in
                     await store.respondToServerRequest(
@@ -1644,8 +1672,23 @@ struct SessionDetailView: View {
             composer
                 .padding(.horizontal, 12)
                 .padding(.bottom, 8)
+            }
+            .padding(.top, 6)
         }
-        .padding(.top, 6)
+    }
+
+    private func unavailableDetail(for task: AgentTask) -> String {
+        if task.state == "failed" {
+            return "Worker failed"
+        }
+        switch task.runtime?.state {
+        case "recoverable":
+            return task.runtime?.recoveryAvailable == true ? "Worker can be recovered" : "Worker recovery is unavailable"
+        case "ended":
+            return "Worker ended"
+        default:
+            return "Session is unavailable"
+        }
     }
 
     private var composer: some View {

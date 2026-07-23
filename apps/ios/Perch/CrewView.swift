@@ -1,4 +1,5 @@
 import SwiftUI
+import PerchSessionNavigation
 
 // Session-first fallback for a crew worker whose durable task snapshot has
 // not reached the phone yet. It keeps the same identity, description,
@@ -255,9 +256,14 @@ struct TaskRow: View {
     }
 
     private var liveSessionId: String? {
-        [task.runtime?.ptySessionId, task.sessionId, session?.id]
-            .compactMap { $0 }
-            .first { store.sessionsById[$0] != nil }
+        SessionNavigationPresentation.navigationTarget(
+            taskState: task.state,
+            runtimeState: task.runtime?.state,
+            runtimeSessionId: task.runtime?.ptySessionId,
+            taskSessionId: task.sessionId,
+            visibleSessionId: session?.id,
+            cachedSessionIds: Set(store.sessionsById.keys)
+        )
     }
 
     private var workerAgent: AgentKind {

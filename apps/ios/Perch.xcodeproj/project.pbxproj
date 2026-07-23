@@ -10,6 +10,7 @@
 		9A2222222222222222222001 /* MarkdownUI in Frameworks */ = {isa = PBXBuildFile; productRef = 9A2222222222222222222101 /* MarkdownUI */; };
 		9A2222222222222222222002 /* Clibsodium in Frameworks */ = {isa = PBXBuildFile; productRef = 9A2222222222222222222102 /* Clibsodium */; };
 		9A2222222222222222222003 /* PerchUsage in Frameworks */ = {isa = PBXBuildFile; productRef = 9A2222222222222222222103 /* PerchUsage */; };
+		9A2222222222222222222004 /* PerchSessionNavigation in Frameworks */ = {isa = PBXBuildFile; productRef = 9A2222222222222222222104 /* PerchSessionNavigation */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXFileReference section */
@@ -49,6 +50,7 @@
 				9A2222222222222222222001 /* MarkdownUI in Frameworks */,
 				9A2222222222222222222002 /* Clibsodium in Frameworks */,
 				9A2222222222222222222003 /* PerchUsage in Frameworks */,
+				9A2222222222222222222004 /* PerchSessionNavigation in Frameworks */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -94,6 +96,7 @@
 				9A2222222222222222222101 /* MarkdownUI */,
 				9A2222222222222222222102 /* Clibsodium */,
 				9A2222222222222222222103 /* PerchUsage */,
+				9A2222222222222222222104 /* PerchSessionNavigation */,
 			);
 			productName = Perch;
 			productReference = 9A1111111111111111111205 /* Perch.app */;
@@ -126,6 +129,7 @@
 				9A2222222222222222222201 /* XCRemoteSwiftPackageReference "swift-markdown-ui" */,
 				9A2222222222222222222202 /* XCRemoteSwiftPackageReference "swift-sodium" */,
 				9A2222222222222222222203 /* XCLocalSwiftPackageReference "PerchUsage" */,
+				9A2222222222222222222204 /* XCLocalSwiftPackageReference "PerchSessionNavigation" */,
 			);
 			minimizedProjectReferenceProxies = 1;
 			preferredProjectObjectVersion = 77;
@@ -163,6 +167,10 @@
 			isa = XCLocalSwiftPackageReference;
 			relativePath = PerchUsage;
 		};
+		9A2222222222222222222204 /* XCLocalSwiftPackageReference "PerchSessionNavigation" */ = {
+			isa = XCLocalSwiftPackageReference;
+			relativePath = PerchSessionNavigation;
+		};
 /* End XCLocalSwiftPackageReference section */
 
 /* Begin XCRemoteSwiftPackageReference section */
@@ -199,6 +207,11 @@
 			isa = XCSwiftPackageProductDependency;
 			package = 9A2222222222222222222203 /* XCLocalSwiftPackageReference "PerchUsage" */;
 			productName = PerchUsage;
+		};
+		9A2222222222222222222104 /* PerchSessionNavigation */ = {
+			isa = XCSwiftPackageProductDependency;
+			package = 9A2222222222222222222204 /* XCLocalSwiftPackageReference "PerchSessionNavigation" */;
+			productName = PerchSessionNavigation;
 		};
 /* End XCSwiftPackageProductDependency section */
 
