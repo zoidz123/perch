@@ -278,11 +278,14 @@ export function createControlServer(options: HttpServerOptions) {
   options.recoveryCoordinator ??= new RecoveryCoordinator(options);
   options.recoveryContinuationCoordinator ??= new RecoveryContinuationCoordinator(options);
   if (!options.mateRecoveryCoordinator && options.ownerManager && options.taskScheduler) {
-    options.mateRecoveryCoordinator = new MateRecoveryCoordinator({
+    const mateRecoveryOptions: HttpServerOptions & ConstructorParameters<typeof MateRecoveryCoordinator>[0] = {
       ...options,
       ownerManager: options.ownerManager,
       taskScheduler: options.taskScheduler
-    });
+    };
+    const mateRecoveryCoordinator = new MateRecoveryCoordinator(mateRecoveryOptions);
+    options.mateRecoveryCoordinator = mateRecoveryCoordinator;
+    mateRecoveryOptions.mateRecoveryCoordinator = mateRecoveryCoordinator;
   }
   options.monitor.setRpcHandler((rpc, auth) => handleWebSocketRpcRequest(rpc, auth, options));
   options.monitor.setSessionModelFallback((session) => sessionModelFallback(session, options));

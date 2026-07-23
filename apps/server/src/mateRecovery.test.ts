@@ -725,8 +725,14 @@ test("Codex mate recovery resumes the exact thread over the app-server and binds
     mateProviders: [codexDriver],
     identityTimeoutMs: 500
   };
-  const recovery = new MateRecoveryCoordinator(recoveryOptions);
-  (recoveryOptions as { mateRecoveryCoordinator?: MateRecoveryCoordinator }).mateRecoveryCoordinator = recovery;
+  const server = createControlServer({
+    ...recoveryOptions,
+    authToken: "test-token",
+    boxSecretKey: new Uint8Array(32),
+    devices: new DeviceRegistry({ PERCH_HOME: home } as NodeJS.ProcessEnv),
+    prPoller: new PrPoller(tasks, async () => { throw new Error("gh disabled in tests"); }),
+    settings: new FleetSettings({ PERCH_HOME: home } as NodeJS.ProcessEnv)
+  });
 
   try {
     const starting = ownerManager.beginMateLaunch({
@@ -738,10 +744,18 @@ test("Codex mate recovery resumes the exact thread over the app-server and binds
     });
     ownerManager.markLive(starting, "pty:old-codex-mate");
     ownerManager.recordProviderSession("pty:old-codex-mate", "codex", MATE_CONVERSATION);
-    const recoverable = ownerManager.interruptSession("pty:old-codex-mate")!;
+    ownerManager.interruptSession("pty:old-codex-mate");
 
-    const result = await recovery.recover(recoverable);
-    assert.equal(result.recoveredMate, true);
+    await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+    const port = (server.address() as AddressInfo).port;
+    const response = await fetch(`http://127.0.0.1:${port}/mate/start`, {
+      method: "POST",
+      headers: { authorization: "Bearer test-token", "content-type": "application/json" },
+      body: "{}"
+    });
+    assert.equal(response.status, 200, await response.clone().text());
+    const body = await response.json() as { recovery: { recoveredMate: boolean } };
+    assert.equal(body.recovery.recoveredMate, true);
     // The resume ran through the owning adapter against the exact thread;
     // the PTY backend never saw a codex launch.
     assert.deepEqual(codexOwned.launches[0]?.resume, { threadId: MATE_CONVERSATION });
@@ -750,6 +764,8 @@ test("Codex mate recovery resumes the exact thread over the app-server and binds
     assert.equal(ownerManager.snapshot()?.providerSessionId, MATE_CONVERSATION);
     assert.equal(ownerManager.snapshot()?.generation, 1);
   } finally {
+    server.closeAllConnections?.();
+    if (server.listening) await new Promise<void>((resolve) => server.close(() => resolve()));
     await scheduler.stop();
     monitor.stop();
     timeline.stop();
