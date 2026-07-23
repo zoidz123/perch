@@ -96,8 +96,10 @@ test("recovery E2E config homes are isolated across PERCH_HOME", () => {
   mkdirSync(globalCodex, { recursive: true });
   const claudeOriginal = '{"hooks":{"Stop":[{"hooks":[{"type":"command","command":"cmux hook"}]}]}}\n';
   const codexOriginal = '{"hooks":{"Stop":[{"hooks":[{"type":"command","command":"cmux hook"}]}]}}\n';
+  const authOriginal = '{"tokens":{"access_token":"sandbox-copy-sentinel"}}\n';
   writeFileSync(join(globalClaude, "settings.json"), claudeOriginal);
   writeFileSync(join(globalCodex, "hooks.json"), codexOriginal);
+  writeFileSync(join(globalCodex, "auth.json"), authOriginal);
   const globalBefore = {
     claude: directoryBytes(globalClaude),
     codex: directoryBytes(globalCodex)
@@ -108,11 +110,15 @@ test("recovery E2E config homes are isolated across PERCH_HOME", () => {
     CODEX_HOME: globalCodex
   };
   const firstEnv = recoveryE2eEnv(firstHome, inherited);
+  assert.equal(readFileSync(join(firstEnv.CODEX_HOME as string, "auth.json"), "utf8"), authOriginal);
+  assert.equal(statSync(join(firstEnv.CODEX_HOME as string, "auth.json")).mode & 0o777, 0o600);
   assert.equal(installClaudeHooks(firstEnv), true);
   assert.equal(installCodexHooks(firstEnv), true);
   const firstBefore = directoryBytes(firstHome);
 
   const secondEnv = recoveryE2eEnv(secondHome, inherited);
+  assert.equal(readFileSync(join(secondEnv.CODEX_HOME as string, "auth.json"), "utf8"), authOriginal);
+  assert.equal(statSync(join(secondEnv.CODEX_HOME as string, "auth.json")).mode & 0o777, 0o600);
   assert.equal(installClaudeHooks(secondEnv), true);
   assert.equal(installCodexHooks(secondEnv), true);
 
@@ -255,8 +261,8 @@ test("installers clean stale legacy perch hooks and preserve live stable and non
     const commands = Object.values(hooks)
       .flatMap((eventEntries) => eventEntries.flatMap((entry) => entry.hooks.map((hook) => hook.command)));
     assert.ok(commands.includes("cmux hook"), path);
-    for (const entries of Object.values(hooks)) {
-      const mixed = entries.find((entry) => entry.matcher === "mixed");
+    for (const event of ["Stop", "LegacyEvent"]) {
+      const mixed = hooks[event]?.find((entry) => entry.matcher === "mixed");
       assert.deepEqual(mixed?.hooks, [{ type: "command", command: "cmux mixed hook" }], path);
     }
     assert.ok(commands.some((command) => command.includes(stableHook)), path);
