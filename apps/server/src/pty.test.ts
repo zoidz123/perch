@@ -161,6 +161,34 @@ test("PTY adapter starts sessions and streams coalesced raw deltas", async () =>
   adapter.stop();
 });
 
+test("PTY adapter does not leak NO_COLOR into interactive Claude sessions", async () => {
+  let spawnOptions: Parameters<SpawnPty>[2] | undefined;
+  const adapter = new PtyAgentAdapter(
+    (_command, _args, options) => {
+      spawnOptions = options;
+      return new FakePtyProcess();
+    },
+    {
+      sessionEnv: () => ({
+        NO_COLOR: "1",
+        COLORTERM: "truecolor",
+        PERCH_SESSION_ID: "pty:test"
+      })
+    }
+  );
+
+  await adapter.startAgent({
+    command: "claude",
+    cwd: "/tmp/perch-test"
+  });
+
+  assert.equal(spawnOptions?.env.NO_COLOR, undefined);
+  assert.equal(spawnOptions?.env.TERM, "xterm-256color");
+  assert.equal(spawnOptions?.env.COLORTERM, "truecolor");
+  assert.equal(spawnOptions?.env.PERCH_SESSION_ID, "pty:test");
+  adapter.stop();
+});
+
 test("spawned sessions default the no-mistakes telemetry opt-out; a user export wins", async () => {
   let spawnEnv: NodeJS.ProcessEnv | undefined;
   const spawn: SpawnPty = (_command, _args, options) => {

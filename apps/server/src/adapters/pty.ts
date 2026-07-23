@@ -549,16 +549,23 @@ export class PtyAgentAdapter implements AgentAdapter {
       ...(desktop ? { desktop } : {})
     };
 
+    const env: NodeJS.ProcessEnv = {
+      ...sanitizeSpawnEnv(process.env),
+      TERM: "xterm-256color",
+      ...(this.options.sessionEnv?.(id, request) ?? {})
+    };
+    // Perch can itself run inside an agent environment that sets NO_COLOR.
+    // That parent-only preference must not disable Claude's interactive theme.
+    if (agent === "claude") {
+      delete env.NO_COLOR;
+    }
+
     const child = this.spawnPty(command, args, {
       name: "xterm-256color",
       cols,
       rows,
       cwd,
-      env: {
-        ...sanitizeSpawnEnv(process.env),
-        TERM: "xterm-256color",
-        ...(this.options.sessionEnv?.(id, request) ?? {})
-      }
+      env
     });
 
     const terminal = new HeadlessTerminalCtor({
