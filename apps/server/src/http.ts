@@ -454,14 +454,6 @@ async function buildConfigResponse(
     defaultValue: "direct-PR",
     overriddenBy: null
   };
-  entries["task.yolo"] = {
-    effectiveValue: project?.yolo ?? false,
-    source: project?.yolo !== undefined ? "project" : "built-in",
-    scope: "project",
-    storedValue: project?.yolo ?? null,
-    defaultValue: false,
-    overriddenBy: null
-  };
   const runtime = noMistakesRuntimeFacts();
   for (const [suffix, value] of Object.entries({
     version: runtime?.version ?? null,
@@ -547,6 +539,9 @@ async function registerProject(
   options: HttpServerOptions,
   auditMeta: Pick<Parameters<AuditLog["write"]>[0], "deviceId" | "remoteAddress">
 ): Promise<RpcResult> {
+  const allowedKeys = new Set(["rootPath", "mode", "name"]);
+  const unknown = Object.keys(body).find((key) => !allowedKeys.has(key));
+  if (unknown) return rpcError(400, `unknown project config key: ${unknown}`);
   if (typeof body.rootPath !== "string" || body.rootPath.trim().length === 0) {
     return rpcError(400, "rootPath required");
   }
@@ -564,8 +559,7 @@ async function registerProject(
     ...(typeof body.name === "string" && body.name ? { name: body.name } : {}),
     ...(body.mode === "direct-PR" || body.mode === "no-mistakes" || body.mode === "local-only"
       ? { mode: body.mode as Project["mode"] }
-      : {}),
-    ...(typeof body.yolo === "boolean" ? { yolo: body.yolo } : {})
+      : {})
   };
   if (body.mode === "no-mistakes") {
     const noMistakes = await initNoMistakesGate(root, options, auditMeta);
@@ -587,7 +581,7 @@ async function configureProject(
   options: HttpServerOptions,
   auditMeta: Pick<Parameters<AuditLog["write"]>[0], "deviceId" | "remoteAddress">
 ): Promise<RpcResult> {
-  const allowedKeys = new Set(["rootPath", "mode", "yolo"]);
+  const allowedKeys = new Set(["rootPath", "mode"]);
   const unknown = Object.keys(body).find((key) => !allowedKeys.has(key));
   if (unknown) return rpcError(400, `unknown project config key: ${unknown}`);
   if (typeof body.rootPath !== "string" || body.rootPath.trim().length === 0) {
@@ -603,10 +597,7 @@ async function configureProject(
   if (body.mode !== undefined && body.mode !== null && (typeof body.mode !== "string" || !modes.has(body.mode))) {
     return rpcError(400, "mode must be direct-PR, no-mistakes, local-only, or null");
   }
-  if (body.yolo !== undefined && body.yolo !== null && typeof body.yolo !== "boolean") {
-    return rpcError(400, "yolo must be a boolean or null");
-  }
-  if (body.mode === undefined && body.yolo === undefined) return rpcError(400, "mode or yolo required");
+  if (body.mode === undefined) return rpcError(400, "mode required");
   let noMistakes: NoMistakesInitResult | undefined;
   if (body.mode === "no-mistakes") {
     noMistakes = await initNoMistakesGate(root, options, auditMeta);
@@ -615,8 +606,7 @@ async function configureProject(
     }
   }
   const project = options.projects.configure(root, {
-    ...(body.mode !== undefined ? { mode: body.mode as Project["mode"] | null } : {}),
-    ...(body.yolo !== undefined ? { yolo: body.yolo as boolean | null } : {})
+    ...(body.mode !== undefined ? { mode: body.mode as Project["mode"] | null } : {})
   });
   return rpcOk(200, { project, ...(noMistakes ? { noMistakes } : {}) });
 }
@@ -1560,7 +1550,7 @@ async function route(
       return;
     }
 
-    // Register a project or set its delivery fields (mode, yolo, name).
+    // Register a project or set its delivery fields (mode, name).
     if (request.method === "POST" && pathname === "/projects") {
       const body = await readJsonOrEmpty<Record<string, unknown>>(request);
       const result = await registerProject(body, options, {

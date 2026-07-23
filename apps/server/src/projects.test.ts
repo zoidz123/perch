@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdirSync, mkdtempSync, rmSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
@@ -25,6 +25,37 @@ test("project registry seeds from usage and sorts by recency", async () => {
   assert.equal(registry.list()[0]?.name, "alpha");
   assert.equal(registry.list().length, 2);
   assert.equal(registry.find("/tmp/beta")?.mode, "direct-PR");
+
+  rmSync(home, { recursive: true, force: true });
+});
+
+test("legacy yolo rows load without a startup write and prune on the next registry mutation", () => {
+  const home = mkdtempSync(join(tmpdir(), "perch-proj-"));
+  const file = join(home, "projects.json");
+  const raw = `${JSON.stringify({
+    projects: [{
+      rootPath: "/tmp/legacy",
+      name: "legacy",
+      mode: "direct-PR",
+      yolo: true,
+      addedAt: "2026-07-20T00:00:00.000Z",
+      lastUsedAt: "2026-07-20T00:00:00.000Z",
+      preserved: "value"
+    }]
+  }, null, 2)}\n`;
+  writeFileSync(file, raw);
+
+  const registry = new ProjectRegistry({ PERCH_HOME: home } as NodeJS.ProcessEnv);
+  const loaded = registry.find("/tmp/legacy") as Record<string, unknown> | undefined;
+  assert.ok(loaded);
+  assert.equal(Object.hasOwn(loaded, "yolo"), false);
+  assert.equal(loaded.preserved, "value");
+  assert.equal(readFileSync(file, "utf8"), raw, "loading does not rewrite the boss's registry");
+
+  registry.configure("/tmp/legacy", { mode: "local-only" });
+  const persisted = readFileSync(file, "utf8");
+  assert.doesNotMatch(persisted, /"yolo"/);
+  assert.match(persisted, /"preserved": "value"/);
 
   rmSync(home, { recursive: true, force: true });
 });

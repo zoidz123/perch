@@ -553,29 +553,27 @@ async function runProjectCommand(args, options) {
     const rows = projects.map((project) => ({
       name: project.name,
       mode: project.mode ?? "direct-PR (default)",
-      yolo: project.yolo ? "true" : "false (default)",
       used: humanizeSince(project.lastUsedAt),
       path: prettyPath(project.rootPath)
     }));
     const widths = {
       name: Math.max(4, ...rows.map((row) => row.name.length)),
       mode: Math.max(4, ...rows.map((row) => row.mode.length)),
-      yolo: Math.max(4, ...rows.map((row) => row.yolo.length)),
       used: Math.max(9, ...rows.map((row) => row.used.length))
     };
     console.log(
-      `${"NAME".padEnd(widths.name)}  ${"MODE".padEnd(widths.mode)}  ${"YOLO".padEnd(widths.yolo)}  ${"LAST USED".padEnd(widths.used)}  PATH`
+      `${"NAME".padEnd(widths.name)}  ${"MODE".padEnd(widths.mode)}  ${"LAST USED".padEnd(widths.used)}  PATH`
     );
     for (const row of rows) {
       console.log(
-        `${row.name.padEnd(widths.name)}  ${row.mode.padEnd(widths.mode)}  ${row.yolo.padEnd(widths.yolo)}  ${row.used.padEnd(widths.used)}  ${row.path}`
+        `${row.name.padEnd(widths.name)}  ${row.mode.padEnd(widths.mode)}  ${row.used.padEnd(widths.used)}  ${row.path}`
       );
     }
     return;
   }
 
   if (action === "add") {
-    const { path, mode, yolo, yes } = parseProjectArgs(args.slice(1), "add");
+    const { path, mode, yes } = parseProjectArgs(args.slice(1), "add");
     const root = resolve(path);
     if (!existsSync(root)) {
       throw new Error(`no such directory: ${root}`);
@@ -594,8 +592,7 @@ async function runProjectCommand(args, options) {
       headers: jsonHeaders(options),
       body: JSON.stringify({
         rootPath: root,
-        ...(mode ? { mode } : {}),
-        ...(yolo !== undefined ? { yolo } : {})
+        ...(mode ? { mode } : {})
       })
     });
     if (!response.ok) {
@@ -633,13 +630,13 @@ async function runProjectCommand(args, options) {
     if (!response.ok) throw new Error(await responseError(response));
     const project = (await response.json()).projects?.find((entry) => resolve(entry.rootPath) === root);
     if (!project) throw new Error(`unknown project: ${root}`);
-    console.log(`PROJECT  ${project.name}\nPATH     ${prettyPath(project.rootPath)}\nMODE     ${project.mode ?? "direct-PR (built-in default)"}\nYOLO     ${project.yolo ? "true" : "false (built-in default)"}`);
+    console.log(`PROJECT  ${project.name}\nPATH     ${prettyPath(project.rootPath)}\nMODE     ${project.mode ?? "direct-PR (built-in default)"}`);
     return;
   }
 
   if (action === "set") {
-    const { path, mode, yolo, yes } = parseProjectArgs(args.slice(1), "set");
-    if (mode === undefined && yolo === undefined) throw new Error("project set requires --mode or --yolo");
+    const { path, mode, yes } = parseProjectArgs(args.slice(1), "set");
+    if (mode === undefined) throw new Error("project set requires --mode");
     const root = resolve(path);
     if (mode === "no-mistakes") {
       const config = await fetchConfig(options);
@@ -653,7 +650,7 @@ async function runProjectCommand(args, options) {
         }
       }
     }
-    const response = await fetch(httpUrl(options, "/projects"), { method: "PATCH", headers: jsonHeaders(options), body: JSON.stringify({ rootPath: root, ...(mode !== undefined ? { mode } : {}), ...(yolo !== undefined ? { yolo } : {}) }) });
+    const response = await fetch(httpUrl(options, "/projects"), { method: "PATCH", headers: jsonHeaders(options), body: JSON.stringify({ rootPath: root, ...(mode !== undefined ? { mode } : {}) }) });
     if (!response.ok) throw new Error(await responseError(response));
     console.log(`updated ${prettyPath(root)}`);
     return;
@@ -665,7 +662,6 @@ async function runProjectCommand(args, options) {
 function parseProjectArgs(args, action) {
   let path;
   let mode;
-  let yolo;
   let yes;
   for (let index = 0; index < args.length; index += 1) {
     const arg = args[index];
@@ -673,10 +669,6 @@ function parseProjectArgs(args, action) {
       mode = requireValue(args, (index += 1), arg);
     } else if (arg.startsWith("--mode=")) {
       mode = arg.slice("--mode=".length);
-    } else if (arg === "--yolo") {
-      yolo = true;
-    } else if (arg === "--no-yolo") {
-      yolo = false;
     } else if (arg === "--yes" || arg === "-y") {
       yes = true;
     } else if (arg.startsWith("-")) {
@@ -693,7 +685,7 @@ function parseProjectArgs(args, action) {
   if (mode !== undefined && !PROJECT_MODES.has(mode)) {
     throw new Error(`invalid --mode: ${mode} (expected ${[...PROJECT_MODES].join("|")})`);
   }
-  return { path, mode, yolo, yes };
+  return { path, mode, yes };
 }
 
 // ---------------------------------------------------------------------------
@@ -1043,7 +1035,7 @@ async function mutateConfig(parsed, options) {
   const key = parsed.positionals[0];
   const spec = CONFIG_KEYS[key];
   if (!spec) {
-    if (key === "task.mode" || key === "task.yolo") {
+    if (key === "task.mode") {
       throw new Error(`${key} moved to the project registry; use \`${projectSetHint(key, parsed)}\``);
     }
     if (key?.startsWith("runtime.no-mistakes.")) {
@@ -1074,11 +1066,7 @@ async function mutateConfig(parsed, options) {
 function projectSetHint(key, parsed) {
   const path = parsed.project ?? "<path>";
   const value = parsed.action === "set" ? parsed.positionals[1] : undefined;
-  if (key === "task.mode") {
-    return `perch project set ${path} --mode ${value ?? "<direct-PR|no-mistakes|local-only>"}`;
-  }
-  const flag = value === "true" ? "--yolo" : value === "false" ? "--no-yolo" : "--yolo|--no-yolo";
-  return `perch project set ${path} ${flag}`;
+  return `perch project set ${path} --mode ${value ?? "<direct-PR|no-mistakes|local-only>"}`;
 }
 
 function redactConfigEntries(entries) {
@@ -2442,9 +2430,9 @@ function printHelp(command) {
   perch pair
   perch devices [ls|revoke <id>]
   perch project [list]
-  perch project add <path> [--mode direct-PR|no-mistakes|local-only] [--yolo] [--yes]
+  perch project add <path> [--mode direct-PR|no-mistakes|local-only] [--yes]
   perch project show <path>
-  perch project set <path> [--mode direct-PR|no-mistakes|local-only] [--yolo|--no-yolo] [--yes]
+  perch project set <path> --mode direct-PR|no-mistakes|local-only [--yes]
   perch project remove <path>
   perch runtime [show|validate] [--json]
   perch models [--json]
@@ -2479,7 +2467,7 @@ Session ids can be shortened: \`perch attach e1b4\` works if unambiguous.
 perchctl package. It never downloads or repairs that runtime from PATH; reinstall
 this exact perchctl version if the bundled bytes are missing or corrupt.
 \`perch config\` shows global Mate and dispatch defaults only. Use \`perch project\`
-for delivery mode and yolo, and \`perch runtime\` for bundled-runtime provenance.
+for delivery mode and \`perch runtime\` for bundled-runtime provenance.
 
 Examples:
   perch claude
@@ -2508,10 +2496,10 @@ function commandHelp(command) {
   if (command === "tasks") return "Usage: perch tasks [--json]\n\nLists active durable tasks using the same task state, runtime, and PR facts shown in the mobile app.";
   if (command === "pair") return "Usage: perch pair [--title <device-name>]\n\nCreates a device pairing offer. Treat the printed URL and QR code as credentials.";
   if (command === "devices") return "Usage:\n  perch devices [ls]\n  perch devices revoke <id>\n\nLists paired devices or revokes one device token.";
-  if (command === "project") return `Usage:\n  perch project [list|ls]\n  perch project add <path> [--mode direct-PR|no-mistakes|local-only] [--yolo] [--yes]\n  perch project show <path>\n  perch project set <path> [--mode direct-PR|no-mistakes|local-only] [--yolo|--no-yolo] [--yes]\n  perch project remove|rm <path>\n\nThe project registry is live server state. Use \`perch project list\` to inspect it.\n\`--mode no-mistakes\` initializes and verifies the bundled gate before persisting the mode; it asks once unless --yes is present.`;
+  if (command === "project") return `Usage:\n  perch project [list|ls]\n  perch project add <path> [--mode direct-PR|no-mistakes|local-only] [--yes]\n  perch project show <path>\n  perch project set <path> --mode direct-PR|no-mistakes|local-only [--yes]\n  perch project remove|rm <path>\n\nThe project registry is live server state. Use \`perch project list\` to inspect it.\n\`--mode no-mistakes\` initializes and verifies the bundled gate before persisting the mode; it asks once unless --yes is present.`;
   if (command === "models") return "Usage: perch models [--json]\n\nLists selectable Mate and dispatch models, aliases, supported effort levels, and sources.";
   if (command === "runtime") return "Usage: perch runtime [show|validate] [--json]\n\nShows or validates the read-only bundled no-mistakes runtime provenance shipped with this perchctl package.";
-  if (command === "config") return `Usage:\n  perch config show [--global] [--effective] [--json]\n  perch config get <key> [--global] [--effective] [--json]\n  perch config set <mate|dispatch> <model> [--effort <level>] [--agent <agent>]\n  perch config set --global <key> <value>\n  perch config unset --global <key>\n  perch config validate [--global] [--effective] [--json]\n\nGlobal defaults: dispatch.* for workers and mate.* for Mate.\nProject settings (delivery mode and yolo) moved to \`perch project show|set <path>\`.\nRuntime keys are read-only provenance for this perchctl package; view them with \`perch runtime [show|validate]\`.\nUse \`perch project list\` for the live project registry.`;
+  if (command === "config") return `Usage:\n  perch config show [--global] [--effective] [--json]\n  perch config get <key> [--global] [--effective] [--json]\n  perch config set <mate|dispatch> <model> [--effort <level>] [--agent <agent>]\n  perch config set --global <key> <value>\n  perch config unset --global <key>\n  perch config validate [--global] [--effective] [--json]\n\nGlobal defaults: dispatch.* for workers and mate.* for Mate.\nProject delivery mode moved to \`perch project show|set <path>\`.\nRuntime keys are read-only provenance for this perchctl package; view them with \`perch runtime [show|validate]\`.\nUse \`perch project list\` for the live project registry.`;
   if (command === "worktrees") return "Usage:\n  perch worktrees\n  perch worktrees release <id> [--force]\n\nLists isolated task worktrees or releases an orphaned lease.";
   if (command === "doctor") return "Usage: perch doctor [--json] [--fix [--yes]]\n\nChecks the server environment and validates the immutable bundled no-mistakes runtime. It does not download or PATH-repair that runtime.";
   if (command === "uninstall") return "Usage: perch uninstall [--dry-run] [--purge-data] [--force]\n\nRemoves Perch-managed agent configuration. It preserves ~/.perch state unless --purge-data is supplied.";
