@@ -229,6 +229,7 @@ test("wrapper help covers top-level and nested commands without starting the ser
       [["attach", "--help"], /Attaches this terminal/],
       [["stop", "--help"], /Stops a live Perch session/],
       [["ls", "--help"], /Lists Perch sessions/],
+      [["tasks", "--help"], /same task state, runtime, and PR facts shown in the mobile app/],
       [["pair", "--help"], /Creates a device pairing offer/],
       [["devices", "revoke", "--help"], /perch devices revoke <id>/],
       [["project", "add", "--help"], /project remove\|rm <path>/],
@@ -419,14 +420,14 @@ test("models lists both agents, marks selected roles, emits JSON, and notes an a
   }
 });
 
-test("config show reports resolved agents and warns without rewriting an invalid tuple", async () => {
+test("config show warns about invalid tuples without synthetic resolved-agent rows", async () => {
   const home = mkdtempSync(join(tmpdir(), "perch-config-home-"));
   try {
     await withStubServer(async (serverUrl, state) => {
       state.mateDefaults = { agent: "codex", model: "fable", effort: "medium" };
       const show = await runConfig(serverUrl, home, ["show", "--global"]);
       assert.equal(show.code, 0, show.stderr);
-      assert.match(show.stdout, /mate\.resolved-agent\s+codex/);
+      assert.doesNotMatch(show.stdout, /resolved-agent/);
       assert.match(show.stdout, /mate\.warning\s+invalid codex\/fable tuple; model resolves to claude/);
       assert.deepEqual(state.patches, []);
     });

@@ -61,7 +61,7 @@ On a trusted LAN, the iPhone connects directly to the authenticated Mac server; 
 
 | Goal | Commands |
 | --- | --- |
-| Orchestrate | `perch mate`, `perch project`, `perch config` |
+| Orchestrate | `perch mate`, `perch project`, `perch config`, `perch tasks` |
 | Run one provider | `perch claude`, `perch codex` |
 | Control and pair | `perch ls`, `perch attach`, `perch stop`, `perch pair`, `perch devices` |
 | Operate and recover | `perch doctor`, `perch server`, `perch worktrees`, `perch recover task` |

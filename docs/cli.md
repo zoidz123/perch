@@ -14,6 +14,7 @@ perch claude [options] [claude args...]
 perch codex [options] [codex args...]
 perch run [options] -- <command> [args...]
 perch ls
+perch tasks [--json]
 perch attach [options] <session-id>
 perch stop <session-id>
 perch recover task <task-id>
@@ -31,6 +32,16 @@ A fresh Codex `perch mate` is different: Perch withholds its attach command, sub
 `perch claude` and Claude mate launches keep the WebSocket terminal mirror.
 If any Codex launch unexpectedly returns without attach metadata, the CLI prints the started session record plus a hint to retry with `perch attach <session-id>` instead of showing an empty terminal.
 `perch codex --no-attach` starts the session and exits without attaching anything.
+
+## Task status
+
+```text
+perch tasks [--json]
+```
+
+`perch tasks` reads the server's default durable task snapshot, the same non-closed task source used by the mobile app.
+Its compact table shows the task and project, server-derived lifecycle state, worker or runtime state, update age, and PR identity or check readiness.
+`--json` prints the unmodified task snapshot for scripts.
 
 ## Projects
 
@@ -109,7 +120,7 @@ Project yolo is an orthogonal boolean and defaults to `false`.
 `perch project set ... --mode no-mistakes` validates the bundled runtime and preserves the prior mode if activation fails.
 
 Effective output includes `effectiveValue`, `source`, `scope`, `storedValue`, `defaultValue`, and `overriddenBy` for every key.
-Configuration listings also report each role's resolved agent and warn about a saved agent and model tuple that the current registry cannot validate.
+Configuration listings warn about a saved agent and model tuple that the current registry cannot validate.
 Warnings never rewrite saved configuration.
 Text and JSON redact secret-shaped keys identically.
 Environment overrides have higher precedence than stored global launch defaults.
