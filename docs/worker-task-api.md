@@ -84,6 +84,12 @@ Reusing an `idempotencyKey` returns the original durable dispatch instead of lau
 With `dispatch: true`, the server appends the standard worker brief to `prompt`.
 That brief contains the exact event commands, worktree and branch rules, and the mode-specific definition of done.
 
+If dispatch fails before launch, Perch preserves the failed operation and failed task event before deciding whether to close the task automatically.
+Auto-close requires the latest durable dispatch payload to show that launch never started and requires the task to have no session, runtime, worktree linkage, or task-owned lease.
+Perch releases a pre-launch lease before evaluating that predicate.
+Failures that launched or still own worker resources remain `failed` and visible.
+At startup, Perch applies the same predicate once to repair matching historical failed rows; the append-only `closed` event makes the repair idempotent.
+
 ### `GET /tasks` and `GET /tasks/:id`
 
 `GET /tasks` returns `{ "tasks": [...] }` for non-closed tasks and omits their stored prompts.
@@ -331,6 +337,7 @@ The normal body is `{}`.
 
 Teardown stops the worker, releases its worktree, and records task closure only after the landed gate proves that work is safe to release.
 Dirty or unlanded work and live holders cause refusal rather than silent data loss.
+The verified pre-launch dispatch failures defined above may pass normal teardown because they prove that no worker resources exist.
 Before using commit reachability as landing proof, the gate refreshes only the default remote-tracking branch and never moves a local branch.
 If that fetch is unavailable, the gate falls back to the last-known remote-tracking ref.
 

@@ -25,7 +25,14 @@ export type LandedVerdict = {
   defaultBranch?: DefaultBranchResolution;
 };
 
-export async function landedGate(task: Task, worktreePath?: string): Promise<LandedVerdict> {
+export async function landedGate(
+  task: Task,
+  worktreePath?: string,
+  options: { verifiedPrelaunchDispatchFailure?: boolean } = {}
+): Promise<LandedVerdict> {
+  if (options.verifiedPrelaunchDispatchFailure) {
+    return { landed: true, reason: "verified pre-launch dispatch failure has no worker resources" };
+  }
   // Scouts produce reports, not code: reaching done IS landing.
   if (task.kind === "scout") {
     return task.state === "done" || task.state === "landed" || task.state === "closed"

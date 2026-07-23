@@ -79,6 +79,7 @@ import {
   type HookRegistry
 } from "./hooks.js";
 import { usageLimitFromClaudeHook } from "./usageLimitDetect.js";
+import { isVerifiedPrelaunchDispatchFailure } from "./dispatchFailures.js";
 import { ASK_USER_QUESTION_TOOL, KEY_DELAY_MS, questionKeystrokes } from "./askQuestion.js";
 import { buildOffer, tokensEqual, type DeviceRegistry } from "./pairing.js";
 import { EncryptedServerChannel } from "./e2ee/channel.js";
@@ -3404,7 +3405,9 @@ async function teardownTaskRpc(
   let verdict: LandedVerdict | undefined;
   if (!force) {
     const ownLease = ownLeaseFor(task, options.worktrees);
-    verdict = await landedGate(task, ownLease?.path);
+    verdict = await landedGate(task, ownLease?.path, {
+      verifiedPrelaunchDispatchFailure: isVerifiedPrelaunchDispatchFailure(task, options)
+    });
     if (!verdict.landed) {
       return rpcError(409, `refusing teardown: ${verdict.reason}`);
     }
@@ -4553,7 +4556,9 @@ async function handleTeardown(
 
   if (!force) {
     const ownLease = ownLeaseFor(task, options.worktrees);
-    verdict = await landedGate(task, ownLease?.path);
+    verdict = await landedGate(task, ownLease?.path, {
+      verifiedPrelaunchDispatchFailure: isVerifiedPrelaunchDispatchFailure(task, options)
+    });
     if (!verdict.landed) {
       writeJson(response, 409, { error: `refusing teardown: ${verdict.reason}` });
       return;
