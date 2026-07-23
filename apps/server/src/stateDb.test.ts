@@ -75,6 +75,80 @@ test("fresh startup creates the versioned WAL database with foreign keys enabled
   rmSync(root, { recursive: true, force: true });
 });
 
+test("version 13 migrates an earlier prompt delivery schema without losing rows", () => {
+  const root = home();
+  const current = new StateDb(env(root));
+  current.close();
+
+  const legacy = new Database(join(root, "state.sqlite"));
+  legacy.exec(`
+    DROP INDEX prompt_deliveries_session_state_idx;
+    DROP INDEX prompt_deliveries_task_idx;
+    ALTER TABLE prompt_deliveries RENAME TO prompt_deliveries_current;
+    CREATE TABLE prompt_deliveries (
+      id TEXT PRIMARY KEY,
+      perch_session_id TEXT NOT NULL,
+      runtime_generation INTEGER,
+      task_id TEXT REFERENCES tasks(id) ON DELETE RESTRICT,
+      source TEXT NOT NULL CHECK (source IN ('human', 'agent')),
+      state TEXT NOT NULL CHECK (state IN ('queued', 'typing', 'submitted', 'accepted', 'delivery_unknown')),
+      prompt_text TEXT NOT NULL,
+      prompt_hash TEXT NOT NULL,
+      receipt_kind TEXT CHECK (receipt_kind IN ('user_prompt_submit', 'transcript')),
+      receipt_id TEXT,
+      failure_reason TEXT,
+      created_at TEXT NOT NULL,
+      typing_at TEXT,
+      submitted_at TEXT,
+      accepted_at TEXT,
+      unknown_at TEXT,
+      unknown_from_state TEXT CHECK (unknown_from_state IN ('queued', 'typing', 'submitted')),
+      unknown_notified_at TEXT,
+      updated_at TEXT NOT NULL
+    ) STRICT;
+    INSERT INTO prompt_deliveries(
+      id, perch_session_id, source, state, prompt_text, prompt_hash, failure_reason,
+      created_at, typing_at, submitted_at, unknown_at, unknown_from_state,
+      unknown_notified_at, updated_at
+    ) VALUES (
+      'legacy-delivery', 'pty:legacy', 'agent', 'delivery_unknown', 'Legacy prompt',
+      'legacy-hash', 'receipt timeout', '2026-07-23T00:00:00.000Z',
+      '2026-07-23T00:00:01.000Z', '2026-07-23T00:00:02.000Z',
+      '2026-07-23T00:00:03.000Z', 'submitted', '2026-07-23T00:00:04.000Z',
+      '2026-07-23T00:00:04.000Z'
+    );
+    DROP TABLE prompt_deliveries_current;
+    CREATE INDEX prompt_deliveries_session_state_idx
+      ON prompt_deliveries(perch_session_id, state, created_at);
+    CREATE INDEX prompt_deliveries_task_idx
+      ON prompt_deliveries(task_id, created_at);
+    DELETE FROM schema_migrations WHERE version = 13;
+    PRAGMA user_version = 12;
+  `);
+  legacy.close();
+
+  const migrated = new StateDb(env(root));
+  assert.equal(migrated.schemaVersion(), 13);
+  assert.deepEqual(migrated.promptDeliveries.find("legacy-delivery"), {
+    id: "legacy-delivery",
+    perchSessionId: "pty:legacy",
+    source: "agent",
+    state: "delivery_unknown",
+    promptText: "Legacy prompt",
+    promptHash: "legacy-hash",
+    failureReason: "receipt timeout",
+    createdAt: "2026-07-23T00:00:00.000Z",
+    typingAt: "2026-07-23T00:00:01.000Z",
+    submittedAt: "2026-07-23T00:00:02.000Z",
+    unknownAt: "2026-07-23T00:00:03.000Z",
+    unknownFromState: "submitted",
+    unknownNotifiedAt: "2026-07-23T00:00:04.000Z",
+    updatedAt: "2026-07-23T00:00:04.000Z"
+  });
+  migrated.close();
+  rmSync(root, { recursive: true, force: true });
+});
+
 test("legacy JSON and JSONL import idempotently at each startup without modifying the source", () => {
   const root = home();
   const task: Task = {
