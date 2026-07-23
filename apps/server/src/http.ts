@@ -4307,16 +4307,7 @@ async function registerChartCore(
   const task = options.tasks
     .list()
     .find((candidate) => candidate.sessionId === owningSessionId && candidate.state !== "closed");
-  // Crew parentage: the owning session's supervising session (normally the
-  // mate), captured now so the chart surfaces up the chain after the worker
-  // session is gone.
-  let parentSessionId: string | undefined;
-  try {
-    const sessions = await options.adapter.listSessions();
-    parentSessionId = sessions.find((session) => session.id === owningSessionId)?.labels?.parent;
-  } catch {
-    // Parentage is best-effort; registration must not fail on a fleet hiccup.
-  }
+  const parentSessionId = task?.parentSessionId;
   let chart: Chart;
   try {
     chart = options.charts.register(file, {
@@ -4499,22 +4490,22 @@ async function chartFeedbackRpc(
     sessionId
       ? sessions.find((session) => session.id === sessionId && session.status !== "done" && session.status !== "error")
       : undefined;
-  const recipient = liveSession(chart.sessionId) ?? liveSession(chart.parentSessionId);
+  const owner = liveSession(chart.sessionId);
+  const parent = liveSession(chart.parentSessionId);
+  const recipient = owner ?? (parent?.labels?.role === "mate" ? parent : undefined);
   if (!recipient) {
-    const parentDetail = chart.parentSessionId
-      ? ` and its registered parent (${chart.parentSessionId}) are unavailable`
-      : " and it has no registered parent";
-    return {
-      status: 409,
-      body: {
-        error: `The session that drew this chart is gone (${chart.sessionId})${parentDetail}. Start a fresh agent with the chart as context.`,
-        chartId: chart.id,
-        alternatives: ["new_agent"]
-      }
-    };
+    return chartFeedbackUnavailable(chart);
   }
   const block = formatChartFeedback(chart, { message, annotations });
-  const { queued } = await deliverInput(options, recipient.id, block, "human");
+  let queued: boolean;
+  try {
+    ({ queued } = await deliverInput(options, recipient.id, block, "human"));
+  } catch (error) {
+    if (error instanceof Error && error.message === "worker session has ended; follow-up input was not accepted") {
+      return chartFeedbackUnavailable(chart);
+    }
+    throw error;
+  }
   await audit(options.auditLog, {
     action: "chart_feedback",
     sessionId: recipient.id,
@@ -4525,6 +4516,20 @@ async function chartFeedbackRpc(
   });
   const responseBody: ChartFeedbackResponse = { ok: true, queued };
   return rpcOk(202, responseBody);
+}
+
+function chartFeedbackUnavailable(chart: Chart): RpcResult {
+  const parentDetail = chart.parentSessionId
+    ? ` and its registered parent (${chart.parentSessionId}) are unavailable`
+    : " and it has no registered parent";
+  return {
+    status: 409,
+    body: {
+      error: `The session that drew this chart is gone (${chart.sessionId})${parentDetail}. Start a fresh agent with the chart as context.`,
+      chartId: chart.id,
+      alternatives: ["new_agent"]
+    }
+  };
 }
 
 // Layout-audit findings from the injected SDK, delivered to the drawing agent
