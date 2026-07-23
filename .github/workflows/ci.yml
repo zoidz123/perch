@@ -19,6 +19,19 @@ jobs:
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+      - name: Detect iOS changes
+        id: changes
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.before }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+        run: |
+          if git diff --quiet "$BASE_SHA" "$HEAD_SHA" -- apps/ios; then
+            echo "ios=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "ios=true" >> "$GITHUB_OUTPUT"
+          fi
       - uses: actions/setup-node@v5
         with:
           node-version: 24
@@ -34,6 +47,7 @@ jobs:
           apps/server/src/reliabilityE2e.test.ts
       - run: npm run test:package
       - name: Compile iOS app with Xcode 26
+        if: steps.changes.outputs.ios == 'true'
         run: >-
           xcodebuild
           -project apps/ios/Perch.xcodeproj
