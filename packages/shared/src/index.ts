@@ -567,7 +567,7 @@ export type Task = {
   updatedAt: string;
 };
 
-// Worker verbs (the five, plus poller/system-sourced reconciliations).
+// Worker verbs, plus poller/system-sourced reconciliations.
 // "stalled" and "chart_ready" are server-emitted only. They move no task
 // state and exist to wake the orchestrator at the moment attention is needed.
 export type TaskEventKind =

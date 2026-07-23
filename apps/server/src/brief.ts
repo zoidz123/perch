@@ -4,7 +4,7 @@ import { CHART_CAPABILITY_NOTE } from "./hooks.js";
 // The dispatch brief: Perch task reporting and delivery instructions.
 // Appended to the user's kickoff prompt when a task is dispatched, it tells
 // the worker where it is, how to name its branch, and how to report - the
-// five verbs are curl calls authed by the session's existing hook token
+// reporting verbs are curl calls authed by the session's existing hook token
 // (already in the PTY env), so no new secret ever enters the prompt.
 
 // Plan linkage carried into the kickoff:

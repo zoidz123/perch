@@ -46,7 +46,7 @@ Bearer-authenticated events are persisted with `source: "system"` and do not sat
 | `POST /tasks` | Mate | Create a task and, with `dispatch: true`, acquire a worktree, start a worker, and link the runtime. |
 | `GET /tasks` | Mate, CLI, phone | List durable task projections. |
 | `GET /tasks/:id` | Mate, CLI, phone | Read one task and its immutable ordered event log. |
-| `POST /tasks/:id/events` | Worker | Report `working`, `needs_decision`, `blocked`, `done`, `failed`, or `note`. |
+| `POST /tasks/:id/events` | Worker | Report `working`, `pr_linked`, `needs_decision`, `blocked`, `done`, `failed`, or `note`. |
 | `POST /hooks` | Installed provider hook | Report provider lifecycle signals such as turn start and turn completion. |
 | `POST /tasks/:id/completion` | Mate with the server token | Accept or reject the latest worker completion request. |
 | `POST /tasks/:id/decision` | Mate or phone | Answer a structured no-mistakes review gate reported through `needs_decision`. |
@@ -57,6 +57,7 @@ Bearer-authenticated events are persisted with `source: "system"` and do not sat
 
 The authenticated routes use JSON request and response bodies.
 Errors use an HTTP status plus an `{ "error": "..." }` body.
+Authenticated WebSocket RPC exposes the same `GET /tasks` and `GET /tasks/:id` projections, including the linked PR fact.
 
 ## Dispatch and read endpoints
 
