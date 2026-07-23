@@ -377,32 +377,70 @@ test("feedback queues (never injects) while a permission prompt is open", async 
   });
 });
 
-test("feedback for a dead owning session is an explicit 409 naming the alternatives", async () => {
-  await withServer(async ({ port, adapter, hooks, chartFile }) => {
-    // Register while "alive" via hook token, then let the session vanish.
+test("feedback from an ended worker routes whole-chart feedback to its registered live parent", async () => {
+  await withServer(async ({ port, adapter, hooks, chartFile, home }) => {
+    adapter.sessions = [
+      liveSession("pty:worker", { labels: { parent: "pty:mate" } }),
+      liveSession("pty:mate", { labels: { role: "mate" } })
+    ];
     const { token } = hooks.register("pty:worker");
     const registered = await post(port, "/charts", hookHeaders("pty:worker", token), { file: chartFile });
     const { chart } = (await registered.json()) as { chart: Chart };
-    adapter.sessions = [];
+    assert.equal(chart.parentSessionId, "pty:mate");
 
+    adapter.sessions = [liveSession("pty:mate", { labels: { role: "mate" } })];
+    const response = await post(port, `/charts/${chart.id}/feedback`, bearer, {
+      message: "Keep the decision visible",
+      sessionId: "pty:attacker"
+    });
+    assert.equal(response.status, 202);
+    assert.equal(adapter.submitted.length, 1);
+    assert.equal(adapter.submitted[0]?.sessionId, "pty:mate");
+    assert.match(adapter.submitted[0]?.text ?? "", /Keep the decision visible/);
+
+    const audit = await import("node:fs/promises").then((fs) => fs.readFile(join(home, "audit.jsonl"), "utf8"));
+    assert.match(audit, /"sessionId":"pty:mate"/);
+  });
+});
+
+test("feedback from an ended worker routes element annotations to its registered live parent", async () => {
+  await withServer(async ({ port, adapter, hooks, chartFile }) => {
+    adapter.sessions = [
+      liveSession("pty:worker", { labels: { parent: "pty:mate" } }),
+      liveSession("pty:mate", { labels: { role: "mate" } })
+    ];
+    const { token } = hooks.register("pty:worker");
+    const registered = await post(port, "/charts", hookHeaders("pty:worker", token), { file: chartFile });
+    const { chart } = (await registered.json()) as { chart: Chart };
+
+    adapter.sessions = [liveSession("pty:mate", { labels: { role: "mate" } })];
+    const response = await post(port, `/charts/${chart.id}/feedback`, bearer, {
+      annotations: [{ prompt: "Make this precise", selector: "h1", tag: "h1", text: "Roadmap" }]
+    });
+    assert.equal(response.status, 202);
+    assert.equal(adapter.submitted.length, 1);
+    assert.equal(adapter.submitted[0]?.sessionId, "pty:mate");
+    assert.match(adapter.submitted[0]?.text ?? "", /h1 "Roadmap" - Make this precise/);
+  });
+});
+
+test("feedback stays truthful when neither the worker nor its registered parent is live", async () => {
+  await withServer(async ({ port, adapter, hooks, chartFile }) => {
+    adapter.sessions = [
+      liveSession("pty:worker", { labels: { parent: "pty:intended-mate" } }),
+      liveSession("pty:intended-mate", { labels: { role: "mate" } })
+    ];
+    const { token } = hooks.register("pty:worker");
+    const registered = await post(port, "/charts", hookHeaders("pty:worker", token), { file: chartFile });
+    const { chart } = (await registered.json()) as { chart: Chart };
+
+    adapter.sessions = [liveSession("pty:other-mate", { labels: { role: "mate" } })];
     const response = await post(port, `/charts/${chart.id}/feedback`, bearer, { message: "who reads this?" });
     assert.equal(response.status, 409);
-    const body = (await response.json()) as {
-      error: string;
-      alternatives: string[];
-      mateSessionId?: string;
-    };
-    assert.match(body.error, /gone/);
-    assert.deepEqual(body.alternatives, ["mate", "new_agent"]);
-    assert.equal(body.mateSessionId, undefined);
+    const body = (await response.json()) as { error: string; alternatives: string[] };
+    assert.match(body.error, /registered parent \(pty:intended-mate\) are unavailable/);
+    assert.deepEqual(body.alternatives, ["new_agent"]);
     assert.equal(adapter.submitted.length, 0);
-
-    // With a live mate on deck, the error names it as the route.
-    adapter.sessions = [liveSession("pty:mate", { labels: { role: "mate" } })];
-    const withMate = await post(port, `/charts/${chart.id}/feedback`, bearer, { message: "again" });
-    assert.equal(withMate.status, 409);
-    const mateBody = (await withMate.json()) as { mateSessionId?: string };
-    assert.equal(mateBody.mateSessionId, "pty:mate");
   });
 });
 
@@ -948,7 +986,7 @@ test("a chart still renders after its worktree copy is deleted; dead-owner feedb
     const feedback = await post(port, `/charts/${chart.id}/feedback`, bearer, { message: "nice" });
     assert.equal(feedback.status, 409);
     const body = (await feedback.json()) as { alternatives: string[] };
-    assert.deepEqual(body.alternatives, ["mate", "new_agent"]);
+    assert.deepEqual(body.alternatives, ["new_agent"]);
   });
 });
 
