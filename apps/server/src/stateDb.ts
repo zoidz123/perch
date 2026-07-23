@@ -961,6 +961,9 @@ export class StateDb {
         if (migration.version <= committed) {
           return;
         }
+        if (migration.version === 13) {
+          this.normalizePromptDeliveriesV12();
+        }
         this.db.exec(migration.sql);
         this.db
           .prepare("INSERT INTO schema_migrations(version, name, applied_at) VALUES (?, ?, ?)")
@@ -977,6 +980,31 @@ export class StateDb {
       const row = applied.find((candidate) => candidate.version === migration.version);
       if (!row || row.name !== migration.name) {
         throw new Error(`state database migration ${migration.version} is missing or inconsistent`);
+      }
+    }
+  }
+
+  private normalizePromptDeliveriesV12(): void {
+    // Early development builds recorded migration 12 before all of its
+    // delivery-correlation columns were added. Bring that schema up to the
+    // final v12 shape so migration 13 can copy every existing row.
+    const columns = new Set(
+      (this.db.pragma("table_info(prompt_deliveries)") as Array<{ name: string }>).map((column) => column.name)
+    );
+    const additions = [
+      "allow_late_receipt INTEGER NOT NULL DEFAULT 0 CHECK (allow_late_receipt IN (0, 1))",
+      "hook_receipt_at TEXT",
+      "hook_receipt_id TEXT",
+      "transcript_receipt_at TEXT",
+      "transcript_receipt_id TEXT",
+      "typing_order INTEGER",
+      "accepted_order INTEGER",
+      "accepted_notified_at TEXT"
+    ];
+    for (const addition of additions) {
+      const name = addition.slice(0, addition.indexOf(" "));
+      if (!columns.has(name)) {
+        this.db.exec(`ALTER TABLE prompt_deliveries ADD COLUMN ${addition}`);
       }
     }
   }
