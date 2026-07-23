@@ -1159,13 +1159,14 @@ async function runTasksCommand(args, options) {
     console.log(JSON.stringify({ tasks }, null, 2));
     return;
   }
-  if (!tasks.length) {
+  const visibleTasks = tasks.filter((task) => (task.presentation?.state ?? task.state) !== "closed");
+  if (!visibleTasks.length) {
     console.log("no active tasks");
     return;
   }
   printTable(
     ["TASK", "PROJECT", "STATE", "WORKER/RUNTIME", "UPDATED", "PR"],
-    tasks.map((task) => [
+    visibleTasks.map((task) => [
       task.title,
       basename(task.project),
       taskStateLabel(task),

@@ -85,6 +85,17 @@ test("perch tasks renders active durable task, runtime, and PR facts in plain no
       runtime: { state: "recoverable", recoveryAvailable: false },
       createdAt: "2026-07-23T12:00:00.000Z",
       updatedAt: new Date().toISOString()
+    },
+    {
+      id: "landed-task",
+      title: "Already landed",
+      project: "/work/perch",
+      kind: "ship",
+      mode: "direct-PR",
+      state: "landed",
+      presentation: { state: "closed" },
+      createdAt: "2026-07-23T12:00:00.000Z",
+      updatedAt: new Date().toISOString()
     }
   ];
   try {
@@ -102,6 +113,7 @@ test("perch tasks renders active durable task, runtime, and PR facts in plain no
       assert.match(result.stdout, /Review task status\s+perch\s+Reviewing\s+Live \(Alder\)\s+now\s+PR #42 checks passed/);
       assert.match(result.stdout, /Ship release notes\s+release-notes\s+Ready to merge\s+Birch\s+now\s+PR #43 ready to merge/);
       assert.match(result.stdout, /Resume interrupted worker\s+recovery\s+Working\s+Interrupted\s+now\s+-/);
+      assert.doesNotMatch(result.stdout, /Already landed/);
       assert.doesNotMatch(result.stdout, /\x1b\[/);
 
       const json = await runTasks(serverUrl, home, ["--json"]);
