@@ -211,13 +211,29 @@ To render, include this snippet once at the end of `<body>` (this exact snippet 
 
 A chart is a 15-second review surface.
 Make the answer obvious without scrolling.
+Choose the shape that matches the work.
+Both use the same Oro Nero styling and the same HTML vocabulary above.
 
-Use this order:
+### Exploratory report
+
+Use this for a scout, research readout, comparison, or decision exploration.
 
 1. **Verdict / Answer** - put one decisive line at the very top.
-2. **Problem / Findings** - use at most four short bullets.
-3. **Fix / Recommendation** - use at most four short bullets.
-4. **Open question / Decision** - optionally end with one short line.
+2. **Findings** - use at most four short bullets.
+3. **Evidence** - link or name the short proof behind the findings; do not paste an evidence dump.
+4. **Recommendation** or **Open question / Decision** - optionally end with one short line.
+
+Do not force an exploratory report into Problem / Fix framing.
+
+### Code-change report
+
+Use this for an implemented behavior change, bug fix, or review of a patch.
+
+1. **Verdict / Status** - put one decisive line at the very top.
+2. **Root cause** - state the concrete cause in at most three short bullets.
+3. **Fix** - use at most four short bullets.
+4. **Verification** - name the tests, browser proof, or CI result that establishes the change.
+5. **Remaining risks** - optionally end with one short line.
 
 Keep the entire chart to one screen.
 Cut content until a reader can get the point in about 15 seconds.

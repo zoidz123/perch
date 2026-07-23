@@ -119,10 +119,12 @@ test("the brief carries the terse one-screen chart contract", () => {
   const brief = dispatchBrief(task(), "/tmp/wt");
   assert.match(brief, /keep the chart to one screen/);
   assert.match(brief, /one-line verdict/);
-  assert.match(brief, /Problem \/ Findings with at most four short bullets/);
-  assert.match(brief, /Fix \/ Recommendation with at most four short bullets/);
-  assert.match(brief, /Risks and open questions are optional/);
-  assert.match(brief, /at most one short open-question or decision line/);
+  assert.match(brief, /Choose one shape/);
+  assert.match(brief, /exploratory reports use a one-line verdict, Findings, Evidence/);
+  assert.match(brief, /optional Recommendation or Open question/);
+  assert.match(brief, /code-change reports use a one-line verdict, Root cause, Fix, Verification/);
+  assert.match(brief, /optional remaining risks/);
+  assert.match(brief, /Do not force exploratory reports into Problem \/ Fix framing/);
   assert.ok(!brief.includes("roughly two screens"));
   assert.ok(!brief.includes("end a plan with its risks and open questions"));
 });

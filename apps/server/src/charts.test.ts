@@ -891,9 +891,15 @@ test("GET /charts/authoring serves the authoring guide as markdown WITHOUT auth"
     assert.match(markdown, /chart\.css/);
     const mandates = [
       "**Verdict / Answer** - put one decisive line at the very top.",
-      "**Problem / Findings** - use at most four short bullets.",
-      "**Fix / Recommendation** - use at most four short bullets.",
-      "**Open question / Decision** - optionally end with one short line.",
+      "### Exploratory report",
+      "**Findings** - use at most four short bullets.",
+      "**Evidence** - link or name the short proof behind the findings; do not paste an evidence dump.",
+      "Do not force an exploratory report into Problem / Fix framing.",
+      "### Code-change report",
+      "**Root cause** - state the concrete cause in at most three short bullets.",
+      "**Fix** - use at most four short bullets.",
+      "**Verification** - name the tests, browser proof, or CI result that establishes the change.",
+      "**Remaining risks** - optionally end with one short line.",
       "Keep the entire chart to one screen.",
       "Cut content until a reader can get the point in about 15 seconds.",
       "Prefer bullets, short cards, and tables over paragraphs.",
@@ -914,17 +920,18 @@ test("GET /charts/authoring serves the authoring guide as markdown WITHOUT auth"
   });
 });
 
-test("chart reference demonstrates the terse verdict-findings-fix format", () => {
+test("chart reference demonstrates the terse exploratory verdict-findings-evidence format", () => {
   const html = readFileSync(new URL("../assets/charts/reference.html", import.meta.url), "utf8");
-  const verdict = html.indexOf("<h1>Charts must deliver the answer in 15 seconds</h1>");
-  const findings = html.indexOf("<h2>Problem / Findings</h2>");
-  const fix = html.indexOf("<h2>Fix / Recommendation</h2>");
-  assert.ok(verdict >= 0 && verdict < findings && findings < fix);
+  const verdict = html.indexOf("<h1>Exploratory charts should make evidence-led decisions in 15 seconds</h1>");
+  const findings = html.indexOf("<h2>Findings</h2>");
+  const evidence = html.indexOf("<h2>Evidence</h2>");
+  assert.ok(verdict >= 0 && verdict < findings && findings < evidence);
 
-  const findingsList = html.slice(findings, fix);
-  const fixList = html.slice(fix);
+  const findingsList = html.slice(findings, evidence);
+  const evidenceList = html.slice(evidence);
   assert.equal([...findingsList.matchAll(/<li>/g)].length, 4);
-  assert.equal([...fixList.matchAll(/<li>/g)].length, 4);
+  assert.equal([...evidenceList.matchAll(/<li>/g)].length, 2);
+  assert.match(html, /<blockquote>Recommendation:/);
   assert.doesNotMatch(html, /<style\b|style=/);
 });
 
