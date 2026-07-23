@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
@@ -30,6 +30,23 @@ function makeEnv(settings?: object): NodeJS.ProcessEnv {
 
 function makeCodexEnv(home: string): NodeJS.ProcessEnv {
   return { CODEX_HOME: home, PERCH_HOME: join(home, "perch-home") };
+}
+
+function directoryBytes(root: string): Record<string, string> {
+  const snapshot: Record<string, string> = {};
+  const visit = (dir: string, prefix: string): void => {
+    for (const entry of readdirSync(dir, { withFileTypes: true })) {
+      const relative = join(prefix, entry.name);
+      const path = join(dir, entry.name);
+      if (entry.isDirectory()) {
+        visit(path, relative);
+      } else {
+        snapshot[relative] = readFileSync(path).toString("base64");
+      }
+    }
+  };
+  visit(root, "");
+  return snapshot;
 }
 
 test("installs hook entries for every event, idempotently, preserving user hooks", () => {
@@ -73,25 +90,39 @@ test("recovery E2E config homes are isolated across PERCH_HOME", () => {
   const root = mkdtempSync(join(tmpdir(), "perch-recovery-config-isolation-"));
   const globalClaude = join(root, "global-claude");
   const globalCodex = join(root, "global-codex");
-  const home = join(root, "e2e-home");
+  const firstHome = join(root, "e2e-home-first");
+  const secondHome = join(root, "e2e-home-second");
   mkdirSync(globalClaude, { recursive: true });
   mkdirSync(globalCodex, { recursive: true });
   const claudeOriginal = '{"hooks":{"Stop":[{"hooks":[{"type":"command","command":"cmux hook"}]}]}}\n';
   const codexOriginal = '{"hooks":{"Stop":[{"hooks":[{"type":"command","command":"cmux hook"}]}]}}\n';
   writeFileSync(join(globalClaude, "settings.json"), claudeOriginal);
   writeFileSync(join(globalCodex, "hooks.json"), codexOriginal);
+  const globalBefore = {
+    claude: directoryBytes(globalClaude),
+    codex: directoryBytes(globalCodex)
+  };
 
-  const env = recoveryE2eEnv(home, {
+  const inherited = {
     CLAUDE_CONFIG_DIR: globalClaude,
     CODEX_HOME: globalCodex
-  });
-  assert.equal(installClaudeHooks(env), true);
-  assert.equal(installCodexHooks(env), true);
+  };
+  const firstEnv = recoveryE2eEnv(firstHome, inherited);
+  assert.equal(installClaudeHooks(firstEnv), true);
+  assert.equal(installCodexHooks(firstEnv), true);
+  const firstBefore = directoryBytes(firstHome);
 
-  assert.equal(readFileSync(join(globalClaude, "settings.json"), "utf8"), claudeOriginal);
-  assert.equal(readFileSync(join(globalCodex, "hooks.json"), "utf8"), codexOriginal);
-  assert.ok(existsSync(join(env.CLAUDE_CONFIG_DIR as string, "settings.json")));
-  assert.ok(existsSync(join(env.CODEX_HOME as string, "hooks.json")));
+  const secondEnv = recoveryE2eEnv(secondHome, inherited);
+  assert.equal(installClaudeHooks(secondEnv), true);
+  assert.equal(installCodexHooks(secondEnv), true);
+
+  assert.deepEqual(directoryBytes(firstHome), firstBefore);
+  assert.deepEqual(directoryBytes(globalClaude), globalBefore.claude);
+  assert.deepEqual(directoryBytes(globalCodex), globalBefore.codex);
+  assert.ok(existsSync(join(firstEnv.CLAUDE_CONFIG_DIR as string, "settings.json")));
+  assert.ok(existsSync(join(firstEnv.CODEX_HOME as string, "hooks.json")));
+  assert.ok(existsSync(join(secondEnv.CLAUDE_CONFIG_DIR as string, "settings.json")));
+  assert.ok(existsSync(join(secondEnv.CODEX_HOME as string, "hooks.json")));
   rmSync(root, { recursive: true, force: true });
 });
 
@@ -197,6 +228,13 @@ test("installers clean stale legacy perch hooks and preserve live stable and non
     { hooks: [{ type: "command", command: "cmux hook" }] },
     { hooks: [{ type: "command", command: `'${stableHook}' stop` }] },
     { hooks: [{ type: "command", command: `'${devHook}' stop # perch-managed-hook` }] },
+    {
+      matcher: "mixed",
+      hooks: [
+        { type: "command", command: "cmux mixed hook" },
+        { type: "command", command: "'/private/tmp/run/.perch/bin/perch-hook' stop" }
+      ]
+    },
     { hooks: [{ type: "command", command: "'/private/tmp/perch-e2e-gone/bin/perch-hook' stop" }] },
     { hooks: [{ type: "command", command: "'/var/folders/zz/abc/T/perch-mate-e2e-gone/bin/perch-hook' stop" }] }
   ];
@@ -206,17 +244,24 @@ test("installers clean stale legacy perch hooks and preserve live stable and non
   const env = {
     CLAUDE_CONFIG_DIR: claudeHome,
     CODEX_HOME: codexRoot,
-    PERCH_HOME: currentHome
+    PERCH_HOME: currentHome,
+    HOME: root
   } as NodeJS.ProcessEnv;
 
   assert.equal(installClaudeHooks(env), true);
   assert.equal(installCodexHooks(env), true);
   for (const path of [join(claudeHome, "settings.json"), join(codexRoot, "hooks.json")]) {
-    const commands = Object.values(JSON.parse(readFileSync(path, "utf8")).hooks as Record<string, Array<{ hooks: Array<{ command: string }> }>>)
+    const hooks = JSON.parse(readFileSync(path, "utf8")).hooks as Record<string, Array<{ matcher?: string; hooks: Array<{ command: string }> }>>;
+    const commands = Object.values(hooks)
       .flatMap((eventEntries) => eventEntries.flatMap((entry) => entry.hooks.map((hook) => hook.command)));
     assert.ok(commands.includes("cmux hook"), path);
+    for (const entries of Object.values(hooks)) {
+      const mixed = entries.find((entry) => entry.matcher === "mixed");
+      assert.deepEqual(mixed?.hooks, [{ type: "command", command: "cmux mixed hook" }], path);
+    }
     assert.ok(commands.some((command) => command.includes(stableHook)), path);
     assert.ok(commands.some((command) => command.includes(devHook)), path);
+    assert.ok(!commands.some((command) => command.includes("/private/tmp/run/.perch")), path);
     assert.ok(!commands.some((command) => command.includes("/private/tmp/perch-e2e-gone")), path);
     assert.ok(!commands.some((command) => command.includes("/var/folders/zz/abc/T/perch-mate-e2e-gone")), path);
   }

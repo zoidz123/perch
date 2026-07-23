@@ -284,8 +284,8 @@ export function installClaudeHooks(env: NodeJS.ProcessEnv = process.env): boolea
     if (wanted.has(event)) {
       continue;
     }
-    const withoutPerch = entries.filter((entry) => !isInstallReplaceablePerchEntry(entry, env));
-    if (withoutPerch.length !== entries.length) {
+    const withoutPerch = withoutInstallReplaceablePerchHooks(entries, env);
+    if (JSON.stringify(withoutPerch) !== JSON.stringify(entries)) {
       changed = true;
       if (withoutPerch.length > 0) {
         hooks[event] = withoutPerch;
@@ -297,7 +297,7 @@ export function installClaudeHooks(env: NodeJS.ProcessEnv = process.env): boolea
 
   for (const event of CLAUDE_HOOK_EVENTS) {
     const entries = [...(hooks[event] ?? [])];
-    const withoutPerch = entries.filter((entry) => !isInstallReplaceablePerchEntry(entry, env));
+    const withoutPerch = withoutInstallReplaceablePerchHooks(entries, env);
     // Replacing marker-matched entries also UPGRADES an older installed perch
     // command in place (e.g. SessionStart gaining the echo variant).
     const shim = shellQuote(perchHookPath(env));
@@ -337,30 +337,45 @@ function perchHookTarget(command: string): string | undefined {
   return bare?.[1];
 }
 
-function isEphemeralHookTarget(path: string): boolean {
-  if (/\/(?:\.perch|\.perch-dev)\/bin\/perch-hook$/.test(path)) {
+function isEphemeralHookTarget(path: string, env: NodeJS.ProcessEnv): boolean {
+  const home = env.HOME ?? homedir();
+  if (
+    path === join(home, ".perch", "bin", HOOK_SHIM_NAME) ||
+    path === join(home, ".perch-dev", "bin", HOOK_SHIM_NAME)
+  ) {
     return false;
   }
   return /^\/(?:private\/)?tmp\//.test(path) ||
     /^\/(?:private\/)?var\/folders\/[^/]+\/[^/]+\/T\//.test(path);
 }
 
-function isStaleLegacyPerchEntry(entry: HookEntry): boolean {
-  return entry.hooks?.some((hook) => {
-    const target = perchHookTarget(hook.command ?? "");
-    return target !== undefined && (isEphemeralHookTarget(target) || !existsSync(target));
-  }) ?? false;
+function isStaleLegacyPerchHook(command: string, env: NodeJS.ProcessEnv): boolean {
+  const target = perchHookTarget(command);
+  return target !== undefined && (isEphemeralHookTarget(target, env) || !existsSync(target));
+}
+
+function isCurrentPerchHook(command: string, env: NodeJS.ProcessEnv): boolean {
+  return command.includes(HOOK_MARKER) || perchHookTarget(command) === perchHookPath(env);
 }
 
 function isCurrentPerchEntry(entry: HookEntry, env: NodeJS.ProcessEnv = process.env): boolean {
-  const shimPath = perchHookPath(env);
-  return entry.hooks?.some((hook) =>
-    hook.command?.includes(HOOK_MARKER) || perchHookTarget(hook.command ?? "") === shimPath
-  ) ?? false;
+  return entry.hooks?.some((hook) => isCurrentPerchHook(hook.command ?? "", env)) ?? false;
 }
 
-function isInstallReplaceablePerchEntry(entry: HookEntry, env: NodeJS.ProcessEnv): boolean {
-  return isCurrentPerchEntry(entry, env) || isStaleLegacyPerchEntry(entry);
+function withoutInstallReplaceablePerchHooks(
+  entries: HookEntry[],
+  env: NodeJS.ProcessEnv
+): HookEntry[] {
+  return entries.flatMap((entry) => {
+    const hooks = entry.hooks.filter((hook) =>
+      !isCurrentPerchHook(hook.command ?? "", env) &&
+      !isStaleLegacyPerchHook(hook.command ?? "", env)
+    );
+    if (hooks.length === 0) {
+      return [];
+    }
+    return hooks.length === entry.hooks.length ? [entry] : [{ ...entry, hooks }];
+  });
 }
 
 function isPerchEntry(entry: HookEntry, env: NodeJS.ProcessEnv = process.env): boolean {
@@ -624,8 +639,8 @@ export function installCodexHooks(env: NodeJS.ProcessEnv = process.env): boolean
     if (wanted.has(event)) {
       continue;
     }
-    const withoutPerch = entries.filter((entry) => !isInstallReplaceablePerchEntry(entry, env));
-    if (withoutPerch.length !== entries.length) {
+    const withoutPerch = withoutInstallReplaceablePerchHooks(entries, env);
+    if (JSON.stringify(withoutPerch) !== JSON.stringify(entries)) {
       changed = true;
       if (withoutPerch.length > 0) {
         hooks[event] = withoutPerch;
@@ -636,7 +651,7 @@ export function installCodexHooks(env: NodeJS.ProcessEnv = process.env): boolean
   }
   for (const event of CODEX_HOOK_EVENTS) {
     const entries = [...(hooks[event] ?? [])];
-    const withoutPerch = entries.filter((entry) => !isInstallReplaceablePerchEntry(entry, env));
+    const withoutPerch = withoutInstallReplaceablePerchHooks(entries, env);
     const command = codexHookCommand(event, env);
     const perchEntry: HookEntry = {
       hooks: [{ type: "command", command, timeout: CODEX_HOOK_TIMEOUT_SEC }]
