@@ -4500,17 +4500,41 @@ async function chartFeedbackRpc(
   }
   const block = formatChartFeedback(chart, { message, annotations });
   let queued: boolean;
+  let deliveredRecipient = recipient;
   try {
     ({ queued } = await deliverInput(options, recipient.id, block, "human"));
   } catch (error) {
-    if (isUnavailableSessionError(error)) {
+    if (!isUnavailableSessionError(error)) {
+      throw error;
+    }
+    if (recipient.id !== chart.sessionId) {
       return chartFeedbackUnavailable(chart);
     }
-    throw error;
+    const refreshedMateSessionId = options.ownerManager?.liveMateSessionId();
+    const refreshedSessions = options.monitor.withLiveState(await options.adapter.listSessions());
+    const refreshedParent =
+      chart.parentSessionId === refreshedMateSessionId
+        ? refreshedSessions.find(
+            (session) =>
+              session.id === refreshedMateSessionId && session.status !== "done" && session.status !== "error"
+          )
+        : undefined;
+    if (!refreshedParent) {
+      return chartFeedbackUnavailable(chart);
+    }
+    try {
+      ({ queued } = await deliverInput(options, refreshedParent.id, block, "human"));
+      deliveredRecipient = refreshedParent;
+    } catch (fallbackError) {
+      if (isUnavailableSessionError(fallbackError)) {
+        return chartFeedbackUnavailable(chart);
+      }
+      throw fallbackError;
+    }
   }
   await audit(options.auditLog, {
     action: "chart_feedback",
-    sessionId: recipient.id,
+    sessionId: deliveredRecipient.id,
     chartId: chart.id,
     ...(chart.taskId ? { taskId: chart.taskId } : {}),
     ...auditMeta,

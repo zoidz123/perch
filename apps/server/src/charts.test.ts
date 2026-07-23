@@ -514,6 +514,34 @@ test("feedback reports a delivery race as recipient unavailable", async () => {
   });
 });
 
+test("feedback retries the verified parent when the owner exits during delivery", async () => {
+  await withServer(async ({ port, adapter, hooks, tasks, ownerManager, monitor, chartFile }) => {
+    adapter.sessions = [
+      liveSession("pty:worker"),
+      liveSession("pty:mate", { labels: { role: "mate" } })
+    ];
+    const task = tasks.create({ title: "retry the roadmap", project: "/tmp/p" });
+    tasks.update(task.id, { sessionId: "pty:worker", parentSessionId: "pty:mate" });
+    recordLiveMate(ownerManager, "pty:mate");
+    const { token } = hooks.register("pty:worker");
+    const registered = await post(port, "/charts", hookHeaders("pty:worker", token), { file: chartFile });
+    const { chart } = (await registered.json()) as { chart: Chart };
+
+    const queueOrSubmit = monitor.queueOrSubmit.bind(monitor);
+    monitor.queueOrSubmit = async (...args) => {
+      if (args[0] === "pty:worker") {
+        adapter.sessions = [liveSession("pty:mate", { labels: { role: "mate" } })];
+        throw new Error("Unknown PTY session: pty:worker");
+      }
+      return queueOrSubmit(...args);
+    };
+    const response = await post(port, `/charts/${chart.id}/feedback`, bearer, { message: "route this" });
+    assert.equal(response.status, 202);
+    assert.equal(adapter.submitted.length, 1);
+    assert.equal(adapter.submitted[0]?.sessionId, "pty:mate");
+  });
+});
+
 test("layout warnings deliver once as machine feedback and dedupe repeats", async () => {
   await withServer(async ({ port, adapter, chartFile }) => {
     adapter.sessions = [liveSession("pty:worker")];
