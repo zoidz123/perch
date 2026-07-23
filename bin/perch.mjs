@@ -92,6 +92,11 @@ async function main() {
     return;
   }
 
+  if (parsed.command === "tasks") {
+    await runTasksCommand(parsed.args, parsed.options);
+    return;
+  }
+
   if (parsed.command === "pair") {
     await pairDevice(parsed.options);
     return;
@@ -849,7 +854,7 @@ async function runConfigCommand(args, options) {
     else console.log(formatConfigValue(entry.storedValue));
     return;
   }
-  entries = { ...entries, ...await roleResolutionEntries(config, options) };
+  entries = { ...entries, ...await roleDiagnosticEntries(config, options) };
   const selected = entries;
   if (parsed.json) {
     console.log(JSON.stringify(selected, null, 2));
@@ -993,7 +998,7 @@ function editDistance(left, right) {
   return previous[right.length];
 }
 
-async function roleResolutionEntries(config, options) {
+async function roleDiagnosticEntries(config, options) {
   let registry;
   try {
     registry = await fetchModels(options);
@@ -1004,8 +1009,6 @@ async function roleResolutionEntries(config, options) {
   const result = {};
   for (const role of ["dispatch", "mate"]) {
     const defaults = config[role === "mate" ? "mateDefaults" : "dispatchDefaults"] ?? {};
-    const resolved = config[role === "mate" ? "mateResolved" : "dispatchResolved"] ?? defaults;
-    if (resolved.agent) result[`${role}.resolved-agent`] = syntheticConfigEntry(resolved.agent);
     const configuredModel = defaults.model;
     if (!configuredModel || configuredModel === "auto" || !defaults.agent) continue;
     if (!modelCandidates(registry, configuredModel, defaults.agent).length) {
@@ -1134,6 +1137,101 @@ async function runRuntimeCommand(args, options) {
 function formatConfigValue(value) {
   if (value === null || value === undefined) return "(unset)";
   return String(value);
+}
+
+// ---------------------------------------------------------------------------
+// Durable task status
+// ---------------------------------------------------------------------------
+
+async function runTasksCommand(args, options) {
+  let json = false;
+  for (const arg of args) {
+    if (arg === "--json") json = true;
+    else throw new Error(`unknown tasks option: ${arg} (expected \`perch tasks [--json]\`)`);
+  }
+  const response = await fetch(httpUrl(options, "/tasks"), { headers: jsonHeaders(options) });
+  if (!response.ok) {
+    throw new Error(await responseError(response));
+  }
+  const body = await response.json();
+  const tasks = body.tasks ?? [];
+  if (json) {
+    console.log(JSON.stringify({ tasks }, null, 2));
+    return;
+  }
+  const visibleTasks = tasks.filter((task) => (task.presentation?.state ?? task.state) !== "closed");
+  if (!visibleTasks.length) {
+    console.log("no active tasks");
+    return;
+  }
+  printTable(
+    ["TASK", "PROJECT", "STATE", "WORKER/RUNTIME", "UPDATED", "PR"],
+    visibleTasks.map((task) => [
+      task.title,
+      basename(task.project),
+      taskStateLabel(task),
+      taskRuntimeLabel(task),
+      taskAge(task.updatedAt),
+      taskPrLabel(task.pr)
+    ])
+  );
+}
+
+function taskStateLabel(task) {
+  const state = task.presentation?.state ?? task.state;
+  return {
+    queued: "Queued",
+    working: "Working",
+    reviewing: "Reviewing",
+    needs_you: "Needs you",
+    blocked: "Blocked",
+    completion_requested: "Awaiting verification",
+    awaiting_verification: "Awaiting verification",
+    done: "Done",
+    landed: "Landed",
+    ready_to_merge: "Ready to merge",
+    ready_to_apply: "Ready to apply",
+    failed: "Failed",
+    closed: "Closed"
+  }[state] ?? state;
+}
+
+function taskRuntimeLabel(task) {
+  const runtime = task.runtime;
+  const workerName = runtime?.workerName ?? task.workerName;
+  if (!runtime) return workerName ?? "-";
+  const state = runtime.state === "recoverable" && !runtime.recoveryAvailable
+    ? "Interrupted"
+    : {
+        starting: "Starting",
+        live: "Live",
+        recoverable: "Recoverable",
+        recovering: "Recovering",
+        ended: "Ended"
+      }[runtime.state] ?? runtime.state;
+  return workerName ? `${state} (${workerName})` : state;
+}
+
+function taskAge(value) {
+  const timestamp = Date.parse(value);
+  if (!Number.isFinite(timestamp)) return value;
+  const seconds = Math.max(0, Math.floor((Date.now() - timestamp) / 1000));
+  if (seconds < 60) return "now";
+  if (seconds < 3600) return `${Math.floor(seconds / 60)}m`;
+  if (seconds < 86400) return `${Math.floor(seconds / 3600)}h`;
+  return `${Math.floor(seconds / 86400)}d`;
+}
+
+function taskPrLabel(pr) {
+  if (!pr) return "-";
+  const match = /\/pull\/(\d+)\/?$/.exec(pr.url ?? "");
+  const label = match ? `PR #${match[1]}` : "PR";
+  if (pr.merged) return `${label} merged`;
+  if (pr.mergeReady) return `${label} ready to merge`;
+  if (pr.checks === "failing") return `${label} checks failed`;
+  if (pr.checks === "pending") return `${label} checks pending`;
+  if (pr.checks === "passing") return `${label} checks passed`;
+  return label;
 }
 
 // ---------------------------------------------------------------------------
@@ -1783,9 +1881,9 @@ function parseArgs(argv) {
       passthrough = true;
       continue;
     }
-    // `project`, `config`, `runtime`, `models`, `worktrees`, and `doctor` keep their own flags as positionals; the shared flags above
+    // `project`, `config`, `runtime`, `models`, `tasks`, `worktrees`, and `doctor` keep their own flags as positionals; the shared flags above
     // (--server, --token, ...) are already consumed.
-    if (arg.startsWith("-") && command !== "project" && command !== "config" && command !== "runtime" && command !== "models" && command !== "worktrees" && command !== "doctor") {
+    if (arg.startsWith("-") && command !== "project" && command !== "config" && command !== "runtime" && command !== "models" && command !== "tasks" && command !== "worktrees" && command !== "doctor") {
       throw new Error(`unknown option for ${command}: ${arg} (see \`perch --help\`)`);
     }
     args.push(arg);
@@ -2340,6 +2438,7 @@ function printHelp(command) {
   perch attach [options] <session-id>
   perch stop <session-id>
   perch ls
+  perch tasks [--json]
   perch pair
   perch devices [ls|revoke <id>]
   perch project [list]
@@ -2406,6 +2505,7 @@ function commandHelp(command) {
   if (command === "attach") return `Usage: perch attach [options] <session-id>\n\nAttaches this terminal to a live Perch session. Session ids may be shortened when unambiguous.\nCodex sessions attach by launching the native Codex TUI (the session record's attach command); other sessions mirror the Perch-owned terminal (Ctrl-] detaches).\n${common}`;
   if (command === "stop") return "Usage: perch stop <session-id>\n\nStops a live Perch session. Session ids may be shortened when unambiguous.";
   if (command === "ls") return "Usage: perch ls\n\nLists Perch sessions.";
+  if (command === "tasks") return "Usage: perch tasks [--json]\n\nLists active durable tasks using the same task state, runtime, and PR facts shown in the mobile app.";
   if (command === "pair") return "Usage: perch pair [--title <device-name>]\n\nCreates a device pairing offer. Treat the printed URL and QR code as credentials.";
   if (command === "devices") return "Usage:\n  perch devices [ls]\n  perch devices revoke <id>\n\nLists paired devices or revokes one device token.";
   if (command === "project") return `Usage:\n  perch project [list|ls]\n  perch project add <path> [--mode direct-PR|no-mistakes|local-only] [--yolo] [--yes]\n  perch project show <path>\n  perch project set <path> [--mode direct-PR|no-mistakes|local-only] [--yolo|--no-yolo] [--yes]\n  perch project remove|rm <path>\n\nThe project registry is live server state. Use \`perch project list\` to inspect it.\n\`--mode no-mistakes\` initializes and verifies the bundled gate before persisting the mode; it asks once unless --yes is present.`;

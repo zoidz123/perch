@@ -33,7 +33,7 @@ The validated agent, model, and effort are persisted together so no intermediate
 
 Existing dotted-key `config set --global` commands keep working and print one deprecation line recommending the atomic role form.
 Existing configuration files remain readable without migration or silent rewriting.
-`perch config` and `perch config show` continue to display effective values and add the resolved agent for mate and dispatch.
+Current `perch config` reporting behavior is owned by [the CLI reference](../cli.md#configuration).
 Saved invalid agent and model tuples produce a warning row while remaining unchanged on disk.
 
 ## Documentation and verification
