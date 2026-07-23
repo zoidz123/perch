@@ -1,4 +1,5 @@
 import SwiftUI
+import PerchSessionNavigation
 
 // Session-first fallback for a crew worker whose durable task snapshot has
 // not reached the phone yet. It keeps the same identity, description,
@@ -75,10 +76,12 @@ struct CrewSessionRow: View {
     }
 }
 
-// A crew row: one tracked task joined with its worker session. The task
-// carries the meaning (verb state, PR progress); the session carries the
-// liveness (running / needs approval). Tap opens the worker's chat; the
-// context menu runs teardown through the server's landed-gate.
+// A crew row: one tracked task joined with its worker session when available.
+// The task carries the meaning (verb state, PR progress); the session carries
+// liveness (running / needs approval). Runtime identity lets a tap open the
+// worker detail before the session snapshot arrives; that shell stays
+// read-only until the snapshot catches up. The context menu runs teardown
+// through the server's landed-gate.
 struct TaskRow: View {
     @EnvironmentObject private var store: PerchStore
     @Environment(\.openURL) private var openURL
@@ -255,9 +258,14 @@ struct TaskRow: View {
     }
 
     private var liveSessionId: String? {
-        [task.runtime?.ptySessionId, task.sessionId, session?.id]
-            .compactMap { $0 }
-            .first { store.sessionsById[$0] != nil }
+        SessionNavigationPresentation.navigationTarget(
+            taskState: task.state,
+            runtimeState: task.runtime?.state,
+            runtimeSessionId: task.runtime?.ptySessionId,
+            taskSessionId: task.sessionId,
+            visibleSessionId: session?.id,
+            cachedSessionIds: Set(store.sessionsById.keys)
+        )
     }
 
     private var workerAgent: AgentKind {
