@@ -217,7 +217,6 @@ curl -sf -X POST "$BASE/charts" \
 ```
 
 Registration notifies the boss; edits to the file refresh an open review live; boss annotations arrive in your chat as a `[perch chart]` block - treat them as the boss's word.
-Content shape: lead with the decision the chart answers; show concrete behavior for each option, not abstract pros and cons; end a plan with its risks and open questions; keep it under roughly two screens.
 
 Charts are working documents: the server keeps the canonical copy under `~/.perch/charts/`, per-install state like the task ledger.
 When the boss approves a chart as a plan, approval is the promotion: the crew task you dispatch to implement it converts the approved chart's content into a markdown plan doc committed to the target project's repo (`docs/plans/<date>-<name>.md`, or that project's docs convention) as the first commit of the implementation branch, then builds against it.
