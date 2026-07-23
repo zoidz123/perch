@@ -52,6 +52,6 @@ jobs:
           xcodebuild
           -project apps/ios/Perch.xcodeproj
           -scheme Perch
-          -destination 'platform=iOS Simulator,name=iPhone 17 Pro'
+          -destination 'generic/platform=iOS Simulator'
           -derivedDataPath "$RUNNER_TEMP/PerchDerivedData"
           build
