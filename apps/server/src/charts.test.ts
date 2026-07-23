@@ -33,6 +33,7 @@ import { FleetMonitor } from "./fleetMonitor.js";
 import { wireChartWake, wireMateWake } from "./mateWake.js";
 import { HookRegistry } from "./hooks.js";
 import { createControlServer, handleWebSocketRpcRequest } from "./http.js";
+import { OwnerManager } from "./ownerManager.js";
 import { DeviceRegistry } from "./pairing.js";
 import { PrPoller } from "./prPoller.js";
 import { ProjectRegistry } from "./projects.js";
@@ -88,6 +89,7 @@ type Fixture = {
   chartEvents: Array<{ chart: Chart; kind: ChartEventKind }>;
   hooks: HookRegistry;
   tasks: TaskStore;
+  ownerManager: OwnerManager;
   monitor: FleetMonitor;
   completedTurns: Array<{ sessionId: string; provider: string }>;
   chartFile: string;
@@ -102,6 +104,7 @@ async function withServer(run: (ctx: Fixture) => Promise<void>): Promise<void> {
   const adapter = new FakeAdapter();
   const monitor = new FleetMonitor(adapter, { broadcastMs: 5 });
   const tasks = new TaskStore(env);
+  const ownerManager = new OwnerManager(tasks);
   const timeline = new TimelineStore();
   const charts = new ChartRegistry(env);
   const chartEvents: Fixture["chartEvents"] = [];
@@ -129,6 +132,7 @@ async function withServer(run: (ctx: Fixture) => Promise<void>): Promise<void> {
     projects: new ProjectRegistry(env),
     worktrees: new WorktreePool({ env }),
     tasks,
+    ownerManager,
     prPoller: new PrPoller(tasks, async () => {
       throw new Error("gh disabled in tests");
     }),
@@ -143,7 +147,7 @@ async function withServer(run: (ctx: Fixture) => Promise<void>): Promise<void> {
   const chartFile = join(chartDir, "roadmap.html");
   writeFileSync(chartFile, "<html><body><h1>Roadmap</h1></body></html>");
   try {
-    await run({ port, home, adapter, charts, chartEvents, hooks, tasks, monitor, completedTurns, chartFile, options });
+    await run({ port, home, adapter, charts, chartEvents, hooks, tasks, ownerManager, monitor, completedTurns, chartFile, options });
   } finally {
     charts.stop();
     timeline.stop();
@@ -151,6 +155,16 @@ async function withServer(run: (ctx: Fixture) => Promise<void>): Promise<void> {
     await new Promise<void>((resolve) => server.close(() => resolve()));
     rmSync(home, { recursive: true, force: true });
   }
+}
+
+function recordLiveMate(ownerManager: OwnerManager, sessionId: string): void {
+  const runtime = ownerManager.beginMateLaunch({
+    command: "claude",
+    agent: "claude",
+    sessionId,
+    cwd: "/tmp/perch-mate"
+  });
+  ownerManager.markLive(runtime, sessionId);
 }
 
 const bearer = { authorization: "Bearer test-token", "content-type": "application/json" };
@@ -378,13 +392,14 @@ test("feedback queues (never injects) while a permission prompt is open", async 
 });
 
 test("feedback from an ended worker routes whole-chart feedback to its registered live parent", async () => {
-  await withServer(async ({ port, adapter, hooks, tasks, chartFile, home }) => {
+  await withServer(async ({ port, adapter, hooks, tasks, ownerManager, chartFile, home }) => {
     adapter.sessions = [
       liveSession("pty:worker", { labels: { parent: "pty:attacker" } }),
       liveSession("pty:mate", { labels: { role: "mate" } })
     ];
     const task = tasks.create({ title: "draw the roadmap", project: "/tmp/p" });
     tasks.update(task.id, { sessionId: "pty:worker", parentSessionId: "pty:mate" });
+    recordLiveMate(ownerManager, "pty:mate");
     const { token } = hooks.register("pty:worker");
     const registered = await post(port, "/charts", hookHeaders("pty:worker", token), { file: chartFile });
     const { chart } = (await registered.json()) as { chart: Chart };
@@ -406,13 +421,14 @@ test("feedback from an ended worker routes whole-chart feedback to its registere
 });
 
 test("feedback from an ended worker routes element annotations to its registered live parent", async () => {
-  await withServer(async ({ port, adapter, hooks, tasks, chartFile }) => {
+  await withServer(async ({ port, adapter, hooks, tasks, ownerManager, chartFile }) => {
     adapter.sessions = [
       liveSession("pty:worker", { labels: { parent: "pty:attacker" } }),
       liveSession("pty:mate", { labels: { role: "mate" } })
     ];
     const task = tasks.create({ title: "annotate the roadmap", project: "/tmp/p" });
     tasks.update(task.id, { sessionId: "pty:worker", parentSessionId: "pty:mate" });
+    recordLiveMate(ownerManager, "pty:mate");
     const { token } = hooks.register("pty:worker");
     const registered = await post(port, "/charts", hookHeaders("pty:worker", token), { file: chartFile });
     const { chart } = (await registered.json()) as { chart: Chart };
@@ -429,13 +445,14 @@ test("feedback from an ended worker routes element annotations to its registered
 });
 
 test("feedback stays truthful when neither the worker nor its registered parent is live", async () => {
-  await withServer(async ({ port, adapter, hooks, tasks, chartFile }) => {
+  await withServer(async ({ port, adapter, hooks, tasks, ownerManager, chartFile }) => {
     adapter.sessions = [
       liveSession("pty:worker", { labels: { parent: "pty:attacker" } }),
       liveSession("pty:intended-mate", { labels: { role: "mate" } })
     ];
     const task = tasks.create({ title: "review the roadmap", project: "/tmp/p" });
     tasks.update(task.id, { sessionId: "pty:worker", parentSessionId: "pty:intended-mate" });
+    recordLiveMate(ownerManager, "pty:intended-mate");
     const { token } = hooks.register("pty:worker");
     const registered = await post(port, "/charts", hookHeaders("pty:worker", token), { file: chartFile });
     const { chart } = (await registered.json()) as { chart: Chart };
@@ -450,16 +467,20 @@ test("feedback stays truthful when neither the worker nor its registered parent 
   });
 });
 
-test("feedback rejects a registered parent that is not a live Mate", async () => {
+test("feedback rejects a labeled parent without live Mate ownership", async () => {
   await withServer(async ({ port, adapter, hooks, tasks, chartFile }) => {
-    adapter.sessions = [liveSession("pty:worker"), liveSession("pty:parent")];
+    adapter.sessions = [
+      liveSession("pty:worker"),
+      liveSession("pty:parent", { labels: { role: "mate" } })
+    ];
     const task = tasks.create({ title: "verify the roadmap", project: "/tmp/p" });
     tasks.update(task.id, { sessionId: "pty:worker", parentSessionId: "pty:parent" });
     const { token } = hooks.register("pty:worker");
     const registered = await post(port, "/charts", hookHeaders("pty:worker", token), { file: chartFile });
     const { chart } = (await registered.json()) as { chart: Chart };
+    assert.equal(chart.parentSessionId, undefined);
 
-    adapter.sessions = [liveSession("pty:parent")];
+    adapter.sessions = [liveSession("pty:parent", { labels: { role: "mate" } })];
     const response = await post(port, `/charts/${chart.id}/feedback`, bearer, { message: "do not misroute" });
     assert.equal(response.status, 409);
     assert.equal(adapter.submitted.length, 0);
@@ -467,20 +488,28 @@ test("feedback rejects a registered parent that is not a live Mate", async () =>
 });
 
 test("feedback reports a delivery race as recipient unavailable", async () => {
-  await withServer(async ({ port, adapter, hooks, tasks, monitor, chartFile }) => {
+  await withServer(async ({ port, adapter, hooks, tasks, ownerManager, monitor, chartFile }) => {
     adapter.sessions = [liveSession("pty:worker"), liveSession("pty:mate", { labels: { role: "mate" } })];
     const task = tasks.create({ title: "race the roadmap", project: "/tmp/p" });
     tasks.update(task.id, { sessionId: "pty:worker", parentSessionId: "pty:mate" });
+    recordLiveMate(ownerManager, "pty:mate");
     const { token } = hooks.register("pty:worker");
     const registered = await post(port, "/charts", hookHeaders("pty:worker", token), { file: chartFile });
     const { chart } = (await registered.json()) as { chart: Chart };
 
     adapter.sessions = [liveSession("pty:mate", { labels: { role: "mate" } })];
-    monitor.queueOrSubmit = async () => {
-      throw new Error("worker session has ended; follow-up input was not accepted");
-    };
-    const response = await post(port, `/charts/${chart.id}/feedback`, bearer, { message: "too late" });
-    assert.equal(response.status, 409);
+    for (const message of [
+      "worker session has ended; follow-up input was not accepted",
+      "Unknown PTY session: pty:mate",
+      "Session pty:mate has ended",
+      "unknown codex app-server session: pty:mate"
+    ]) {
+      monitor.queueOrSubmit = async () => {
+        throw new Error(message);
+      };
+      const response = await post(port, `/charts/${chart.id}/feedback`, bearer, { message: "too late" });
+      assert.equal(response.status, 409);
+    }
     assert.equal(adapter.submitted.length, 0);
   });
 });
@@ -1070,7 +1099,7 @@ test("closing the owning task archives its charts; re-registering same path crea
 });
 
 test("a crew chart wakes the supervising session with the review link", async () => {
-  await withServer(async ({ port, adapter, hooks, tasks, charts, monitor, chartFile }) => {
+  await withServer(async ({ port, adapter, hooks, tasks, ownerManager, charts, monitor, chartFile }) => {
     wireMateWake(tasks, adapter, monitor);
     wireChartWake(charts, tasks, (chartId) => `http://mac:4711/charts/${chartId}/review`);
     const sessionId = "pty:worker";
@@ -1081,6 +1110,7 @@ test("a crew chart wakes the supervising session with the review link", async ()
     const { token } = hooks.register(sessionId);
     const task = tasks.create({ title: "draw the roadmap", project: "/tmp/p" });
     tasks.update(task.id, { sessionId, parentSessionId: "pty:mate" });
+    recordLiveMate(ownerManager, "pty:mate");
 
     const registered = await post(port, "/charts", hookHeaders(sessionId, token), { file: chartFile });
     const { chart } = (await registered.json()) as { chart: Chart };
@@ -1124,7 +1154,7 @@ test("a solo chart (no task, no parent) wakes nobody", async () => {
   });
 });
 
-test("a scout chart is persisted and wakes the live mate when its recorded parent is gone", async () => {
+test("a scout chart is persisted and wakes the current live mate", async () => {
   await withServer(async ({ port, adapter, hooks, tasks, charts, monitor, chartFile }) => {
     wireMateWake(tasks, adapter, monitor);
     wireChartWake(charts, tasks, (chartId) => `http://mac:4711/charts/${chartId}/review`);
