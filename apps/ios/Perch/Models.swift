@@ -734,7 +734,10 @@ struct TaskPrCheckModel: Codable, Equatable {
 
 // Workspace home grouping (WorkspaceGrouping.swift): tasks nest under their
 // project header; the fields it reads are already on every task record.
-extension AgentTask: WorkspaceTaskLike {}
+extension AgentTask: WorkspaceTaskLike {
+    var runtimeSessionId: String? { runtime?.ptySessionId }
+    var presentationState: String? { presentation?.state }
+}
 
 extension AgentSession: WorkspaceSessionLike {
     var taskId: String? { labels?["task"] }

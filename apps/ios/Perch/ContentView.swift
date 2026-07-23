@@ -449,7 +449,7 @@ struct HomeView: View {
     private var otherSessions: [AgentSession] {
         let otherIds = Set(WorkspaceGrouping.otherSessionIds(
             sessions: store.agentSessions,
-            tasks: liveTasks,
+            tasks: store.tasks,
             mateSessionId: store.mateSession?.id
         ))
         return store.agentSessions.filter { otherIds.contains($0.id) }
@@ -461,7 +461,7 @@ struct HomeView: View {
     // copy; the list is the information.
     private var projectSections: [WorkspaceProjectSectionModel] {
         WorkspaceGrouping.projectSections(
-            tasks: liveTasks,
+            tasks: store.tasks,
             sessions: store.agentSessions,
             mateSessionId: store.mateSession?.id,
             knownProjects: store.projects.map(\.rootPath)
