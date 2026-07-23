@@ -989,7 +989,7 @@ export function createArtifactSdk(
       c.tag === "text"
         ? "Selected text"
         : c.tag === "mermaid-node"
-          ? nodeLabel || "Diagram node"
+          ? escapeAnnotationText(nodeLabel) || "Diagram node"
           : "&lt;" + c.tag + "&gt;";
     const placeholder =
       c.tag === "text"

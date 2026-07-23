@@ -566,16 +566,6 @@ iframe {
 }
 
 @media (max-width: 460px) {
-  .session-chip {
-    display: none;
-  }
-  .brand-support {
-    display: none;
-  }
-  .bar {
-    gap: 10px;
-    padding: 0 12px;
-  }
   .composer-guide,
   .button kbd {
     display: none;
