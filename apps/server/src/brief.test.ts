@@ -31,6 +31,14 @@ test("no-mistakes mode brief carries the gate driving section and the structured
   assert.match(brief, /tasks\/ship-the-thing-a1b2\/events/);
   assert.match(brief, /"data":\{"noMistakes":\{"step":"review","findings":/);
   assert.match(brief, /no-mistakes axi respond/);
+  assert.match(brief, /inspect `branch_sync`/);
+  assert.match(brief, /if `next_action\.code` is `sync`, run exactly `no-mistakes axi sync`/);
+  assert.match(brief, /POST kind `done` with the explicit PR URL/);
+  assert.match(brief, /Do not emit final prose until the response confirms `task\.state == completion_requested`/);
+  assert.match(brief, /If sync or the POST fails, report `blocked` or `failed` accurately/);
+  assert.match(brief, /curl --silent --show-error --fail-with-body/);
+  assert.match(brief, /response\.task\?\.state !== "completion_requested"/);
+  assert.match(brief, /expected task\.state == completion_requested/);
 });
 
 test("every brief carries the never-end-a-turn-silently reporting clause", () => {
@@ -38,6 +46,22 @@ test("every brief carries the never-end-a-turn-silently reporting clause", () =>
     const brief = dispatchBrief(t, undefined);
     assert.match(brief, /Never end a turn without reporting your current state/, `missing clause for ${t.kind}/${t.mode}`);
     assert.match(brief, /report working: naming what you are waiting on first/);
+  }
+});
+
+test("completion examples require PR URLs only for remote ship modes", () => {
+  for (const mode of ["direct-PR", "no-mistakes"] as const) {
+    assert.match(dispatchBrief(task({ mode }), undefined), /what you did; include the explicit PR URL/);
+  }
+
+  const local = dispatchBrief(task({ mode: "local-only" }), undefined);
+  assert.match(local, /what you did; no PR was opened/);
+  assert.ok(!local.includes("what you did; include the explicit PR URL"));
+
+  for (const mode of ["direct-PR", "no-mistakes", "local-only"] as const) {
+    const scout = dispatchBrief(task({ kind: "scout", mode }), undefined);
+    assert.match(scout, /what you found; no PR is required/);
+    assert.ok(!scout.includes("what you did; include the explicit PR URL"));
   }
 });
 
