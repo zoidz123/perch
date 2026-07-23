@@ -161,32 +161,44 @@ test("PTY adapter starts sessions and streams coalesced raw deltas", async () =>
   adapter.stop();
 });
 
-test("PTY adapter does not leak NO_COLOR into interactive Claude sessions", async () => {
-  let spawnOptions: Parameters<SpawnPty>[2] | undefined;
+test("PTY adapter drops inherited NO_COLOR but preserves a Claude session override", async () => {
+  const spawnEnvs: NodeJS.ProcessEnv[] = [];
   const adapter = new PtyAgentAdapter(
     (_command, _args, options) => {
-      spawnOptions = options;
+      spawnEnvs.push(options.env);
       return new FakePtyProcess();
     },
     {
-      sessionEnv: () => ({
-        NO_COLOR: "1",
+      sessionEnv: (_id, request) => ({
+        ...(request.title === "explicit override" ? { NO_COLOR: "session" } : {}),
         COLORTERM: "truecolor",
         PERCH_SESSION_ID: "pty:test"
       })
     }
   );
+  const saved = process.env.NO_COLOR;
+  try {
+    process.env.NO_COLOR = "1";
+    await adapter.startAgent({
+      command: "claude",
+      cwd: "/tmp/perch-test"
+    });
+    await adapter.startAgent({
+      command: "claude",
+      cwd: "/tmp/perch-test",
+      title: "explicit override"
+    });
 
-  await adapter.startAgent({
-    command: "claude",
-    cwd: "/tmp/perch-test"
-  });
-
-  assert.equal(spawnOptions?.env.NO_COLOR, undefined);
-  assert.equal(spawnOptions?.env.TERM, "xterm-256color");
-  assert.equal(spawnOptions?.env.COLORTERM, "truecolor");
-  assert.equal(spawnOptions?.env.PERCH_SESSION_ID, "pty:test");
-  adapter.stop();
+    assert.equal(spawnEnvs[0]?.NO_COLOR, undefined);
+    assert.equal(spawnEnvs[0]?.TERM, "xterm-256color");
+    assert.equal(spawnEnvs[0]?.COLORTERM, "truecolor");
+    assert.equal(spawnEnvs[0]?.PERCH_SESSION_ID, "pty:test");
+    assert.equal(spawnEnvs[1]?.NO_COLOR, "session");
+  } finally {
+    if (saved === undefined) delete process.env.NO_COLOR;
+    else process.env.NO_COLOR = saved;
+    adapter.stop();
+  }
 });
 
 test("spawned sessions default the no-mistakes telemetry opt-out; a user export wins", async () => {
