@@ -4307,7 +4307,8 @@ async function registerChartCore(
   const task = options.tasks
     .list()
     .find((candidate) => candidate.sessionId === owningSessionId && candidate.state !== "closed");
-  const parentSessionId = task?.parentSessionId;
+  const liveMateSessionId = options.ownerManager?.liveMateSessionId();
+  const parentSessionId = task?.parentSessionId === liveMateSessionId ? liveMateSessionId : undefined;
   let chart: Chart;
   try {
     chart = options.charts.register(file, {
@@ -4491,8 +4492,9 @@ async function chartFeedbackRpc(
       ? sessions.find((session) => session.id === sessionId && session.status !== "done" && session.status !== "error")
       : undefined;
   const owner = liveSession(chart.sessionId);
-  const parent = liveSession(chart.parentSessionId);
-  const recipient = owner ?? (parent?.labels?.role === "mate" ? parent : undefined);
+  const liveMateSessionId = options.ownerManager?.liveMateSessionId();
+  const parent = chart.parentSessionId === liveMateSessionId ? liveSession(liveMateSessionId) : undefined;
+  const recipient = owner ?? parent;
   if (!recipient) {
     return chartFeedbackUnavailable(chart);
   }
@@ -4501,7 +4503,7 @@ async function chartFeedbackRpc(
   try {
     ({ queued } = await deliverInput(options, recipient.id, block, "human"));
   } catch (error) {
-    if (error instanceof Error && error.message === "worker session has ended; follow-up input was not accepted") {
+    if (isUnavailableSessionError(error)) {
       return chartFeedbackUnavailable(chart);
     }
     throw error;
@@ -4516,6 +4518,16 @@ async function chartFeedbackRpc(
   });
   const responseBody: ChartFeedbackResponse = { ok: true, queued };
   return rpcOk(202, responseBody);
+}
+
+function isUnavailableSessionError(error: unknown): boolean {
+  if (!(error instanceof Error)) return false;
+  return (
+    error.message === "worker session has ended; follow-up input was not accepted" ||
+    error.message.startsWith("Unknown PTY session:") ||
+    /^Session .+ has ended$/.test(error.message) ||
+    error.message.startsWith("unknown codex app-server session:")
+  );
 }
 
 function chartFeedbackUnavailable(chart: Chart): RpcResult {
