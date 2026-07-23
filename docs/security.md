@@ -55,6 +55,8 @@ Perch launches the installed Claude Code or Codex CLI and inherits its existing 
 Perch does not ask for provider API keys or proxy provider sign-in.
 
 Provider configuration remains subject to the provider CLI's own storage and security model.
+Opt-in real recovery E2Es create disposable provider homes under their temporary `$PERCH_HOME` and copy only Codex's `auth.json` into that sandbox with mode 0600.
+The tests keep hooks, trust, sessions, and provider writes inside the sandbox.
 Do not copy provider configuration into `$PERCH_HOME` or bug reports.
 
 ## Remote actions and approvals
