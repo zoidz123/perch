@@ -137,7 +137,7 @@ export function dispatchBrief(
     "Fetch the authoring guide first (curl -sf \"${PERCH_HOOK_URL%/hooks}/charts/authoring\") and follow it: every chart renders in the one fixed perch look via chart.css and its documented classes - no <style> blocks, no style= attributes, no external design systems.",
     "Write the file to .charts/<slug>.html in your workspace (keep it out of commits) and register it once:",
     chartVerb,
-    "Registration notifies the boss; edits to the file refresh an open review live; boss feedback arrives in your session as a [perch chart] block.",
+    "Registration notifies the boss; edits to the file refresh an open review live; feedback delivery follows the authoring guide.",
     "Content: keep the chart to one screen. Choose one shape: exploratory reports use a one-line verdict, Findings, Evidence, then an optional Recommendation or Open question; code-change reports use a one-line verdict, Root cause, Fix, Verification, then optional remaining risks. Do not force exploratory reports into Problem / Fix framing.",
     "Charts are working documents: on registration the server keeps the canonical copy under ~/.perch/charts/, so the chart outlives your worktree. When the boss approves a chart as a plan, approval is the promotion: the worker implementing it converts the approved chart's content into a markdown plan doc committed to the target project's repo (docs/plans/<date>-<name>.md, or that project's docs convention) as the first commit of the implementation branch, then builds against it. Scratchpad centrally, canon per-repo.",
     "",
