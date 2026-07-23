@@ -91,6 +91,18 @@ test("the brief points chart authoring at the served guide, never a repo path", 
   assert.ok(!brief.includes("apps/server/assets/charts/AUTHORING.md"));
 });
 
+test("the brief carries the terse one-screen chart contract", () => {
+  const brief = dispatchBrief(task(), "/tmp/wt");
+  assert.match(brief, /keep the chart to one screen/);
+  assert.match(brief, /one-line verdict/);
+  assert.match(brief, /Problem \/ Findings with at most four short bullets/);
+  assert.match(brief, /Fix \/ Recommendation with at most four short bullets/);
+  assert.match(brief, /Risks and open questions are optional/);
+  assert.match(brief, /at most one short open-question or decision line/);
+  assert.ok(!brief.includes("roughly two screens"));
+  assert.ok(!brief.includes("end a plan with its risks and open questions"));
+});
+
 test("codex worker briefs append the canonical chart note while Claude briefs stay unchanged", () => {
   const existing = dispatchBrief(task(), "/tmp/wt");
   const claude = dispatchBrief(task(), "/tmp/wt", {}, "claude");
