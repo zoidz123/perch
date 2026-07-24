@@ -1,5 +1,6 @@
 import SwiftUI
 import PhotosUI
+import PerchMatePresentation
 import PerchSessionNavigation
 
 // Design language (reference: minimal dark chat apps): near-black canvas,
@@ -1157,13 +1158,12 @@ struct MateRow: View {
                         MateModelBadge(label: badge)
                     }
                 }
-                Text(session.promptDeliveryWarning?.message ?? session.promptDeliveryResolution?.message ?? "Runs the crew for you")
+                Text(MateRowPresentation.subtitle(
+                    promptDeliveryWarning: session.promptDeliveryWarning?.message,
+                    promptDeliveryResolution: session.promptDeliveryResolution?.message
+                ))
                     .font(.system(size: 12.5))
-                    .foregroundStyle(
-                        session.promptDeliveryWarning != nil
-                            ? Color.orange
-                            : session.promptDeliveryResolution != nil ? Style.successText : Style.textSecondary
-                    )
+                    .foregroundStyle(Style.textSecondary)
                     .lineLimit(2)
             }
 
