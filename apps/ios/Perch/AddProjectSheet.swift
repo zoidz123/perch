@@ -19,79 +19,100 @@ struct AddProjectSheet: View {
     var body: some View {
         NavigationStack {
             ScrollView {
-                VStack(alignment: .leading, spacing: 12) {
-                    HStack(spacing: 8) {
-                        Image(systemName: "magnifyingglass")
-                            .font(.system(size: 14))
-                            .foregroundStyle(Style.textSecondary)
-                        TextField("Search directories…", text: $query)
-                            .font(.system(size: 15))
-                            .autocorrectionDisabled()
-                            .textInputAutocapitalization(.never)
-                            .focused($searchFocused)
-                            .onChange(of: query) { _, value in scheduleSearch(value) }
-                    }
-                    .padding(.vertical, 10)
-                    .padding(.horizontal, 12)
-                    .background(Style.secondaryFill)
-                    .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
-
-                    VStack(spacing: 0) {
-                        ForEach(suggestions, id: \.self) { path in
-                            directoryRow(path)
-                            if path != suggestions.last { Divider().overlay(Style.hairline) }
-                        }
-                        if suggestions.isEmpty {
-                            Text(query.trimmingCharacters(in: .whitespaces).isEmpty
-                                 ? "Search for a directory on your Mac."
-                                 : "No matches")
+                if store.isConnectingToServer {
+                    ConnectionWaitingState()
+                        .frame(maxWidth: .infinity)
+                        .padding(.vertical, 120)
+                } else {
+                    VStack(alignment: .leading, spacing: 12) {
+                        HStack(spacing: 8) {
+                            Image(systemName: "magnifyingglass")
                                 .font(.system(size: 14))
                                 .foregroundStyle(Style.textSecondary)
-                                .frame(maxWidth: .infinity, alignment: .leading)
-                                .padding(.vertical, 12)
-                                .padding(.horizontal, 4)
+                            TextField("Search directories…", text: $query)
+                                .font(.system(size: 15))
+                                .autocorrectionDisabled()
+                                .textInputAutocapitalization(.never)
+                                .focused($searchFocused)
+                                .onChange(of: query) { _, value in scheduleSearch(value) }
+                                .disabled(!store.isServerLive)
+                        }
+                        .padding(.vertical, 10)
+                        .padding(.horizontal, 12)
+                        .background(Style.secondaryFill)
+                        .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
+
+                        if store.isServerLive {
+                            VStack(spacing: 0) {
+                                ForEach(suggestions, id: \.self) { path in
+                                    directoryRow(path)
+                                    if path != suggestions.last { Divider().overlay(Style.hairline) }
+                                }
+                                if suggestions.isEmpty {
+                                    Text(query.trimmingCharacters(in: .whitespaces).isEmpty
+                                         ? "Search for a directory on your Mac."
+                                         : "No matches")
+                                        .font(.system(size: 14))
+                                        .foregroundStyle(Style.textSecondary)
+                                        .frame(maxWidth: .infinity, alignment: .leading)
+                                        .padding(.vertical, 12)
+                                        .padding(.horizontal, 4)
+                                }
+                            }
+                        } else {
+                            ConnectionOfflineSheetState()
+                        }
+
+                        if let addError {
+                            Text(addError)
+                                .font(.system(size: 13))
+                                .foregroundStyle(Style.errorText)
+                                .fixedSize(horizontal: false, vertical: true)
                         }
                     }
-
-                    if let addError {
-                        Text(addError)
-                            .font(.system(size: 13))
-                            .foregroundStyle(Style.errorText)
-                            .fixedSize(horizontal: false, vertical: true)
-                    }
+                    .padding(20)
                 }
-                .padding(20)
             }
             .background(Style.canvas)
             .scrollDismissesKeyboard(.interactively)
             .navigationTitle("Add project")
             .navigationBarTitleDisplayMode(.inline)
-            .task {
+            .task(id: store.isServerLive) {
+                searchTask?.cancel()
+                suggestions = []
+                selectedPath = nil
+                addError = nil
+                guard store.isServerLive else { return }
+
                 // E2E hook (sim automation cannot type): -PerchAddProjectQuery
                 // prefills the search so the results list can be captured.
                 if let seed = UserDefaults.standard.string(forKey: "PerchAddProjectQuery"), query.isEmpty {
                     query = seed
                     scheduleSearch(seed)
+                } else {
+                    scheduleSearch(query)
                 }
             }
             .toolbar {
                 ToolbarItem(placement: .cancellationAction) {
                     Button("Cancel") { dismiss() }
                 }
-                ToolbarItem(placement: .confirmationAction) {
-                    Button(action: add) {
-                        if adding {
-                            ProgressView().controlSize(.small)
-                        } else {
-                            Text("Add").fontWeight(.semibold)
+                if !store.isConnectingToServer {
+                    ToolbarItem(placement: .confirmationAction) {
+                        Button(action: add) {
+                            if adding {
+                                ProgressView().controlSize(.small)
+                            } else {
+                                Text("Add").fontWeight(.semibold)
+                            }
                         }
+                        .disabled(selectedPath == nil || adding || !store.isServerLive)
                     }
-                    .disabled(selectedPath == nil || adding)
-                }
-                ToolbarItemGroup(placement: .keyboard) {
-                    Spacer()
-                    Button("Done") {
-                        searchFocused = false
+                    ToolbarItemGroup(placement: .keyboard) {
+                        Spacer()
+                        Button("Done") {
+                            searchFocused = false
+                        }
                     }
                 }
             }
@@ -132,6 +153,10 @@ struct AddProjectSheet: View {
 
     private func scheduleSearch(_ value: String) {
         searchTask?.cancel()
+        guard store.isServerLive else {
+            suggestions = []
+            return
+        }
         let trimmed = value.trimmingCharacters(in: .whitespaces)
         guard !trimmed.isEmpty else {
             suggestions = []
@@ -141,13 +166,13 @@ struct AddProjectSheet: View {
             try? await Task.sleep(for: .milliseconds(180))
             if Task.isCancelled { return }
             let results = await store.suggestDirectories(trimmed)
-            if Task.isCancelled { return }
+            if Task.isCancelled || !store.isServerLive { return }
             suggestions = results
         }
     }
 
     private func add() {
-        guard let path = selectedPath, !adding else { return }
+        guard let path = selectedPath, !adding, store.isServerLive else { return }
         adding = true
         addError = nil
         Task {

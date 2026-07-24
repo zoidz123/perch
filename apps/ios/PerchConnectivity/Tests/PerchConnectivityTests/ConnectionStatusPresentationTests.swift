@@ -2,33 +2,188 @@ import XCTest
 @testable import PerchConnectivity
 
 final class ConnectionStatusPresentationTests: XCTestCase {
-    func testFlappingNeverPresentsOffline() {
-        var status = ConnectionStatusHysteresis(offlineDelay: 2)
+    func testColdLaunchBeginsConnectingAndHidesStaleServerData() {
+        var status = ConnectionStatusHysteresis(readinessTimeout: 8)
 
-        XCTAssertFalse(status.observe(isLive: false, at: 0))
-        XCTAssertFalse(status.observe(isLive: false, at: 1))
-        XCTAssertFalse(status.observe(isLive: true, at: 1.5))
-        XCTAssertFalse(status.advance(to: 10))
+        XCTAssertEqual(status.presentedAvailability, .connecting)
+        XCTAssertFalse(status.presentedAvailability.showsFreshServerData)
+        XCTAssertFalse(status.presentedAvailability.permitsServerActions)
+        XCTAssertFalse(status.beginConnecting(at: 0))
+        XCTAssertEqual(status.readinessDeadline, 8)
+    }
+
+    func testRelayRemainsConnectingThroughE2EEReadyUntilFleetSnapshot() {
+        var status = ConnectionStatusHysteresis(readinessTimeout: 8)
+
+        status.beginConnecting(at: 0)
+        XCTAssertFalse(status.observe(.encryptedChannel))
+        XCTAssertEqual(status.presentedAvailability, .connecting)
+
+        XCTAssertTrue(status.observe(.authenticatedFleetSnapshot))
+        XCTAssertEqual(status.presentedAvailability, .online)
+        XCTAssertTrue(status.presentedAvailability.showsFreshServerData)
+        XCTAssertTrue(status.presentedAvailability.permitsServerActions)
+    }
+
+    func testDelayedDirectBootstrapDoesNotFlashOfflineBeforeReadinessDeadline() {
+        var status = ConnectionStatusHysteresis(readinessTimeout: 8)
+
+        status.beginConnecting(at: 0)
+        XCTAssertFalse(status.advance(to: 7.99))
+        XCTAssertEqual(status.presentedAvailability, .connecting)
+        XCTAssertTrue(status.observe(.directBootstrap))
+        XCTAssertFalse(status.advance(to: 20))
         XCTAssertEqual(status.presentedAvailability, .online)
     }
 
-    func testOfflineMustRemainStableForFullDelay() {
-        var status = ConnectionStatusHysteresis(offlineDelay: 2)
+    func testReadinessTimeoutBecomesOffline() {
+        var status = ConnectionStatusHysteresis(readinessTimeout: 8)
 
-        XCTAssertFalse(status.observe(isLive: false, at: 10))
-        XCTAssertFalse(status.advance(to: 11.99))
-        XCTAssertEqual(status.presentedAvailability, .online)
-        XCTAssertTrue(status.advance(to: 12))
+        status.beginConnecting(at: 10)
+        XCTAssertFalse(status.advance(to: 17.99))
+        XCTAssertTrue(status.advance(to: 18))
         XCTAssertEqual(status.presentedAvailability, .offline)
     }
 
-    func testRecoveryPresentsOnlineImmediately() {
-        var status = ConnectionStatusHysteresis(
-            initialAvailability: .offline,
-            offlineDelay: 2
-        )
+    func testOverlappingRefreshDoesNotExtendPendingReadinessWindow() {
+        var status = ConnectionStatusHysteresis(readinessTimeout: 8)
 
-        XCTAssertTrue(status.observe(isLive: true, at: 20))
+        status.beginConnecting(at: 10)
+        XCTAssertFalse(status.beginConnecting(at: 15))
+        XCTAssertEqual(status.readinessDeadline, 18)
+        XCTAssertTrue(status.advance(to: 18))
+    }
+
+    func testForegroundReconnectRequiresFreshEvidenceBeforeOnline() {
+        var status = ConnectionStatusHysteresis(initialAvailability: .online, readinessTimeout: 8)
+
+        XCTAssertTrue(status.beginConnecting(at: 20))
+        XCTAssertEqual(status.presentedAvailability, .connecting)
+        XCTAssertTrue(status.observe(.directBootstrap))
         XCTAssertEqual(status.presentedAvailability, .online)
+    }
+
+    func testReconnectRevokesOnlinePresentationUntilFreshEvidence() {
+        var status = ConnectionStatusHysteresis(initialAvailability: .online, readinessTimeout: 8)
+
+        XCTAssertTrue(status.beginConnecting(at: 20))
+        XCTAssertEqual(status.presentedAvailability, .connecting)
+        XCTAssertFalse(status.presentedAvailability.showsFreshServerData)
+        XCTAssertFalse(status.presentedAvailability.permitsServerActions)
+    }
+
+    func testUnpairResetClearsPriorReadinessDeadline() {
+        var status = ConnectionStatusHysteresis(readinessTimeout: 8)
+
+        status.beginConnecting(at: 20)
+        XCTAssertEqual(status.readinessDeadline, 28)
+        XCTAssertTrue(status.reset())
+        XCTAssertEqual(status.presentedAvailability, .connecting)
+        XCTAssertNil(status.readinessDeadline)
+        XCTAssertFalse(status.advance(to: 100))
+    }
+
+    func testQueuedFullRelayReconciliationRetainsTimelineRecoveryScope() {
+        var queue = FleetReconciliationQueue()
+
+        XCTAssertTrue(queue.request(.partial))
+        XCTAssertFalse(queue.request(.full))
+        XCTAssertEqual(queue.active, .partial)
+        XCTAssertEqual(queue.pending, .full)
+        XCTAssertEqual(queue.complete(), .full)
+    }
+
+    func testForegroundRequestDuringFullRefreshQueuesTrailingFullRefresh() {
+        var queue = FleetReconciliationQueue()
+
+        XCTAssertTrue(queue.request(.full))
+        XCTAssertFalse(queue.request(.full))
+        XCTAssertEqual(queue.active, .full)
+        XCTAssertEqual(queue.pending, .full)
+        XCTAssertEqual(queue.complete(), .full)
+    }
+
+    func testFleetRequestAfterTaskSnapshotQueuesTrailingPartialRefresh() {
+        var queue = FleetReconciliationQueue()
+
+        XCTAssertTrue(queue.request(.partial))
+        XCTAssertFalse(queue.request(.partial))
+        XCTAssertEqual(queue.active, .partial)
+        XCTAssertEqual(queue.pending, .partial)
+        XCTAssertEqual(queue.complete(), .partial)
+    }
+
+    func testTrailingReconciliationRetainsMaximumRequestedScope() {
+        var queue = FleetReconciliationQueue()
+
+        XCTAssertTrue(queue.request(.full))
+        XCTAssertFalse(queue.request(.partial))
+        XCTAssertFalse(queue.request(.full))
+        XCTAssertEqual(queue.pending, .full)
+    }
+
+    func testTrailingPartialReconciliationWaitsForThrottleWindow() {
+        let throttle = FleetReconciliationThrottle(minimumInterval: 2)
+        let lastStart = Date(timeIntervalSinceReferenceDate: 100)
+
+        XCTAssertEqual(
+            throttle.delaySinceLastStart(
+                lastStart,
+                now: Date(timeIntervalSinceReferenceDate: 100.5)
+            ),
+            1.5
+        )
+        XCTAssertEqual(
+            throttle.delaySinceLastStart(
+                lastStart,
+                now: Date(timeIntervalSinceReferenceDate: 102)
+            ),
+            0
+        )
+    }
+
+    func testPairingReplacementRejectsOldHostRefresh() {
+        var gate = ConnectionRefreshGate()
+        let oldGeneration = gate.beginRefresh()
+
+        gate.beginPairingReplacement()
+
+        XCTAssertTrue(gate.isReplacingPairing)
+        XCTAssertNil(gate.beginRefresh())
+        XCTAssertFalse(gate.owns(oldGeneration ?? -1))
+    }
+
+    func testNewPairingRefreshOwnsCompletionAfterReplacement() {
+        var gate = ConnectionRefreshGate()
+
+        gate.beginPairingReplacement()
+        gate.finishPairingReplacement()
+        let newGeneration = gate.beginRefresh()
+
+        XCTAssertFalse(gate.isReplacingPairing)
+        XCTAssertNotNil(newGeneration)
+        XCTAssertTrue(gate.owns(newGeneration ?? -1))
+    }
+
+    func testReconnectResultRequiresMatchingPairingAndActiveTask() {
+        let oldPairing = PairingIdentity(serverID: "old")
+
+        XCTAssertFalse(
+            oldPairing.acceptsReconnectResult(currentServerID: "new", isCancelled: false)
+        )
+        XCTAssertFalse(
+            oldPairing.acceptsReconnectResult(currentServerID: "old", isCancelled: true)
+        )
+        XCTAssertTrue(
+            oldPairing.acceptsReconnectResult(currentServerID: "old", isCancelled: false)
+        )
+    }
+
+    func testOnlyCrossHostPairingClearsServerSnapshots() {
+        let pairing = PairingIdentity(serverID: "new")
+
+        XCTAssertTrue(pairing.replaces("old"))
+        XCTAssertFalse(pairing.replaces("new"))
+        XCTAssertFalse(pairing.replaces(nil))
     }
 }

@@ -140,10 +140,6 @@ struct ContentView: View {
                     .environmentObject(store)
                     .preferredColorScheme(.dark)
             }
-            .onChange(of: showUsageSheet) { _, isPresented in
-                guard isPresented else { return }
-                Task { await store.fetchUsage(trigger: .sheetOpened) }
-            }
             .onOpenURL { url in
             // perch://session/<id> routes straight into a session (push
             // notification taps); anything else is a pairing offer.
@@ -269,7 +265,9 @@ struct HomeView: View {
 
             if !store.isPaired {
                 PairPrompt(showPairSheet: $showPairSheet)
-            } else if !store.isServerLive && store.agentSessions.isEmpty && liveTasks.isEmpty {
+            } else if store.isConnectingToServer {
+                connectingState
+            } else if !store.isServerLive {
                 offlineState
             } else if store.agentSessions.isEmpty && liveTasks.isEmpty {
                 emptyState
@@ -277,7 +275,9 @@ struct HomeView: View {
                 sessionList
             }
 
-            footer
+            if !store.isConnectingToServer {
+                footer
+            }
         }
         .background(Style.canvas.ignoresSafeArea())
         .toolbar(.hidden, for: .navigationBar)
@@ -335,66 +335,51 @@ struct HomeView: View {
         HStack(spacing: 12) {
             // Host avatar: tap for host actions; the tiny dot is connection
             // state so no text competes with the title.
-            Menu {
-                Button {
-                    showPairSheet = true
-                } label: {
-                    Label(store.isPaired ? "Re-pair" : "Pair with Mac", systemImage: "qrcode.viewfinder")
-                }
-                Button {
-                    Task { await store.refresh() }
-                } label: {
-                    Label("Refresh", systemImage: "arrow.clockwise")
-                }
-                if store.isPaired {
-                    // Secondary path to the demoted one-off agent launcher
-                    // (the primary one sits on the Solo agents header).
+            if store.isConnectingToServer {
+                hostAvatar
+            } else {
+                Menu {
                     Button {
-                        showNewAgent = true
+                        showPairSheet = true
                     } label: {
-                        Label("New agent", systemImage: "plus")
+                        Label(store.isPaired ? "Re-pair" : "Pair with Mac", systemImage: "qrcode.viewfinder")
                     }
-                    Button(role: .destructive) {
-                        store.unpair()
+                    Button {
+                        Task { await store.refresh() }
                     } label: {
-                        Label("Unpair", systemImage: "xmark.circle")
+                        Label("Refresh", systemImage: "arrow.clockwise")
                     }
+                    if store.isPaired, store.isServerLive {
+                        // Secondary path to the demoted one-off agent launcher
+                        // (the primary one sits on the Solo agents header).
+                        Button {
+                            showNewAgent = true
+                        } label: {
+                            Label("New agent", systemImage: "plus")
+                        }
+                    }
+                    if store.isPaired {
+                        Button(role: .destructive) {
+                            store.unpair()
+                        } label: {
+                            Label("Unpair", systemImage: "xmark.circle")
+                        }
+                    }
+                } label: {
+                    hostAvatar
                 }
-            } label: {
-                // Warm avatar: a nero-to-warm gradient with a soft inner
-                // shadow for depth, the cream initial in the serif display
-                // face, and a restrained hairline gold ring - the row's one
-                // accent (the gauge stays quiet).
-                ZStack {
-                    Circle()
-                        .fill(
-                            LinearGradient(
-                                colors: [Style.bubbleFill, Style.canvas],
-                                startPoint: .topLeading,
-                                endPoint: .bottomTrailing
-                            )
-                            .shadow(.inner(color: .black.opacity(0.45), radius: 3, y: 1))
-                        )
-                    Circle()
-                        .strokeBorder(Style.accent.opacity(0.55), lineWidth: 1)
-                    Text(hostInitial)
-                        .font(.system(size: 18, weight: .semibold, design: .serif))
-                        // The Menu label inherits the gold tint; the avatar
-                        // initial is identity, not an accent - keep it cream.
-                        .foregroundStyle(Style.textPrimary)
-                }
-                .frame(width: 44, height: 44)
             }
 
             Spacer()
 
             // Host presence: a quiet capsule (panel fill, hairline border)
             // carrying the liveness dot and the Mac's name. Connected reads
-            // calm; disconnected turns the dot amber.
+            // calm; connecting stays neutral and true offline turns amber
+            // only after the readiness deadline expires.
             if store.isPaired {
                 HStack(spacing: 7) {
                     Circle()
-                        .fill(isLive ? Style.successText : Style.warningText)
+                        .fill(connectionStatusColor)
                         .frame(width: 7, height: 7)
                     Text(store.savedHost?.name ?? "")
                         .font(.system(size: 14, weight: .medium))
@@ -412,7 +397,7 @@ struct HomeView: View {
             // snapshot, or a transient read failure makes the button vanish. The
             // panel itself conveys freshness/unavailability. Sized and chromed to
             // match the host capsule so the row reads as one bar.
-            if store.isPaired {
+            if store.isPaired, !store.isConnectingToServer {
                 Button {
                     showUsageSheet = true
                 } label: {
@@ -434,8 +419,35 @@ struct HomeView: View {
         String(store.savedHost?.name.prefix(1) ?? "P").uppercased()
     }
 
-    private var isLive: Bool {
-        store.isServerLive
+    private var hostAvatar: some View {
+        ZStack {
+            Circle()
+                .fill(
+                    LinearGradient(
+                        colors: [Style.bubbleFill, Style.canvas],
+                        startPoint: .topLeading,
+                        endPoint: .bottomTrailing
+                    )
+                    .shadow(.inner(color: .black.opacity(0.45), radius: 3, y: 1))
+                )
+            Circle()
+                .strokeBorder(Style.accent.opacity(0.55), lineWidth: 1)
+            Text(hostInitial)
+                .font(.system(size: 18, weight: .semibold, design: .serif))
+                .foregroundStyle(Style.textPrimary)
+        }
+        .frame(width: 44, height: 44)
+    }
+
+    private var connectionStatusColor: Color {
+        switch store.presentedServerAvailability {
+        case .connecting:
+            Style.textSecondary
+        case .online:
+            Style.successText
+        case .offline:
+            Style.warningText
+        }
     }
 
     // The crew: live tasks (ledger 1) joined with their worker sessions. The
@@ -482,9 +494,6 @@ struct HomeView: View {
     private var sessionList: some View {
         ScrollView {
             LazyVStack(spacing: 2) {
-                if !store.isServerLive {
-                    transportBanner
-                }
                 if let mate = store.mateSession {
                     Button {
                         store.openSessionRef = SessionRef(id: mate.id)
@@ -624,30 +633,6 @@ struct HomeView: View {
         return sessionId.flatMap { store.sessionsById[$0] }
     }
 
-    private var transportBanner: some View {
-        HStack(spacing: 9) {
-            ProgressView()
-                .controlSize(.small)
-                .tint(Style.warningText)
-            VStack(alignment: .leading, spacing: 1) {
-                Text("Mac offline")
-                    .font(.system(size: 13, weight: .semibold))
-                    .foregroundStyle(Style.textPrimary)
-                Text("Showing the last server snapshot")
-                    .font(.system(size: 11.5))
-                    .foregroundStyle(Style.textFaint)
-            }
-            Spacer()
-        }
-        .padding(.horizontal, 12)
-        .padding(.vertical, 9)
-        .background(Style.warning.opacity(0.09), in: RoundedRectangle(cornerRadius: 12, style: .continuous))
-        .overlay(RoundedRectangle(cornerRadius: 12, style: .continuous).strokeBorder(Style.warning.opacity(0.28), lineWidth: 1))
-        .padding(.horizontal, 4)
-        .padding(.bottom, 4)
-        .accessibilityElement(children: .combine)
-    }
-
     // "Solo agents" carries the demoted one-off agent launcher: the mate
     // flow is the product, solo agents are for quick Q&A alongside it.
     // Serif display + cream marks it as a section of a different KIND than
@@ -709,6 +694,18 @@ struct HomeView: View {
         }
         .frame(maxWidth: .infinity)
         .padding(.horizontal, Style.pageInset)
+    }
+
+    private var connectingState: some View {
+        VStack {
+            Spacer()
+            ConnectionWaitingState()
+            Spacer()
+        }
+        .frame(maxWidth: .infinity)
+        .padding(.horizontal, Style.pageInset)
+        .accessibilityElement(children: .combine)
+        .accessibilityLabel("Connecting to Mac. Workspace controls are disabled until fresh data arrives.")
     }
 
     private var offlineState: some View {
@@ -779,7 +776,9 @@ struct HomeView: View {
                 // The composer has exactly one target: the mate. Without a
                 // live one there is nothing to message, so the slot becomes
                 // the Start-mate action instead.
-                if !store.isServerLive {
+                if store.isConnectingToServer {
+                    EmptyView()
+                } else if !store.isServerLive {
                     EmptyView()
                 } else if store.mateSession != nil {
                     HomeComposer(focused: $composerFocused)
@@ -792,6 +791,99 @@ struct HomeView: View {
                 }
             }
         }
+    }
+}
+
+// Connecting never reuses cached rows or leaves a disabled control in place.
+// The navigation shell remains, then the full interface appears after fresh
+// readiness evidence arrives.
+struct ConnectionWaitingState: View {
+    var body: some View {
+        HStack(spacing: 8) {
+            ProgressView()
+                .controlSize(.small)
+                .tint(Style.textSecondary)
+            Text("Connecting to Mac")
+                .font(.system(size: 15, weight: .medium))
+                .foregroundStyle(Style.textSecondary)
+        }
+        .accessibilityElement(children: .combine)
+        .accessibilityLabel("Connecting to Mac. Fresh data is still loading.")
+    }
+}
+
+struct ConnectionDetailPlaceholder: View {
+    var body: some View {
+        VStack {
+            Spacer()
+            ConnectionWaitingState()
+            Spacer()
+        }
+        .frame(maxWidth: .infinity)
+        .accessibilityElement(children: .combine)
+        .accessibilityLabel("Connecting to Mac. Conversation data is hidden until refreshed.")
+    }
+}
+
+struct ConnectionOfflineDetail: View {
+    var body: some View {
+        VStack(spacing: 12) {
+            Spacer()
+            Image(systemName: "wifi.exclamationmark")
+                .font(.system(size: 26, weight: .regular))
+                .foregroundStyle(Style.warningText)
+            Text("Mac offline")
+                .font(.system(size: 18, weight: .semibold))
+                .foregroundStyle(Style.textPrimary)
+            Text("Reconnect to refresh this conversation.")
+                .font(.system(size: 14))
+                .foregroundStyle(Style.textFaint)
+            Spacer()
+        }
+        .frame(maxWidth: .infinity)
+    }
+}
+
+struct ConnectionOfflineSheetState: View {
+    @EnvironmentObject private var store: PerchStore
+
+    var body: some View {
+        VStack(spacing: 12) {
+            Image(systemName: "wifi.exclamationmark")
+                .font(.system(size: 24, weight: .regular))
+                .foregroundStyle(Style.warningText)
+            Text("Mac offline")
+                .font(.system(size: 17, weight: .semibold))
+                .foregroundStyle(Style.textPrimary)
+            Text("Start Perch on your computer, then refresh.")
+                .font(.system(size: 14))
+                .foregroundStyle(Style.textFaint)
+                .multilineTextAlignment(.center)
+            Button {
+                Task { await store.refresh() }
+            } label: {
+                HStack(spacing: 8) {
+                    if store.isLoading {
+                        ProgressView()
+                            .controlSize(.small)
+                            .tint(.black)
+                    } else {
+                        Image(systemName: "arrow.clockwise")
+                            .font(.system(size: 14, weight: .semibold))
+                    }
+                    Text(store.isLoading ? "Checking…" : "Refresh")
+                        .font(.system(size: 15, weight: .semibold))
+                }
+                .padding(.horizontal, 24)
+                .padding(.vertical, 11)
+                .background(Style.textPrimary)
+                .foregroundStyle(.black)
+                .clipShape(Capsule())
+            }
+            .disabled(store.isLoading)
+        }
+        .frame(maxWidth: .infinity)
+        .padding(.vertical, 20)
     }
 }
 
@@ -1439,7 +1531,11 @@ struct SessionDetailView: View {
                 .padding(.bottom, 10)
                 .background(Style.canvas)
 
-            if detailPresentation == .launching {
+            if store.isConnectingToServer {
+                ConnectionDetailPlaceholder()
+            } else if !store.isServerLive {
+                ConnectionOfflineDetail()
+            } else if detailPresentation == .launching {
                 LaunchingSessionShell(task: sessionTask)
             } else if detailPresentation == .unavailable {
                 UnavailableSessionShell(task: sessionTask)
@@ -1501,21 +1597,28 @@ struct SessionDetailView: View {
             Spacer()
 
             VStack(spacing: 1) {
-                Text(session.map { titleFor($0) } ?? sessionTask?.workerName ?? "Agent")
-                    .font(.system(size: 18, weight: .semibold))
-                    .lineLimit(1)
-                if let session, let description = workDescriptionFor(session) {
+                if !store.isConnectingToServer {
+                    Text(detailTitle)
+                        .font(.system(size: 18, weight: .semibold))
+                        .lineLimit(1)
+                }
+                if store.isServerLive, let session, let description = workDescriptionFor(session) {
                     Text(description)
                         .font(.system(size: 12))
                         .foregroundStyle(Style.textSecondary)
                         .lineLimit(1)
                 }
-                if let session, let context = sessionWorkContext(session) {
+                if store.isServerLive, let session, let context = sessionWorkContext(session) {
                     Text(context)
                         .font(.system(size: 12))
                         .foregroundStyle(Style.textFaint)
                         .lineLimit(1)
                         .truncationMode(.head)
+                } else if !store.isServerLive, !store.isConnectingToServer {
+                    Text("Reconnect to continue")
+                        .font(.system(size: 12))
+                        .foregroundStyle(Style.textSecondary)
+                        .lineLimit(1)
                 } else if detailPresentation == .launching {
                     Text("Launching on your Mac")
                         .font(.system(size: 12))
@@ -1531,7 +1634,7 @@ struct SessionDetailView: View {
 
             Spacer()
 
-            if detailPresentation.permitsActions {
+            if detailPresentation.permitsActions && store.isServerLive {
                 Menu {
                     Button {
                         Task { await store.interrupt(sessionId) }
@@ -1560,6 +1663,13 @@ struct SessionDetailView: View {
         sessionTask?.workerName ?? session.workerName ?? sessionDisplayTitle(session)
     }
 
+    private var detailTitle: String {
+        if !store.isServerLive {
+            return "Mac offline"
+        }
+        return session.map { titleFor($0) } ?? sessionTask?.workerName ?? "Agent"
+    }
+
     // When the worker name takes the title slot, the task title moves here so
     // the header keeps the work description; title-led sessions need nothing.
     private func workDescriptionFor(_ session: AgentSession) -> String? {
@@ -1574,7 +1684,9 @@ struct SessionDetailView: View {
 
     @ViewBuilder
     private var bottomArea: some View {
-        if detailPresentation.permitsActions {
+        if store.isConnectingToServer {
+            EmptyView()
+        } else if detailPresentation.permitsActions && store.isServerLive {
             VStack(spacing: 8) {
                 if let request = session?.pendingServerRequest {
                     StructuredRequestCard(request: request) { decision, content in
