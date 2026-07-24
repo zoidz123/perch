@@ -112,44 +112,17 @@ struct UsageSheet: View {
 
     var body: some View {
         NavigationStack {
-            ScrollView {
-                VStack(spacing: 14) {
-                    if store.usageIsLoading && store.usage == nil {
-                        UsageLoadingCard()
+            Group {
+                if store.isConnectingToServer {
+                    VStack {
+                        Spacer()
+                        ConnectionWaitingState()
+                        Spacer()
                     }
-
-                    if let error = store.usageErrorMessage {
-                        UsageErrorCard(
-                            message: error,
-                            showingLastGood: store.usage != nil,
-                            lastUpdatedAt: store.usageLastUpdatedAt
-                        )
-                    }
-
-                    if let providers = store.usage?.providers, !providers.isEmpty {
-                        ForEach(providers) { provider in
-                            ProviderUsageCard(provider: provider)
-                        }
-                    } else if !store.usageIsLoading && store.usageErrorMessage == nil {
-                        UsageUnavailableCard()
-                    }
-
-                    if let updatedAt = store.usageLastUpdatedAt, let age = relativeAge(updatedAt) {
-                        Text(store.usageIsShowingStaleData ? "Showing data from \(age)" : "Updated \(age)")
-                            .font(.system(size: 12, weight: .medium))
-                            .foregroundStyle(store.usageIsShowingStaleData ? Style.warningText : Style.textFaint)
-                            .frame(maxWidth: .infinity, alignment: .leading)
-                            .padding(.horizontal, 4)
-                    }
-
-                    Text("Read locally on your Mac - no extra login. Claude and Codex report the same plan limits you see in each CLI.")
-                        .font(.system(size: 12))
-                        .foregroundStyle(Style.textFaint)
-                        .frame(maxWidth: .infinity, alignment: .leading)
-                        .padding(.horizontal, 4)
-                        .padding(.top, 2)
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+                } else {
+                    usageContent
                 }
-                .padding(Style.pageInset)
             }
             .background(Style.canvas.ignoresSafeArea())
             .navigationTitle("Usage")
@@ -158,21 +131,69 @@ struct UsageSheet: View {
                 ToolbarItem(placement: .topBarTrailing) {
                     Button("Done") { dismiss() }
                 }
-                ToolbarItem(placement: .topBarLeading) {
-                    Button {
-                        Task { await store.fetchUsage(trigger: .manualRefresh) }
-                    } label: {
-                        if store.usageIsLoading {
-                            ProgressView()
-                                .controlSize(.small)
-                        } else {
-                            Label("Refresh", systemImage: "arrow.clockwise")
+                if !store.isConnectingToServer {
+                    ToolbarItem(placement: .topBarLeading) {
+                        Button {
+                            Task { await store.fetchUsage(trigger: .manualRefresh) }
+                        } label: {
+                            if store.usageIsLoading {
+                                ProgressView()
+                                    .controlSize(.small)
+                            } else {
+                                Label("Refresh", systemImage: "arrow.clockwise")
+                            }
                         }
+                        .disabled(store.usageIsLoading)
+                        .accessibilityLabel(store.usageIsLoading ? "Refreshing usage" : "Refresh usage")
                     }
-                    .disabled(store.usageIsLoading)
-                    .accessibilityLabel(store.usageIsLoading ? "Refreshing usage" : "Refresh usage")
                 }
             }
+        }
+        .task(id: store.presentedServerAvailability) {
+            guard store.isServerLive else { return }
+            await store.fetchUsage(trigger: .sheetOpened)
+        }
+    }
+
+    private var usageContent: some View {
+        ScrollView {
+            VStack(spacing: 14) {
+                if store.usageIsLoading && store.usage == nil {
+                    UsageLoadingCard()
+                }
+
+                if let error = store.usageErrorMessage {
+                    UsageErrorCard(
+                        message: error,
+                        showingLastGood: store.usage != nil,
+                        lastUpdatedAt: store.usageLastUpdatedAt
+                    )
+                }
+
+                if let providers = store.usage?.providers, !providers.isEmpty {
+                    ForEach(providers) { provider in
+                        ProviderUsageCard(provider: provider)
+                    }
+                } else if !store.usageIsLoading && store.usageErrorMessage == nil {
+                    UsageUnavailableCard()
+                }
+
+                if let updatedAt = store.usageLastUpdatedAt, let age = relativeAge(updatedAt) {
+                    Text(store.usageIsShowingStaleData ? "Showing data from \(age)" : "Updated \(age)")
+                        .font(.system(size: 12, weight: .medium))
+                        .foregroundStyle(store.usageIsShowingStaleData ? Style.warningText : Style.textFaint)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .padding(.horizontal, 4)
+                }
+
+                Text("Read locally on your Mac - no extra login. Claude and Codex report the same plan limits you see in each CLI.")
+                    .font(.system(size: 12))
+                    .foregroundStyle(Style.textFaint)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .padding(.horizontal, 4)
+                    .padding(.top, 2)
+            }
+            .padding(Style.pageInset)
         }
     }
 }

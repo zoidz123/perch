@@ -140,10 +140,6 @@ struct ContentView: View {
                     .environmentObject(store)
                     .preferredColorScheme(.dark)
             }
-            .onChange(of: showUsageSheet) { _, isPresented in
-                guard isPresented else { return }
-                Task { await store.fetchUsage(trigger: .sheetOpened) }
-            }
             .onOpenURL { url in
             // perch://session/<id> routes straight into a session (push
             // notification taps); anything else is a pairing offer.
