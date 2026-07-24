@@ -348,7 +348,7 @@ struct HomeView: View {
                 } label: {
                     Label("Refresh", systemImage: "arrow.clockwise")
                 }
-                if store.isPaired {
+                if store.isPaired, store.isServerLive {
                     // Secondary path to the demoted one-off agent launcher
                     // (the primary one sits on the Solo agents header).
                     Button {
@@ -356,7 +356,8 @@ struct HomeView: View {
                     } label: {
                         Label("New agent", systemImage: "plus")
                     }
-                    .disabled(!store.isServerLive)
+                }
+                if store.isPaired {
                     Button(role: .destructive) {
                         store.unpair()
                     } label: {
@@ -696,33 +697,9 @@ struct HomeView: View {
     }
 
     private var connectingState: some View {
-        VStack(spacing: 18) {
+        VStack {
             Spacer()
-            ZStack {
-                RoundedRectangle(cornerRadius: 18, style: .continuous)
-                    .fill(Style.secondaryFill)
-                    .frame(width: 66, height: 66)
-                ProgressView()
-                    .controlSize(.regular)
-                    .tint(Style.textSecondary)
-            }
-            VStack(spacing: 7) {
-                Text("Connecting to Mac")
-                    .font(.system(size: 19, weight: .semibold))
-                    .foregroundStyle(Style.textPrimary)
-                Text("Checking your latest workspace…")
-                    .font(.system(size: 14))
-                    .foregroundStyle(Style.textFaint)
-            }
-            .multilineTextAlignment(.center)
-
-            VStack(spacing: 8) {
-                ConnectionPlaceholderRow()
-                ConnectionPlaceholderRow()
-                ConnectionPlaceholderRow(short: true)
-            }
-            .padding(.horizontal, 12)
-            .padding(.top, 6)
+            ConnectionWaitingState()
             Spacer()
         }
         .frame(maxWidth: .infinity)
@@ -800,9 +777,7 @@ struct HomeView: View {
                 // live one there is nothing to message, so the slot becomes
                 // the Start-mate action instead.
                 if store.isConnectingToServer {
-                    ConnectionComposerPlaceholder()
-                        .padding(.horizontal, 12)
-                        .padding(.bottom, 8)
+                    EmptyView()
                 } else if !store.isServerLive {
                     EmptyView()
                 } else if store.mateSession != nil {
@@ -819,82 +794,29 @@ struct HomeView: View {
     }
 }
 
-// Neutral placeholders deliberately replace the previous server snapshot while
-// a fresh connection attempt is resolving. They never reuse row names, task
-// states, or status colors from the last authenticated fleet.
-struct ConnectionPlaceholderRow: View {
-    var short = false
-
+// Connecting never reuses cached rows or leaves a disabled control in place.
+// The navigation shell remains, then the full interface appears after fresh
+// readiness evidence arrives.
+struct ConnectionWaitingState: View {
     var body: some View {
-        HStack(spacing: 11) {
-            Circle()
-                .fill(Style.textFaint.opacity(0.45))
-                .frame(width: 38, height: 38)
-            VStack(alignment: .leading, spacing: 7) {
-                RoundedRectangle(cornerRadius: 4, style: .continuous)
-                    .fill(Style.textSecondary.opacity(0.35))
-                    .frame(width: short ? 112 : 164, height: 11)
-                RoundedRectangle(cornerRadius: 4, style: .continuous)
-                    .fill(Style.textFaint.opacity(0.45))
-                    .frame(width: short ? 76 : 118, height: 9)
-            }
-            Spacer(minLength: 0)
-        }
-        .padding(.horizontal, 12)
-        .padding(.vertical, 11)
-        .background(Style.panel, in: RoundedRectangle(cornerRadius: 14, style: .continuous))
-        .overlay(
-            RoundedRectangle(cornerRadius: 14, style: .continuous)
-                .strokeBorder(Style.hairline, lineWidth: 1)
-        )
-        .accessibilityHidden(true)
-    }
-}
-
-struct ConnectionComposerPlaceholder: View {
-    var body: some View {
-        HStack(spacing: 10) {
+        HStack(spacing: 8) {
             ProgressView()
                 .controlSize(.small)
                 .tint(Style.textSecondary)
             Text("Connecting to Mac…")
-                .font(.system(size: 16))
+                .font(.system(size: 15, weight: .medium))
                 .foregroundStyle(Style.textSecondary)
-            Spacer(minLength: 0)
-            Image(systemName: "arrow.up")
-                .font(.system(size: 16, weight: .bold))
-                .foregroundStyle(Style.textFaint)
-                .frame(width: 38, height: 38)
-                .background(Style.secondaryFill, in: Circle())
         }
-        .padding(.leading, 18)
-        .padding(.trailing, 7)
-        .padding(.vertical, 8)
-        .background(Style.composerFill, in: RoundedRectangle(cornerRadius: Style.composerRadius, style: .continuous))
-        .overlay(
-            RoundedRectangle(cornerRadius: Style.composerRadius, style: .continuous)
-                .strokeBorder(Style.composerBorder, lineWidth: 1)
-        )
         .accessibilityElement(children: .combine)
-        .accessibilityLabel("Connecting to Mac. Composer disabled.")
+        .accessibilityLabel("Connecting to Mac. Fresh data is still loading.")
     }
 }
 
 struct ConnectionDetailPlaceholder: View {
     var body: some View {
-        VStack(spacing: 16) {
+        VStack {
             Spacer()
-            ProgressView()
-                .controlSize(.regular)
-                .tint(Style.textSecondary)
-            Text("Connecting to Mac")
-                .font(.system(size: 18, weight: .semibold))
-                .foregroundStyle(Style.textPrimary)
-            Text("Refreshing this conversation…")
-                .font(.system(size: 14))
-                .foregroundStyle(Style.textFaint)
-            ConnectionPlaceholderRow()
-                .padding(.horizontal, 12)
+            ConnectionWaitingState()
             Spacer()
         }
         .frame(maxWidth: .infinity)
@@ -1769,9 +1691,7 @@ struct SessionDetailView: View {
     @ViewBuilder
     private var bottomArea: some View {
         if store.isConnectingToServer {
-            ConnectionComposerPlaceholder()
-                .padding(.horizontal, 12)
-                .padding(.bottom, 8)
+            EmptyView()
         } else if detailPresentation.permitsActions && store.isServerLive {
             VStack(spacing: 8) {
                 if let request = session?.pendingServerRequest {

@@ -56,10 +56,9 @@ struct AddProjectSheet: View {
                             }
                         }
                     case .placeholders:
-                        VStack(spacing: 8) {
-                            ConnectionPlaceholderRow()
-                            ConnectionPlaceholderRow(short: true)
-                        }
+                        ConnectionWaitingState()
+                            .frame(maxWidth: .infinity)
+                            .padding(.vertical, 24)
                     case .offlineRetry:
                         ConnectionOfflineSheetState()
                     }
