@@ -155,6 +155,7 @@ perch server stop
 perch server start
 ```
 
+`perch server stop` reports success only after the verified server process exits, so an immediate start can reuse the configured port.
 The default server URL is `http://127.0.0.1:8787` from the CLI, while the server itself listens on all Mac interfaces for direct phone access.
 Use `PERCH_SERVER_URL` to select another loopback port for development or isolated checks.
 Never expose the server port directly to the public internet.
