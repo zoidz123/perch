@@ -113,7 +113,7 @@ fi
 
 Choose the exact local development profile for `com.ellipsoid.perch` and validate it before the build.
 This checks the profile team, app ID, selected identity, and selected device.
-It passes the profile’s team and unique UUID to `xcodebuild`, so it cannot silently select a different team or profile:
+It passes the profile’s team, unique UUID, and the selected identity’s validated SHA-1 fingerprint to `xcodebuild`, so it cannot silently select a different team, profile, or same-named certificate:
 
 ```sh
 PROFILE_PATH='<absolute path to the selected .mobileprovision file>'
@@ -199,7 +199,7 @@ if ! xcodebuild \
   -derivedDataPath "$DERIVED_DATA" \
   CODE_SIGN_STYLE=Manual \
   DEVELOPMENT_TEAM="$PROFILE_TEAM" \
-  CODE_SIGN_IDENTITY="$IDENTITY_NAME" \
+  CODE_SIGN_IDENTITY="$IDENTITY_SHA1" \
   PROVISIONING_PROFILE="$PROFILE_UUID" \
   build; then
   printf '%s\n' 'Stop: the command-line build failed. Preserve the signing material and resolve the reported Xcode error before retrying.' >&2
