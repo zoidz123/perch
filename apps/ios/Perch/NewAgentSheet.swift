@@ -63,7 +63,7 @@ struct NewAgentSheet: View {
                                 Text("Start").fontWeight(.semibold)
                             }
                         }
-                        .disabled(!canStart || starting)
+                        .disabled(!canStart || starting || !store.isServerLive)
                     }
                     ToolbarItemGroup(placement: .keyboard) {
                         Spacer()
@@ -82,6 +82,7 @@ struct NewAgentSheet: View {
                         agent = kind
                     }
                     model = resolvedModel(for: agent)
+                    guard store.isServerLive else { return }
                     recents = await store.fetchProjects()
                     // Default the destination to the most recent project.
                     if selectedPath == nil { selectedPath = recents.first?.rootPath }
@@ -251,6 +252,7 @@ struct NewAgentSheet: View {
                     .textInputAutocapitalization(.never)
                     .focused($searchFocused)
                     .onChange(of: query) { _, value in scheduleSearch(value) }
+                    .disabled(!store.isServerLive)
             }
             .padding(.vertical, 10)
             .padding(.horizontal, 12)
@@ -374,6 +376,10 @@ struct NewAgentSheet: View {
 
     private func scheduleSearch(_ value: String) {
         searchTask?.cancel()
+        guard store.isServerLive else {
+            suggestions = []
+            return
+        }
         let trimmed = value.trimmingCharacters(in: .whitespaces)
         guard !trimmed.isEmpty else {
             suggestions = []
@@ -389,7 +395,7 @@ struct NewAgentSheet: View {
     }
 
     private func start() {
-        guard let path = selectedPath, !starting else { return }
+        guard let path = selectedPath, !starting, store.isServerLive else { return }
         starting = true
         Task {
             let ok = await store.startAgent(

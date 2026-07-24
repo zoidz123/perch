@@ -30,6 +30,7 @@ struct AddProjectSheet: View {
                             .textInputAutocapitalization(.never)
                             .focused($searchFocused)
                             .onChange(of: query) { _, value in scheduleSearch(value) }
+                            .disabled(!store.isServerLive)
                     }
                     .padding(.vertical, 10)
                     .padding(.horizontal, 12)
@@ -86,7 +87,7 @@ struct AddProjectSheet: View {
                             Text("Add").fontWeight(.semibold)
                         }
                     }
-                    .disabled(selectedPath == nil || adding)
+                    .disabled(selectedPath == nil || adding || !store.isServerLive)
                 }
                 ToolbarItemGroup(placement: .keyboard) {
                     Spacer()
@@ -132,6 +133,10 @@ struct AddProjectSheet: View {
 
     private func scheduleSearch(_ value: String) {
         searchTask?.cancel()
+        guard store.isServerLive else {
+            suggestions = []
+            return
+        }
         let trimmed = value.trimmingCharacters(in: .whitespaces)
         guard !trimmed.isEmpty else {
             suggestions = []
@@ -147,7 +152,7 @@ struct AddProjectSheet: View {
     }
 
     private func add() {
-        guard let path = selectedPath, !adding else { return }
+        guard let path = selectedPath, !adding, store.isServerLive else { return }
         adding = true
         addError = nil
         Task {
