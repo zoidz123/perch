@@ -40,12 +40,11 @@ struct FleetReconciliationQueue {
     private(set) var pending: FleetReconciliationScope?
 
     mutating func request(_ scope: FleetReconciliationScope) -> Bool {
-        guard let active else {
+        guard active != nil else {
             self.active = scope
             return true
         }
-        if scope.rawValue > active.rawValue,
-           scope.rawValue > (pending?.rawValue ?? -1) {
+        if scope.rawValue > (pending?.rawValue ?? -1) {
             pending = scope
         }
         return false

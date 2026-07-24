@@ -1966,16 +1966,11 @@ final class PerchStore: ObservableObject {
     private func reconcileFleet(_ scope: FleetReconciliationScope) async -> Bool {
         guard isPaired else { return false }
         if let task = fleetReconciliationTask,
-           let activeScope = fleetReconciliationQueue.active,
            let reconciliationID = fleetReconciliationID {
             _ = fleetReconciliationQueue.request(scope)
-            let activeSatisfiesRequest = activeScope.rawValue >= scope.rawValue
-            let result = await task.value
+            _ = await task.value
             finishFleetReconciliation(reconciliationID)
-            if activeSatisfiesRequest {
-                return result
-            }
-            return await reconcileFleet(scope)
+            return await awaitActiveFleetReconciliation()
         }
 
         if scope == .partial {
@@ -1987,6 +1982,16 @@ final class PerchStore: ObservableObject {
             return await reconcileFleet(scope)
         }
         let (reconciliationID, task) = beginFleetReconciliation(scope)
+        let result = await task.value
+        finishFleetReconciliation(reconciliationID)
+        return result
+    }
+
+    private func awaitActiveFleetReconciliation() async -> Bool {
+        guard let task = fleetReconciliationTask,
+              let reconciliationID = fleetReconciliationID else {
+            return false
+        }
         let result = await task.value
         finishFleetReconciliation(reconciliationID)
         return result
