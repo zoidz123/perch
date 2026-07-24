@@ -307,9 +307,9 @@ final class PerchStore: ObservableObject {
         connectionState = "Not paired"
     }
 
-    // Exponential backoff reconnect with endpoint failover: after a couple of
-    // failures on the active endpoint, re-probe every stored endpoint and
-    // switch to whichever answers fastest (for example, a direct endpoint at home).
+    // Exponential backoff reconnect with endpoint failover: after each failure,
+    // re-probe every stored endpoint and switch to whichever answers fastest
+    // (for example, a direct endpoint at home).
     private func scheduleReconnect(presentingReadiness: Bool = true) {
         guard isPaired, reconnectTask == nil else {
             return
@@ -346,8 +346,8 @@ final class PerchStore: ObservableObject {
         }
     }
 
-    // Scene-phase resume: revalidate on foreground and perform a full resync when
-    // away for a while). Called from the root view.
+    // Scene-phase resume always revalidates on foreground. The shared refresh
+    // coalesces overlapping launch and activation requests.
     private var backgroundedAt: Date?
 
     func sceneDidBackground() {
