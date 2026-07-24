@@ -30,27 +30,38 @@ struct AddProjectSheet: View {
                             .textInputAutocapitalization(.never)
                             .focused($searchFocused)
                             .onChange(of: query) { _, value in scheduleSearch(value) }
+                            .disabled(!store.isServerLive)
                     }
                     .padding(.vertical, 10)
                     .padding(.horizontal, 12)
                     .background(Style.secondaryFill)
                     .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
 
-                    VStack(spacing: 0) {
-                        ForEach(suggestions, id: \.self) { path in
-                            directoryRow(path)
-                            if path != suggestions.last { Divider().overlay(Style.hairline) }
+                    switch store.presentedServerAvailability.snapshotSurfaceState {
+                    case .content:
+                        VStack(spacing: 0) {
+                            ForEach(suggestions, id: \.self) { path in
+                                directoryRow(path)
+                                if path != suggestions.last { Divider().overlay(Style.hairline) }
+                            }
+                            if suggestions.isEmpty {
+                                Text(query.trimmingCharacters(in: .whitespaces).isEmpty
+                                     ? "Search for a directory on your Mac."
+                                     : "No matches")
+                                    .font(.system(size: 14))
+                                    .foregroundStyle(Style.textSecondary)
+                                    .frame(maxWidth: .infinity, alignment: .leading)
+                                    .padding(.vertical, 12)
+                                    .padding(.horizontal, 4)
+                            }
                         }
-                        if suggestions.isEmpty {
-                            Text(query.trimmingCharacters(in: .whitespaces).isEmpty
-                                 ? "Search for a directory on your Mac."
-                                 : "No matches")
-                                .font(.system(size: 14))
-                                .foregroundStyle(Style.textSecondary)
-                                .frame(maxWidth: .infinity, alignment: .leading)
-                                .padding(.vertical, 12)
-                                .padding(.horizontal, 4)
+                    case .placeholders:
+                        VStack(spacing: 8) {
+                            ConnectionPlaceholderRow()
+                            ConnectionPlaceholderRow(short: true)
                         }
+                    case .offlineRetry:
+                        ConnectionOfflineSheetState()
                     }
 
                     if let addError {
@@ -66,12 +77,20 @@ struct AddProjectSheet: View {
             .scrollDismissesKeyboard(.interactively)
             .navigationTitle("Add project")
             .navigationBarTitleDisplayMode(.inline)
-            .task {
+            .task(id: store.isServerLive) {
+                searchTask?.cancel()
+                suggestions = []
+                selectedPath = nil
+                addError = nil
+                guard store.isServerLive else { return }
+
                 // E2E hook (sim automation cannot type): -PerchAddProjectQuery
                 // prefills the search so the results list can be captured.
                 if let seed = UserDefaults.standard.string(forKey: "PerchAddProjectQuery"), query.isEmpty {
                     query = seed
                     scheduleSearch(seed)
+                } else {
+                    scheduleSearch(query)
                 }
             }
             .toolbar {
@@ -86,7 +105,7 @@ struct AddProjectSheet: View {
                             Text("Add").fontWeight(.semibold)
                         }
                     }
-                    .disabled(selectedPath == nil || adding)
+                    .disabled(selectedPath == nil || adding || !store.isServerLive)
                 }
                 ToolbarItemGroup(placement: .keyboard) {
                     Spacer()
@@ -132,6 +151,10 @@ struct AddProjectSheet: View {
 
     private func scheduleSearch(_ value: String) {
         searchTask?.cancel()
+        guard store.isServerLive else {
+            suggestions = []
+            return
+        }
         let trimmed = value.trimmingCharacters(in: .whitespaces)
         guard !trimmed.isEmpty else {
             suggestions = []
@@ -141,13 +164,13 @@ struct AddProjectSheet: View {
             try? await Task.sleep(for: .milliseconds(180))
             if Task.isCancelled { return }
             let results = await store.suggestDirectories(trimmed)
-            if Task.isCancelled { return }
+            if Task.isCancelled || !store.isServerLive { return }
             suggestions = results
         }
     }
 
     private func add() {
-        guard let path = selectedPath, !adding else { return }
+        guard let path = selectedPath, !adding, store.isServerLive else { return }
         adding = true
         addError = nil
         Task {

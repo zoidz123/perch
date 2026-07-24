@@ -63,7 +63,7 @@ struct NewAgentSheet: View {
                                 Text("Start").fontWeight(.semibold)
                             }
                         }
-                        .disabled(!canStart || starting)
+                        .disabled(!canStart || starting || !store.isServerLive)
                     }
                     ToolbarItemGroup(placement: .keyboard) {
                         Spacer()
@@ -82,9 +82,6 @@ struct NewAgentSheet: View {
                         agent = kind
                     }
                     model = resolvedModel(for: agent)
-                    recents = await store.fetchProjects()
-                    // Default the destination to the most recent project.
-                    if selectedPath == nil { selectedPath = recents.first?.rootPath }
                     // E2E hook: -PerchDictationDemo drives one scripted record -> stop
                     // pass on the kickoff prompt (it implies the fake engine) so the
                     // recording UI and the committed transcript can be captured under
@@ -96,6 +93,9 @@ struct NewAgentSheet: View {
                         try? await Task.sleep(for: .seconds(4))
                         dictation.finishRecording()
                     }
+                }
+                .task(id: store.isServerLive) {
+                    await updateProjectRowsForAvailability()
                 }
             }
         }
@@ -251,29 +251,39 @@ struct NewAgentSheet: View {
                     .textInputAutocapitalization(.never)
                     .focused($searchFocused)
                     .onChange(of: query) { _, value in scheduleSearch(value) }
+                    .disabled(!store.isServerLive)
             }
             .padding(.vertical, 10)
             .padding(.horizontal, 12)
             .background(Style.secondaryFill)
             .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
 
-            // Live suggestions while searching, recents otherwise.
-            let rows = query.trimmingCharacters(in: .whitespaces).isEmpty
-                ? recents.map(\.rootPath)
-                : suggestions
-            VStack(spacing: 0) {
-                ForEach(rows, id: \.self) { path in
-                    projectRow(path)
-                    if path != rows.last { Divider().overlay(Style.hairline) }
+            switch store.presentedServerAvailability.snapshotSurfaceState {
+            case .content:
+                let rows = query.trimmingCharacters(in: .whitespaces).isEmpty
+                    ? recents.map(\.rootPath)
+                    : suggestions
+                VStack(spacing: 0) {
+                    ForEach(rows, id: \.self) { path in
+                        projectRow(path)
+                        if path != rows.last { Divider().overlay(Style.hairline) }
+                    }
+                    if rows.isEmpty {
+                        Text(query.isEmpty ? "No recent projects yet" : "No matches")
+                            .font(.system(size: 14))
+                            .foregroundStyle(Style.textSecondary)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                            .padding(.vertical, 12)
+                            .padding(.horizontal, 4)
+                    }
                 }
-                if rows.isEmpty {
-                    Text(query.isEmpty ? "No recent projects yet" : "No matches")
-                        .font(.system(size: 14))
-                        .foregroundStyle(Style.textSecondary)
-                        .frame(maxWidth: .infinity, alignment: .leading)
-                        .padding(.vertical, 12)
-                        .padding(.horizontal, 4)
+            case .placeholders:
+                VStack(spacing: 8) {
+                    ConnectionPlaceholderRow()
+                    ConnectionPlaceholderRow(short: true)
                 }
+            case .offlineRetry:
+                ConnectionOfflineSheetState()
             }
         }
     }
@@ -372,8 +382,26 @@ struct NewAgentSheet: View {
         selectedPath != nil
     }
 
+    private func updateProjectRowsForAvailability() async {
+        searchTask?.cancel()
+        suggestions = []
+        recents = []
+        selectedPath = nil
+        guard store.isServerLive else { return }
+
+        let projects = await store.fetchProjects()
+        guard !Task.isCancelled, store.isServerLive else { return }
+        recents = projects
+        selectedPath = projects.first?.rootPath
+        scheduleSearch(query)
+    }
+
     private func scheduleSearch(_ value: String) {
         searchTask?.cancel()
+        guard store.isServerLive else {
+            suggestions = []
+            return
+        }
         let trimmed = value.trimmingCharacters(in: .whitespaces)
         guard !trimmed.isEmpty else {
             suggestions = []
@@ -383,13 +411,13 @@ struct NewAgentSheet: View {
             try? await Task.sleep(for: .milliseconds(180))
             if Task.isCancelled { return }
             let results = await store.suggestDirectories(trimmed)
-            if Task.isCancelled { return }
+            if Task.isCancelled || !store.isServerLive { return }
             suggestions = results
         }
     }
 
     private func start() {
-        guard let path = selectedPath, !starting else { return }
+        guard let path = selectedPath, !starting, store.isServerLive else { return }
         starting = true
         Task {
             let ok = await store.startAgent(

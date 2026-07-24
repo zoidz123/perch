@@ -68,14 +68,11 @@ final class PerchStore: ObservableObject {
     }
     // Bumped when lastSeen changes so attention dots re-derive.
     @Published private(set) var seenVersion = 0
-    // Raw socket state changes can arrive several times per second when a
-    // relay registration flaps. Do not publish those changes through the
-    // shared store: doing so invalidates the entire home screen. Only the
-    // hysteresis-filtered availability below is UI state.
-    private(set) var connectionState = "Disconnected" {
-        didSet { observeConnectionState() }
-    }
-    @Published private(set) var presentedServerAvailability: PresentedServerAvailability = .online
+    // Raw socket state changes are diagnostics, not product readiness. A relay
+    // socket can receive e2ee_ready before the Mac authenticates it and emits
+    // the fleet snapshot the phone can safely present.
+    private(set) var connectionState = "Disconnected"
+    @Published private(set) var presentedServerAvailability: PresentedServerAvailability = .connecting
     @Published var errorMessage: String?
     @Published private(set) var taskRefreshErrorMessage: String?
     @Published var isLoading = false
@@ -120,11 +117,22 @@ final class PerchStore: ObservableObject {
     private var keepaliveTask: Task<Void, Never>?
     private var connectionPresentationTask: Task<Void, Never>?
     private var connectionStatusHysteresis = ConnectionStatusHysteresis()
+    private var refreshTask: Task<Void, Never>?
+    private var refreshGeneration = 0
     private var selectionToken: UUID?
     // Encrypted transport state (nil on the legacy plaintext path). The channel
     // is recreated per socket; e2eeRetryTask re-sends e2ee_hello until the
     // server acks; pendingSends holds app frames until the channel opens.
     private var channel: EncryptedChannel?
+    // Per-socket evidence. A relay RPC is useful for foreground reconciliation
+    // only after this connection has received its first decrypted fleet frame.
+    private var hasReceivedFleetSnapshotForSocket = false
+    private var needsDirectReconciliationAfterSocketReconnect = false
+    private var isReconcilingDirectSocket = false
+    private var fleetReconciliationTask: Task<Bool, Never>?
+    private var fleetReconciliationID: UUID?
+    private var fleetReconciliationQueue = FleetReconciliationQueue()
+    private var latestFleetSessionsWhileReconciling: [AgentSession]?
     private var e2eeRetryTask: Task<Void, Never>?
     private var pendingSends: [QueuedSocketSend] = []
     private struct PendingRPC {
@@ -149,17 +157,21 @@ final class PerchStore: ObservableObject {
     }
 
     var isServerLive: Bool {
-        presentedServerAvailability == .online
+        presentedServerAvailability.permitsServerActions
     }
 
-    private func observeConnectionState() {
+    var isConnectingToServer: Bool {
+        presentedServerAvailability == .connecting
+    }
+
+    private func beginConnectionReadiness() {
         let now = ProcessInfo.processInfo.systemUptime
-        if connectionStatusHysteresis.observe(isLive: connectionState == "Live", at: now) {
-            presentedServerAvailability = connectionStatusHysteresis.presentedAvailability
+        if connectionStatusHysteresis.beginConnecting(at: now) {
+            publishConnectionAvailability(reason: "readiness started")
         }
 
         connectionPresentationTask?.cancel()
-        guard let deadline = connectionStatusHysteresis.offlineDeadline else {
+        guard let deadline = connectionStatusHysteresis.readinessDeadline else {
             connectionPresentationTask = nil
             return
         }
@@ -168,10 +180,38 @@ final class PerchStore: ObservableObject {
             try? await Task.sleep(for: .seconds(delay))
             guard let self, !Task.isCancelled else { return }
             if self.connectionStatusHysteresis.advance(to: ProcessInfo.processInfo.systemUptime) {
-                self.presentedServerAvailability = self.connectionStatusHysteresis.presentedAvailability
+                self.publishConnectionAvailability(reason: "readiness deadline expired")
             }
             self.connectionPresentationTask = nil
         }
+    }
+
+    @discardableResult
+    private func completeConnectionReadiness(
+        _ evidence: ConnectionReadinessEvidence,
+        reason: String
+    ) -> Bool {
+        guard connectionStatusHysteresis.observe(evidence) else {
+            return false
+        }
+        connectionPresentationTask?.cancel()
+        connectionPresentationTask = nil
+        reconnectAttempts = 0
+        reconnectTask?.cancel()
+        reconnectTask = nil
+        publishConnectionAvailability(reason: reason)
+        return true
+    }
+
+    private func publishConnectionAvailability(reason: String) {
+        let next = connectionStatusHysteresis.presentedAvailability
+        guard presentedServerAvailability != next else { return }
+        let previous = presentedServerAvailability
+        presentedServerAvailability = next
+        #if DEBUG
+        let timestamp = ISO8601DateFormatter().string(from: Date())
+        print("Perch: connection \(previous) -> \(next) [\(reason)] at \(timestamp)")
+        #endif
     }
 
     private var activeEndpoint: SavedEndpoint? {
@@ -244,11 +284,22 @@ final class PerchStore: ObservableObject {
         // Leaving a cancelled task in place would block every future
         // scheduleReconnect (it guards on reconnectTask == nil).
         reconnectTask = nil
+        refreshTask?.cancel()
+        refreshTask = nil
+        refreshGeneration += 1
         keepaliveTask?.cancel()
         keepaliveTask = nil
         e2eeRetryTask?.cancel()
         e2eeRetryTask = nil
         channel = nil
+        hasReceivedFleetSnapshotForSocket = false
+        needsDirectReconciliationAfterSocketReconnect = false
+        isReconcilingDirectSocket = false
+        fleetReconciliationTask?.cancel()
+        fleetReconciliationTask = nil
+        fleetReconciliationID = nil
+        fleetReconciliationQueue.reset()
+        latestFleetSessionsWhileReconciling = nil
         pendingSends = []
         failPendingRPCs(PerchClientError.connectionReset)
         webSocketTask?.cancel(with: .goingAway, reason: nil)
@@ -256,10 +307,10 @@ final class PerchStore: ObservableObject {
         connectionState = "Not paired"
     }
 
-    // Exponential backoff reconnect with endpoint failover: after a couple of
-    // failures on the active endpoint, re-probe every stored endpoint and
-    // switch to whichever answers fastest (for example, a direct endpoint at home).
-    private func scheduleReconnect() {
+    // Exponential backoff reconnect with endpoint failover: after each failure,
+    // re-probe every stored endpoint and switch to whichever answers fastest
+    // (for example, a direct endpoint at home).
+    private func scheduleReconnect(presentingReadiness: Bool = true) {
         guard isPaired, reconnectTask == nil else {
             return
         }
@@ -287,29 +338,16 @@ final class PerchStore: ObservableObject {
                 }
             }
 
-            await self.refresh()
-        }
-    }
-
-    private func noteConnected() {
-        let wasReconnecting = reconnectAttempts > 0
-        reconnectAttempts = 0
-        reconnectTask?.cancel()
-        reconnectTask = nil
-        // Missed live items during the outage: the authoritative fetch is
-        // the catch-up path (live stream = immediacy, fetch = truth).
-        if wasReconnecting {
-            Task {
-                await self.refetchAuthoritativeFleet()
-                if let selectedSessionId = self.selectedSessionId {
-                    await self.loadTimeline(selectedSessionId)
-                }
+            if presentingReadiness {
+                await self.refresh()
+            } else {
+                self.connectWebSocket()
             }
         }
     }
 
-    // Scene-phase resume: revalidate on foreground and perform a full resync when
-    // away for a while). Called from the root view.
+    // Scene-phase resume always revalidates on foreground. The shared refresh
+    // coalesces overlapping launch and activation requests.
     private var backgroundedAt: Date?
 
     func sceneDidBackground() {
@@ -320,9 +358,6 @@ final class PerchStore: ObservableObject {
         guard isPaired else { return }
         backgroundedAt = nil
         await refresh()
-        if let selectedSessionId {
-            await loadTimeline(selectedSessionId)
-        }
     }
 
     func session(for sessionId: String) -> AgentSession? {
@@ -557,13 +592,47 @@ final class PerchStore: ObservableObject {
             return
         }
 
+        // Cold launch and scene activation can arrive together. One attempt
+        // owns the outstanding request/socket, while later callers await its
+        // result instead of cancelling it to start another attempt.
+        if let refreshTask {
+            await refreshTask.value
+            return
+        }
+
+        let retryingOfflineRelay = isRelayActive && presentedServerAvailability == .offline
+        refreshGeneration += 1
+        let generation = refreshGeneration
+        beginConnectionReadiness()
+        let task = Task { @MainActor [weak self] in
+            guard let self else { return }
+            await self.performRefresh(retryingOfflineRelay: retryingOfflineRelay)
+        }
+        refreshTask = task
+        await task.value
+        if refreshGeneration == generation {
+            refreshTask = nil
+        }
+    }
+
+    private func performRefresh(retryingOfflineRelay: Bool) async {
         isLoading = true
         defer { isLoading = false }
 
         if isRelayActive {
-            if webSocketTask?.state != .running {
-                connectWebSocket()
-                connectionState = "Connecting"
+            // Do not replace a healthy relay socket during a foreground
+            // refresh. An encrypted reconciliation response is fresh
+            // authenticated server data; a new socket still waits for an
+            // authenticated fleet frame before it can become Online.
+            if webSocketTask == nil || retryingOfflineRelay {
+                connectWebSocket(forceReconnect: retryingOfflineRelay)
+            } else if channel?.isOpen == true,
+                      hasReceivedFleetSnapshotForSocket,
+                      await reconcileFleet(.full) {
+                _ = completeConnectionReadiness(
+                    .authenticatedFleetSnapshot,
+                    reason: "authenticated relay reconciliation"
+                )
             }
             errorMessage = nil
             Task { [weak self] in
@@ -596,11 +665,15 @@ final class PerchStore: ObservableObject {
             if let chartsResult: ChartsResult = try? await request(path: "/charts") {
                 charts = chartsResult.charts
             }
-            connectionState = "Live"
+            if let selectedSessionId {
+                await loadTimeline(selectedSessionId)
+            }
+            connectionState = "Direct bootstrap complete"
+            _ = completeConnectionReadiness(.directBootstrap, reason: "fresh direct bootstrap")
             errorMessage = nil
             // Never tear down a healthy socket (foreground/pull-to-refresh
             // call this constantly); reconnect only when it is gone or dead.
-            if webSocketTask?.state != .running {
+            if webSocketTask == nil {
                 connectWebSocket()
             }
         } catch {
@@ -1223,14 +1296,17 @@ final class PerchStore: ObservableObject {
 
     // Reconnect and recovery both converge through full server snapshots.
     // Neither path derives task/runtime state from socket presence.
-    private func refetchAuthoritativeFleet() async {
-        if let response: SessionsResponse = try? await request(path: "/sessions") {
-            sessions = response.sessions
+    @discardableResult
+    private func refetchAuthoritativeFleet() async -> Bool {
+        guard let response: SessionsResponse = try? await request(path: "/sessions") else {
+            return false
         }
+        sessions = response.sessions
         await refreshTaskSnapshot()
         if let response: ProjectsResult = try? await request(path: "/projects") {
             projects = response.projects
         }
+        return true
     }
 
     private func refreshTaskSnapshot() async {
@@ -1343,7 +1419,10 @@ final class PerchStore: ObservableObject {
         }
     }
 
-    func connectWebSocket() {
+    func connectWebSocket(forceReconnect: Bool = false) {
+        guard forceReconnect || webSocketTask == nil else {
+            return
+        }
         let endpoint = activeEndpoint ?? SavedEndpoint.legacy(serverURL, serverId: savedHost?.serverId, pk: savedHost?.pk)
         webSocketTask?.cancel(with: .goingAway, reason: nil)
         failPendingRPCs(PerchClientError.connectionReset)
@@ -1351,6 +1430,7 @@ final class PerchStore: ObservableObject {
         e2eeRetryTask?.cancel()
         e2eeRetryTask = nil
         channel = nil
+        hasReceivedFleetSnapshotForSocket = false
         pendingSends = []
 
         guard var components = URLComponents(string: endpoint.url) else {
@@ -1430,6 +1510,9 @@ final class PerchStore: ObservableObject {
     // encrypted frame, then flush any app frames queued while handshaking.
     private func onE2eeReady() {
         guard let task = webSocketTask, let channel else { return }
+        // This intentionally leaves the presentation in Connecting. The next
+        // decrypted fleet payload is the readiness evidence for relay.
+        _ = connectionStatusHysteresis.observe(.encryptedChannel)
         e2eeRetryTask?.cancel()
         e2eeRetryTask = nil
         if let auth = channel.authFrame() {
@@ -1472,7 +1555,11 @@ final class PerchStore: ObservableObject {
                         self.webSocketTask?.cancel(with: .goingAway, reason: nil)
                         self.webSocketTask = nil
                         self.connectionState = "Connection lost"
-                        self.scheduleReconnect()
+                        self.beginConnectionReadiness()
+                        if !self.isRelayActive {
+                            self.needsDirectReconciliationAfterSocketReconnect = true
+                        }
+                        self.scheduleReconnect(presentingReadiness: self.isRelayActive)
                     }
                 }
             }
@@ -1722,14 +1809,34 @@ final class PerchStore: ObservableObject {
 
                 switch result {
                 case let .success(message):
-                    self.connectionState = "Live"
-                    self.noteConnected()
+                    if !self.isRelayActive {
+                        self.reconnectAttempts = 0
+                    }
+                    if !self.isRelayActive,
+                       self.needsDirectReconciliationAfterSocketReconnect,
+                       !self.isReconcilingDirectSocket {
+                        self.isReconcilingDirectSocket = true
+                        Task { [weak self] in
+                            guard let self else { return }
+                            await self.refresh()
+                            if self.isServerLive {
+                                self.needsDirectReconciliationAfterSocketReconnect = false
+                            }
+                            self.isReconcilingDirectSocket = false
+                        }
+                    }
                     self.handle(message)
                     self.receiveSocketMessage()
                 case let .failure(error):
                     self.connectionState = error.localizedDescription
+                    self.webSocketTask = nil
+                    self.hasReceivedFleetSnapshotForSocket = false
                     self.failPendingRPCs(error)
-                    self.scheduleReconnect()
+                    self.beginConnectionReadiness()
+                    if !self.isRelayActive {
+                        self.needsDirectReconciliationAfterSocketReconnect = true
+                    }
+                    self.scheduleReconnect(presentingReadiness: self.isRelayActive)
                 }
             }
         }
@@ -1769,8 +1876,13 @@ final class PerchStore: ObservableObject {
                 // the socket and reconnect, which renegotiates a fresh channel.
                 webSocketTask?.cancel(with: .goingAway, reason: nil)
                 webSocketTask = nil
+                hasReceivedFleetSnapshotForSocket = false
                 failPendingRPCs(PerchClientError.connectionReset)
-                scheduleReconnect()
+                beginConnectionReadiness()
+                if !isRelayActive {
+                    needsDirectReconciliationAfterSocketReconnect = true
+                }
+                scheduleReconnect(presentingReadiness: isRelayActive)
             }
             return
         }
@@ -1788,11 +1900,27 @@ final class PerchStore: ObservableObject {
             case let .event(event):
                 self.appendEvent(event)
             case let .fleet(sessions):
+                hasReceivedFleetSnapshotForSocket = true
                 self.sessions = sessions
-                // The task ledger has no live stream; ride the fleet frame
-                // (already coalesced server-side) with a throttled refetch so
-                // crew rows appear without a pull-to-refresh.
-                self.refreshTasksThrottled()
+                if fleetReconciliationTask != nil {
+                    latestFleetSessionsWhileReconciling = sessions
+                }
+                let completedRelayReadiness = isRelayActive && completeConnectionReadiness(
+                    .authenticatedFleetSnapshot,
+                    reason: "decrypted authenticated relay fleet"
+                )
+                if completedRelayReadiness {
+                    // A fleet frame establishes readiness. The REST/RPC reads
+                    // immediately converge task/project snapshots and the open
+                    // timeline after any reconnect gap.
+                    Task { [weak self] in
+                        _ = await self?.reconcileFleet(.full)
+                    }
+                } else {
+                    Task { [weak self] in
+                        _ = await self?.reconcileFleet(.partial)
+                    }
+                }
             case .hello:
                 break
             }
@@ -1834,22 +1962,84 @@ final class PerchStore: ObservableObject {
     }
 
     private var lastTasksFetch = Date.distantPast
+    private let fleetReconciliationThrottle = FleetReconciliationThrottle(minimumInterval: 2)
 
-    private func refreshTasksThrottled() {
-        guard Date().timeIntervalSince(lastTasksFetch) > 2 else { return }
-        lastTasksFetch = Date()
-        Task {
-            await self.refreshTaskSnapshot()
-            // Projects ride the same cadence: on the relay path refresh()
-            // never runs its HTTP block, so this is where the mate panel's
-            // scope headers get their data.
-            if let result: ProjectsResult = try? await self.request(path: "/projects") {
-                self.projects = result.projects
+    private func reconcileFleet(_ scope: FleetReconciliationScope) async -> Bool {
+        guard isPaired else { return false }
+        if let task = fleetReconciliationTask,
+           let reconciliationID = fleetReconciliationID {
+            _ = fleetReconciliationQueue.request(scope)
+            _ = await task.value
+            finishFleetReconciliation(reconciliationID)
+            return await awaitActiveFleetReconciliation()
+        }
+
+        guard fleetReconciliationQueue.request(scope) else {
+            return await reconcileFleet(scope)
+        }
+        let (reconciliationID, task) = beginFleetReconciliation(scope)
+        let result = await task.value
+        finishFleetReconciliation(reconciliationID)
+        return result
+    }
+
+    private func awaitActiveFleetReconciliation() async -> Bool {
+        guard let task = fleetReconciliationTask,
+              let reconciliationID = fleetReconciliationID else {
+            return false
+        }
+        let result = await task.value
+        finishFleetReconciliation(reconciliationID)
+        return result
+    }
+
+    private func beginFleetReconciliation(
+        _ scope: FleetReconciliationScope
+    ) -> (UUID, Task<Bool, Never>) {
+        let reconciliationID = UUID()
+        fleetReconciliationID = reconciliationID
+        latestFleetSessionsWhileReconciling = nil
+        let delay = scope == .partial
+            ? fleetReconciliationThrottle.delaySinceLastStart(lastTasksFetch, now: Date())
+            : 0
+        let task = Task { [weak self] in
+            guard let self else { return false }
+            if delay > 0 {
+                try? await Task.sleep(for: .seconds(delay))
+                guard !Task.isCancelled else { return false }
             }
-            // Charts too - the relay path's only pull besides the WS message.
-            if let result: ChartsResult = try? await self.request(path: "/charts") {
-                self.charts = result.charts
+            if scope == .full {
+                let refreshed = await self.refetchAuthoritativeFleet()
+                if let selectedSessionId = self.selectedSessionId {
+                    await self.loadTimeline(selectedSessionId)
+                }
+                return refreshed
+            } else {
+                self.lastTasksFetch = Date()
+                await self.refreshTaskSnapshot()
+                if let result: ProjectsResult = try? await self.request(path: "/projects") {
+                    self.projects = result.projects
+                }
+                if let result: ChartsResult = try? await self.request(path: "/charts") {
+                    self.charts = result.charts
+                }
+                return true
             }
+        }
+        fleetReconciliationTask = task
+        return (reconciliationID, task)
+    }
+
+    private func finishFleetReconciliation(_ reconciliationID: UUID) {
+        guard fleetReconciliationID == reconciliationID else { return }
+        if let latestFleetSessionsWhileReconciling {
+            sessions = latestFleetSessionsWhileReconciling
+        }
+        latestFleetSessionsWhileReconciling = nil
+        fleetReconciliationTask = nil
+        fleetReconciliationID = nil
+        if let nextScope = fleetReconciliationQueue.complete() {
+            _ = beginFleetReconciliation(nextScope)
         }
     }
 
