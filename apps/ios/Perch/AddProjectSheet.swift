@@ -37,7 +37,8 @@ struct AddProjectSheet: View {
                     .background(Style.secondaryFill)
                     .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
 
-                    if store.isServerLive {
+                    switch store.presentedServerAvailability.snapshotSurfaceState {
+                    case .content:
                         VStack(spacing: 0) {
                             ForEach(suggestions, id: \.self) { path in
                                 directoryRow(path)
@@ -54,11 +55,13 @@ struct AddProjectSheet: View {
                                     .padding(.horizontal, 4)
                             }
                         }
-                    } else {
+                    case .placeholders:
                         VStack(spacing: 8) {
                             ConnectionPlaceholderRow()
                             ConnectionPlaceholderRow(short: true)
                         }
+                    case .offlineRetry:
+                        ConnectionOfflineSheetState()
                     }
 
                     if let addError {

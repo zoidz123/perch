@@ -922,6 +922,49 @@ struct ConnectionOfflineDetail: View {
     }
 }
 
+struct ConnectionOfflineSheetState: View {
+    @EnvironmentObject private var store: PerchStore
+
+    var body: some View {
+        VStack(spacing: 12) {
+            Image(systemName: "wifi.exclamationmark")
+                .font(.system(size: 24, weight: .regular))
+                .foregroundStyle(Style.warningText)
+            Text("Mac offline")
+                .font(.system(size: 17, weight: .semibold))
+                .foregroundStyle(Style.textPrimary)
+            Text("Start Perch on your computer, then refresh.")
+                .font(.system(size: 14))
+                .foregroundStyle(Style.textFaint)
+                .multilineTextAlignment(.center)
+            Button {
+                Task { await store.refresh() }
+            } label: {
+                HStack(spacing: 8) {
+                    if store.isLoading {
+                        ProgressView()
+                            .controlSize(.small)
+                            .tint(.black)
+                    } else {
+                        Image(systemName: "arrow.clockwise")
+                            .font(.system(size: 14, weight: .semibold))
+                    }
+                    Text(store.isLoading ? "Checking…" : "Refresh")
+                        .font(.system(size: 15, weight: .semibold))
+                }
+                .padding(.horizontal, 24)
+                .padding(.vertical, 11)
+                .background(Style.textPrimary)
+                .foregroundStyle(.black)
+                .clipShape(Capsule())
+            }
+            .disabled(store.isLoading)
+        }
+        .frame(maxWidth: .infinity)
+        .padding(.vertical, 20)
+    }
+}
+
 // The L-shaped connector from a project header down into a nested crew row.
 struct TaskThreadLine: Shape {
     func path(in rect: CGRect) -> Path {

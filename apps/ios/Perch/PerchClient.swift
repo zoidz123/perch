@@ -129,9 +129,9 @@ final class PerchStore: ObservableObject {
     private var hasReceivedFleetSnapshotForSocket = false
     private var needsDirectReconciliationAfterSocketReconnect = false
     private var isReconcilingDirectSocket = false
-    private var fleetReconciliationTask: Task<Void, Never>?
+    private var fleetReconciliationTask: Task<Bool, Never>?
     private var fleetReconciliationID: UUID?
-    private var fleetRefreshPending = false
+    private var fleetReconciliationQueue = FleetReconciliationQueue()
     private var latestFleetSessionsWhileReconciling: [AgentSession]?
     private var e2eeRetryTask: Task<Void, Never>?
     private var pendingSends: [QueuedSocketSend] = []
@@ -298,7 +298,7 @@ final class PerchStore: ObservableObject {
         fleetReconciliationTask?.cancel()
         fleetReconciliationTask = nil
         fleetReconciliationID = nil
-        fleetRefreshPending = false
+        fleetReconciliationQueue.reset()
         latestFleetSessionsWhileReconciling = nil
         pendingSends = []
         failPendingRPCs(PerchClientError.connectionReset)
@@ -628,10 +628,7 @@ final class PerchStore: ObservableObject {
                 connectWebSocket(forceReconnect: retryingOfflineRelay)
             } else if channel?.isOpen == true,
                       hasReceivedFleetSnapshotForSocket,
-                      await refetchAuthoritativeFleet() {
-                if let selectedSessionId {
-                    await loadTimeline(selectedSessionId)
-                }
+                      await reconcileFleet(.full) {
                 _ = completeConnectionReadiness(
                     .authenticatedFleetSnapshot,
                     reason: "authenticated relay reconciliation"
@@ -1916,9 +1913,13 @@ final class PerchStore: ObservableObject {
                     // A fleet frame establishes readiness. The REST/RPC reads
                     // immediately converge task/project snapshots and the open
                     // timeline after any reconnect gap.
-                    startFleetReconciliation(full: true)
+                    Task { [weak self] in
+                        _ = await self?.reconcileFleet(.full)
+                    }
                 } else {
-                    refreshTasksThrottled()
+                    Task { [weak self] in
+                        _ = await self?.reconcileFleet(.partial)
+                    }
                 }
             case .hello:
                 break
@@ -1962,31 +1963,49 @@ final class PerchStore: ObservableObject {
 
     private var lastTasksFetch = Date.distantPast
 
-    private func refreshTasksThrottled() {
-        startFleetReconciliation(full: false)
-    }
-
-    private func startFleetReconciliation(full: Bool) {
-        guard fleetReconciliationTask == nil else {
-            fleetRefreshPending = true
-            return
+    private func reconcileFleet(_ scope: FleetReconciliationScope) async -> Bool {
+        guard isPaired else { return false }
+        if let task = fleetReconciliationTask,
+           let activeScope = fleetReconciliationQueue.active,
+           let reconciliationID = fleetReconciliationID {
+            _ = fleetReconciliationQueue.request(scope)
+            let activeSatisfiesRequest = activeScope.rawValue >= scope.rawValue
+            let result = await task.value
+            finishFleetReconciliation(reconciliationID)
+            if activeSatisfiesRequest {
+                return result
+            }
+            return await reconcileFleet(scope)
         }
-        if !full {
-            guard Date().timeIntervalSince(lastTasksFetch) > 2 else { return }
+
+        if scope == .partial {
+            guard Date().timeIntervalSince(lastTasksFetch) > 2 else { return true }
             lastTasksFetch = Date()
         }
 
+        guard fleetReconciliationQueue.request(scope) else {
+            return await reconcileFleet(scope)
+        }
+        let (reconciliationID, task) = beginFleetReconciliation(scope)
+        let result = await task.value
+        finishFleetReconciliation(reconciliationID)
+        return result
+    }
+
+    private func beginFleetReconciliation(
+        _ scope: FleetReconciliationScope
+    ) -> (UUID, Task<Bool, Never>) {
         let reconciliationID = UUID()
         fleetReconciliationID = reconciliationID
-        fleetRefreshPending = false
         latestFleetSessionsWhileReconciling = nil
-        fleetReconciliationTask = Task { [weak self] in
-            guard let self else { return }
-            if full {
-                _ = await self.refetchAuthoritativeFleet()
+        let task = Task { [weak self] in
+            guard let self else { return false }
+            if scope == .full {
+                let refreshed = await self.refetchAuthoritativeFleet()
                 if let selectedSessionId = self.selectedSessionId {
                     await self.loadTimeline(selectedSessionId)
                 }
+                return refreshed
             } else {
                 await self.refreshTaskSnapshot()
                 if let result: ProjectsResult = try? await self.request(path: "/projects") {
@@ -1995,20 +2014,23 @@ final class PerchStore: ObservableObject {
                 if let result: ChartsResult = try? await self.request(path: "/charts") {
                     self.charts = result.charts
                 }
+                return true
             }
+        }
+        fleetReconciliationTask = task
+        return (reconciliationID, task)
+    }
 
-            guard self.fleetReconciliationID == reconciliationID else { return }
-            if let latestFleetSessionsWhileReconciling = self.latestFleetSessionsWhileReconciling {
-                self.sessions = latestFleetSessionsWhileReconciling
-            }
-            let refreshAgain = self.fleetRefreshPending
-            self.fleetRefreshPending = false
-            self.latestFleetSessionsWhileReconciling = nil
-            self.fleetReconciliationTask = nil
-            self.fleetReconciliationID = nil
-            if refreshAgain {
-                self.refreshTasksThrottled()
-            }
+    private func finishFleetReconciliation(_ reconciliationID: UUID) {
+        guard fleetReconciliationID == reconciliationID else { return }
+        if let latestFleetSessionsWhileReconciling {
+            sessions = latestFleetSessionsWhileReconciling
+        }
+        latestFleetSessionsWhileReconciling = nil
+        fleetReconciliationTask = nil
+        fleetReconciliationID = nil
+        if let nextScope = fleetReconciliationQueue.complete() {
+            _ = beginFleetReconciliation(nextScope)
         }
     }
 

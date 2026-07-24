@@ -62,4 +62,39 @@ final class ConnectionStatusPresentationTests: XCTestCase {
         XCTAssertTrue(status.observe(.directBootstrap))
         XCTAssertEqual(status.presentedAvailability, .online)
     }
+
+    func testQueuedFullRelayReconciliationRetainsTimelineRecoveryScope() {
+        var queue = FleetReconciliationQueue()
+
+        XCTAssertTrue(queue.request(.partial))
+        XCTAssertFalse(queue.request(.full))
+        XCTAssertEqual(queue.active, .partial)
+        XCTAssertEqual(queue.pending, .full)
+        XCTAssertEqual(queue.complete(), .full)
+    }
+
+    func testForegroundAndFleetRefreshesShareOneReconciliation() {
+        var queue = FleetReconciliationQueue()
+
+        XCTAssertTrue(queue.request(.full))
+        XCTAssertFalse(queue.request(.full))
+        XCTAssertFalse(queue.request(.partial))
+        XCTAssertEqual(queue.active, .full)
+        XCTAssertNil(queue.pending)
+    }
+
+    func testSheetSnapshotStateDistinguishesConnectingOnlineAndOffline() {
+        XCTAssertEqual(
+            PresentedServerAvailability.connecting.snapshotSurfaceState,
+            .placeholders
+        )
+        XCTAssertEqual(
+            PresentedServerAvailability.online.snapshotSurfaceState,
+            .content
+        )
+        XCTAssertEqual(
+            PresentedServerAvailability.offline.snapshotSurfaceState,
+            .offlineRetry
+        )
+    }
 }

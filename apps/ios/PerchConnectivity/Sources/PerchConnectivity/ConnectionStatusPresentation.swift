@@ -14,6 +14,55 @@ enum PresentedServerAvailability: Equatable {
     }
 }
 
+enum ServerSnapshotSurfaceState: Equatable {
+    case placeholders
+    case content
+    case offlineRetry
+}
+
+extension PresentedServerAvailability {
+    var snapshotSurfaceState: ServerSnapshotSurfaceState {
+        switch self {
+        case .connecting: .placeholders
+        case .online: .content
+        case .offline: .offlineRetry
+        }
+    }
+}
+
+enum FleetReconciliationScope: Int, Equatable {
+    case partial
+    case full
+}
+
+struct FleetReconciliationQueue {
+    private(set) var active: FleetReconciliationScope?
+    private(set) var pending: FleetReconciliationScope?
+
+    mutating func request(_ scope: FleetReconciliationScope) -> Bool {
+        guard let active else {
+            self.active = scope
+            return true
+        }
+        if scope.rawValue > active.rawValue,
+           scope.rawValue > (pending?.rawValue ?? -1) {
+            pending = scope
+        }
+        return false
+    }
+
+    mutating func complete() -> FleetReconciliationScope? {
+        active = pending
+        pending = nil
+        return active
+    }
+
+    mutating func reset() {
+        active = nil
+        pending = nil
+    }
+}
+
 enum ConnectionReadinessEvidence: Equatable {
     case directBootstrap
     case encryptedChannel
