@@ -11,6 +11,7 @@
 		9A2222222222222222222002 /* Clibsodium in Frameworks */ = {isa = PBXBuildFile; productRef = 9A2222222222222222222102 /* Clibsodium */; };
 		9A2222222222222222222003 /* PerchUsage in Frameworks */ = {isa = PBXBuildFile; productRef = 9A2222222222222222222103 /* PerchUsage */; };
 		9A2222222222222222222004 /* PerchSessionNavigation in Frameworks */ = {isa = PBXBuildFile; productRef = 9A2222222222222222222104 /* PerchSessionNavigation */; };
+		9A2222222222222222222005 /* PerchMatePresentation in Frameworks */ = {isa = PBXBuildFile; productRef = 9A2222222222222222222105 /* PerchMatePresentation */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXFileReference section */
@@ -51,6 +52,7 @@
 				9A2222222222222222222002 /* Clibsodium in Frameworks */,
 				9A2222222222222222222003 /* PerchUsage in Frameworks */,
 				9A2222222222222222222004 /* PerchSessionNavigation in Frameworks */,
+				9A2222222222222222222005 /* PerchMatePresentation in Frameworks */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -97,6 +99,7 @@
 				9A2222222222222222222102 /* Clibsodium */,
 				9A2222222222222222222103 /* PerchUsage */,
 				9A2222222222222222222104 /* PerchSessionNavigation */,
+				9A2222222222222222222105 /* PerchMatePresentation */,
 			);
 			productName = Perch;
 			productReference = 9A1111111111111111111205 /* Perch.app */;
@@ -130,6 +133,7 @@
 				9A2222222222222222222202 /* XCRemoteSwiftPackageReference "swift-sodium" */,
 				9A2222222222222222222203 /* XCLocalSwiftPackageReference "PerchUsage" */,
 				9A2222222222222222222204 /* XCLocalSwiftPackageReference "PerchSessionNavigation" */,
+				9A2222222222222222222205 /* XCLocalSwiftPackageReference "PerchMatePresentation" */,
 			);
 			minimizedProjectReferenceProxies = 1;
 			preferredProjectObjectVersion = 77;
@@ -170,6 +174,10 @@
 		9A2222222222222222222204 /* XCLocalSwiftPackageReference "PerchSessionNavigation" */ = {
 			isa = XCLocalSwiftPackageReference;
 			relativePath = PerchSessionNavigation;
+		};
+		9A2222222222222222222205 /* XCLocalSwiftPackageReference "PerchMatePresentation" */ = {
+			isa = XCLocalSwiftPackageReference;
+			relativePath = PerchMatePresentation;
 		};
 /* End XCLocalSwiftPackageReference section */
 
@@ -212,6 +220,11 @@
 			isa = XCSwiftPackageProductDependency;
 			package = 9A2222222222222222222204 /* XCLocalSwiftPackageReference "PerchSessionNavigation" */;
 			productName = PerchSessionNavigation;
+		};
+		9A2222222222222222222105 /* PerchMatePresentation */ = {
+			isa = XCSwiftPackageProductDependency;
+			package = 9A2222222222222222222205 /* XCLocalSwiftPackageReference "PerchMatePresentation" */;
+			productName = PerchMatePresentation;
 		};
 /* End XCSwiftPackageProductDependency section */
 
