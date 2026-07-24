@@ -1,6 +1,6 @@
 # Perch CLI
 
-This guide describes `perchctl@0.1.12`.
+This guide describes `perchctl@0.1.13`.
 `perch --help` prints the canonical command list, and `perch --version` prints the version from the root package manifest.
 Every command supports `--help` or `-h` without starting a server or provider session.
 Use `perch help <command>` as an equivalent form.
