@@ -164,4 +164,26 @@ final class ConnectionStatusPresentationTests: XCTestCase {
         XCTAssertNotNil(newGeneration)
         XCTAssertTrue(gate.owns(newGeneration ?? -1))
     }
+
+    func testReconnectResultRequiresMatchingPairingAndActiveTask() {
+        let oldPairing = PairingIdentity(serverID: "old")
+
+        XCTAssertFalse(
+            oldPairing.acceptsReconnectResult(currentServerID: "new", isCancelled: false)
+        )
+        XCTAssertFalse(
+            oldPairing.acceptsReconnectResult(currentServerID: "old", isCancelled: true)
+        )
+        XCTAssertTrue(
+            oldPairing.acceptsReconnectResult(currentServerID: "old", isCancelled: false)
+        )
+    }
+
+    func testOnlyCrossHostPairingClearsServerSnapshots() {
+        let pairing = PairingIdentity(serverID: "new")
+
+        XCTAssertTrue(pairing.replaces("old"))
+        XCTAssertFalse(pairing.replaces("new"))
+        XCTAssertFalse(pairing.replaces(nil))
+    }
 }

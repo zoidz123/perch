@@ -38,6 +38,19 @@ struct ConnectionRefreshGate {
     }
 }
 
+struct PairingIdentity {
+    let serverID: String
+
+    func acceptsReconnectResult(currentServerID: String?, isCancelled: Bool) -> Bool {
+        !isCancelled && currentServerID == serverID
+    }
+
+    func replaces(_ currentServerID: String?) -> Bool {
+        guard let currentServerID else { return false }
+        return currentServerID != serverID
+    }
+}
+
 enum FleetReconciliationScope: Int, Equatable {
     case partial
     case full

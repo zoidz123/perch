@@ -254,7 +254,12 @@ final class PerchStore: ObservableObject {
             activeEndpoint: active,
             pk: offer.pk
         )
+        let pairingIdentity = PairingIdentity(serverID: offer.serverId)
+        let clearsServerState = pairingIdentity.replaces(savedHost?.serverId)
         await retireConnectionForPairingReplacement()
+        if clearsServerState {
+            clearServerOwnedState()
+        }
         Keychain.saveToken(offer.token, account: offer.serverId)
         HostStore.save(host)
 
@@ -278,10 +283,7 @@ final class PerchStore: ObservableObject {
         HostStore.clear(serverId: savedHost?.serverId)
         savedHost = nil
         token = ""
-        sessions = []
-        usageRefresh.reset()
-        applyUsageState()
-        selectedSessionId = nil
+        clearServerOwnedState()
         reconnectTask?.cancel()
         // Leaving a cancelled task in place would block every future
         // scheduleReconnect (it guards on reconnectTask == nil).
@@ -314,14 +316,52 @@ final class PerchStore: ObservableObject {
         connectionState = "Not paired"
     }
 
+    private func clearServerOwnedState() {
+        sessions = []
+        terminalTaskLinks = []
+        tasks = []
+        recoveryActions = [:]
+        projects = []
+        answeredQuestions = [:]
+        sentDecisions = [:]
+        selectedSessionId = nil
+        selectionToken = nil
+        openSessionRef = nil
+        timelinesBySession = [:]
+        streamingBySession = [:]
+        optimisticBySession = [:]
+        modelSwitchHintBySession = [:]
+        draft = ""
+        lastSubmitQueued = false
+        pendingAttachmentsBySession = SessionScopedValues()
+        pendingModelBySession = [:]
+        pendingEffortBySession = [:]
+        models = nil
+        config = nil
+        charts = []
+        chartVersions = [:]
+        openChart = nil
+        openPlan = nil
+        timelineCatchUps = []
+        errorMessage = nil
+        taskRefreshErrorMessage = nil
+        isLoading = false
+        usageRefresh.reset()
+        applyUsageState()
+        lastTasksFetch = .distantPast
+        DraftStore.clearAll()
+    }
+
     private func retireConnectionForPairingReplacement() async {
         refreshGate.beginPairingReplacement()
         let task = refreshTask
         refreshTask = nil
         task?.cancel()
         await task?.value
-        reconnectTask?.cancel()
+        let reconnect = reconnectTask
         reconnectTask = nil
+        reconnect?.cancel()
+        await reconnect?.value
         keepaliveTask?.cancel()
         keepaliveTask = nil
         connectionPresentationTask?.cancel()
@@ -350,9 +390,10 @@ final class PerchStore: ObservableObject {
     // re-probe every stored endpoint and switch to whichever answers fastest
     // (for example, a direct endpoint at home).
     private func scheduleReconnect(presentingReadiness: Bool = true) {
-        guard isPaired, reconnectTask == nil else {
+        guard let host = savedHost, isPaired, reconnectTask == nil else {
             return
         }
+        let pairingIdentity = PairingIdentity(serverID: host.serverId)
 
         if presentingReadiness {
             beginConnectionReadiness()
@@ -364,22 +405,26 @@ final class PerchStore: ObservableObject {
         reconnectTask = Task { [weak self] in
             try? await Task.sleep(for: .seconds(delay))
             guard let self, !Task.isCancelled else { return }
-            self.reconnectTask = nil
 
             // Re-probe every stored endpoint on the first failure already:
             // the common cause is the Mac changing networks since pairing
             // (LAN IP moved; the .local name usually still resolves).
-            if let host = self.savedHost {
-                let reachable = await EndpointProber.reachableEndpoints(host.endpoints)
-                if let best = reachable.first, best != host.activeEndpoint {
-                    var updated = host
-                    updated.activeEndpoint = best
-                    HostStore.save(updated)
-                    self.savedHost = updated
-                    self.serverURL = best.url
-                }
+            let reachable = await EndpointProber.reachableEndpoints(host.endpoints)
+            guard pairingIdentity.acceptsReconnectResult(
+                currentServerID: self.savedHost?.serverId,
+                isCancelled: Task.isCancelled
+            ) else {
+                return
+            }
+            if let best = reachable.first, best != host.activeEndpoint {
+                var updated = host
+                updated.activeEndpoint = best
+                HostStore.save(updated)
+                self.savedHost = updated
+                self.serverURL = best.url
             }
 
+            self.reconnectTask = nil
             if presentingReadiness {
                 await self.refresh()
             } else {
