@@ -37,20 +37,27 @@ struct AddProjectSheet: View {
                     .background(Style.secondaryFill)
                     .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
 
-                    VStack(spacing: 0) {
-                        ForEach(suggestions, id: \.self) { path in
-                            directoryRow(path)
-                            if path != suggestions.last { Divider().overlay(Style.hairline) }
+                    if store.isServerLive {
+                        VStack(spacing: 0) {
+                            ForEach(suggestions, id: \.self) { path in
+                                directoryRow(path)
+                                if path != suggestions.last { Divider().overlay(Style.hairline) }
+                            }
+                            if suggestions.isEmpty {
+                                Text(query.trimmingCharacters(in: .whitespaces).isEmpty
+                                     ? "Search for a directory on your Mac."
+                                     : "No matches")
+                                    .font(.system(size: 14))
+                                    .foregroundStyle(Style.textSecondary)
+                                    .frame(maxWidth: .infinity, alignment: .leading)
+                                    .padding(.vertical, 12)
+                                    .padding(.horizontal, 4)
+                            }
                         }
-                        if suggestions.isEmpty {
-                            Text(query.trimmingCharacters(in: .whitespaces).isEmpty
-                                 ? "Search for a directory on your Mac."
-                                 : "No matches")
-                                .font(.system(size: 14))
-                                .foregroundStyle(Style.textSecondary)
-                                .frame(maxWidth: .infinity, alignment: .leading)
-                                .padding(.vertical, 12)
-                                .padding(.horizontal, 4)
+                    } else {
+                        VStack(spacing: 8) {
+                            ConnectionPlaceholderRow()
+                            ConnectionPlaceholderRow(short: true)
                         }
                     }
 
@@ -67,12 +74,20 @@ struct AddProjectSheet: View {
             .scrollDismissesKeyboard(.interactively)
             .navigationTitle("Add project")
             .navigationBarTitleDisplayMode(.inline)
-            .task {
+            .task(id: store.isServerLive) {
+                searchTask?.cancel()
+                suggestions = []
+                selectedPath = nil
+                addError = nil
+                guard store.isServerLive else { return }
+
                 // E2E hook (sim automation cannot type): -PerchAddProjectQuery
                 // prefills the search so the results list can be captured.
                 if let seed = UserDefaults.standard.string(forKey: "PerchAddProjectQuery"), query.isEmpty {
                     query = seed
                     scheduleSearch(seed)
+                } else {
+                    scheduleSearch(query)
                 }
             }
             .toolbar {
@@ -146,7 +161,7 @@ struct AddProjectSheet: View {
             try? await Task.sleep(for: .milliseconds(180))
             if Task.isCancelled { return }
             let results = await store.suggestDirectories(trimmed)
-            if Task.isCancelled { return }
+            if Task.isCancelled || !store.isServerLive { return }
             suggestions = results
         }
     }

@@ -129,6 +129,10 @@ final class PerchStore: ObservableObject {
     private var hasReceivedFleetSnapshotForSocket = false
     private var needsDirectReconciliationAfterSocketReconnect = false
     private var isReconcilingDirectSocket = false
+    private var fleetReconciliationTask: Task<Void, Never>?
+    private var fleetReconciliationID: UUID?
+    private var fleetRefreshPending = false
+    private var latestFleetSessionsWhileReconciling: [AgentSession]?
     private var e2eeRetryTask: Task<Void, Never>?
     private var pendingSends: [QueuedSocketSend] = []
     private struct PendingRPC {
@@ -291,6 +295,11 @@ final class PerchStore: ObservableObject {
         hasReceivedFleetSnapshotForSocket = false
         needsDirectReconciliationAfterSocketReconnect = false
         isReconcilingDirectSocket = false
+        fleetReconciliationTask?.cancel()
+        fleetReconciliationTask = nil
+        fleetReconciliationID = nil
+        fleetRefreshPending = false
+        latestFleetSessionsWhileReconciling = nil
         pendingSends = []
         failPendingRPCs(PerchClientError.connectionReset)
         webSocketTask?.cancel(with: .goingAway, reason: nil)
@@ -1896,6 +1905,9 @@ final class PerchStore: ObservableObject {
             case let .fleet(sessions):
                 hasReceivedFleetSnapshotForSocket = true
                 self.sessions = sessions
+                if fleetReconciliationTask != nil {
+                    latestFleetSessionsWhileReconciling = sessions
+                }
                 let completedRelayReadiness = isRelayActive && completeConnectionReadiness(
                     .authenticatedFleetSnapshot,
                     reason: "decrypted authenticated relay fleet"
@@ -1904,15 +1916,9 @@ final class PerchStore: ObservableObject {
                     // A fleet frame establishes readiness. The REST/RPC reads
                     // immediately converge task/project snapshots and the open
                     // timeline after any reconnect gap.
-                    Task { [weak self] in
-                        guard let self else { return }
-                        _ = await self.refetchAuthoritativeFleet()
-                        if let selectedSessionId = self.selectedSessionId {
-                            await self.loadTimeline(selectedSessionId)
-                        }
-                    }
+                    startFleetReconciliation(full: true)
                 } else {
-                    self.refreshTasksThrottled()
+                    refreshTasksThrottled()
                 }
             case .hello:
                 break
@@ -1957,19 +1963,51 @@ final class PerchStore: ObservableObject {
     private var lastTasksFetch = Date.distantPast
 
     private func refreshTasksThrottled() {
-        guard Date().timeIntervalSince(lastTasksFetch) > 2 else { return }
-        lastTasksFetch = Date()
-        Task {
-            await self.refreshTaskSnapshot()
-            // Projects ride the same cadence: on the relay path refresh()
-            // never runs its HTTP block, so this is where the mate panel's
-            // scope headers get their data.
-            if let result: ProjectsResult = try? await self.request(path: "/projects") {
-                self.projects = result.projects
+        startFleetReconciliation(full: false)
+    }
+
+    private func startFleetReconciliation(full: Bool) {
+        guard fleetReconciliationTask == nil else {
+            fleetRefreshPending = true
+            return
+        }
+        if !full {
+            guard Date().timeIntervalSince(lastTasksFetch) > 2 else { return }
+            lastTasksFetch = Date()
+        }
+
+        let reconciliationID = UUID()
+        fleetReconciliationID = reconciliationID
+        fleetRefreshPending = false
+        latestFleetSessionsWhileReconciling = nil
+        fleetReconciliationTask = Task { [weak self] in
+            guard let self else { return }
+            if full {
+                _ = await self.refetchAuthoritativeFleet()
+                if let selectedSessionId = self.selectedSessionId {
+                    await self.loadTimeline(selectedSessionId)
+                }
+            } else {
+                await self.refreshTaskSnapshot()
+                if let result: ProjectsResult = try? await self.request(path: "/projects") {
+                    self.projects = result.projects
+                }
+                if let result: ChartsResult = try? await self.request(path: "/charts") {
+                    self.charts = result.charts
+                }
             }
-            // Charts too - the relay path's only pull besides the WS message.
-            if let result: ChartsResult = try? await self.request(path: "/charts") {
-                self.charts = result.charts
+
+            guard self.fleetReconciliationID == reconciliationID else { return }
+            if let latestFleetSessionsWhileReconciling = self.latestFleetSessionsWhileReconciling {
+                self.sessions = latestFleetSessionsWhileReconciling
+            }
+            let refreshAgain = self.fleetRefreshPending
+            self.fleetRefreshPending = false
+            self.latestFleetSessionsWhileReconciling = nil
+            self.fleetReconciliationTask = nil
+            self.fleetReconciliationID = nil
+            if refreshAgain {
+                self.refreshTasksThrottled()
             }
         }
     }
