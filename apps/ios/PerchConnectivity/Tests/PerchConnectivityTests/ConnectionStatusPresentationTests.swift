@@ -63,6 +63,26 @@ final class ConnectionStatusPresentationTests: XCTestCase {
         XCTAssertEqual(status.presentedAvailability, .online)
     }
 
+    func testReconnectRevokesOnlinePresentationUntilFreshEvidence() {
+        var status = ConnectionStatusHysteresis(initialAvailability: .online, readinessTimeout: 8)
+
+        XCTAssertTrue(status.beginConnecting(at: 20))
+        XCTAssertEqual(status.presentedAvailability, .connecting)
+        XCTAssertFalse(status.presentedAvailability.showsFreshServerData)
+        XCTAssertFalse(status.presentedAvailability.permitsServerActions)
+    }
+
+    func testUnpairResetClearsPriorReadinessDeadline() {
+        var status = ConnectionStatusHysteresis(readinessTimeout: 8)
+
+        status.beginConnecting(at: 20)
+        XCTAssertEqual(status.readinessDeadline, 28)
+        XCTAssertTrue(status.reset())
+        XCTAssertEqual(status.presentedAvailability, .connecting)
+        XCTAssertNil(status.readinessDeadline)
+        XCTAssertFalse(status.advance(to: 100))
+    }
+
     func testQueuedFullRelayReconciliationRetainsTimelineRecoveryScope() {
         var queue = FleetReconciliationQueue()
 

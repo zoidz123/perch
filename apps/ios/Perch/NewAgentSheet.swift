@@ -37,15 +37,21 @@ struct NewAgentSheet: View {
         NavigationStack {
             ScrollViewReader { proxy in
                 ScrollView {
-                    VStack(alignment: .leading, spacing: 22) {
-                        agentPicker
-                        modelPicker
-                        projectPicker
-                        isolationToggle
-                        promptField
-                            .id("prompt")
+                    if store.isConnectingToServer {
+                        ConnectionWaitingState()
+                            .frame(maxWidth: .infinity)
+                            .padding(.vertical, 120)
+                    } else {
+                        VStack(alignment: .leading, spacing: 22) {
+                            agentPicker
+                            modelPicker
+                            projectPicker
+                            isolationToggle
+                            promptField
+                                .id("prompt")
+                        }
+                        .padding(20)
                     }
-                    .padding(20)
                 }
                 .background(Style.canvas)
                 .scrollDismissesKeyboard(.interactively)
@@ -55,21 +61,23 @@ struct NewAgentSheet: View {
                     ToolbarItem(placement: .cancellationAction) {
                         Button("Cancel") { dismiss() }
                     }
-                    ToolbarItem(placement: .confirmationAction) {
-                        Button(action: start) {
-                            if starting {
-                                ProgressView().controlSize(.small)
-                            } else {
-                                Text("Start").fontWeight(.semibold)
+                    if !store.isConnectingToServer {
+                        ToolbarItem(placement: .confirmationAction) {
+                            Button(action: start) {
+                                if starting {
+                                    ProgressView().controlSize(.small)
+                                } else {
+                                    Text("Start").fontWeight(.semibold)
+                                }
                             }
+                            .disabled(!canStart || starting || !store.isServerLive)
                         }
-                        .disabled(!canStart || starting || !store.isServerLive)
-                    }
-                    ToolbarItemGroup(placement: .keyboard) {
-                        Spacer()
-                        Button("Done") {
-                            searchFocused = false
-                            promptFocused = false
+                        ToolbarItemGroup(placement: .keyboard) {
+                            Spacer()
+                            Button("Done") {
+                                searchFocused = false
+                                promptFocused = false
+                            }
                         }
                     }
                 }

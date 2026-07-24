@@ -289,6 +289,11 @@ final class PerchStore: ObservableObject {
         refreshGeneration += 1
         keepaliveTask?.cancel()
         keepaliveTask = nil
+        connectionPresentationTask?.cancel()
+        connectionPresentationTask = nil
+        if connectionStatusHysteresis.reset() {
+            publishConnectionAvailability(reason: "pairing cleared")
+        }
         e2eeRetryTask?.cancel()
         e2eeRetryTask = nil
         channel = nil
@@ -315,6 +320,9 @@ final class PerchStore: ObservableObject {
             return
         }
 
+        if presentingReadiness {
+            beginConnectionReadiness()
+        }
         reconnectAttempts += 1
         let delay = min(pow(2, Double(min(reconnectAttempts, 5))), 30)
         connectionState = "Reconnecting in \(Int(delay))s"

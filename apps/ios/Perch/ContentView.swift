@@ -279,7 +279,9 @@ struct HomeView: View {
                 sessionList
             }
 
-            footer
+            if !store.isConnectingToServer {
+                footer
+            }
         }
         .background(Style.canvas.ignoresSafeArea())
         .toolbar(.hidden, for: .navigationBar)
@@ -337,57 +339,39 @@ struct HomeView: View {
         HStack(spacing: 12) {
             // Host avatar: tap for host actions; the tiny dot is connection
             // state so no text competes with the title.
-            Menu {
-                Button {
-                    showPairSheet = true
-                } label: {
-                    Label(store.isPaired ? "Re-pair" : "Pair with Mac", systemImage: "qrcode.viewfinder")
-                }
-                Button {
-                    Task { await store.refresh() }
-                } label: {
-                    Label("Refresh", systemImage: "arrow.clockwise")
-                }
-                if store.isPaired, store.isServerLive {
-                    // Secondary path to the demoted one-off agent launcher
-                    // (the primary one sits on the Solo agents header).
+            if store.isConnectingToServer {
+                hostAvatar
+            } else {
+                Menu {
                     Button {
-                        showNewAgent = true
+                        showPairSheet = true
                     } label: {
-                        Label("New agent", systemImage: "plus")
+                        Label(store.isPaired ? "Re-pair" : "Pair with Mac", systemImage: "qrcode.viewfinder")
                     }
-                }
-                if store.isPaired {
-                    Button(role: .destructive) {
-                        store.unpair()
+                    Button {
+                        Task { await store.refresh() }
                     } label: {
-                        Label("Unpair", systemImage: "xmark.circle")
+                        Label("Refresh", systemImage: "arrow.clockwise")
                     }
+                    if store.isPaired, store.isServerLive {
+                        // Secondary path to the demoted one-off agent launcher
+                        // (the primary one sits on the Solo agents header).
+                        Button {
+                            showNewAgent = true
+                        } label: {
+                            Label("New agent", systemImage: "plus")
+                        }
+                    }
+                    if store.isPaired {
+                        Button(role: .destructive) {
+                            store.unpair()
+                        } label: {
+                            Label("Unpair", systemImage: "xmark.circle")
+                        }
+                    }
+                } label: {
+                    hostAvatar
                 }
-            } label: {
-                // Warm avatar: a nero-to-warm gradient with a soft inner
-                // shadow for depth, the cream initial in the serif display
-                // face, and a restrained hairline gold ring - the row's one
-                // accent (the gauge stays quiet).
-                ZStack {
-                    Circle()
-                        .fill(
-                            LinearGradient(
-                                colors: [Style.bubbleFill, Style.canvas],
-                                startPoint: .topLeading,
-                                endPoint: .bottomTrailing
-                            )
-                            .shadow(.inner(color: .black.opacity(0.45), radius: 3, y: 1))
-                        )
-                    Circle()
-                        .strokeBorder(Style.accent.opacity(0.55), lineWidth: 1)
-                    Text(hostInitial)
-                        .font(.system(size: 18, weight: .semibold, design: .serif))
-                        // The Menu label inherits the gold tint; the avatar
-                        // initial is identity, not an accent - keep it cream.
-                        .foregroundStyle(Style.textPrimary)
-                }
-                .frame(width: 44, height: 44)
             }
 
             Spacer()
@@ -417,7 +401,7 @@ struct HomeView: View {
             // snapshot, or a transient read failure makes the button vanish. The
             // panel itself conveys freshness/unavailability. Sized and chromed to
             // match the host capsule so the row reads as one bar.
-            if store.isPaired {
+            if store.isPaired, !store.isConnectingToServer {
                 Button {
                     showUsageSheet = true
                 } label: {
@@ -437,6 +421,26 @@ struct HomeView: View {
 
     private var hostInitial: String {
         String(store.savedHost?.name.prefix(1) ?? "P").uppercased()
+    }
+
+    private var hostAvatar: some View {
+        ZStack {
+            Circle()
+                .fill(
+                    LinearGradient(
+                        colors: [Style.bubbleFill, Style.canvas],
+                        startPoint: .topLeading,
+                        endPoint: .bottomTrailing
+                    )
+                    .shadow(.inner(color: .black.opacity(0.45), radius: 3, y: 1))
+                )
+            Circle()
+                .strokeBorder(Style.accent.opacity(0.55), lineWidth: 1)
+            Text(hostInitial)
+                .font(.system(size: 18, weight: .semibold, design: .serif))
+                .foregroundStyle(Style.textPrimary)
+        }
+        .frame(width: 44, height: 44)
     }
 
     private var connectionStatusColor: Color {
@@ -803,7 +807,7 @@ struct ConnectionWaitingState: View {
             ProgressView()
                 .controlSize(.small)
                 .tint(Style.textSecondary)
-            Text("Connecting to Mac…")
+            Text("Connecting to Mac")
                 .font(.system(size: 15, weight: .medium))
                 .foregroundStyle(Style.textSecondary)
         }
@@ -1597,9 +1601,11 @@ struct SessionDetailView: View {
             Spacer()
 
             VStack(spacing: 1) {
-                Text(detailTitle)
-                    .font(.system(size: 18, weight: .semibold))
-                    .lineLimit(1)
+                if !store.isConnectingToServer {
+                    Text(detailTitle)
+                        .font(.system(size: 18, weight: .semibold))
+                        .lineLimit(1)
+                }
                 if store.isServerLive, let session, let description = workDescriptionFor(session) {
                     Text(description)
                         .font(.system(size: 12))
@@ -1612,12 +1618,7 @@ struct SessionDetailView: View {
                         .foregroundStyle(Style.textFaint)
                         .lineLimit(1)
                         .truncationMode(.head)
-                } else if store.isConnectingToServer {
-                    Text("Refreshing your latest session")
-                        .font(.system(size: 12))
-                        .foregroundStyle(Style.textSecondary)
-                        .lineLimit(1)
-                } else if !store.isServerLive {
+                } else if !store.isServerLive, !store.isConnectingToServer {
                     Text("Reconnect to continue")
                         .font(.system(size: 12))
                         .foregroundStyle(Style.textSecondary)
@@ -1667,9 +1668,6 @@ struct SessionDetailView: View {
     }
 
     private var detailTitle: String {
-        if store.isConnectingToServer {
-            return "Connecting to Mac"
-        }
         if !store.isServerLive {
             return "Mac offline"
         }

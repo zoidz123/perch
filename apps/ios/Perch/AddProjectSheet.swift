@@ -19,58 +19,59 @@ struct AddProjectSheet: View {
     var body: some View {
         NavigationStack {
             ScrollView {
-                VStack(alignment: .leading, spacing: 12) {
-                    HStack(spacing: 8) {
-                        Image(systemName: "magnifyingglass")
-                            .font(.system(size: 14))
-                            .foregroundStyle(Style.textSecondary)
-                        TextField("Search directories…", text: $query)
-                            .font(.system(size: 15))
-                            .autocorrectionDisabled()
-                            .textInputAutocapitalization(.never)
-                            .focused($searchFocused)
-                            .onChange(of: query) { _, value in scheduleSearch(value) }
-                            .disabled(!store.isServerLive)
-                    }
-                    .padding(.vertical, 10)
-                    .padding(.horizontal, 12)
-                    .background(Style.secondaryFill)
-                    .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
-
-                    switch store.presentedServerAvailability.snapshotSurfaceState {
-                    case .content:
-                        VStack(spacing: 0) {
-                            ForEach(suggestions, id: \.self) { path in
-                                directoryRow(path)
-                                if path != suggestions.last { Divider().overlay(Style.hairline) }
-                            }
-                            if suggestions.isEmpty {
-                                Text(query.trimmingCharacters(in: .whitespaces).isEmpty
-                                     ? "Search for a directory on your Mac."
-                                     : "No matches")
-                                    .font(.system(size: 14))
-                                    .foregroundStyle(Style.textSecondary)
-                                    .frame(maxWidth: .infinity, alignment: .leading)
-                                    .padding(.vertical, 12)
-                                    .padding(.horizontal, 4)
-                            }
+                if store.isConnectingToServer {
+                    ConnectionWaitingState()
+                        .frame(maxWidth: .infinity)
+                        .padding(.vertical, 120)
+                } else {
+                    VStack(alignment: .leading, spacing: 12) {
+                        HStack(spacing: 8) {
+                            Image(systemName: "magnifyingglass")
+                                .font(.system(size: 14))
+                                .foregroundStyle(Style.textSecondary)
+                            TextField("Search directories…", text: $query)
+                                .font(.system(size: 15))
+                                .autocorrectionDisabled()
+                                .textInputAutocapitalization(.never)
+                                .focused($searchFocused)
+                                .onChange(of: query) { _, value in scheduleSearch(value) }
+                                .disabled(!store.isServerLive)
                         }
-                    case .placeholders:
-                        ConnectionWaitingState()
-                            .frame(maxWidth: .infinity)
-                            .padding(.vertical, 24)
-                    case .offlineRetry:
-                        ConnectionOfflineSheetState()
-                    }
+                        .padding(.vertical, 10)
+                        .padding(.horizontal, 12)
+                        .background(Style.secondaryFill)
+                        .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
 
-                    if let addError {
-                        Text(addError)
-                            .font(.system(size: 13))
-                            .foregroundStyle(Style.errorText)
-                            .fixedSize(horizontal: false, vertical: true)
+                        if store.isServerLive {
+                            VStack(spacing: 0) {
+                                ForEach(suggestions, id: \.self) { path in
+                                    directoryRow(path)
+                                    if path != suggestions.last { Divider().overlay(Style.hairline) }
+                                }
+                                if suggestions.isEmpty {
+                                    Text(query.trimmingCharacters(in: .whitespaces).isEmpty
+                                         ? "Search for a directory on your Mac."
+                                         : "No matches")
+                                        .font(.system(size: 14))
+                                        .foregroundStyle(Style.textSecondary)
+                                        .frame(maxWidth: .infinity, alignment: .leading)
+                                        .padding(.vertical, 12)
+                                        .padding(.horizontal, 4)
+                                }
+                            }
+                        } else {
+                            ConnectionOfflineSheetState()
+                        }
+
+                        if let addError {
+                            Text(addError)
+                                .font(.system(size: 13))
+                                .foregroundStyle(Style.errorText)
+                                .fixedSize(horizontal: false, vertical: true)
+                        }
                     }
+                    .padding(20)
                 }
-                .padding(20)
             }
             .background(Style.canvas)
             .scrollDismissesKeyboard(.interactively)
@@ -96,20 +97,22 @@ struct AddProjectSheet: View {
                 ToolbarItem(placement: .cancellationAction) {
                     Button("Cancel") { dismiss() }
                 }
-                ToolbarItem(placement: .confirmationAction) {
-                    Button(action: add) {
-                        if adding {
-                            ProgressView().controlSize(.small)
-                        } else {
-                            Text("Add").fontWeight(.semibold)
+                if !store.isConnectingToServer {
+                    ToolbarItem(placement: .confirmationAction) {
+                        Button(action: add) {
+                            if adding {
+                                ProgressView().controlSize(.small)
+                            } else {
+                                Text("Add").fontWeight(.semibold)
+                            }
                         }
+                        .disabled(selectedPath == nil || adding || !store.isServerLive)
                     }
-                    .disabled(selectedPath == nil || adding || !store.isServerLive)
-                }
-                ToolbarItemGroup(placement: .keyboard) {
-                    Spacer()
-                    Button("Done") {
-                        searchFocused = false
+                    ToolbarItemGroup(placement: .keyboard) {
+                        Spacer()
+                        Button("Done") {
+                            searchFocused = false
+                        }
                     }
                 }
             }

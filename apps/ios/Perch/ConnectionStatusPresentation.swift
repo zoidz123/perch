@@ -108,6 +108,14 @@ struct ConnectionStatusHysteresis {
     }
 
     @discardableResult
+    mutating func reset() -> Bool {
+        let changed = presentedAvailability != .connecting || readinessDeadline != nil
+        presentedAvailability = .connecting
+        readinessDeadline = nil
+        return changed
+    }
+
+    @discardableResult
     mutating func observe(_ evidence: ConnectionReadinessEvidence) -> Bool {
         switch evidence {
         case .encryptedChannel:
