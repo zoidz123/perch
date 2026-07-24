@@ -2,33 +2,64 @@ import XCTest
 @testable import PerchConnectivity
 
 final class ConnectionStatusPresentationTests: XCTestCase {
-    func testFlappingNeverPresentsOffline() {
-        var status = ConnectionStatusHysteresis(offlineDelay: 2)
+    func testColdLaunchBeginsConnectingAndHidesStaleServerData() {
+        var status = ConnectionStatusHysteresis(readinessTimeout: 8)
 
-        XCTAssertFalse(status.observe(isLive: false, at: 0))
-        XCTAssertFalse(status.observe(isLive: false, at: 1))
-        XCTAssertFalse(status.observe(isLive: true, at: 1.5))
-        XCTAssertFalse(status.advance(to: 10))
+        XCTAssertEqual(status.presentedAvailability, .connecting)
+        XCTAssertFalse(status.presentedAvailability.showsFreshServerData)
+        XCTAssertFalse(status.presentedAvailability.permitsServerActions)
+        XCTAssertFalse(status.beginConnecting(at: 0))
+        XCTAssertEqual(status.readinessDeadline, 8)
+    }
+
+    func testRelayRemainsConnectingThroughE2EEReadyUntilFleetSnapshot() {
+        var status = ConnectionStatusHysteresis(readinessTimeout: 8)
+
+        status.beginConnecting(at: 0)
+        XCTAssertFalse(status.observe(.encryptedChannel))
+        XCTAssertEqual(status.presentedAvailability, .connecting)
+
+        XCTAssertTrue(status.observe(.authenticatedFleetSnapshot))
+        XCTAssertEqual(status.presentedAvailability, .online)
+        XCTAssertTrue(status.presentedAvailability.showsFreshServerData)
+        XCTAssertTrue(status.presentedAvailability.permitsServerActions)
+    }
+
+    func testDelayedDirectBootstrapDoesNotFlashOfflineBeforeReadinessDeadline() {
+        var status = ConnectionStatusHysteresis(readinessTimeout: 8)
+
+        status.beginConnecting(at: 0)
+        XCTAssertFalse(status.advance(to: 7.99))
+        XCTAssertEqual(status.presentedAvailability, .connecting)
+        XCTAssertTrue(status.observe(.directBootstrap))
+        XCTAssertFalse(status.advance(to: 20))
         XCTAssertEqual(status.presentedAvailability, .online)
     }
 
-    func testOfflineMustRemainStableForFullDelay() {
-        var status = ConnectionStatusHysteresis(offlineDelay: 2)
+    func testReadinessTimeoutBecomesOffline() {
+        var status = ConnectionStatusHysteresis(readinessTimeout: 8)
 
-        XCTAssertFalse(status.observe(isLive: false, at: 10))
-        XCTAssertFalse(status.advance(to: 11.99))
-        XCTAssertEqual(status.presentedAvailability, .online)
-        XCTAssertTrue(status.advance(to: 12))
+        status.beginConnecting(at: 10)
+        XCTAssertFalse(status.advance(to: 17.99))
+        XCTAssertTrue(status.advance(to: 18))
         XCTAssertEqual(status.presentedAvailability, .offline)
     }
 
-    func testRecoveryPresentsOnlineImmediately() {
-        var status = ConnectionStatusHysteresis(
-            initialAvailability: .offline,
-            offlineDelay: 2
-        )
+    func testOverlappingRefreshDoesNotExtendPendingReadinessWindow() {
+        var status = ConnectionStatusHysteresis(readinessTimeout: 8)
 
-        XCTAssertTrue(status.observe(isLive: true, at: 20))
+        status.beginConnecting(at: 10)
+        XCTAssertFalse(status.beginConnecting(at: 15))
+        XCTAssertEqual(status.readinessDeadline, 18)
+        XCTAssertTrue(status.advance(to: 18))
+    }
+
+    func testForegroundReconnectRequiresFreshEvidenceBeforeOnline() {
+        var status = ConnectionStatusHysteresis(initialAvailability: .online, readinessTimeout: 8)
+
+        XCTAssertTrue(status.beginConnecting(at: 20))
+        XCTAssertEqual(status.presentedAvailability, .connecting)
+        XCTAssertTrue(status.observe(.directBootstrap))
         XCTAssertEqual(status.presentedAvailability, .online)
     }
 }
