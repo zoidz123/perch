@@ -266,8 +266,7 @@ struct NewAgentSheet: View {
             .background(Style.secondaryFill)
             .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
 
-            switch store.presentedServerAvailability.snapshotSurfaceState {
-            case .content:
+            if store.isServerLive {
                 let rows = query.trimmingCharacters(in: .whitespaces).isEmpty
                     ? recents.map(\.rootPath)
                     : suggestions
@@ -285,11 +284,7 @@ struct NewAgentSheet: View {
                             .padding(.horizontal, 4)
                     }
                 }
-            case .placeholders:
-                ConnectionWaitingState()
-                    .frame(maxWidth: .infinity)
-                    .padding(.vertical, 24)
-            case .offlineRetry:
+            } else {
                 ConnectionOfflineSheetState()
             }
         }

@@ -118,7 +118,7 @@ final class PerchStore: ObservableObject {
     private var connectionPresentationTask: Task<Void, Never>?
     private var connectionStatusHysteresis = ConnectionStatusHysteresis()
     private var refreshTask: Task<Void, Never>?
-    private var refreshGeneration = 0
+    private var refreshGate = ConnectionRefreshGate()
     private var selectionToken: UUID?
     // Encrypted transport state (nil on the legacy plaintext path). The channel
     // is recreated per socket; e2eeRetryTask re-sends e2ee_hello until the
@@ -254,6 +254,7 @@ final class PerchStore: ObservableObject {
             activeEndpoint: active,
             pk: offer.pk
         )
+        await retireConnectionForPairingReplacement()
         Keychain.saveToken(offer.token, account: offer.serverId)
         HostStore.save(host)
 
@@ -261,6 +262,7 @@ final class PerchStore: ObservableObject {
         serverURL = active.url
         token = offer.token
         reconnectAttempts = 0
+        refreshGate.finishPairingReplacement()
         await refresh()
         // Now that a server exists to receive the token, ask for notification
         // permission and register with APNs. Screenshot/E2E runs skip the
@@ -286,7 +288,7 @@ final class PerchStore: ObservableObject {
         reconnectTask = nil
         refreshTask?.cancel()
         refreshTask = nil
-        refreshGeneration += 1
+        refreshGate.beginPairingReplacement()
         keepaliveTask?.cancel()
         keepaliveTask = nil
         connectionPresentationTask?.cancel()
@@ -310,6 +312,38 @@ final class PerchStore: ObservableObject {
         webSocketTask?.cancel(with: .goingAway, reason: nil)
         webSocketTask = nil
         connectionState = "Not paired"
+    }
+
+    private func retireConnectionForPairingReplacement() async {
+        refreshGate.beginPairingReplacement()
+        let task = refreshTask
+        refreshTask = nil
+        task?.cancel()
+        await task?.value
+        reconnectTask?.cancel()
+        reconnectTask = nil
+        keepaliveTask?.cancel()
+        keepaliveTask = nil
+        connectionPresentationTask?.cancel()
+        connectionPresentationTask = nil
+        if connectionStatusHysteresis.reset() {
+            publishConnectionAvailability(reason: "pairing replaced")
+        }
+        e2eeRetryTask?.cancel()
+        e2eeRetryTask = nil
+        channel = nil
+        hasReceivedFleetSnapshotForSocket = false
+        needsDirectReconciliationAfterSocketReconnect = false
+        isReconcilingDirectSocket = false
+        fleetReconciliationTask?.cancel()
+        fleetReconciliationTask = nil
+        fleetReconciliationID = nil
+        fleetReconciliationQueue.reset()
+        latestFleetSessionsWhileReconciling = nil
+        pendingSends = []
+        failPendingRPCs(PerchClientError.connectionReset)
+        webSocketTask?.cancel(with: .goingAway, reason: nil)
+        webSocketTask = nil
     }
 
     // Exponential backoff reconnect with endpoint failover: after each failure,
@@ -599,6 +633,7 @@ final class PerchStore: ObservableObject {
             connectionState = "Not paired"
             return
         }
+        guard !refreshGate.isReplacingPairing else { return }
 
         // Cold launch and scene activation can arrive together. One attempt
         // owns the outstanding request/socket, while later callers await its
@@ -609,8 +644,7 @@ final class PerchStore: ObservableObject {
         }
 
         let retryingOfflineRelay = isRelayActive && presentedServerAvailability == .offline
-        refreshGeneration += 1
-        let generation = refreshGeneration
+        guard let generation = refreshGate.beginRefresh() else { return }
         beginConnectionReadiness()
         let task = Task { @MainActor [weak self] in
             guard let self else { return }
@@ -618,7 +652,7 @@ final class PerchStore: ObservableObject {
         }
         refreshTask = task
         await task.value
-        if refreshGeneration == generation {
+        if refreshGate.owns(generation) {
             refreshTask = nil
         }
     }

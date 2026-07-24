@@ -142,18 +142,26 @@ final class ConnectionStatusPresentationTests: XCTestCase {
         )
     }
 
-    func testSheetSnapshotStateDistinguishesConnectingOnlineAndOffline() {
-        XCTAssertEqual(
-            PresentedServerAvailability.connecting.snapshotSurfaceState,
-            .placeholders
-        )
-        XCTAssertEqual(
-            PresentedServerAvailability.online.snapshotSurfaceState,
-            .content
-        )
-        XCTAssertEqual(
-            PresentedServerAvailability.offline.snapshotSurfaceState,
-            .offlineRetry
-        )
+    func testPairingReplacementRejectsOldHostRefresh() {
+        var gate = ConnectionRefreshGate()
+        let oldGeneration = gate.beginRefresh()
+
+        gate.beginPairingReplacement()
+
+        XCTAssertTrue(gate.isReplacingPairing)
+        XCTAssertNil(gate.beginRefresh())
+        XCTAssertFalse(gate.owns(oldGeneration ?? -1))
+    }
+
+    func testNewPairingRefreshOwnsCompletionAfterReplacement() {
+        var gate = ConnectionRefreshGate()
+
+        gate.beginPairingReplacement()
+        gate.finishPairingReplacement()
+        let newGeneration = gate.beginRefresh()
+
+        XCTAssertFalse(gate.isReplacingPairing)
+        XCTAssertNotNil(newGeneration)
+        XCTAssertTrue(gate.owns(newGeneration ?? -1))
     }
 }

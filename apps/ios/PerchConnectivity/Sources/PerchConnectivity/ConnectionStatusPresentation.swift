@@ -14,19 +14,27 @@ enum PresentedServerAvailability: Equatable {
     }
 }
 
-enum ServerSnapshotSurfaceState: Equatable {
-    case placeholders
-    case content
-    case offlineRetry
-}
+struct ConnectionRefreshGate {
+    private(set) var generation = 0
+    private(set) var isReplacingPairing = false
 
-extension PresentedServerAvailability {
-    var snapshotSurfaceState: ServerSnapshotSurfaceState {
-        switch self {
-        case .connecting: .placeholders
-        case .online: .content
-        case .offline: .offlineRetry
-        }
+    mutating func beginPairingReplacement() {
+        generation += 1
+        isReplacingPairing = true
+    }
+
+    mutating func finishPairingReplacement() {
+        isReplacingPairing = false
+    }
+
+    mutating func beginRefresh() -> Int? {
+        guard !isReplacingPairing else { return nil }
+        generation += 1
+        return generation
+    }
+
+    func owns(_ candidate: Int) -> Bool {
+        generation == candidate
     }
 }
 
