@@ -31,7 +31,8 @@ It verifies the bundled no-mistakes inventory and byte hashes without downloadin
 
 Run TestFlight releases from a clean checkout of `origin/main` with Xcode installed and the existing Perch app record visible in App Store Connect.
 Confirm the intended marketing version and build number are unused in App Store Connect before archiving.
-Do not bump the build number merely to bypass a collision.
+If App Store Connect already contains that build number, update `CURRENT_PROJECT_VERSION` to the next verified-unused number before archiving.
+Keep `MARKETING_VERSION` unchanged unless the release itself requires a new marketing version.
 
 ### Credentials
 
@@ -118,7 +119,7 @@ cat > "$RELEASE_DIR/ExportOptions.plist" <<PLIST
   <key>manageAppVersionAndBuildNumber</key>
   <false/>
   <key>testFlightInternalTestingOnly</key>
-  <true/>
+  <false/>
   <key>uploadSymbols</key>
   <true/>
 </dict>
@@ -143,10 +144,9 @@ xcodebuild \
 ### After upload
 
 Treat an ambiguous upload response as unknown and check App Store Connect before retrying.
-The build is restricted to TestFlight Internal Testing, not external beta testing or App Store review.
-An internal group can contain zero testers, so an App Store Connect administrator may still need to add internal testers before anyone can install the build.
-
-Never create a replacement app record, distribute to external testers, or submit for App Store review without explicit owner approval.
+Wait for processing to finish, resolve export compliance, and verify the uploaded build is eligible for external testing before attaching it to an external group.
+External TestFlight distribution may require Beta App Review metadata and approval, but it does not submit or release the app to App Store production.
+Never create a replacement app record, distribute to external testers, or submit for either Beta App Review or App Store production review without explicit owner approval.
 Never commit key identifiers, issuer identifiers, team identifiers, certificate identifiers, provisioning profile identifiers, `.p8` contents, or temporary export files.
 
 The key path, key identifier, issuer identifier, and team identifier should be moved out of transcript-only history into a durable private configuration.
