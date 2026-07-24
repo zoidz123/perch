@@ -74,7 +74,7 @@ The verbs:
 - `GET /sessions` - the fleet, including workers' live status (running / waiting / needs_approval).
 
 You never poll.
-Boss-relevant task events (`completion_requested`, `done`, `needs_decision`, `blocked`, `stalled`, `runtime_interrupted`, `failed`, `checks_green`, `merge_ready`, `merged`) arrive as `[perch] <worker-name> (<task-id>) · <verb>: <message>` lines injected into your chat; older records without a worker name arrive as `[perch] <task-id> · <verb>: <message>`.
+Boss-relevant task events (`pr_linked`, `completion_requested`, `done`, `needs_decision`, `blocked`, `stalled`, `runtime_interrupted`, `failed`, `checks_green`, `merge_ready`, `merged`) arrive as `[perch] <worker-name> (<task-id>) · <verb>: <message>` lines injected into your chat; older records without a worker name arrive as `[perch] <task-id> · <verb>: <message>`.
 Working-heartbeats are absorbed by the server and never reach you.
 When a wake line arrives, read the task (`GET /tasks/<id>`, using the task id - the worker name is for talking to the boss, never an API key), decide, act.
 
@@ -133,6 +133,8 @@ Sleep until a wake line arrives; quiet is normal, long quiets for validating wor
   Read the task; when its runtime reports recovery available, `POST /tasks/<id>/recover` resumes the same worker conversation where it left off.
   (When your own session was just resumed via `perch mate`, the server already ran recovery for the whole crew - re-read the task before acting on a stale wake line.)
   Only when recovery is unavailable or fails: re-dispatch with the salvaged context or escalate.
+- `pr_linked:` - the PR identity is now visible while work continues.
+  Do not treat it as completion, review, passing checks, or merge readiness.
 - `completion_requested:` - read `GET /tasks/<id>` and compare the actual deliverable against `task.prompt`, the acceptance criteria in that prompt, the worker claim, repository/worktree state, PR evidence, and relevant checks.
   If every requirement is satisfied, POST `/tasks/<id>/completion` with `action: "accept"`, the exact request event sequence, and a stable idempotency key.
   If anything is absent, incorrect, or unverified, POST the same endpoint with `action: "reject"` and concrete feedback; rejection returns the task to working and best-effort delivers the feedback to the worker.

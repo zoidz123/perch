@@ -464,15 +464,17 @@ export type TaskState =
 
 export type TaskPr = {
   url: string;
+  // GitHub PR number, parsed from the server-canonical URL when the PR is
+  // attached. Optional so historical task records remain readable.
+  number?: number;
   // GitHub owner/repo for the PR base repo and head repo. These are recorded
   // after the server verifies the PR belongs to the task project and branch.
   repo?: string;
   headRepo?: string;
   head?: string;
-  // The PR head commit the done gate verified against the worker's checkout
-  // HEAD. Recorded when the gate proved the PR carries the worker's delivered
-  // commits (which is how a reused branch, whose name differs from the
-  // auto-assigned task branch, is admitted).
+  // The currently observed PR head commit. Completion later verifies its
+  // deliverable against the worker checkout, which is how a reused branch
+  // whose name differs from the auto-assigned task branch is admitted.
   headOid?: string;
   checks?: "pending" | "passing" | "failing";
   checkDetails?: TaskPrCheck[];
@@ -565,12 +567,13 @@ export type Task = {
   updatedAt: string;
 };
 
-// Worker verbs (the five, plus poller/system-sourced reconciliations).
+// Worker verbs, plus poller/system-sourced reconciliations.
 // "stalled" and "chart_ready" are server-emitted only. They move no task
 // state and exist to wake the orchestrator at the moment attention is needed.
 export type TaskEventKind =
   | "created"
   | "working"
+  | "pr_linked"
   | "needs_decision"
   | "blocked"
   | "completion_requested"
@@ -638,7 +641,9 @@ export type CreateTaskRequest = {
 export type TaskEventRequest = {
   kind: TaskEventKind; // the worker verb
   message?: string;
-  pr?: string; // convenience: a PR url attached to a done verb
+  // Required by pr_linked; also accepted as the existing convenience field on
+  // done. The server canonicalizes and verifies it before persisting a fact.
+  pr?: string;
   // Structured payload persisted onto the event verbatim (server-bounded in
   // size). data.noMistakes carries a NoMistakesGate when a worker's ask-user
   // gate parks the no-mistakes pipeline. Append-only wire change.

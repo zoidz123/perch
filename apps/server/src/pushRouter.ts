@@ -35,6 +35,7 @@ export type SessionRole = "mate" | "crew" | "solo";
 // which pushes via chartReady - and the mate-only stalled) is inert here and
 // never enqueued for this channel.
 export const PUSH_EVENT_KINDS = new Set<TaskEventKind>([
+  "pr_linked",
   "needs_decision",
   "blocked",
   "runtime_interrupted",
@@ -266,6 +267,15 @@ export class PushRouter {
     const project = this.deps.projectName(task.project) ?? "a project";
     const sessionId = task.sessionId ?? "system";
     switch (event.kind) {
+      case "pr_linked":
+        await this.deps.push.send({
+          title: `${project} PR linked`,
+          subtitle: taskSubtitle(task),
+          body: event.message ?? "A task PR is now available.",
+          sessionId,
+          category: "turn_done"
+        });
+        break;
       case "completion_requested":
         await this.deps.push.send({
           title: `${project} task needs verification`,

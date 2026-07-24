@@ -4,7 +4,7 @@ import { CHART_CAPABILITY_NOTE } from "./hooks.js";
 // The dispatch brief: Perch task reporting and delivery instructions.
 // Appended to the user's kickoff prompt when a task is dispatched, it tells
 // the worker where it is, how to name its branch, and how to report - the
-// five verbs are curl calls authed by the session's existing hook token
+// reporting verbs are curl calls authed by the session's existing hook token
 // (already in the PTY env), so no new secret ever enters the prompt.
 
 // Plan linkage carried into the kickoff:
@@ -34,6 +34,10 @@ export function dispatchBrief(
   const doneVerb =
     `${verb("done", doneExample)} \\\n` +
     `  | node -e 'let body=""; process.stdin.setEncoding("utf8"); process.stdin.on("data", chunk => body += chunk); process.stdin.on("end", () => { console.log(body); const response = JSON.parse(body); if (response.task?.state !== "completion_requested") { console.error("done report was not accepted: expected task.state == completion_requested"); process.exitCode = 1; } });'`;
+  const prLinkedVerb =
+    `curl --silent --show-error --fail-with-body -X POST "\${PERCH_HOOK_URL%/hooks}/tasks/${task.id}/events" \\\n` +
+    `  -H "x-perch-session: $PERCH_SESSION_ID" -H "x-perch-token: $PERCH_HOOK_TOKEN" \\\n` +
+    `  -H "content-type: application/json" -d '{"kind":"pr_linked","pr":"<canonical GitHub PR URL>"}'`;
 
   const location = worktreePath
     ? `You are working in an isolated worktree at ${worktreePath}. Verify with pwd before changing anything; never cd outside it.`
@@ -91,6 +95,7 @@ export function dispatchBrief(
           "- When a gate parks the run with ask-user findings, never answer or bypass them yourself. Report needs_decision with message = a one-line summary and the findings table copied VERBATIM into data.noMistakes - every finding's id, severity, file, line, action, and description exactly as the gate printed them, no paraphrasing, no dropped findings:",
           askUserExample,
           "- The answer arrives as a message in your chat; resume the parked run with `no-mistakes axi respond`.",
+          "- As soon as no-mistakes creates or prints its PR URL, report it with the exact pr_linked command below. Do this before waiting for checks or running branch_sync; it links the badge only and does not request completion.",
           "- After checks pass, inspect `branch_sync`; if `next_action.code` is `sync`, run exactly `no-mistakes axi sync` to advance the checkout to the PR head.",
           "- Then POST kind `done` with the explicit PR URL.",
           "- Do not emit final prose until the response confirms `task.state == completion_requested`.",
@@ -128,6 +133,11 @@ export function dispatchBrief(
     "",
     "Report status by POSTing task events (run these exact curl commands from your shell):",
     `- started working:\n${verb("working", "short note on your approach")}`,
+    ...(task.kind !== "scout" && task.mode !== "local-only"
+      ? [
+          "- PR opened or discovered: immediately link it before continuing or reporting done. This records only durable PR identity and keeps the current task state:\n" + prLinkedVerb
+        ]
+      : []),
     `- need a human decision:\n${verb("needs_decision", "the question, with options")}`,
     `- blocked on something external:\n${verb("blocked", "what blocks you")}`,
     `- request completion verification (the command fails unless Perch acknowledges task.state == completion_requested):\n${doneVerb}`,

@@ -2,7 +2,7 @@ import { mkdirSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { basename, join } from "node:path";
 import { randomBytes } from "node:crypto";
-import type { Task, TaskEvent, TaskEventKind, TaskEventSource, TaskState } from "@perch/shared";
+import type { Task, TaskEvent, TaskEventKind, TaskEventSource, TaskPr, TaskState } from "@perch/shared";
 import { BOSS_EVENT_KINDS } from "./mateWake.js";
 import { PUSH_EVENT_KINDS } from "./pushRouter.js";
 import { StateDb, type NotificationIntentInput } from "./stateDb.js";
@@ -251,6 +251,46 @@ export class TaskStore {
     return this.withPresentation({ ...task });
   }
 
+  // Attach the stable PR identity and its ledger receipt in one SQLite
+  // transaction. A link is evidence only: it never moves the task lifecycle.
+  // Replaying the same report refreshes mutable observations without another
+  // receipt; replacing a different task PR is refused.
+  linkPr(
+    id: string,
+    pr: TaskPr,
+    event: { message?: string; source: TaskEventSource; data?: Record<string, unknown> }
+  ): { task: Task; linked: boolean } {
+    const task = this.mustFind(id);
+    if (task.pr) {
+      if (!samePrIdentity(task.pr, pr)) {
+        throw new Error(`task is already linked to ${task.pr.url}`);
+      }
+      const refreshed = { ...task.pr, ...pr };
+      if (prObservationChanged(task.pr, refreshed)) {
+        task.pr = refreshed;
+        task.updatedAt = nextTimestamp(task.updatedAt);
+        this.stateDb.tasks.save(withoutDerived(task));
+      }
+      return { task: this.withPresentation({ ...task }), linked: false };
+    }
+
+    const previousState = task.state;
+    task.pr = { ...pr };
+    task.updatedAt = nextTimestamp(task.updatedAt);
+    const linkedEvent = { kind: "pr_linked" as const, ...event };
+    const notificationIntents = taskEventNotificationIntents(task, linkedEvent);
+    this.stateDb.tasks.record(withoutDerived(task), linkedEvent, notificationIntents);
+    const updated = this.withPresentation({ ...task });
+    for (const listener of this.listeners) {
+      try {
+        listener({ ...updated }, { ...linkedEvent, previousState });
+      } catch {
+        // Observers never disturb the ledger.
+      }
+    }
+    return { task: updated, linked: true };
+  }
+
   // Append an event; when the event kind implies a state, the transition is
   // validated against the state machine (illegal ones throw, nothing is
   // written). Returns the updated task.
@@ -421,6 +461,41 @@ function taskEventNotificationIntents(
     intents.push({ channel: "push", payload });
   }
   return intents;
+}
+
+function samePrIdentity(existing: TaskPr, incoming: TaskPr): boolean {
+  const existingIdentity = githubPrIdentity(existing.url);
+  const incomingIdentity = githubPrIdentity(incoming.url);
+  if (existingIdentity && incomingIdentity) {
+    return existingIdentity.repo === incomingIdentity.repo && existingIdentity.number === incomingIdentity.number;
+  }
+  return existing.url === incoming.url;
+}
+
+function githubPrIdentity(url: string): { repo: string; number: number } | undefined {
+  try {
+    const parsed = new URL(url);
+    if (parsed.hostname.toLowerCase() !== "github.com") {
+      return undefined;
+    }
+    const parts = parsed.pathname.split("/").filter(Boolean);
+    if (parts.length !== 4 || parts[2]?.toLowerCase() !== "pull" || !/^\d+$/.test(parts[3] ?? "")) {
+      return undefined;
+    }
+    const number = Number(parts[3]);
+    if (!Number.isSafeInteger(number) || number < 1) {
+      return undefined;
+    }
+    return { repo: `${parts[0]}/${parts[1]}`.toLowerCase(), number };
+  } catch {
+    return undefined;
+  }
+}
+
+function prObservationChanged(existing: TaskPr, incoming: TaskPr): boolean {
+  return Object.entries(incoming).some(
+    ([key, value]) => existing[key as keyof TaskPr] !== value
+  );
 }
 
 // "fix the flaky auth test" -> "fix-the-flaky-auth-a1b2" - readable slug plus

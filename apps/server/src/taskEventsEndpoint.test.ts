@@ -519,6 +519,168 @@ test("remote ship modes keep the normal matching-PR attachment path", async () =
   );
 });
 
+test("worker pr_linked persists a canonical fact before completion, exposes it immediately, and is idempotent", async () => {
+  let checkoutHead = "";
+  await withServer(
+    async ({ home, port, tasks, hooks }) => {
+      const { project, head } = makeProjectWithCommit(home);
+      checkoutHead = head;
+      const task = tasks.create({ title: "show PR while the gate runs", project, mode: "direct-PR" });
+      const { token } = hooks.register("pty:worker");
+      const headers = { "x-perch-session": "pty:worker", "x-perch-token": token };
+      tasks.update(task.id, { sessionId: "pty:worker", branch: "perch/show-pr-now" });
+      tasks.recordEvent(task.id, { kind: "working", source: "worker" });
+
+      const bearerOnly = await post(
+        port,
+        task.id,
+        { authorization: "Bearer test-token" },
+        { kind: "pr_linked", pr: "https://github.com/o/r/pull/62" }
+      );
+      assert.equal(bearerOnly.status, 401);
+      assert.match((await bearerOnly.json() as { error: string }).error, /task-session credentials/);
+
+      const proseOnly = await post(port, task.id, headers, {
+        kind: "pr_linked",
+        message: "opened https://github.com/o/r/pull/62"
+      });
+      assert.equal(proseOnly.status, 400);
+      assert.match((await proseOnly.json() as { error: string }).error, /pr is required/);
+      assert.equal(tasks.find(task.id)?.pr, undefined, "ordinary worker prose never attaches a PR");
+
+      const link = await post(port, task.id, headers, {
+        kind: "pr_linked",
+        pr: "https://github.com/O/R/pull/62/?ignored=1"
+      });
+      assert.equal(link.status, 200);
+      const linked = (await link.json()) as { task: { state: string; presentation?: { state: string }; pr?: { url: string; number?: number; repo?: string; headOid?: string } } };
+      assert.equal(linked.task.state, "working");
+      assert.equal(linked.task.presentation?.state, "working");
+      assert.equal(linked.task.pr?.url, "https://github.com/o/r/pull/62");
+      assert.equal(linked.task.pr?.number, 62);
+      assert.equal(linked.task.pr?.repo, "o/r");
+      assert.equal(linked.task.pr?.headOid, checkoutHead);
+
+      const detail = await fetch(`http://127.0.0.1:${port}/tasks/${task.id}`, {
+        headers: { authorization: "Bearer test-token" }
+      });
+      const detailBody = (await detail.json()) as { task: { state: string; pr?: { number?: number }; }; events: Array<{ kind: string; data?: { pr?: { number?: number } } }> };
+      assert.equal(detailBody.task.state, "working");
+      assert.equal(detailBody.task.pr?.number, 62);
+      const prEvent = detailBody.events.find((event) => event.kind === "pr_linked");
+      assert.equal(prEvent?.data?.pr?.number, 62);
+      assert.deepEqual(
+        tasks.stateDb.outbox.forTaskEvent(task.id, tasks.events(task.id).find((event) => event.kind === "pr_linked")!.seq)
+          .map((intent) => intent.channel)
+          .sort(),
+        ["mate", "push"]
+      );
+
+      const duplicate = await post(port, task.id, headers, { kind: "pr_linked", pr: "https://github.com/o/r/pull/62" });
+      assert.equal(duplicate.status, 200);
+      assert.equal(tasks.events(task.id).filter((event) => event.kind === "pr_linked").length, 1);
+
+      const conflicting = await post(port, task.id, headers, { kind: "pr_linked", pr: "https://github.com/o/r/pull/63" });
+      assert.equal(conflicting.status, 409);
+      assert.match((await conflicting.json() as { error: string }).error, /already linked/);
+      assert.equal(tasks.find(task.id)?.state, "working");
+
+      const unauthorized = await post(
+        port,
+        task.id,
+        { "x-perch-session": "pty:worker", "x-perch-token": "wrong" },
+        { kind: "pr_linked", pr: "https://github.com/o/r/pull/62" }
+      );
+      assert.equal(unauthorized.status, 401);
+
+      const completion = await post(port, task.id, headers, { kind: "done", pr: "https://github.com/o/r/pull/62", message: "checks still running" });
+      assert.equal(completion.status, 200);
+      assert.equal(tasks.find(task.id)?.state, "completion_requested");
+      assert.equal(tasks.events(task.id).filter((event) => event.kind === "pr_linked").length, 1);
+    },
+    async () => ({
+      state: "OPEN",
+      headRefName: "perch/show-pr-now",
+      headRefOid: checkoutHead,
+      headRepository: { nameWithOwner: "o/r" }
+    })
+  );
+});
+
+test("no-mistakes pr_linked accepts the task branch before branch_sync but completion remains head-pinned", async () => {
+  let prHead = "pipeline-head";
+  await withServer(
+    async ({ home, port, tasks, hooks }) => {
+      const { project } = makeProjectWithCommit(home);
+      const task = tasks.create({ title: "link gate PR early", project, mode: "no-mistakes" });
+      const { token } = hooks.register("pty:worker");
+      const headers = { "x-perch-session": "pty:worker", "x-perch-token": token };
+      tasks.update(task.id, { sessionId: "pty:worker", branch: "perch/link-gate-pr-early" });
+      tasks.recordEvent(task.id, { kind: "working", source: "worker" });
+
+      const linked = await post(port, task.id, headers, { kind: "pr_linked", pr: "https://github.com/o/r/pull/64" });
+      assert.equal(linked.status, 200);
+      assert.equal(tasks.find(task.id)?.state, "working");
+      assert.equal(tasks.find(task.id)?.pr?.headOid, "pipeline-head");
+
+      const prematureDone = await post(port, task.id, headers, { kind: "done", pr: "https://github.com/o/r/pull/64" });
+      assert.equal(prematureDone.status, 409);
+      assert.match((await prematureDone.json() as { error: string }).error, /does not match checkout HEAD/);
+      assert.equal(tasks.find(task.id)?.state, "working");
+
+      execFileSync("git", ["-C", project, "commit", "-q", "--allow-empty", "-m", "branch sync"], { stdio: "pipe" });
+      prHead = execFileSync("git", ["-C", project, "rev-parse", "HEAD"], { encoding: "utf8" }).trim();
+
+      const completed = await post(port, task.id, headers, { kind: "done" });
+      assert.equal(completed.status, 200);
+      assert.equal(tasks.find(task.id)?.state, "completion_requested");
+      assert.equal(tasks.find(task.id)?.pr?.headOid, prHead);
+      assert.equal(tasks.events(task.id).filter((event) => event.kind === "pr_linked").length, 1);
+    },
+    async () => ({
+      state: "OPEN",
+      headRefName: "perch/link-gate-pr-early",
+      headRefOid: prHead,
+      headRepository: { nameWithOwner: "o/r" }
+    })
+  );
+});
+
+test("done revalidates an early-linked PR after it has merged", async () => {
+  let checkoutHead = "";
+  await withServer(
+    async ({ home, port, tasks, hooks }) => {
+      const { project, head } = makeProjectWithCommit(home);
+      checkoutHead = head;
+      const task = tasks.create({ title: "validate merged linked PR", project, mode: "no-mistakes" });
+      const { token } = hooks.register("pty:worker");
+      const headers = { "x-perch-session": "pty:worker", "x-perch-token": token };
+      tasks.update(task.id, { sessionId: "pty:worker", branch: "perch/validate-merged" });
+      tasks.recordEvent(task.id, { kind: "working", source: "worker" });
+
+      const linked = await post(port, task.id, headers, {
+        kind: "pr_linked",
+        pr: "https://github.com/o/r/pull/65"
+      });
+      assert.equal(linked.status, 200);
+      tasks.update(task.id, { pr: { ...tasks.find(task.id)!.pr!, merged: true } });
+      execFileSync("git", ["-C", project, "commit", "-q", "--allow-empty", "-m", "unpublished work"], { stdio: "pipe" });
+
+      const refused = await post(port, task.id, headers, { kind: "done" });
+      assert.equal(refused.status, 409);
+      assert.match((await refused.json() as { error: string }).error, /does not match checkout HEAD/);
+      assert.equal(tasks.find(task.id)?.state, "working");
+    },
+    async () => ({
+      state: "MERGED",
+      mergedAt: "2026-07-23T00:00:00Z",
+      headRefName: "perch/validate-merged",
+      headRefOid: checkoutHead,
+      headRepository: { nameWithOwner: "o/r" }
+    })
+  );
+});
+
 test("local-only done requests completion without resolving a GitHub repo", async () => {
   let repoResolutions = 0;
   await withServer(

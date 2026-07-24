@@ -113,3 +113,46 @@ test("GET /tasks defaults to the prompt-free live snapshot while includeClosed p
     assert.equal(((await detail.json()) as { task: Task }).task.prompt, "private live brief");
   });
 });
+
+test("REST and WebSocket task snapshots expose an early PR link without changing task state", async () => {
+  await withServer(async ({ port, tasks, rpc }) => {
+    const task = tasks.create({ title: "badge before completion", project: "/tmp/repo", mode: "no-mistakes" });
+    tasks.recordEvent(task.id, { kind: "working", source: "worker" });
+    tasks.recordEvent(task.id, {
+      kind: "note",
+      source: "system",
+      data: { noMistakesAuthorization: { allowed: true, operation: "run", reason: "authorized" } }
+    });
+    tasks.linkPr(task.id, {
+      url: "https://github.com/o/r/pull/62",
+      number: 62,
+      repo: "o/r",
+      headRepo: "o/r",
+      head: "perch/badge-before-completion",
+      headOid: "abc123"
+    }, { source: "worker", message: "https://github.com/o/r/pull/62" });
+
+    const rest = await fetch(`http://127.0.0.1:${port}/tasks/${task.id}`, { headers: bearer });
+    const detail = (await rest.json()) as { task: Task; events: Array<{ kind: string }> };
+    assert.equal(detail.task.state, "working");
+    assert.equal(detail.task.presentation?.state, "reviewing");
+    assert.equal(detail.task.pr?.number, 62);
+    assert.ok(detail.events.some((event) => event.kind === "pr_linked"));
+
+    const list = await fetch(`http://127.0.0.1:${port}/tasks`, { headers: bearer });
+    const listed = (await list.json()) as TasksResponse;
+    assert.equal(listed.tasks.find((candidate) => candidate.id === task.id)?.pr?.number, 62);
+
+    const rpcResponse = await rpc(`/tasks/${task.id}`);
+    assert.equal(rpcResponse.ok, true);
+    const rpcDetail = (rpcResponse.ok ? rpcResponse.body : undefined) as { task: Task };
+    assert.equal(rpcDetail.task.state, "working");
+    assert.equal(rpcDetail.task.pr?.url, "https://github.com/o/r/pull/62");
+    assert.equal(rpcDetail.task.pr?.number, 62);
+
+    const listRpc = await rpc("/tasks");
+    assert.equal(listRpc.ok, true);
+    const rpcList = (listRpc.ok ? listRpc.body : undefined) as TasksResponse;
+    assert.equal(rpcList.tasks.find((candidate) => candidate.id === task.id)?.pr?.number, 62);
+  });
+});

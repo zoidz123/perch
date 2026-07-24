@@ -38,6 +38,41 @@ test("task event, mate wake, and push intents survive failure and retry with bac
   rmSync(home, { recursive: true, force: true });
 });
 
+test("an early PR link durably notifies both channels without changing task lifecycle", async () => {
+  const home = mkdtempSync(join(tmpdir(), "perch-pr-link-outbox-"));
+  const tasks = new TaskStore({ PERCH_HOME: home } as NodeJS.ProcessEnv);
+  const task = tasks.create({ title: "early PR", project: "/tmp/repo" });
+  tasks.recordEvent(task.id, { kind: "working", source: "worker" });
+  const linked = tasks.linkPr(task.id, {
+    url: "https://github.com/o/r/pull/62",
+    number: 62,
+    repo: "o/r",
+    headRepo: "o/r",
+    head: "perch/early-pr",
+    headOid: "head-a"
+  }, { source: "worker", message: "https://github.com/o/r/pull/62" });
+  const event = tasks.events(task.id).at(-1)!;
+  assert.equal(event.kind, "pr_linked");
+  assert.equal(linked.task.state, "working");
+
+  const delivered: string[] = [];
+  const worker = new OutboxWorker({
+    stateDb: tasks.stateDb,
+    deliver: {
+      mate: (delivery) => { delivered.push(`mate:${delivery.event.kind}`); },
+      push: (delivery) => { delivered.push(`push:${delivery.event.kind}`); }
+    }
+  });
+  await worker.drain();
+  assert.ok(delivered.includes("mate:pr_linked"));
+  assert.ok(delivered.includes("push:pr_linked"));
+  assert.ok(tasks.stateDb.outbox.forTaskEvent(task.id, event.seq).every((intent) => intent.state === "delivered"));
+  assert.equal(tasks.find(task.id)?.state, "working");
+
+  tasks.close();
+  rmSync(home, { recursive: true, force: true });
+});
+
 test("only channel-notifiable events enqueue intents and settled rows age out of the outbox", async () => {
   const home = mkdtempSync(join(tmpdir(), "perch-outbox-retention-"));
   const tasks = new TaskStore({ PERCH_HOME: home } as NodeJS.ProcessEnv);

@@ -71,6 +71,55 @@ test("poller flips checks then merged, exactly once each", async () => {
   rmSync(home, { recursive: true, force: true });
 });
 
+test("poller tracks an early PR link while the task remains working", async () => {
+  const home = mkdtempSync(join(tmpdir(), "perch-poller-"));
+  const tasks = new TaskStore({ PERCH_HOME: home } as NodeJS.ProcessEnv);
+  const task = tasks.create({ title: "show badge before completion", project: "/tmp/repo" });
+  tasks.recordEvent(task.id, { kind: "working", source: "worker" });
+  tasks.linkPr(task.id, {
+    url: "https://github.com/o/r/pull/62",
+    number: 62,
+    repo: "o/r",
+    headRepo: "o/r",
+    head: "perch/early-pr",
+    headOid: "head-a"
+  }, { source: "worker", message: "https://github.com/o/r/pull/62" });
+
+  let phase: "pending" | "passing" | "merged" = "pending";
+  const poller = new PrPoller(
+    tasks,
+    async () => view({
+      state: phase === "merged" ? "MERGED" : "OPEN",
+      mergedAt: phase === "merged" ? "2026-07-23T00:00:00Z" : null,
+      headRefName: "perch/early-pr",
+      headRefOid: "head-a",
+      statusCheckRollup: [{ name: "server", conclusion: phase === "pending" ? "" : "SUCCESS" }]
+    }),
+    { resolveLocalRepo: async () => "o/r" }
+  );
+
+  poller.armFast(task.id);
+  await poller.fastTick();
+  assert.equal(tasks.find(task.id)?.state, "working");
+  assert.equal(tasks.find(task.id)?.pr?.checks, "pending");
+  assert.equal(tasks.events(task.id).filter((event) => event.kind === "completion_requested").length, 0);
+
+  phase = "passing";
+  await poller.fastTick();
+  assert.equal(tasks.find(task.id)?.state, "working");
+  assert.equal(tasks.find(task.id)?.pr?.checks, "passing");
+  assert.equal(tasks.events(task.id).filter((event) => event.kind === "checks_green").length, 1);
+  assert.equal(tasks.events(task.id).filter((event) => event.kind === "completion_requested").length, 0);
+
+  phase = "merged";
+  await poller.fastTick();
+  assert.equal(tasks.find(task.id)?.pr?.merged, true, "the merge observation is durable before completion");
+  assert.equal(tasks.find(task.id)?.state, "working", "a PR observation never fabricates completion");
+  assert.equal(tasks.events(task.id).filter((event) => event.kind === "merged").length, 0);
+
+  rmSync(home, { recursive: true, force: true });
+});
+
 test("merge readiness stays false for draft PRs even when checks pass", async () => {
   const home = mkdtempSync(join(tmpdir(), "perch-poller-"));
   const tasks = new TaskStore({ PERCH_HOME: home } as NodeJS.ProcessEnv);

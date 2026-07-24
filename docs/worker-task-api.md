@@ -46,7 +46,7 @@ Bearer-authenticated events are persisted with `source: "system"` and do not sat
 | `POST /tasks` | Mate | Create a task and, with `dispatch: true`, acquire a worktree, start a worker, and link the runtime. |
 | `GET /tasks` | Mate, CLI, phone | List durable task projections. |
 | `GET /tasks/:id` | Mate, CLI, phone | Read one task and its immutable ordered event log. |
-| `POST /tasks/:id/events` | Worker | Report `working`, `needs_decision`, `blocked`, `done`, `failed`, or `note`. |
+| `POST /tasks/:id/events` | Worker | Report `working`, `pr_linked`, `needs_decision`, `blocked`, `done`, `failed`, or `note`. |
 | `POST /hooks` | Installed provider hook | Report provider lifecycle signals such as turn start and turn completion. |
 | `POST /tasks/:id/completion` | Mate with the server token | Accept or reject the latest worker completion request. |
 | `POST /tasks/:id/decision` | Mate or phone | Answer a structured no-mistakes review gate reported through `needs_decision`. |
@@ -57,6 +57,7 @@ Bearer-authenticated events are persisted with `source: "system"` and do not sat
 
 The authenticated routes use JSON request and response bodies.
 Errors use an HTTP status plus an `{ "error": "..." }` body.
+Authenticated WebSocket RPC exposes the same `GET /tasks` and `GET /tasks/:id` projections, including the linked PR fact.
 
 ## Dispatch and read endpoints
 
@@ -136,7 +137,7 @@ The request body is:
 
 ```json
 {
-  "kind": "working | needs_decision | blocked | done | failed | note",
+  "kind": "working | pr_linked | needs_decision | blocked | done | failed | note",
   "message": "optional human-readable evidence",
   "pr": "optional pull request URL",
   "data": { "optional": "structured evidence" }
@@ -150,6 +151,7 @@ The successful response is `{ "task": <updated-task> }`.
 | Worker wire verb | Durable event | Resulting task state | Meaning |
 | --- | --- | --- | --- |
 | `working` | `working` | `working` | The worker started or resumed meaningful work. |
+| `pr_linked` | `pr_linked` | unchanged | A remote ship task authenticated its canonical PR identity. The server validates and records the URL, repo, number, head branch, and head commit, then begins polling it without requesting completion. |
 | `needs_decision` | `needs_decision` | `needs_you` | Work is parked on a human or Mate decision. |
 | `blocked` | `blocked` | `blocked` | Work is parked on an external dependency. |
 | `done` | `completion_requested` | `completion_requested` | The worker claims the definition of done is met and asks Mate to verify it. |
@@ -159,9 +161,14 @@ The successful response is `{ "task": <updated-task> }`.
 The `done` name is retained as the worker wire verb for compatibility.
 It never directly creates trusted `done` state.
 
-For a non-scout, non-`local-only` task, a `done` request must resolve to a valid pull request unless the attached task PR is already merged.
+For remote ship tasks, report `pr_linked` as soon as the worker or no-mistakes pipeline creates or discovers the PR.
+Its body must contain an explicit `pr` URL, never a URL scraped from ordinary working text.
+The server verifies it against the task identity, persists the PR fact and `pr_linked` event atomically, and immediately exposes it through task snapshots while lifecycle state remains unchanged.
+Repeating the same identity is harmless; a different PR is rejected.
+
+For a non-scout, non-`local-only` task, every `done` request must re-resolve a valid pull request and validate its head commit against the task checkout `HEAD`, including when the task already has an attached merged PR.
 The worker may send `pr`, include the URL in `message`, or let the server discover the unique PR for the server-minted branch.
-The server requires the PR head commit to equal the task checkout `HEAD`, then attaches the PR before recording the completion request.
+The server attaches the validated PR before recording the completion request.
 For `no-mistakes` tasks, the standard worker brief therefore requires inspecting `branch_sync`, running exactly `no-mistakes axi sync` when `next_action.code` is `sync`, and confirming the event response reached `task.state == completion_requested`.
 
 ## What happens when a provider turn completes
