@@ -75,6 +75,7 @@ See the [complete CLI guide](docs/cli.md) for verified arguments, options, defau
 - [Architecture](docs/architecture.md)
 - [Worker task API and turn lifecycle](docs/worker-task-api.md)
 - [Security](docs/security.md)
+- [Physical iPhone install](docs/ios-device-install.md)
 - [No-mistakes authorization](docs/no-mistakes-authorization.md)
 - [Release and version synchronization](docs/releasing.md)
 
