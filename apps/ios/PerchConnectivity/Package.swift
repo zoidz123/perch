@@ -1,8 +1,8 @@
 // swift-tools-version:5.9
 import PackageDescription
 
-// Standalone harness for the connection-status hysteresis used by the iOS
-// app. Keeping the state machine free of SwiftUI makes relay-flap timing
+// Standalone harness for the connection-readiness presentation used by the
+// iOS app. Keeping the state machine free of SwiftUI makes readiness timing
 // deterministic under `swift test`.
 let package = Package(
   name: "PerchConnectivity",
