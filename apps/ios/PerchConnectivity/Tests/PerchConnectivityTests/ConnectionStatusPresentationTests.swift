@@ -102,6 +102,26 @@ final class ConnectionStatusPresentationTests: XCTestCase {
         XCTAssertEqual(queue.pending, .full)
     }
 
+    func testTrailingPartialReconciliationWaitsForThrottleWindow() {
+        let throttle = FleetReconciliationThrottle(minimumInterval: 2)
+        let lastStart = Date(timeIntervalSinceReferenceDate: 100)
+
+        XCTAssertEqual(
+            throttle.delaySinceLastStart(
+                lastStart,
+                now: Date(timeIntervalSinceReferenceDate: 100.5)
+            ),
+            1.5
+        )
+        XCTAssertEqual(
+            throttle.delaySinceLastStart(
+                lastStart,
+                now: Date(timeIntervalSinceReferenceDate: 102)
+            ),
+            0
+        )
+    }
+
     func testSheetSnapshotStateDistinguishesConnectingOnlineAndOffline() {
         XCTAssertEqual(
             PresentedServerAvailability.connecting.snapshotSurfaceState,

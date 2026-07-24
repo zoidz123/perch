@@ -1962,6 +1962,7 @@ final class PerchStore: ObservableObject {
     }
 
     private var lastTasksFetch = Date.distantPast
+    private let fleetReconciliationThrottle = FleetReconciliationThrottle(minimumInterval: 2)
 
     private func reconcileFleet(_ scope: FleetReconciliationScope) async -> Bool {
         guard isPaired else { return false }
@@ -1971,11 +1972,6 @@ final class PerchStore: ObservableObject {
             _ = await task.value
             finishFleetReconciliation(reconciliationID)
             return await awaitActiveFleetReconciliation()
-        }
-
-        if scope == .partial {
-            guard Date().timeIntervalSince(lastTasksFetch) > 2 else { return true }
-            lastTasksFetch = Date()
         }
 
         guard fleetReconciliationQueue.request(scope) else {
@@ -2003,8 +1999,15 @@ final class PerchStore: ObservableObject {
         let reconciliationID = UUID()
         fleetReconciliationID = reconciliationID
         latestFleetSessionsWhileReconciling = nil
+        let delay = scope == .partial
+            ? fleetReconciliationThrottle.delaySinceLastStart(lastTasksFetch, now: Date())
+            : 0
         let task = Task { [weak self] in
             guard let self else { return false }
+            if delay > 0 {
+                try? await Task.sleep(for: .seconds(delay))
+                guard !Task.isCancelled else { return false }
+            }
             if scope == .full {
                 let refreshed = await self.refetchAuthoritativeFleet()
                 if let selectedSessionId = self.selectedSessionId {
@@ -2012,6 +2015,7 @@ final class PerchStore: ObservableObject {
                 }
                 return refreshed
             } else {
+                self.lastTasksFetch = Date()
                 await self.refreshTaskSnapshot()
                 if let result: ProjectsResult = try? await self.request(path: "/projects") {
                     self.projects = result.projects

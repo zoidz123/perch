@@ -62,6 +62,14 @@ struct FleetReconciliationQueue {
     }
 }
 
+struct FleetReconciliationThrottle {
+    let minimumInterval: TimeInterval
+
+    func delaySinceLastStart(_ lastStart: Date, now: Date) -> TimeInterval {
+        max(0, minimumInterval - now.timeIntervalSince(lastStart))
+    }
+}
+
 enum ConnectionReadinessEvidence: Equatable {
     case directBootstrap
     case encryptedChannel
