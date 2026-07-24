@@ -27,6 +27,7 @@ const TERMINAL_MODE_RESET =
   "\x1b[?1004l\x1b[?2031l\x1b[?2004l\x1b[?25h";
 const HEALTH_TIMEOUT_MS = 700;
 const STARTUP_TIMEOUT_MS = 8000;
+const STOP_TIMEOUT_MS = 15000;
 const PACKAGE_ROOT = dirname(dirname(fileURLToPath(import.meta.url)));
 const PACKAGE_VERSION = JSON.parse(readFileSync(join(PACKAGE_ROOT, "package.json"), "utf8")).version;
 const NO_MISTAKES_MANIFEST = JSON.parse(
@@ -385,10 +386,14 @@ async function runServerCommand(action, options) {
     }
     try {
       process.kill(pid, "SIGTERM");
-      console.log(`stopped (pid ${pid})`);
     } catch {
       console.log(`no process with pid ${pid} (stale pidfile)`);
+      return;
     }
+    if (!(await waitForPerchServerExit(pid))) {
+      throw new Error(`server pid ${pid} did not stop within ${STOP_TIMEOUT_MS / 1000}s`);
+    }
+    console.log(`stopped (pid ${pid})`);
     return;
   }
 
@@ -436,6 +441,17 @@ function isPerchServerProcess(pid) {
   } catch {
     return false;
   }
+}
+
+async function waitForPerchServerExit(pid) {
+  const deadline = Date.now() + STOP_TIMEOUT_MS;
+  while (Date.now() < deadline) {
+    if (!isPerchServerProcess(pid)) {
+      return true;
+    }
+    await delay(50);
+  }
+  return !isPerchServerProcess(pid);
 }
 
 // ---------------------------------------------------------------------------
