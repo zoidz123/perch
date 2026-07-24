@@ -380,15 +380,26 @@ async function runServerCommand(action, options) {
     }
     // A stale pidfile can point at a recycled PID after an unclean death or
     // reboot; never SIGTERM a process that is not actually a perch server.
-    if (!isPerchServerProcess(pid)) {
+    const processState = inspectPerchServerProcess(pid);
+    if (processState === "absent") {
+      console.log(`no process with pid ${pid} (stale pidfile)`);
+      return;
+    }
+    if (processState === "other") {
       console.log(`pid ${pid} is not a perch server (stale pidfile) - not stopping it`);
       return;
     }
+    if (processState === "unknown") {
+      throw new Error(`could not verify server pid ${pid} before stopping it`);
+    }
     try {
       process.kill(pid, "SIGTERM");
-    } catch {
-      console.log(`no process with pid ${pid} (stale pidfile)`);
-      return;
+    } catch (error) {
+      if (error && typeof error === "object" && error.code === "ESRCH") {
+        console.log(`no process with pid ${pid} (stale pidfile)`);
+        return;
+      }
+      throw new Error(`could not signal server pid ${pid}`);
     }
     if (!(await waitForPerchServerExit(pid))) {
       throw new Error(`server pid ${pid} did not stop within ${STOP_TIMEOUT_MS / 1000}s`);
@@ -430,28 +441,49 @@ function readPid() {
   }
 }
 
-function isPerchServerProcess(pid) {
+function inspectPerchServerProcess(pid) {
+  const existence = inspectProcessExistence(pid);
+  if (existence !== "present") {
+    return existence;
+  }
   try {
     const result = spawnSync("ps", ["-p", String(pid), "-o", "command="], { encoding: "utf8" });
     if (result.status !== 0) {
-      return false;
+      return inspectProcessExistence(pid) === "absent" ? "absent" : "unknown";
     }
     const command = (result.stdout ?? "").trim();
-    return /apps\/server\/dist\/index\.js/.test(command);
+    return /apps\/server\/dist\/index\.js/.test(command) ? "perch" : "other";
   } catch {
-    return false;
+    return inspectProcessExistence(pid) === "absent" ? "absent" : "unknown";
+  }
+}
+
+function inspectProcessExistence(pid) {
+  try {
+    process.kill(pid, 0);
+    return "present";
+  } catch (error) {
+    if (error && typeof error === "object" && error.code === "ESRCH") {
+      return "absent";
+    }
+    return "unknown";
   }
 }
 
 async function waitForPerchServerExit(pid) {
   const deadline = Date.now() + STOP_TIMEOUT_MS;
   while (Date.now() < deadline) {
-    if (!isPerchServerProcess(pid)) {
+    const processState = inspectPerchServerProcess(pid);
+    if (processState === "absent" || processState === "other") {
       return true;
     }
     await delay(50);
   }
-  return !isPerchServerProcess(pid);
+  const processState = inspectPerchServerProcess(pid);
+  if (processState === "unknown") {
+    throw new Error(`could not verify whether server pid ${pid} exited`);
+  }
+  return processState === "absent" || processState === "other";
 }
 
 // ---------------------------------------------------------------------------

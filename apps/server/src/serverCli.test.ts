@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
-import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, copyFileSync, mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { createConnection, createServer } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -11,50 +11,153 @@ import { promisify } from "node:util";
 const execFileAsync = promisify(execFile);
 const PERCH_BIN = fileURLToPath(new URL("../../../bin/perch.mjs", import.meta.url));
 
-test("perch server stop waits until the server process releases its port", async () => {
+test("server stop waits for delayed exit before an immediate start", async () => {
+  const fixture = await createCliFixture(500);
+
+  try {
+    await runCli(fixture, "start");
+    const stopped = await runCli(fixture, "stop");
+    assert.match(stopped.stdout, /stopped/);
+    await assertPortCanBind(fixture.port);
+
+    const restarted = await runCli(fixture, "start");
+    assert.match(restarted.stdout, /running/);
+    await waitForPort(fixture.port);
+  } finally {
+    await cleanupFixture(fixture);
+  }
+});
+
+test("concurrent server starts converge on one healthy server", async () => {
+  const fixture = await createCliFixture(0);
+
+  try {
+    const starts = await Promise.all([runCli(fixture, "start"), runCli(fixture, "start")]);
+    for (const result of starts) {
+      assert.match(result.stdout, /running/);
+    }
+    await waitForPort(fixture.port);
+    assert.ok(readPid(fixture));
+    assert.equal(
+      readFileSync(fixture.log, "utf8")
+        .split("\n")
+        .filter((line) => line === "fixture listening").length,
+      1
+    );
+  } finally {
+    await cleanupFixture(fixture);
+  }
+});
+
+test("server stop fails closed when process inspection fails", async () => {
+  const fixture = await createCliFixture(0);
+  const fakeBin = join(fixture.root, "fake-bin");
+  mkdirSync(fakeBin);
+  const fakePs = join(fakeBin, "ps");
+  writeFileSync(fakePs, "#!/bin/sh\nexit 2\n");
+  chmodSync(fakePs, 0o755);
+
+  try {
+    await runCli(fixture, "start");
+    await assert.rejects(
+      runCli(fixture, "stop", { PATH: `${fakeBin}:${process.env.PATH ?? ""}` }),
+      /could not verify server pid/
+    );
+    await waitForPort(fixture.port);
+  } finally {
+    await cleanupFixture(fixture);
+  }
+});
+
+type CliFixture = {
+  root: string;
+  home: string;
+  bin: string;
+  log: string;
+  port: number;
+};
+
+async function createCliFixture(shutdownDelayMs: number): Promise<CliFixture> {
   const root = mkdtempSync(join(tmpdir(), "perch-server-stop-"));
   const home = join(root, "home");
+  const bin = join(root, "bin", "perch.mjs");
   const entry = join(root, "apps", "server", "dist", "index.js");
   mkdirSync(home, { recursive: true });
+  mkdirSync(join(bin, ".."), { recursive: true });
   mkdirSync(join(entry, ".."), { recursive: true });
+  mkdirSync(join(root, "vendor", "no-mistakes"), { recursive: true });
+  mkdirSync(join(root, "node_modules", "ws"), { recursive: true });
+  copyFileSync(PERCH_BIN, bin);
+  chmodSync(bin, 0o755);
+  writeFileSync(join(root, "package.json"), '{"type":"module","version":"0.0.0"}\n');
+  writeFileSync(join(root, "vendor", "no-mistakes", "manifest.json"), "{}\n");
+  writeFileSync(join(root, "node_modules", "ws", "package.json"), '{"type":"module","exports":"./index.js"}\n');
+  writeFileSync(join(root, "node_modules", "ws", "index.js"), "export default class WebSocket {}\n");
   writeFileSync(
     entry,
     [
-      'import { createServer } from "node:net";',
-      "const server = createServer();",
-      'server.listen(Number(process.env.PORT), "127.0.0.1");',
+      'import { writeFileSync } from "node:fs";',
+      'import { join } from "node:path";',
+      'import { createServer } from "node:http";',
+      "const server = createServer((request, response) => {",
+      '  if (request.url === "/health") {',
+      '    response.writeHead(200, { "content-type": "application/json" });',
+      '    response.end(JSON.stringify({ ok: true, adapter: "fixture", version: "0.0.0" }));',
+      "    return;",
+      "  }",
+      "  response.writeHead(404);",
+      "  response.end();",
+      "});",
+      'server.listen(Number(process.env.PORT), "127.0.0.1", () => {',
+      '  writeFileSync(join(process.env.PERCH_HOME, "perch.pid"), String(process.pid));',
+      '  console.log("fixture listening");',
+      "});",
       'process.on("SIGTERM", () => {',
-      "  setTimeout(() => server.close(() => process.exit(0)), 500);",
+      `  setTimeout(() => server.close(() => process.exit(0)), ${shutdownDelayMs});`,
       "});"
     ].join("\n")
   );
 
   const port = await availablePort();
-  const child = execFile(process.execPath, [entry], {
-    env: { ...process.env, PORT: String(port) }
-  });
-  assert.ok(child.pid);
-  writeFileSync(join(home, "perch.pid"), String(child.pid));
+  return { root, home, bin, log: join(home, "server.log"), port };
+}
 
-  try {
-    await waitForPort(port);
-    const result = await execFileAsync(process.execPath, [PERCH_BIN, "server", "stop"], {
-      env: {
-        ...process.env,
-        PERCH_HOME: home,
-        PERCH_SERVER_URL: `http://127.0.0.1:${port}`
-      }
-    });
-    assert.match(result.stdout, /stopped/);
-    await assertPortCanBind(port);
-  } finally {
-    if (child.pid && isAlive(child.pid)) {
-      child.kill("SIGKILL");
-      await new Promise<void>((resolve) => child.once("exit", () => resolve()));
+async function runCli(
+  fixture: CliFixture,
+  action: "start" | "stop",
+  env: NodeJS.ProcessEnv = {}
+): Promise<{ stdout: string; stderr: string }> {
+  return execFileAsync(process.execPath, [fixture.bin, "server", action], {
+    env: {
+      ...process.env,
+      PERCH_HOME: fixture.home,
+      PERCH_SERVER_URL: `http://127.0.0.1:${fixture.port}`,
+      PERCH_RELAY_URL: "off",
+      ...env
     }
-    rmSync(root, { recursive: true, force: true });
+  });
+}
+
+async function cleanupFixture(fixture: CliFixture): Promise<void> {
+  const pid = readPid(fixture);
+  if (pid && isAlive(pid)) {
+    process.kill(pid, "SIGKILL");
+    const deadline = Date.now() + 2_000;
+    while (isAlive(pid) && Date.now() < deadline) {
+      await new Promise((resolve) => setTimeout(resolve, 20));
+    }
   }
-});
+  rmSync(fixture.root, { recursive: true, force: true });
+}
+
+function readPid(fixture: CliFixture): number | undefined {
+  try {
+    const pid = Number(readFileSync(join(fixture.home, "perch.pid"), "utf8").trim());
+    return Number.isInteger(pid) && pid > 1 ? pid : undefined;
+  } catch {
+    return undefined;
+  }
+}
 
 async function availablePort(): Promise<number> {
   const server = createServer();
