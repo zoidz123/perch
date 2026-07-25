@@ -234,11 +234,13 @@ export class TimelineStore {
     this.append(resolved.sessionId, resolved, opts.live !== false);
   }
 
-  openBackfillGap(sessionId: string): void {
-    if (this.pendingBackfillLanes.has(sessionId)) return;
+  openBackfillGap(sessionId: string): boolean {
+    const existing = this.pendingBackfillLanes.get(sessionId);
+    if (existing) return (existing.anchorIds?.size ?? 0) > 0;
     const lane = this.reserveBackfillLane(sessionId);
     lane.anchorIds = new Set(this.seenIds.get(sessionId) ?? []);
     this.pendingBackfillLanes.set(sessionId, lane);
+    return lane.anchorIds.size > 0;
   }
 
   beginBackfill(

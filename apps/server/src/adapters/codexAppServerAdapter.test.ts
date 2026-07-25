@@ -157,11 +157,12 @@ async function fixture(
       threadId: adapter.threadIdOf(sessionId)!,
       cursor,
       stopAtAnchor,
+      restartsFromHead: !stopAtAnchor && cursor === null,
       onPage: () => {},
       onTerminal: () => {}
     });
-  adapter.setHistoryCatchUpRequester((sessionId) => {
-    startHistoryCatchUp(sessionId, null, true);
+  adapter.setHistoryCatchUpRequester((sessionId, hasUsableAnchor) => {
+    startHistoryCatchUp(sessionId, null, hasUsableAnchor);
   });
   return {
     dir,

@@ -454,13 +454,15 @@ export class FakeCodexOwnedAdapter {
   private readonly turnCompletionWaiters = new Map<string, () => void>();
   private threadCounter = 0;
   private turnCounter = 0;
-  private historyCatchUpRequester?: (sessionId: string) => void;
+  private historyCatchUpRequester?: (sessionId: string, hasUsableAnchor: boolean) => void;
 
   wireEvents(events: CodexOwnedEventSink): void {
     this.events = events;
   }
 
-  setHistoryCatchUpRequester(requester: (sessionId: string) => void): void {
+  setHistoryCatchUpRequester(
+    requester: (sessionId: string, hasUsableAnchor: boolean) => void
+  ): void {
     this.historyCatchUpRequester = requester;
   }
 

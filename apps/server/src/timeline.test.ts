@@ -262,7 +262,7 @@ test("a full replay restarting from its head retires an empty disconnect anchor"
   });
 
   store.beginBackfill("pty:head-retry", "sync-full", false, true);
-  store.openBackfillGap("pty:head-retry");
+  assert.equal(store.openBackfillGap("pty:head-retry"), false);
   store.endBackfill("pty:head-retry", "sync-full", false);
   store.beginBackfill("pty:head-retry", "sync-full", false, true);
   store.ingestBackfill("pty:head-retry", "sync-full", [
@@ -271,7 +271,7 @@ test("a full replay restarting from its head retires an empty disconnect anchor"
   ]);
   store.endBackfill("pty:head-retry", "sync-full", true);
 
-  store.openBackfillGap("pty:head-retry");
+  assert.equal(store.openBackfillGap("pty:head-retry"), true);
   store.beginBackfill("pty:head-retry", "sync-gap", true);
   assert.deepEqual(
     store.ingestBackfill("pty:head-retry", "sync-gap", [

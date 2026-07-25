@@ -51,7 +51,7 @@ export type CodexOwnedEventSink = {
   // `live` is false for history replayed by thread/resume (catch-up rows must
   // not flood the fleet WebSocket; clients page them via GET /timeline).
   onTimelineItem?: (item: TimelineItem, live: boolean) => void;
-  onTimelineGapOpened?: (sessionId: string) => void;
+  onTimelineGapOpened?: (sessionId: string) => boolean;
   onTimelineBackfillStart?: (
     sessionId: string,
     syncId: string,
@@ -81,6 +81,7 @@ export type CodexHistoryCatchUpRequest = {
   threadId: string;
   cursor: string | null;
   stopAtAnchor?: boolean;
+  restartsFromHead?: boolean;
   onPage: (progress: { cursor: string | null; accepted: number }) => void;
   onTerminal: (result: {
     state: "succeeded" | "truncated" | "failed";
@@ -160,6 +161,7 @@ type OwnedSession = {
   stopped: boolean;
   reconnecting: boolean;
   historyReplayEpoch: number;
+  historyGapHasAnchor: boolean;
   historyCatchUp?: { epoch: number; request: CodexHistoryCatchUpRequest };
   attachCommandReady: boolean;
 };
@@ -180,7 +182,7 @@ export class CodexAppServerAdapter implements AgentAdapter {
   private readonly historyPageTimeoutMs: number;
   private readonly fleetHandlers = new Set<(event: FleetEvent) => void>();
   private events: CodexOwnedEventSink = {};
-  private historyCatchUpRequester?: (sessionId: string) => void;
+  private historyCatchUpRequester?: (sessionId: string, hasUsableAnchor: boolean) => void;
 
   constructor(options: CodexAppServerAdapterOptions) {
     this.daemons = options.daemons;
@@ -213,7 +215,9 @@ export class CodexAppServerAdapter implements AgentAdapter {
     this.events = events;
   }
 
-  setHistoryCatchUpRequester(requester: (sessionId: string) => void): void {
+  setHistoryCatchUpRequester(
+    requester: (sessionId: string, hasUsableAnchor: boolean) => void
+  ): void {
     this.historyCatchUpRequester = requester;
   }
 
@@ -361,6 +365,7 @@ export class CodexAppServerAdapter implements AgentAdapter {
       stopped: false,
       reconnecting: false,
       historyReplayEpoch: 0,
+      historyGapHasAnchor: false,
       attachCommandReady: opts.deferAttachCommand !== true
     };
     session.client = this.createClient({
@@ -447,7 +452,7 @@ export class CodexAppServerAdapter implements AgentAdapter {
       session.id,
       request.syncId,
       request.stopAtAnchor === true,
-      request.stopAtAnchor !== true && request.cursor === null
+      request.restartsFromHead === true
     );
     this.replayHistoryInBackground(session, epoch, request);
     return true;
@@ -693,7 +698,7 @@ export class CodexAppServerAdapter implements AgentAdapter {
       session.threadId = resumed.threadId;
       session.model = resumed.model;
       try {
-        this.historyCatchUpRequester?.(session.id);
+        this.historyCatchUpRequester?.(session.id, session.historyGapHasAnchor);
       } catch (error) {
         console.warn(
           `codex history catch-up could not be scheduled for ${session.id}: ${
@@ -709,7 +714,7 @@ export class CodexAppServerAdapter implements AgentAdapter {
   // interruption and the recovery flow own what happens next.
   private handleDisconnect(session: OwnedSession): void {
     if (session.stopped || session.reconnecting) return;
-    this.events.onTimelineGapOpened?.(session.id);
+    session.historyGapHasAnchor = this.events.onTimelineGapOpened?.(session.id) === true;
     session.reconnecting = true;
     void (async () => {
       try {

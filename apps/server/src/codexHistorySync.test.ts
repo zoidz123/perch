@@ -12,9 +12,11 @@ import { StateDb, type RuntimeRecord } from "./stateDb.js";
 
 class HistoryAdapter {
   requests: Array<{ sessionId: string; request: CodexHistoryCatchUpRequest }> = [];
-  requester?: (sessionId: string) => void;
+  requester?: (sessionId: string, hasUsableAnchor: boolean) => void;
 
-  setHistoryCatchUpRequester(requester: (sessionId: string) => void): void {
+  setHistoryCatchUpRequester(
+    requester: (sessionId: string, hasUsableAnchor: boolean) => void
+  ): void {
     this.requester = requester;
   }
 
@@ -110,7 +112,7 @@ test("failed Codex history retries the same durable cursor without a reconnect",
   rmSync(home, { recursive: true, force: true });
 });
 
-test("a full retry from the head absorbs its pending reconnect gap", async () => {
+test("an unknown-only page cannot become an empty reconnect anchor", async () => {
   const home = mkdtempSync(join(tmpdir(), "perch-history-head-retry-"));
   const db = new StateDb({ PERCH_HOME: home } as NodeJS.ProcessEnv);
   const adapter = new HistoryAdapter();
@@ -120,20 +122,51 @@ test("a full retry from the head absorbs its pending reconnect gap", async () =>
     { retryDelaysMs: [] }
   );
   const receipt = coordinator.startForTaskRuntime(liveRuntime())!;
+  adapter.requests[0]!.request.onPage({ cursor: "20", accepted: 0 });
   adapter.requests[0]!.request.onTerminal({
     state: "failed",
-    error: "connection lost before first page"
+    error: "connection lost after unknown-only page"
   });
 
-  const resumed = coordinator.resumeForSession("pty:live")!;
+  const resumed = coordinator.resumeForSession("pty:live", false)!;
 
   assert.equal(resumed.id, receipt.id);
   assert.equal(adapter.requests.length, 2);
   assert.equal(adapter.requests[1]!.request.cursor, null);
   assert.equal(adapter.requests[1]!.request.stopAtAnchor, false);
+  assert.equal(adapter.requests[1]!.request.restartsFromHead, true);
+  adapter.requests[1]!.request.onPage({ cursor: null, accepted: 0 });
   adapter.requests[1]!.request.onTerminal({ state: "succeeded" });
   await new Promise((resolve) => setTimeout(resolve, 5));
   assert.equal(adapter.requests.length, 2);
+
+  coordinator.stop();
+  db.close();
+  rmSync(home, { recursive: true, force: true });
+});
+
+test("an unanchored reconnect after a completed sync starts a full head replay", () => {
+  const home = mkdtempSync(join(tmpdir(), "perch-history-unanchored-complete-"));
+  const db = new StateDb({ PERCH_HOME: home } as NodeJS.ProcessEnv);
+  const adapter = new HistoryAdapter();
+  const coordinator = new CodexHistorySyncCoordinator(
+    db,
+    adapter as unknown as CodexAppServerAdapter,
+    { retryDelaysMs: [] }
+  );
+  const receipt = coordinator.startForTaskRuntime(liveRuntime())!;
+  adapter.requests[0]!.request.onPage({ cursor: null, accepted: 0 });
+  adapter.requests[0]!.request.onTerminal({ state: "succeeded" });
+
+  const replacement = coordinator.resumeForSession("pty:live", false)!;
+
+  assert.notEqual(replacement.id, receipt.id);
+  assert.equal(adapter.requests.length, 2);
+  assert.equal(adapter.requests[1]!.request.cursor, null);
+  assert.equal(adapter.requests[1]!.request.stopAtAnchor, false);
+  assert.equal(adapter.requests[1]!.request.restartsFromHead, true);
+  adapter.requests[1]!.request.onPage({ cursor: null, accepted: 0 });
+  adapter.requests[1]!.request.onTerminal({ state: "succeeded" });
 
   coordinator.stop();
   db.close();
