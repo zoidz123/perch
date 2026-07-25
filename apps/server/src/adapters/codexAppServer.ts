@@ -627,7 +627,7 @@ export class CodexAppServerClient {
 
   // Authoritative thread history (`thread/read` with includeTurns), rebuilt by
   // the daemon from the rollout. Used to reconcile inputs whose response was
-  // lost and to replay history after a resume.
+  // lost; recovery catch-up uses bounded thread/turns/list pages instead.
   async readThread(threadId?: string): Promise<ThreadReadResult> {
     const id = threadId ?? this._threadId;
     if (!id) throw new Error("No thread available to read.");

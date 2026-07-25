@@ -223,7 +223,7 @@ export class TimelineStore {
 
   // Ingest a protocol-native timeline item directly (app-server-owned Codex
   // sessions: thread/turn/item notifications own the timeline, no transcript
-  // tailer). Dedupe by item id makes resume-history replays idempotent
+  // tailer). Dedupe by item id makes history reconciliation idempotent
   // against rows already ingested live. `live: false` (catch-up replay)
   // populates the store without notifying listeners, mirroring the tailer's
   // catch-up read - clients page history via GET /timeline instead. A user

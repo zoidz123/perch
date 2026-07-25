@@ -48,8 +48,8 @@ export class CodexDeliveryUnknownError extends Error {
 }
 
 export type CodexOwnedEventSink = {
-  // `live` is false for history replayed by thread/resume (catch-up rows must
-  // not flood the fleet WebSocket; clients page them via GET /timeline).
+  // `live` is false for authoritative history emitted during lost-delivery
+  // reconciliation, which updates storage without fleet WebSocket fan-out.
   onTimelineItem?: (item: TimelineItem, live: boolean) => void;
   onTimelineGapOpened?: (sessionId: string) => boolean;
   onTimelineBackfillStart?: (

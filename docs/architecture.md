@@ -58,7 +58,7 @@ Composer messages queue while a permission prompt is open so ordinary text canno
 
 ## Durable task state
 
-SQLite stores the current task projection, immutable task events, separately persisted PR, completion-verification, and review facts, runtime generations, Mate ownership, leased operations, and notification outbox.
+SQLite stores the current task projection, immutable task events, separately persisted PR, completion-verification, and review facts, runtime generations, Mate ownership, leased operations, Codex history-sync receipts, and notification outbox.
 The task lifecycle describes work meaning, while runtime state describes the replaceable process executing it.
 
 ```text
@@ -87,7 +87,11 @@ Before recovery launches a replacement process, Perch proves the previous one is
 It only reaps a crash orphan when the executable, PID birth time, and expected provider match the persisted runtime record.
 
 Claude recovery resumes the exact conversation and requires a matching authenticated session-start event.
-Codex recovery `thread/resume`s the exact recorded thread through the owning adapter: a daemon that survived the restart is rebound over its recorded socket without a respawn, a dead daemon is respawned to resume the rollout-backed thread with the stale in-flight turn represented as interrupted, and the resumed thread id from the protocol response is the identity proof.
+Codex recovery `thread/resume`s the exact recorded thread through the owning adapter with turn history excluded from that response.
+A daemon that survived the restart is rebound over its recorded socket without a respawn, while a dead daemon is respawned to resume the rollout-backed thread with the stale in-flight turn represented as interrupted.
+The resumed thread id from the protocol response is the identity proof, so Perch can publish the live session and commit the next runtime generation without waiting for the rollout history.
+After the live bind, a separate durable receipt drives newest-first `thread/turns/list` catch-up through bounded pages.
+Catch-up inserts older rows before live recovery output, records cursor progress, retries bounded failures independently, and notifies timeline clients to refetch when a backfill changes their view.
 Legacy Codex runtimes recorded before app-server ownership migrate through the same thread/resume path when their rollout exists; a thread whose rollout was never written fails with the permanent missing-rollout condition and ends truthfully.
 The replacement session must still be alive before Perch commits the next runtime generation.
 
