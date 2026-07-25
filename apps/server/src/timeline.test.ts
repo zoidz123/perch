@@ -217,6 +217,39 @@ test("late backfill revisions remain resyncable and a failed sync resumes before
   store.stop();
 });
 
+test("an anchored gap inserts only missed rows before post-reconnect live output", () => {
+  const store = new TimelineStore();
+  const item = (id: string, text: string) => ({
+    seq: 0,
+    id,
+    sessionId: "pty:gap",
+    kind: "assistant" as const,
+    text,
+    at: `2026-07-25T00:00:0${text.slice(-1)}.000Z`
+  });
+
+  store.ingest(item("known-before", "known-1"));
+  store.openBackfillGap("pty:gap");
+  store.ingest(item("known-after", "known-4"));
+  store.beginBackfill("pty:gap", "sync-gap", true);
+  assert.deepEqual(
+    store.ingestBackfill("pty:gap", "sync-gap", [
+      item("too-old", "known-0"),
+      item("known-before", "known-1"),
+      item("missed", "known-2"),
+      item("known-after", "known-4")
+    ]),
+    { accepted: 1, done: true }
+  );
+  store.endBackfill("pty:gap", "sync-gap", true);
+
+  assert.deepEqual(
+    store.fetch("pty:gap", 0, 10).items.map((candidate) => candidate.id),
+    ["known-before", "missed", "known-after"]
+  );
+  store.stop();
+});
+
 test("catch-up waits for an unterminated transcript row to finish", async () => {
   const dir = mkdtempSync(join(tmpdir(), "perch-tl-partial-catchup-"));
   const transcript = join(dir, "session.jsonl");

@@ -285,7 +285,9 @@ monitor.setPushRouter(pushRouter);
 // point from the owning adapter into the monitor/task/timeline world.
 codexOwned.wireEvents({
   onTimelineItem: (item, live) => timeline.ingest(item, { live }),
-  onTimelineBackfillStart: (sessionId, token) => timeline.beginBackfill(sessionId, token),
+  onTimelineGapOpened: (sessionId) => timeline.openBackfillGap(sessionId),
+  onTimelineBackfillStart: (sessionId, token, stopAtAnchor) =>
+    timeline.beginBackfill(sessionId, token, stopAtAnchor),
   onTimelineBackfillPage: (sessionId, token, items) =>
     timeline.ingestBackfill(sessionId, token, items),
   onTimelineBackfillEnd: (sessionId, syncId, complete) =>

@@ -110,7 +110,7 @@ test("failed Codex history retries the same durable cursor without a reconnect",
   rmSync(home, { recursive: true, force: true });
 });
 
-test("a completed sync is not restarted by a control reconnect", () => {
+test("a completed sync starts an anchored gap receipt on control reconnect", () => {
   const home = mkdtempSync(join(tmpdir(), "perch-history-complete-"));
   const db = new StateDb({ PERCH_HOME: home } as NodeJS.ProcessEnv);
   const adapter = new HistoryAdapter();
@@ -122,12 +122,19 @@ test("a completed sync is not restarted by a control reconnect", () => {
   const receipt = coordinator.startForTaskRuntime(liveRuntime())!;
   adapter.requests[0]!.request.onTerminal({ state: "succeeded" });
 
-  assert.equal(coordinator.resumeForSession("pty:live")?.id, receipt.id);
+  const gap = coordinator.resumeForSession("pty:live")!;
+  assert.notEqual(gap.id, receipt.id);
+  assert.equal(adapter.requests[1]!.request.syncId, gap.id);
+  assert.equal(adapter.requests[1]!.request.cursor, null);
+  assert.equal(adapter.requests[1]!.request.stopAtAnchor, true);
+  adapter.requests[1]!.request.onTerminal({ state: "succeeded" });
   assert.equal(
     coordinator.startForTaskRuntime({ ...liveRuntime(), generation: 5 })?.id,
-    receipt.id
+    adapter.requests[2]!.request.syncId
   );
-  assert.equal(adapter.requests.length, 1);
+  assert.equal(adapter.requests.length, 3);
+  assert.equal(adapter.requests[2]!.request.stopAtAnchor, true);
+  adapter.requests[2]!.request.onTerminal({ state: "succeeded" });
 
   coordinator.stop();
   db.close();

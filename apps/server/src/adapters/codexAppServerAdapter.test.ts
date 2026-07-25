@@ -48,7 +48,11 @@ type Fixture = {
     exits: Array<{ sessionId: string; status: string }>;
     fleet: FleetEvent[];
   };
-  startHistoryCatchUp: (sessionId: string, cursor?: string | null) => boolean;
+  startHistoryCatchUp: (
+    sessionId: string,
+    cursor?: string | null,
+    stopAtAnchor?: boolean
+  ) => boolean;
   close: () => Promise<void>;
 };
 
@@ -124,7 +128,9 @@ async function fixture(
       events.timeline.push({ item, live });
       timeline.ingest(item, { live });
     },
-    onTimelineBackfillStart: (sessionId, token) => timeline.beginBackfill(sessionId, token),
+    onTimelineGapOpened: (sessionId) => timeline.openBackfillGap(sessionId),
+    onTimelineBackfillStart: (sessionId, token, stopAtAnchor) =>
+      timeline.beginBackfill(sessionId, token, stopAtAnchor),
     onTimelineBackfillPage: (sessionId, token, items) => {
       events.timeline.push(...items.map((item) => ({ item, live: false })));
       return timeline.ingestBackfill(sessionId, token, items);
@@ -141,16 +147,21 @@ async function fixture(
   });
   adapter.subscribeFleetEvents((event) => events.fleet.push(event));
   let historySync = 0;
-  const startHistoryCatchUp = (sessionId: string, cursor: string | null = null) =>
+  const startHistoryCatchUp = (
+    sessionId: string,
+    cursor: string | null = null,
+    stopAtAnchor = false
+  ) =>
     adapter.startHistoryCatchUp(sessionId, {
       syncId: `sync-${++historySync}`,
       threadId: adapter.threadIdOf(sessionId)!,
       cursor,
+      stopAtAnchor,
       onPage: () => {},
       onTerminal: () => {}
     });
   adapter.setHistoryCatchUpRequester((sessionId) => {
-    startHistoryCatchUp(sessionId);
+    startHistoryCatchUp(sessionId, null, true);
   });
   return {
     dir,

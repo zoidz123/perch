@@ -12,11 +12,16 @@ export type CodexHistorySyncCoordinatorOptions = {
   retryDelaysMs?: number[];
 };
 
+type SyncMode = "full" | "gap";
+
 export class CodexHistorySyncCoordinator {
   private readonly retryDelaysMs: number[];
   private readonly runs = new Map<string, symbol>();
   private readonly retryIndexes = new Map<string, number>();
   private readonly retryTimers = new Map<string, NodeJS.Timeout>();
+  private readonly gapTimers = new Map<string, NodeJS.Timeout>();
+  private readonly pendingGaps = new Set<string>();
+  private readonly receiptModes = new Map<string, SyncMode>();
   private readonly processReceipts = new Map<
     string,
     { receiptId: string; providerSessionId: string }
@@ -56,6 +61,7 @@ export class CodexHistorySyncCoordinator {
 
   resumeForSession(sessionId: string): CodexHistorySyncRecord | undefined {
     if (this.stopped) return undefined;
+    this.pendingGaps.add(sessionId);
     const processReceipt = this.processReceipts.get(sessionId);
     const latest = processReceipt
       ? this.stateDb.codexHistorySyncs.find(processReceipt.receiptId)
@@ -65,8 +71,11 @@ export class CodexHistorySyncCoordinator {
         receiptId: latest.id,
         providerSessionId: latest.providerSessionId
       });
-      if (!isTerminalSuccess(latest.state)) this.start(latest);
-      return latest;
+      if (!isTerminalSuccess(latest.state)) {
+        this.start(latest);
+        return latest;
+      }
+      return this.startGap(latest);
     }
 
     const taskRuntime = this.stateDb.runtimes.findBySession(sessionId);
@@ -79,8 +88,12 @@ export class CodexHistorySyncCoordinator {
   stop(): void {
     this.stopped = true;
     for (const timer of this.retryTimers.values()) clearTimeout(timer);
+    for (const timer of this.gapTimers.values()) clearTimeout(timer);
     this.retryTimers.clear();
+    this.gapTimers.clear();
     this.runs.clear();
+    this.pendingGaps.clear();
+    this.receiptModes.clear();
     this.processReceipts.clear();
   }
 
@@ -91,11 +104,30 @@ export class CodexHistorySyncCoordinator {
     if (processReceipt?.providerSessionId === input.providerSessionId) {
       const existing = this.stateDb.codexHistorySyncs.find(processReceipt.receiptId);
       if (existing) {
-        if (!isTerminalSuccess(existing.state)) this.start(existing);
-        return existing;
+        if (!isTerminalSuccess(existing.state)) {
+          this.start(existing);
+          return existing;
+        }
+        if (
+          existing.runtimeKind === input.runtimeKind &&
+          existing.runtimeId === input.runtimeId &&
+          existing.runtimeGeneration === input.runtimeGeneration
+        ) {
+          return existing;
+        }
+        return this.createAndStart(input, "gap");
       }
     }
+    return this.createAndStart(input, "full");
+  }
+
+  private createAndStart(
+    input: Parameters<StateDb["codexHistorySyncs"]["create"]>[0],
+    mode: SyncMode
+  ): CodexHistorySyncRecord {
     const receipt = this.stateDb.codexHistorySyncs.create(input);
+    this.pendingGaps.delete(input.perchSessionId);
+    this.receiptModes.set(receipt.id, mode);
     this.processReceipts.set(input.perchSessionId, {
       receiptId: receipt.id,
       providerSessionId: receipt.providerSessionId
@@ -125,6 +157,10 @@ export class CodexHistorySyncCoordinator {
       } else {
         this.retryIndexes.delete(running.id);
         this.clearRetryTimer(running.id);
+        if (state !== "failed") {
+          this.receiptModes.delete(running.id);
+          this.schedulePendingGap(finished);
+        }
       }
     };
 
@@ -133,6 +169,7 @@ export class CodexHistorySyncCoordinator {
         syncId: running.id,
         threadId: running.providerSessionId,
         cursor: running.cursor ?? null,
+        stopAtAnchor: this.receiptModes.get(running.id) === "gap",
         onPage: ({ cursor, accepted }) => {
           if (!this.stateDb.codexHistorySyncs.recordPage(running.id, cursor, accepted)) {
             throw new Error(`codex history sync receipt is no longer running: ${running.id}`);
@@ -169,6 +206,40 @@ export class CodexHistorySyncCoordinator {
     if (!timer) return;
     clearTimeout(timer);
     this.retryTimers.delete(receiptId);
+  }
+
+  private startGap(receipt: CodexHistorySyncRecord): CodexHistorySyncRecord {
+    return this.createAndStart(
+      {
+        runtimeKind: receipt.runtimeKind,
+        runtimeId: receipt.runtimeId,
+        runtimeGeneration: receipt.runtimeGeneration,
+        perchSessionId: receipt.perchSessionId,
+        providerSessionId: receipt.providerSessionId
+      },
+      "gap"
+    );
+  }
+
+  private schedulePendingGap(receipt: CodexHistorySyncRecord): void {
+    if (
+      this.stopped ||
+      !this.pendingGaps.has(receipt.perchSessionId) ||
+      this.gapTimers.has(receipt.perchSessionId)
+    ) {
+      return;
+    }
+    const timer = setTimeout(() => {
+      this.gapTimers.delete(receipt.perchSessionId);
+      if (this.stopped || !this.pendingGaps.has(receipt.perchSessionId)) return;
+      const processReceipt = this.processReceipts.get(receipt.perchSessionId);
+      const latest = processReceipt
+        ? this.stateDb.codexHistorySyncs.find(processReceipt.receiptId)
+        : undefined;
+      if (latest && isTerminalSuccess(latest.state)) this.startGap(latest);
+    }, 0);
+    timer.unref?.();
+    this.gapTimers.set(receipt.perchSessionId, timer);
   }
 }
 

@@ -121,7 +121,10 @@ type TimelineBackfillState = {
   floor: number;
   ceiling: number;
   dirty: boolean;
+  anchorIds?: Set<string>;
 };
+
+type TimelineBackfillLane = Omit<TimelineBackfillState, "syncId" | "dirty">;
 
 // Resolve the origin of a user turn by its text, consuming the matching
 // buffered injection. Undefined means "not positively an agent turn" - the
@@ -142,6 +145,7 @@ export class TimelineStore {
   private readonly seenIds = new Map<string, Set<string>>();
   private readonly seqs = new Map<string, number>();
   private readonly backfills = new Map<string, TimelineBackfillState>();
+  private readonly pendingBackfillLanes = new Map<string, TimelineBackfillLane>();
   private readonly backfillIds = new Map<string, Set<string>>();
   private readonly backfillRevisions = new Map<string, number>();
   private readonly tailers = new Map<string, JsonlTailer>();
@@ -224,16 +228,26 @@ export class TimelineStore {
     this.append(resolved.sessionId, resolved, opts.live !== false);
   }
 
-  beginBackfill(sessionId: string, syncId: string): void {
+  openBackfillGap(sessionId: string): void {
+    if (this.pendingBackfillLanes.has(sessionId)) return;
+    const lane = this.reserveBackfillLane(sessionId);
+    lane.anchorIds = new Set(this.seenIds.get(sessionId) ?? []);
+    this.pendingBackfillLanes.set(sessionId, lane);
+  }
+
+  beginBackfill(sessionId: string, syncId: string, stopAtAnchor = false): void {
     if (this.backfills.get(sessionId)?.syncId === syncId) return;
-    const current = this.seqs.get(sessionId) ?? 0;
-    const ceiling = current + MAX_ITEMS_PER_SESSION + 1;
-    this.seqs.set(sessionId, ceiling);
+    const pending = this.pendingBackfillLanes.get(sessionId);
+    const lane = pending ?? this.reserveBackfillLane(sessionId);
+    if (pending) this.pendingBackfillLanes.delete(sessionId);
     this.backfills.set(sessionId, {
       syncId,
-      floor: current,
-      ceiling,
-      dirty: false
+      floor: lane.floor,
+      ceiling: lane.ceiling,
+      dirty: false,
+      ...(stopAtAnchor
+        ? { anchorIds: lane.anchorIds ?? new Set(this.seenIds.get(sessionId) ?? []) }
+        : {})
     });
   }
 
@@ -247,7 +261,19 @@ export class TimelineStore {
 
     const resolved = items.map((item) => this.resolveIngestSource(item));
     const seen = this.seenIds.get(sessionId) ?? new Set<string>();
-    const unseen = resolved.filter((item) => !seen.has(item.id));
+    let candidates = resolved;
+    let anchored = false;
+    if (state.anchorIds) {
+      let anchorIndex = -1;
+      for (const [index, item] of resolved.entries()) {
+        if (state.anchorIds.has(item.id)) anchorIndex = index;
+      }
+      if (anchorIndex >= 0) {
+        anchored = true;
+        candidates = resolved.slice(anchorIndex + 1);
+      }
+    }
+    const unseen = candidates.filter((item) => !seen.has(item.id));
     const available = Math.max(0, state.ceiling - state.floor - 1);
     const accepted = unseen.slice(Math.max(0, unseen.length - available));
     const startSeq = state.ceiling - accepted.length;
@@ -277,7 +303,7 @@ export class TimelineStore {
 
     return {
       accepted: sequenced.length,
-      done: accepted.length < unseen.length || state.ceiling <= state.floor + 1
+      done: anchored || accepted.length < unseen.length || state.ceiling <= state.floor + 1
     };
   }
 
@@ -456,6 +482,7 @@ export class TimelineStore {
         this.seenIds.delete(sessionId);
         this.seqs.delete(sessionId);
         this.backfills.delete(sessionId);
+        this.pendingBackfillLanes.delete(sessionId);
         this.backfillIds.delete(sessionId);
         this.backfillRevisions.delete(sessionId);
         this.pendingSources.delete(sessionId);
@@ -539,6 +566,13 @@ export class TimelineStore {
     const next = (this.seqs.get(sessionId) ?? 0) + 1;
     this.seqs.set(sessionId, next);
     return next;
+  }
+
+  private reserveBackfillLane(sessionId: string): TimelineBackfillLane {
+    const floor = this.seqs.get(sessionId) ?? 0;
+    const ceiling = floor + MAX_ITEMS_PER_SESSION + 1;
+    this.seqs.set(sessionId, ceiling);
+    return { floor, ceiling };
   }
 
   private resolveIngestSource(item: TimelineItem): TimelineItem {

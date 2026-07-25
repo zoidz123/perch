@@ -51,7 +51,12 @@ export type CodexOwnedEventSink = {
   // `live` is false for history replayed by thread/resume (catch-up rows must
   // not flood the fleet WebSocket; clients page them via GET /timeline).
   onTimelineItem?: (item: TimelineItem, live: boolean) => void;
-  onTimelineBackfillStart?: (sessionId: string, syncId: string) => void;
+  onTimelineGapOpened?: (sessionId: string) => void;
+  onTimelineBackfillStart?: (
+    sessionId: string,
+    syncId: string,
+    stopAtAnchor: boolean
+  ) => void;
   onTimelineBackfillPage?: (
     sessionId: string,
     syncId: string,
@@ -74,6 +79,7 @@ export type CodexHistoryCatchUpRequest = {
   syncId: string;
   threadId: string;
   cursor: string | null;
+  stopAtAnchor?: boolean;
   onPage: (progress: { cursor: string | null; accepted: number }) => void;
   onTerminal: (result: {
     state: "succeeded" | "truncated" | "failed";
@@ -436,7 +442,11 @@ export class CodexAppServerAdapter implements AgentAdapter {
     }
     const epoch = ++session.historyReplayEpoch;
     session.historyCatchUp = { epoch, request };
-    this.events.onTimelineBackfillStart?.(session.id, request.syncId);
+    this.events.onTimelineBackfillStart?.(
+      session.id,
+      request.syncId,
+      request.stopAtAnchor === true
+    );
     this.replayHistoryInBackground(session, epoch, request);
     return true;
   }
@@ -697,6 +707,7 @@ export class CodexAppServerAdapter implements AgentAdapter {
   // interruption and the recovery flow own what happens next.
   private handleDisconnect(session: OwnedSession): void {
     if (session.stopped || session.reconnecting) return;
+    this.events.onTimelineGapOpened?.(session.id);
     session.reconnecting = true;
     void (async () => {
       try {
