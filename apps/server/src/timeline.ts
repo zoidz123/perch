@@ -31,6 +31,10 @@ const SOURCE_TTL_MS = 60_000;
 
 export type TimelineListener = (item: TimelineItem) => void;
 export type TimelineCatchUpListener = (sessionId: string) => void;
+export type TimelineBackfillResult = {
+  accepted: number;
+  done: boolean;
+};
 
 // Observed live model for a session, read off the transcript itself: claude
 // stamps every assistant row with the model that produced it, which is the
@@ -111,6 +115,12 @@ export function claudeRowModel(row: Record<string, unknown>): string | undefined
 // until the sender-blind transcript row it produces tails back in and can be
 // stamped with this origin. See resolveSource for the correlation.
 type PendingSource = { text: string; source: TimelineItemSource; at: number };
+type TimelineBackfillState = {
+  token: number;
+  floor: number;
+  ceiling: number;
+  anchorIds: Set<string>;
+};
 
 // Resolve the origin of a user turn by its text, consuming the matching
 // buffered injection. Undefined means "not positively an agent turn" - the
@@ -130,6 +140,8 @@ export class TimelineStore {
   private readonly items = new Map<string, TimelineItem[]>();
   private readonly seenIds = new Map<string, Set<string>>();
   private readonly seqs = new Map<string, number>();
+  private readonly backfills = new Map<string, TimelineBackfillState>();
+  private readonly backfillIds = new Map<string, Set<string>>();
   private readonly tailers = new Map<string, JsonlTailer>();
   // Active transcript re-resolvers for resumed Claude sessions (see
   // followClaudeResume). Keyed by perch session id and stopped alongside the
@@ -198,12 +210,74 @@ export class TimelineStore {
   // item without provenance resolves against recorded injections exactly like
   // a tailed row, so mate steers and kickoffs keep their agent attribution.
   ingest(item: TimelineItem, opts: { live?: boolean } = {}): void {
-    let resolved = item;
-    if (item.kind === "user" && !item.source && item.text) {
-      const source = this.resolveSource(item.sessionId, item.text);
-      if (source) resolved = { ...item, source };
-    }
+    const resolved = this.resolveIngestSource(item);
     this.append(resolved.sessionId, resolved, opts.live !== false);
+  }
+
+  beginBackfill(sessionId: string, token: number): void {
+    const current = this.seqs.get(sessionId) ?? 0;
+    const ceiling = current + MAX_ITEMS_PER_SESSION + 1;
+    this.seqs.set(sessionId, ceiling);
+    this.backfills.set(sessionId, {
+      token,
+      floor: current,
+      ceiling,
+      anchorIds: new Set((this.items.get(sessionId) ?? []).map((item) => item.id))
+    });
+  }
+
+  ingestBackfill(
+    sessionId: string,
+    token: number,
+    items: TimelineItem[]
+  ): TimelineBackfillResult {
+    const state = this.backfills.get(sessionId);
+    if (!state || state.token !== token) return { accepted: 0, done: true };
+
+    const resolved = items.map((item) => this.resolveIngestSource(item));
+    let lastAnchorIndex = -1;
+    for (let index = 0; index < resolved.length; index += 1) {
+      if (state.anchorIds.has(resolved[index]!.id)) lastAnchorIndex = index;
+    }
+    const candidates = resolved.slice(lastAnchorIndex + 1);
+    const seen = this.seenIds.get(sessionId) ?? new Set<string>();
+    const unseen = candidates.filter((item) => !seen.has(item.id));
+    const available = Math.max(0, state.ceiling - state.floor - 1);
+    const accepted = unseen.slice(Math.max(0, unseen.length - available));
+    const startSeq = state.ceiling - accepted.length;
+    state.ceiling = startSeq;
+
+    const sequenced = accepted.map((item, index) => ({
+      ...item,
+      seq: startSeq + index
+    }));
+    const backfillIds = this.backfillIds.get(sessionId) ?? new Set<string>();
+    for (const item of sequenced) {
+      this.rememberId(seen, item.id);
+      backfillIds.add(item.id);
+    }
+    this.seenIds.set(sessionId, seen);
+    this.backfillIds.set(sessionId, backfillIds);
+
+    const list = this.items.get(sessionId) ?? [];
+    list.push(...sequenced);
+    list.sort((left, right) => left.seq - right.seq);
+    this.trim(sessionId, list);
+    this.items.set(sessionId, list);
+    for (const item of sequenced) {
+      for (const observer of this.observers) observer(item);
+    }
+
+    return {
+      accepted: sequenced.length,
+      done: lastAnchorIndex >= 0 || accepted.length < unseen.length || state.ceiling <= state.floor + 1
+    };
+  }
+
+  endBackfill(sessionId: string, token: number): void {
+    if (this.backfills.get(sessionId)?.token === token) {
+      this.backfills.delete(sessionId);
+    }
   }
 
   // Begin (or re-point) tailing a session's transcript. Called when the
@@ -368,6 +442,8 @@ export class TimelineStore {
         this.items.delete(sessionId);
         this.seenIds.delete(sessionId);
         this.seqs.delete(sessionId);
+        this.backfills.delete(sessionId);
+        this.backfillIds.delete(sessionId);
         this.pendingSources.delete(sessionId);
       }
     }
@@ -443,26 +519,37 @@ export class TimelineStore {
     return next;
   }
 
+  private resolveIngestSource(item: TimelineItem): TimelineItem {
+    if (item.kind !== "user" || item.source || !item.text) return item;
+    const source = this.resolveSource(item.sessionId, item.text);
+    return source ? { ...item, source } : item;
+  }
+
   private append(sessionId: string, item: TimelineItem, notify = true): void {
     const seen = this.seenIds.get(sessionId) ?? new Set<string>();
     if (seen.has(item.id)) {
+      const backfillIds = this.backfillIds.get(sessionId);
+      if (notify && backfillIds?.has(item.id)) {
+        const list = this.items.get(sessionId) ?? [];
+        const index = list.findIndex((candidate) => candidate.id === item.id);
+        if (index >= 0) {
+          const promoted = { ...item, seq: list[index]!.seq };
+          list[index] = promoted;
+          backfillIds.delete(item.id);
+          for (const observer of this.observers) observer(promoted);
+          for (const listener of this.listeners) listener(promoted);
+          return;
+        }
+      }
       return;
     }
-    seen.add(item.id);
-    for (const id of seen) {
-      if (seen.size <= MAX_SEEN_IDS_PER_SESSION) {
-        break;
-      }
-      seen.delete(id);
-    }
+    this.rememberId(seen, item.id);
     this.seenIds.set(sessionId, seen);
 
     const sequenced: TimelineItem = { ...item, seq: this.nextSeq(sessionId) };
     const list = this.items.get(sessionId) ?? [];
     list.push(sequenced);
-    if (list.length > MAX_ITEMS_PER_SESSION) {
-      list.splice(0, list.length - MAX_ITEMS_PER_SESSION);
-    }
+    this.trim(sessionId, list);
     this.items.set(sessionId, list);
     for (const observer of this.observers) {
       observer(sequenced);
@@ -472,6 +559,25 @@ export class TimelineStore {
     }
     for (const listener of this.listeners) {
       listener(sequenced);
+    }
+  }
+
+  private rememberId(seen: Set<string>, id: string): void {
+    seen.add(id);
+    for (const candidate of seen) {
+      if (seen.size <= MAX_SEEN_IDS_PER_SESSION) break;
+      seen.delete(candidate);
+    }
+  }
+
+  private trim(sessionId: string, list: TimelineItem[]): void {
+    const backfillIds = this.backfillIds.get(sessionId);
+    while (list.length > MAX_ITEMS_PER_SESSION) {
+      const backfillIndex = backfillIds
+        ? list.findIndex((item) => backfillIds.has(item.id))
+        : -1;
+      const [removed] = list.splice(backfillIndex >= 0 ? backfillIndex : 0, 1);
+      if (removed) backfillIds?.delete(removed.id);
     }
   }
 }

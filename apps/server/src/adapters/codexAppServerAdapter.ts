@@ -28,6 +28,7 @@ import type {
   TopologyResponse
 } from "@perch/shared";
 import type { UsageLimit } from "../usageLimitDetect.js";
+import type { TimelineBackfillResult } from "../timeline.js";
 import { CodexAppServerClient, isCodexRpcError, type CodexRpcError } from "./codexAppServer.js";
 import type { CodexDaemonManager } from "./codexDaemon.js";
 import type { ThreadHistoryTurn } from "./codexAppServerTypes.js";
@@ -50,6 +51,13 @@ export type CodexOwnedEventSink = {
   // `live` is false for history replayed by thread/resume (catch-up rows must
   // not flood the fleet WebSocket; clients page them via GET /timeline).
   onTimelineItem?: (item: TimelineItem, live: boolean) => void;
+  onTimelineBackfillStart?: (sessionId: string, token: number) => void;
+  onTimelineBackfillPage?: (
+    sessionId: string,
+    token: number,
+    items: TimelineItem[]
+  ) => TimelineBackfillResult;
+  onTimelineBackfillEnd?: (sessionId: string, token: number) => void;
   onStatus?: (sessionId: string, status: AgentSessionStatus) => void;
   onServerRequest?: (sessionId: string, request: PendingServerRequest) => void;
   onServerRequestResolved?: (sessionId: string, request: PendingServerRequest) => void;
@@ -87,6 +95,8 @@ export type CodexAppServerAdapterOptions = {
   createClient?: CreateOwnedClient;
   // Bounded reconnect backoff after an unexpected control-connection drop.
   reconnectDelaysMs?: number[];
+  historyReplayRetryDelaysMs?: number[];
+  historyPageTimeoutMs?: number;
 };
 
 export type StartOwnedOptions = {
@@ -135,6 +145,8 @@ type OwnedSession = {
 };
 
 const DEFAULT_RECONNECT_DELAYS_MS = [500, 2_000];
+const DEFAULT_HISTORY_REPLAY_RETRY_DELAYS_MS = [250, 1_000];
+const DEFAULT_HISTORY_PAGE_TIMEOUT_MS = 10_000;
 
 export class CodexAppServerAdapter implements AgentAdapter {
   readonly name = "codex-app-server";
@@ -144,6 +156,8 @@ export class CodexAppServerAdapter implements AgentAdapter {
   private readonly sessionEnv?: (sessionId: string, request: StartAgentRequest) => Record<string, string>;
   private readonly createClient: CreateOwnedClient;
   private readonly reconnectDelaysMs: number[];
+  private readonly historyReplayRetryDelaysMs: number[];
+  private readonly historyPageTimeoutMs: number;
   private readonly fleetHandlers = new Set<(event: FleetEvent) => void>();
   private events: CodexOwnedEventSink = {};
 
@@ -151,6 +165,9 @@ export class CodexAppServerAdapter implements AgentAdapter {
     this.daemons = options.daemons;
     this.sessionEnv = options.sessionEnv;
     this.reconnectDelaysMs = options.reconnectDelaysMs ?? DEFAULT_RECONNECT_DELAYS_MS;
+    this.historyReplayRetryDelaysMs =
+      options.historyReplayRetryDelaysMs ?? DEFAULT_HISTORY_REPLAY_RETRY_DELAYS_MS;
+    this.historyPageTimeoutMs = options.historyPageTimeoutMs ?? DEFAULT_HISTORY_PAGE_TIMEOUT_MS;
     this.createClient =
       options.createClient ??
       (({ sessionId, socketPath, handlers }) =>
@@ -327,6 +344,7 @@ export class CodexAppServerAdapter implements AgentAdapter {
       handlers: this.handlersFor(session)
     });
 
+    const historyReplayEpoch = opts.resume ? this.beginHistoryReplay(session) : undefined;
     try {
       await session.client.connect();
       if (opts.resume) {
@@ -343,6 +361,9 @@ export class CodexAppServerAdapter implements AgentAdapter {
         session.model = started.model;
       }
     } catch (error) {
+      if (historyReplayEpoch !== undefined) {
+        this.events.onTimelineBackfillEnd?.(session.id, historyReplayEpoch);
+      }
       await session.client.disconnect().catch(() => {});
       // A daemon acquired for a launch that never produced a session dies
       // with the failure; an adopted resume daemon holds the only live copy
@@ -357,7 +378,9 @@ export class CodexAppServerAdapter implements AgentAdapter {
     this.invalidateTopology("codex.owned-session.added", sessionId);
     this.events.onThreadStarted?.(sessionId, session.threadId!, socketPath);
     if (session.model) this.events.onModelResolved?.(sessionId, session.model);
-    if (opts.resume) this.replayHistoryInBackground(session);
+    if (historyReplayEpoch !== undefined) {
+      this.replayHistoryInBackground(session, historyReplayEpoch);
+    }
     return this.toAgentSession(session);
   }
 
@@ -619,14 +642,20 @@ export class CodexAppServerAdapter implements AgentAdapter {
     await session.client.disconnect().catch(() => {});
     await session.client.connect();
     if (session.threadId) {
-      const resumed = await session.client.resumeThread({
-        threadId: session.threadId,
-        cwd: session.cwd,
-        excludeTurns: true
-      });
-      session.threadId = resumed.threadId;
-      session.model = resumed.model;
-      this.replayHistoryInBackground(session);
+      const epoch = this.beginHistoryReplay(session);
+      try {
+        const resumed = await session.client.resumeThread({
+          threadId: session.threadId,
+          cwd: session.cwd,
+          excludeTurns: true
+        });
+        session.threadId = resumed.threadId;
+        session.model = resumed.model;
+        this.replayHistoryInBackground(session, epoch);
+      } catch (error) {
+        this.events.onTimelineBackfillEnd?.(session.id, epoch);
+        throw error;
+      }
     }
   }
 
@@ -665,73 +694,106 @@ export class CodexAppServerAdapter implements AgentAdapter {
     })();
   }
 
-  // Replay resumed turn history into the timeline, deduped downstream by
-  // protocol item id. An interrupted in-flight turn is represented truthfully
-  // as a system row instead of pretending the turn is still running.
-  private replayHistory(session: OwnedSession, turns: ThreadHistoryTurn[]): void {
-    if (!this.events.onTimelineItem) return;
+  private historyTimelineItems(session: OwnedSession, turns: ThreadHistoryTurn[]): TimelineItem[] {
+    const items: TimelineItem[] = [];
+    const fallbackAt = new Date(Math.max(0, Date.parse(session.createdAt) - 1)).toISOString();
     for (const turn of turns) {
+      const turnAt = historyTimestamp(turn) ?? fallbackAt;
       for (const item of turn.items ?? []) {
-        for (const timelineItem of historyItemToTimeline(session.id, item)) {
-          this.events.onTimelineItem(timelineItem, false);
-        }
+        items.push(...historyItemToTimeline(session.id, item, historyTimestamp(item) ?? turnAt));
       }
       if (turn.status === "interrupted" && turn.id) {
-        this.events.onTimelineItem(
-          {
-            seq: 0,
-            id: `cx-item-${turn.id}:interrupted`,
-            sessionId: session.id,
-            kind: "system",
-            text: "This turn was interrupted by a runtime restart; recovery resumed the thread from persisted history.",
-            at: new Date().toISOString()
-          },
-          false
+        items.push({
+          seq: 0,
+          id: `cx-item-${turn.id}:interrupted`,
+          sessionId: session.id,
+          kind: "system",
+          text: "This turn was interrupted by a runtime restart; recovery resumed the thread from persisted history.",
+          at: turnAt
+        });
+      }
+    }
+    return items;
+  }
+
+  private beginHistoryReplay(session: OwnedSession): number {
+    const epoch = ++session.historyReplayEpoch;
+    this.events.onTimelineBackfillStart?.(session.id, epoch);
+    return epoch;
+  }
+
+  private replayHistoryInBackground(session: OwnedSession, epoch: number): void {
+    const threadId = session.threadId;
+    if (!threadId) {
+      this.events.onTimelineBackfillEnd?.(session.id, epoch);
+      return;
+    }
+    this.emitFleetEvent("activity", "codex.history-catchup.started", session.id);
+    void (async () => {
+      let cursor: string | null = null;
+      do {
+        if (!this.historyReplayIsCurrent(session, threadId, epoch)) return;
+        const page = await this.listHistoryPageWithRetry(session, threadId, cursor, epoch);
+        if (!page || !this.historyReplayIsCurrent(session, threadId, epoch)) return;
+        const turns = [...page.data].reverse();
+        const result = this.events.onTimelineBackfillPage?.(
+          session.id,
+          epoch,
+          this.historyTimelineItems(session, turns)
         );
+        if (result?.done) break;
+        const nextCursor = page.nextCursor;
+        if (nextCursor === cursor) break;
+        cursor = nextCursor;
+      } while (cursor);
+      if (this.historyReplayIsCurrent(session, threadId, epoch)) {
+        this.emitFleetEvent("activity", "codex.history-catchup.completed", session.id);
+      }
+    })().catch((error) => {
+      if (!this.historyReplayIsCurrent(session, threadId, epoch)) return;
+      const message = error instanceof Error ? error.message : String(error);
+      console.warn(`codex history catch-up failed for ${session.id}: ${message}`);
+      this.emitFleetEvent("activity", "codex.history-catchup.failed", session.id);
+    }).finally(() => {
+      this.events.onTimelineBackfillEnd?.(session.id, epoch);
+    });
+  }
+
+  private async listHistoryPageWithRetry(
+    session: OwnedSession,
+    threadId: string,
+    cursor: string | null,
+    epoch: number
+  ) {
+    for (let attempt = 0; ; attempt += 1) {
+      try {
+        return await session.client.listThreadTurns(
+          {
+            threadId,
+            cursor,
+            limit: 20,
+            sortDirection: "desc",
+            itemsView: "full"
+          },
+          this.historyPageTimeoutMs
+        );
+      } catch (error) {
+        if (!this.historyReplayIsCurrent(session, threadId, epoch)) return undefined;
+        const delayMs = this.historyReplayRetryDelaysMs[attempt];
+        if (delayMs === undefined) throw error;
+        this.emitFleetEvent("activity", "codex.history-catchup.retry", session.id);
+        await sleep(delayMs);
       }
     }
   }
 
-  // History catch-up is deliberately outside the ownership transaction.
-  // A slow, unsupported, or failed page never rolls back a live session.
-  private replayHistoryInBackground(session: OwnedSession): void {
-    const threadId = session.threadId;
-    if (!threadId) return;
-    const epoch = ++session.historyReplayEpoch;
-    void (async () => {
-      let cursor: string | null = null;
-      do {
-        if (
-          session.stopped ||
-          session.threadId !== threadId ||
-          session.historyReplayEpoch !== epoch ||
-          !session.client.isConnected()
-        ) {
-          return;
-        }
-        const page = await session.client.listThreadTurns({
-          threadId,
-          cursor,
-          limit: 20,
-          sortDirection: "asc",
-          itemsView: "full"
-        });
-        if (
-          session.stopped ||
-          session.threadId !== threadId ||
-          session.historyReplayEpoch !== epoch
-        ) {
-          return;
-        }
-        this.replayHistory(session, page.data);
-        const nextCursor = page.nextCursor;
-        if (nextCursor === cursor) return;
-        cursor = nextCursor;
-      } while (cursor);
-    })().catch(() => {
-      // Perch's durable timeline and live notifications remain authoritative.
-      // History replay is best-effort catch-up, never an ownership condition.
-    });
+  private historyReplayIsCurrent(session: OwnedSession, threadId: string, epoch: number): boolean {
+    return (
+      !session.stopped &&
+      session.threadId === threadId &&
+      session.historyReplayEpoch === epoch &&
+      session.client.isConnected()
+    );
   }
 
   private handlersFor(session: OwnedSession): Parameters<CreateOwnedClient>[0]["handlers"] {
@@ -767,8 +829,12 @@ export class CodexAppServerAdapter implements AgentAdapter {
   }
 
   private invalidateTopology(name: string, sessionId?: string): void {
+    this.emitFleetEvent("topology", name, sessionId);
+  }
+
+  private emitFleetEvent(kind: FleetEvent["kind"], name: string, sessionId?: string): void {
     const event: FleetEvent = {
-      kind: "topology",
+      kind,
       at: new Date().toISOString(),
       agent: "codex",
       name,
@@ -845,10 +911,13 @@ function findUserMessageByClientMessageId(
 // Project a thread/read (or resume-replayed) history item into perch's
 // timeline shape. Stable `cx-item-<protocol id>` ids make the replay
 // idempotent against rows already ingested live.
-function historyItemToTimeline(sessionId: string, item: Record<string, unknown>): TimelineItem[] {
+function historyItemToTimeline(
+  sessionId: string,
+  item: Record<string, unknown>,
+  at = new Date().toISOString()
+): TimelineItem[] {
   const id = typeof item.id === "string" && item.id.length > 0 ? item.id : undefined;
   const type = typeof item.type === "string" ? item.type : "";
-  const at = new Date().toISOString();
   if (type === "userMessage") {
     const text = userMessageText(item);
     if (!text) return [];
@@ -908,6 +977,21 @@ function historyItemToTimeline(sessionId: string, item: Record<string, unknown>)
     return items;
   }
   return [];
+}
+
+function historyTimestamp(record: Record<string, unknown>): string | undefined {
+  for (const key of ["timestamp", "createdAt", "startedAt", "completedAt", "updatedAt"]) {
+    const value = record[key];
+    if (typeof value === "string" && Number.isFinite(Date.parse(value))) {
+      return new Date(value).toISOString();
+    }
+    if (typeof value === "number" && Number.isFinite(value)) {
+      const milliseconds = value < 10_000_000_000 ? value * 1_000 : value;
+      const date = new Date(milliseconds);
+      if (Number.isFinite(date.getTime())) return date.toISOString();
+    }
+  }
+  return undefined;
 }
 
 function stringifyHistoryCommand(command: unknown): string | undefined {

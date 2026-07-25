@@ -136,7 +136,7 @@ for (const provider of ["claude", "codex"] as const) {
   });
 }
 
-test("private-home E2E: graceful Codex Mate stop is quiet until explicit fresh-daemon recovery", {
+test("private-home E2E: graceful Codex Mate and two-child fleet preserve exact threads", {
   skip: requested !== "all" && requested !== "codex",
   timeout: 300_000
 }, async () => {
@@ -169,6 +169,41 @@ test("private-home E2E: graceful Codex Mate stop is quiet until explicit fresh-d
     assert.ok(oldOwned.socketPath);
     const oldDaemonPid = daemonPid(oldOwned.socketPath);
     assert.equal(processExists(oldDaemonPid), true);
+    await request(port, token, `/sessions/${encodeURIComponent(oldSession)}/submit`, {
+      method: "POST",
+      body: JSON.stringify({
+        text: "Reply with MATE_GRACEFUL_E2E_READY and wait for more input."
+      })
+    });
+    await waitForAssistantText(port, token, oldSession, "MATE_GRACEFUL_E2E_READY");
+
+    const originals: Task[] = [];
+    for (let index = 0; index < 2; index += 1) {
+      const created = await request<{ task: Task }>(port, token, "/tasks", {
+        method: "POST",
+        body: JSON.stringify({
+          title: `graceful Codex Mate child ${index + 1}`,
+          project: repoRoot,
+          kind: "scout",
+          mode: "local-only",
+          agent: "codex",
+          parent: oldSession,
+          dispatch: true,
+          prompt:
+            `Do not use tools or change files. Reply with exactly GRACEFUL_CHILD_READY_${index + 1}.`
+        })
+      });
+      const original = await waitForTask(port, token, created.task.id, (task) =>
+        task.runtime?.state === "live" && Boolean(task.runtime.providerSessionId)
+      );
+      await waitForAssistantText(
+        port,
+        token,
+        original.sessionId!,
+        `GRACEFUL_CHILD_READY_${index + 1}`
+      );
+      originals.push(await waitForTask(port, token, original.id, (task) => task.state === "working"));
+    }
 
     const stop = await execFileAsync(process.execPath, [perchBin, "server", "stop"], {
       env: {
@@ -201,6 +236,19 @@ test("private-home E2E: graceful Codex Mate stop is quiet until explicit fresh-d
     assert.equal(mateRecoveryOperationCount(home), operationsBeforeRestart);
     assert.equal(processExists(oldDaemonPid), false);
     assert.equal(existsSync(oldOwned.socketPath), false);
+    for (const original of originals) {
+      const recoverableChild = await waitForTask(
+        port,
+        token,
+        original.id,
+        (task) => task.runtime?.state === "recoverable"
+      );
+      assert.equal(
+        recoverableChild.runtime?.providerSessionId,
+        original.runtime?.providerSessionId
+      );
+      assert.equal(recoverableChild.runtime?.generation, original.runtime?.generation);
+    }
 
     const recover = () => fetch(`http://127.0.0.1:${port}/mate/start`, {
       method: "POST",
@@ -231,6 +279,44 @@ test("private-home E2E: graceful Codex Mate stop is quiet until explicit fresh-d
     const fleetMate = await waitForFleetMate(port, token);
     assert.equal(fleetMate.model, "gpt-5.6-sol");
     assert.equal(fleetMate.modelLabel, "GPT 5.6 Sol");
+    await request(port, token, `/sessions/${encodeURIComponent(recovered.session!.id)}/submit`, {
+      method: "POST",
+      body: JSON.stringify({
+        text: "Reply with MATE_GRACEFUL_E2E_RECOVERED and wait for more input."
+      })
+    });
+    await waitForAssistantText(
+      port,
+      token,
+      recovered.session!.id,
+      "MATE_GRACEFUL_E2E_RECOVERED"
+    );
+
+    for (const original of originals) {
+      const recoveredChild = await waitForTask(
+        port,
+        token,
+        original.id,
+        (task) => task.runtime?.state === "live"
+      );
+      assert.equal(
+        recoveredChild.runtime?.providerSessionId,
+        original.runtime?.providerSessionId
+      );
+      assert.equal(
+        recoveredChild.runtime?.generation,
+        original.runtime!.generation + 1
+      );
+      assert.notEqual(recoveredChild.sessionId, original.sessionId);
+      assert.equal(recoveredChild.parentSessionId, recovered.session?.id);
+      assert.equal(recoveredChild.workerName, original.workerName);
+      assert.equal(recoveredChild.worktreeId, original.worktreeId);
+      await waitForRecoveredTurn(port, token, original.id, recoveredChild.sessionId!);
+      await request(port, token, `/tasks/${encodeURIComponent(original.id)}/teardown`, {
+        method: "POST",
+        body: JSON.stringify({ force: true })
+      });
+    }
   } finally {
     if (server) await stopServer(server, home, port).catch(() => {});
     rmSync(home, { recursive: true, force: true });

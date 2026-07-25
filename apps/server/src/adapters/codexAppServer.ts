@@ -501,8 +501,11 @@ export class CodexAppServerClient {
     return { threadId: result.thread.id, model: result.model, result };
   }
 
-  async listThreadTurns(opts: ThreadTurnsListParams): Promise<ThreadTurnsListResult> {
-    return (await this.request("thread/turns/list", opts)) as ThreadTurnsListResult;
+  async listThreadTurns(
+    opts: ThreadTurnsListParams,
+    timeoutMs?: number
+  ): Promise<ThreadTurnsListResult> {
+    return (await this.request("thread/turns/list", opts, timeoutMs)) as ThreadTurnsListResult;
   }
 
   private async reconnectAndResumeThread(): Promise<boolean> {

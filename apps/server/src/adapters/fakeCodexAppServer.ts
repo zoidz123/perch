@@ -75,6 +75,8 @@ export class FakeCodexAppServer {
   // Simulates a large rollout whose full-history thread/resume never returns.
   // Metadata-only resume must still establish ownership immediately.
   blockFullHistoryResume = false;
+  threadTurnsListFailuresRemaining = 0;
+  threadTurnsListTimeoutsRemaining = 0;
   model = "gpt-5.5-codex";
 
   private http: Server | null = null;
@@ -285,6 +287,14 @@ export class FakeCodexAppServer {
         });
       }
       case "thread/turns/list": {
+        if (this.threadTurnsListFailuresRemaining > 0) {
+          this.threadTurnsListFailuresRemaining -= 1;
+          return fail(-32000, "transient history page failure");
+        }
+        if (this.threadTurnsListTimeoutsRemaining > 0) {
+          this.threadTurnsListTimeoutsRemaining -= 1;
+          return;
+        }
         const thread = this.threads.get(String(params.threadId ?? ""));
         if (!thread) return fail(-32600, "unknown thread id");
         const limit = typeof params.limit === "number" ? params.limit : 20;

@@ -285,6 +285,10 @@ monitor.setPushRouter(pushRouter);
 // point from the owning adapter into the monitor/task/timeline world.
 codexOwned.wireEvents({
   onTimelineItem: (item, live) => timeline.ingest(item, { live }),
+  onTimelineBackfillStart: (sessionId, token) => timeline.beginBackfill(sessionId, token),
+  onTimelineBackfillPage: (sessionId, token, items) =>
+    timeline.ingestBackfill(sessionId, token, items),
+  onTimelineBackfillEnd: (sessionId, token) => timeline.endBackfill(sessionId, token),
   onStatus: (sessionId, status) => {
     // Status alone never recovers a blocked task: approval resolution also
     // transitions back to `running` mid-turn (see onTurnStarted below).
