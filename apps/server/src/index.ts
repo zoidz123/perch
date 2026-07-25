@@ -317,8 +317,11 @@ codexOwned.wireEvents({
     runtimeManager.recordProviderSession(sessionId, "codex", threadId);
     ownerManager.recordProviderSession(sessionId, "codex", threadId);
   },
-  onModelResolved: (sessionId, model) =>
-    monitor.setSessionModel(sessionId, resolveSessionModel("codex", { model })),
+  onModelResolved: (sessionId, model) => {
+    const threadId = codexOwned.threadIdOf(sessionId);
+    if (threadId) persistMateEffectiveModel(sessionId, "codex", threadId, model);
+    monitor.setSessionModel(sessionId, resolveSessionModel("codex", { model }));
+  },
   onUsageLimit: (sessionId, limit) => monitor.reportUsageLimit(sessionId, "codex", limit),
   onSessionExit: (sessionId, exitContext) => {
     hooks.unregister(sessionId);
@@ -437,6 +440,8 @@ timeline.subscribe((item) => {
 // desktop-side `/model` switches report a model too. setSessionModel merges
 // and dedupes, so repeat rows with an unchanged model are free.
 timeline.subscribeModel((sessionId, model) => {
+  const providerSessionId = hooks.correlation(sessionId)?.agentSessionId;
+  if (providerSessionId) persistMateEffectiveModel(sessionId, "claude", providerSessionId, model);
   monitor.setSessionModel(sessionId, {
     model,
     modelLabel: labelForClaudeModelId(model) ?? model
@@ -449,12 +454,31 @@ timeline.subscribeModel((sessionId, model) => {
 // ignored. setSessionModel keeps partial fields separate and dedupes repeats.
 timeline.subscribeCodexThreadSettings((sessionId, threadId, settings) => {
   if (hooks.correlation(sessionId)?.agentSessionId !== threadId) return;
+  if (settings.model) persistMateEffectiveModel(sessionId, "codex", threadId, settings.model);
   const resolved = settings.model ? resolveSessionModel("codex", { model: settings.model }) : undefined;
   monitor.setSessionModel(sessionId, {
     ...settings,
     ...(resolved?.modelLabel ? { modelLabel: resolved.modelLabel } : {})
   });
 });
+
+function persistMateEffectiveModel(
+  sessionId: string,
+  provider: "claude" | "codex",
+  providerSessionId: string,
+  model: string
+): void {
+  const runtime = tasks.stateDb.ownerRuntimes.findBySession(sessionId);
+  if (!runtime) return;
+  ownerManager.recordEffectiveModel({
+    ownerId: runtime.ownerId,
+    generation: runtime.generation,
+    provider,
+    providerSessionId,
+    sessionId,
+    model
+  });
+}
 
 // Marker-based and idempotent; failure must never block startup.
 try {
@@ -690,22 +714,18 @@ async function shutdown(): Promise<void> {
   for (const runtime of tasks.stateDb.ownerRuntimes.active()) {
     if (runtime.ptySessionId) ownerManager.interruptSession(runtime.ptySessionId);
   }
-  // Leave live owned sessions' daemons running: they hold the in-memory
-  // thread state the next server life rebinds to (runtime rows just flipped
-  // recoverable above). Sockets recorded on still-active worker and mate
-  // runtimes survive too, so a daemon awaiting a not-yet-run recovery is
-  // never torn down by a second graceful restart. Everything else goes.
-  const surviving = codexOwned.liveSocketPaths();
-  for (const runtime of [...tasks.stateDb.runtimes.active(), ...tasks.stateDb.ownerRuntimes.active()]) {
-    const socketPath = runtime.metadata?.appServerSocketPath;
-    if (typeof socketPath === "string" && socketPath.length > 0) surviving.add(socketPath);
-  }
-  codexOwned.stop({ keepDaemons: true });
-  codexDaemons.stopAll(surviving);
+  // Graceful shutdown keeps the durable provider thread identity but retires
+  // every exact Perch-owned app-server process. A SIGKILL never reaches this
+  // path, so abnormal-crash recovery can still adopt its surviving daemon.
+  // Await the provider exit barrier before closing the HTTP server: `perch
+  // server stop` does not succeed while an owned provider or its socket/pid
+  // artifacts remain.
+  await codexOwned.stop();
+  await codexDaemons.stopAll();
   // server.close() waits for open connections; drop WebSocket clients so a
   // connected phone cannot hang the shutdown.
   monitor.closeAllClients();
-  adapter.stop();
+  await adapter.stop({ waitForExit: true });
   tasks.close();
   server.close(() => {
     process.exit(0);

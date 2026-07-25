@@ -7,6 +7,8 @@ class FakePtyProcess implements PtyProcess {
   pid = process.pid;
   writes: string[] = [];
   killed = false;
+  autoExitOnKill = true;
+  signals: Array<string | undefined> = [];
   resizes: Array<{ cols: number; rows: number }> = [];
   private dataListeners = new Set<(data: string) => void>();
   private exitListeners = new Set<(event: { exitCode: number; signal?: number }) => void>();
@@ -21,10 +23,11 @@ class FakePtyProcess implements PtyProcess {
     this.resizes.push({ cols, rows });
   }
 
-  kill(): void {
+  kill(signal?: string): void {
     this.killed = true;
+    this.signals.push(signal);
     // Real PTYs report exit shortly after a kill.
-    this.emitExit(0);
+    if (this.autoExitOnKill) this.emitExit(0);
   }
 
   onData(listener: (data: string) => void) {
@@ -691,4 +694,26 @@ test("PTY adapter stopSession kills the process and marks the session done", asy
   await assert.rejects(adapter.stopSession(session.id), /Unknown PTY session/);
 
   adapter.stop();
+});
+
+test("PTY adapter graceful stop waits for the exact provider exit", async () => {
+  let child: FakePtyProcess | undefined;
+  const adapter = new PtyAgentAdapter(() => {
+    child = new FakePtyProcess();
+    child.autoExitOnKill = false;
+    return child;
+  });
+  await adapter.startAgent({ command: "claude", title: "Mate" });
+
+  let settled = false;
+  const stopping = adapter.stop({ waitForExit: true }).then(() => {
+    settled = true;
+  });
+  await new Promise((resolve) => setTimeout(resolve, 20));
+  assert.equal(settled, false);
+  assert.deepEqual(child?.signals, ["SIGTERM"]);
+
+  child?.emitExit(0);
+  await stopping;
+  assert.equal(settled, true);
 });

@@ -186,6 +186,10 @@ export class CodexAppServerAdapter implements AgentAdapter {
     return this.sessions.get(sessionId)?.socketPath;
   }
 
+  modelOf(sessionId: string): string | undefined {
+    return this.sessions.get(sessionId)?.model;
+  }
+
   // Fingerprint of the codex runtime this adapter's daemons run, for durable
   // runtime metadata (the rebind path re-checks it before adopting a daemon).
   runtimeFingerprint(): string | undefined {
@@ -339,7 +343,7 @@ export class CodexAppServerAdapter implements AgentAdapter {
       // with the failure; an adopted resume daemon holds the only live copy
       // of the thread state and is left alone for the next attempt.
       if (!opts.resume?.socketPath || socketPath !== opts.resume.socketPath) {
-        this.daemons.release(socketPath);
+        await this.daemons.release(socketPath);
       }
       throw error;
     }
@@ -356,20 +360,22 @@ export class CodexAppServerAdapter implements AgentAdapter {
     if (!session || session.stopped) return;
     session.stopped = true;
     await session.client.disconnect().catch(() => {});
-    this.daemons.release(session.socketPath);
+    await this.daemons.release(session.socketPath);
     this.sessions.delete(sessionId);
     this.invalidateTopology("codex.owned-session.removed", sessionId);
     this.events.onSessionExit?.(sessionId, { status: "done" });
   }
 
-  stop(opts: { keepDaemons?: boolean } = {}): void {
+  async stop(opts: { keepDaemons?: boolean } = {}): Promise<void> {
     const hadSessions = this.sessions.size > 0;
+    const stopping: Promise<void>[] = [];
     for (const session of this.sessions.values()) {
       session.stopped = true;
-      void session.client.disconnect().catch(() => {});
-      if (!opts.keepDaemons) this.daemons.release(session.socketPath);
+      stopping.push(session.client.disconnect().catch(() => {}));
+      if (!opts.keepDaemons) stopping.push(this.daemons.release(session.socketPath));
     }
     this.sessions.clear();
+    await Promise.all(stopping);
     if (hadSessions) this.invalidateTopology("codex.owned-session.cleared");
   }
 
@@ -635,7 +641,7 @@ export class CodexAppServerAdapter implements AgentAdapter {
         session.stopped = true;
         session.status = "error";
         await session.client.disconnect().catch(() => {});
-        this.daemons.release(session.socketPath);
+        await this.daemons.release(session.socketPath);
         this.sessions.delete(session.id);
         this.invalidateTopology("codex.owned-session.disconnect-error", session.id);
         this.events.onSessionExit?.(session.id, {

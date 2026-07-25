@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
-import { chmodSync, copyFileSync, mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, copyFileSync, existsSync, mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { createConnection, createServer } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -11,18 +11,41 @@ import { promisify } from "node:util";
 const execFileAsync = promisify(execFile);
 const PERCH_BIN = fileURLToPath(new URL("../../../bin/perch.mjs", import.meta.url));
 
-test("server stop waits for delayed exit before an immediate start", async () => {
+test("server stop remains pending for provider cleanup before one immediate restart", async () => {
   const fixture = await createCliFixture(500);
 
   try {
     await runCli(fixture, "start");
-    const stopped = await runCli(fixture, "stop");
+    const oldPid = readPid(fixture);
+    assert.ok(oldPid);
+    assert.equal(existsSync(join(fixture.home, "provider.alive")), true);
+    let stopSettled = false;
+    const stopping = runCli(fixture, "stop").then((result) => {
+      stopSettled = true;
+      return result;
+    });
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    assert.equal(stopSettled, false, "CLI stop waits while provider cleanup is active");
+    assert.equal(isAlive(oldPid), true);
+    assert.equal(existsSync(join(fixture.home, "provider.alive")), true);
+
+    const stopped = await stopping;
     assert.match(stopped.stdout, /stopped/);
+    assert.equal(isAlive(oldPid), false);
+    assert.equal(existsSync(join(fixture.home, "provider.alive")), false);
     await assertPortCanBind(fixture.port);
 
     const restarted = await runCli(fixture, "start");
     assert.match(restarted.stdout, /running/);
     await waitForPort(fixture.port);
+    assert.notEqual(readPid(fixture), oldPid);
+    assert.equal(
+      readFileSync(fixture.log, "utf8")
+        .split("\n")
+        .filter((line) => line === "fixture listening").length,
+      2,
+      "exactly one successor server started"
+    );
   } finally {
     await cleanupFixture(fixture);
   }
@@ -96,7 +119,7 @@ async function createCliFixture(shutdownDelayMs: number): Promise<CliFixture> {
   writeFileSync(
     entry,
     [
-      'import { writeFileSync } from "node:fs";',
+      'import { rmSync, writeFileSync } from "node:fs";',
       'import { join } from "node:path";',
       'import { createServer } from "node:http";',
       "const server = createServer((request, response) => {",
@@ -110,10 +133,14 @@ async function createCliFixture(shutdownDelayMs: number): Promise<CliFixture> {
       "});",
       'server.listen(Number(process.env.PORT), "127.0.0.1", () => {',
       '  writeFileSync(join(process.env.PERCH_HOME, "perch.pid"), String(process.pid));',
+      '  writeFileSync(join(process.env.PERCH_HOME, "provider.alive"), "owned");',
       '  console.log("fixture listening");',
       "});",
       'process.on("SIGTERM", () => {',
-      `  setTimeout(() => server.close(() => process.exit(0)), ${shutdownDelayMs});`,
+      `  setTimeout(() => {`,
+      '    rmSync(join(process.env.PERCH_HOME, "provider.alive"), { force: true });',
+      '    server.close(() => process.exit(0));',
+      `  }, ${shutdownDelayMs});`,
       "});"
     ].join("\n")
   );

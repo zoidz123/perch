@@ -15,6 +15,7 @@ const PERCH_BIN = fileURLToPath(new URL("../../../bin/perch.mjs", import.meta.ur
 
 type StubState = {
   mateDefaults: Record<string, string>;
+  mateResolved?: Record<string, string>;
   sessions: unknown[];
   startRequests: Array<Record<string, unknown>>;
   liveStartResponse?: { status: number; body: Record<string, unknown> };
@@ -33,7 +34,11 @@ async function withStubServer(run: (serverUrl: string, state: StubState) => Prom
       return;
     }
     if (request.url?.startsWith("/config") && request.method === "GET") {
-      response.end(JSON.stringify({ dispatchDefaults: {}, mateDefaults: state.mateDefaults }));
+      response.end(JSON.stringify({
+        dispatchDefaults: {},
+        mateDefaults: state.mateDefaults,
+        ...(state.mateResolved ? { mateResolved: state.mateResolved } : {})
+      }));
       return;
     }
     if (request.url?.startsWith("/mate/start") && request.method === "POST") {
@@ -141,6 +146,25 @@ test("perch mate codex and claude pick that agent regardless of config without m
       assert.equal(matchingRequest?.agent, "codex");
       assert.equal(matchingRequest?.model, "gpt-5.4");
       assert.equal(matchingRequest?.effort, "high");
+    });
+  } finally {
+    rmSync(home, { recursive: true, force: true });
+  }
+});
+
+test("perch mate uses the server-resolved model for a legacy invalid configured tuple", async () => {
+  const home = mkdtempSync(join(tmpdir(), "perch-mate-cli-"));
+  try {
+    await withStubServer(async (serverUrl, state) => {
+      state.mateDefaults = { agent: "codex", model: "opus", effort: "high" };
+      state.mateResolved = { agent: "codex", model: "gpt-5.6-sol", effort: "high" };
+      const result = await runMate(serverUrl, home, ["--no-attach"]);
+      assert.equal(result.code, 0, result.stderr);
+      assert.deepEqual(state.startRequests.at(-1), {
+        agent: "codex",
+        model: "gpt-5.6-sol",
+        effort: "high"
+      });
     });
   } finally {
     rmSync(home, { recursive: true, force: true });

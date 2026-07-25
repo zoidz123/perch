@@ -145,7 +145,7 @@ export class RoutingAgentAdapter implements AgentAdapter {
     return this.pty.subscribeAgentEvents?.(handler) ?? (() => {});
   }
 
-  stop(): void {
-    this.pty.stop();
+  async stop(opts: { waitForExit?: boolean } = {}): Promise<void> {
+    await this.pty.stop(opts);
   }
 }

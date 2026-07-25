@@ -765,6 +765,20 @@ export function resolveModelIdentifier(
   return [...new Map(matches.map((match) => [`${match.agent}:${match.model}`, match])).values()];
 }
 
+// Classify a model id against every provider in the registry. An empty result
+// means the bundled/live catalog does not know the id, which is intentionally
+// different from a known model owned by another provider. Callers use that
+// distinction to reject known-invalid tuples without blocking future ids that
+// a newer provider may already support.
+export function modelAgentsForIdentifier(
+  registry: ModelsResponse | undefined,
+  identifier: string | undefined
+): AgentKind[] {
+  const trimmed = identifier?.trim();
+  if (!registry || !trimmed) return [];
+  return [...new Set(resolveModelIdentifier(registry, trimmed).map((match) => match.agent))];
+}
+
 // The reasoning efforts a given model supports, resolved from a model registry
 // response. This is the single source of truth config validation uses to reject
 // an effort the selected model does not offer (e.g. `ultra` on gpt-5.5).
@@ -850,7 +864,19 @@ export function resolveMateLaunch(
 ): MateLaunchResolution {
   const configured = input.model?.trim();
   if (configured && configured.toLowerCase() !== MATE_MODEL_AUTO) {
-    return { agent: input.agent, model: configured, effort: input.effort, modelSource: "pinned" };
+    const matches = registry ? resolveModelIdentifier(registry, configured) : [];
+    const providerMatch = matches.find((match) => match.agent === input.agent);
+    if (providerMatch || matches.length === 0) {
+      return {
+        agent: input.agent,
+        model: providerMatch?.model ?? configured,
+        effort: input.effort,
+        modelSource: "pinned"
+      };
+    }
+    // The registry recognizes this id, but only for another provider. Treat a
+    // legacy/stale tuple like automatic selection for the requested provider
+    // instead of launching it or projecting its cross-provider label.
   }
 
   const roleDefault = registry?.providers

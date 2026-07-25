@@ -234,22 +234,35 @@ test("configured defaults fill omitted agent, model, and effort", async () => {
   });
 });
 
-test("PATCH /config also sets mateDefaults, independent of dispatchDefaults", async () => {
-  const patched = await fetch(`${baseUrl}/config`, {
+test("PATCH /config rejects known-invalid Mate tuples and accepts valid or unknown complete tuples", async () => {
+  const invalid = await fetch(`${baseUrl}/config`, {
     ...authed,
     method: "PATCH",
     body: JSON.stringify({ mateDefaults: { agent: "codex", model: "opus", effort: "high" } })
   });
-  assert.equal(patched.status, 200);
+  assert.equal(invalid.status, 400);
+  assert.match(((await invalid.json()) as { error: string }).error, /model "opus".*agent "codex".*claude/);
+
+  const patched = await fetch(`${baseUrl}/config`, {
+    ...authed,
+    method: "PATCH",
+    body: JSON.stringify({ mateDefaults: { agent: "codex", model: "gpt-5.6-sol", effort: "high" } })
+  });
+  assert.equal(patched.status, 200, await patched.clone().text());
   const body = (await patched.json()) as { dispatchDefaults: unknown; mateDefaults: unknown };
-  assert.deepEqual(body.mateDefaults, { agent: "codex", model: "opus", effort: "high" });
+  assert.deepEqual(body.mateDefaults, { agent: "codex", model: "gpt-5.6-sol", effort: "high" });
   // The dispatch defaults from the previous test are untouched by a
   // mateDefaults-only patch.
   assert.deepEqual(body.dispatchDefaults, { agent: "codex", model: "gpt-5.5", effort: "high" });
 
-  const read = await fetch(`${baseUrl}/config`, authed);
-  const readBody = (await read.json()) as { mateDefaults: unknown };
-  assert.deepEqual(readBody.mateDefaults, { agent: "codex", model: "opus", effort: "high" });
+  const future = await fetch(`${baseUrl}/config`, {
+    ...authed,
+    method: "PATCH",
+    body: JSON.stringify({ mateDefaults: { agent: "codex", model: "gpt-9-future", effort: "ultra" } })
+  });
+  assert.equal(future.status, 200, await future.clone().text());
+  const futureBody = (await future.json()) as { mateDefaults: unknown };
+  assert.deepEqual(futureBody.mateDefaults, { agent: "codex", model: "gpt-9-future", effort: "ultra" });
 
   // Clean up so later tests in this file see empty mate defaults again.
   await fetch(`${baseUrl}/config`, {

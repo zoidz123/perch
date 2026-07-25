@@ -91,6 +91,11 @@ const codexEfforts = (model: string | undefined): readonly string[] | undefined 
   if (model === "gpt-5.5") return ["low", "medium", "high", "xhigh"];
   return undefined;
 };
+const modelAgents = (model: string | undefined) => {
+  if (model === "opus") return ["claude"] as const;
+  if (model === "gpt-5.5" || model === "gpt-5.6-sol") return ["codex"] as const;
+  return [];
+};
 
 test("per-model resolver accepts an effort the selected model supports (ultra on gpt-5.6)", () => {
   withHome((home) => {
@@ -143,6 +148,63 @@ test("mate defaults enforce the selected model's effort ceiling too", () => {
       /invalid mate effort "ultra" for model "gpt-5.5"/
     );
     assert.deepEqual(settings.mateDefaults(), {});
+  });
+});
+
+test("known cross-provider defaults are rejected while unknown future ids remain compatible", () => {
+  withHome((home) => {
+    const settings = new FleetSettings({ PERCH_HOME: home } as NodeJS.ProcessEnv);
+    assert.throws(
+      () => settings.updateMateDefaults(
+        { agent: "codex", model: "opus", effort: "high" },
+        codexEfforts,
+        modelAgents
+      ),
+      /invalid mate model "opus" for agent "codex".*claude/
+    );
+    assert.deepEqual(
+      settings.updateMateDefaults(
+        { agent: "codex", model: "gpt-9-future", effort: "ultra" },
+        codexEfforts,
+        modelAgents
+      ),
+      { agent: "codex", model: "gpt-9-future", effort: "ultra" }
+    );
+  });
+});
+
+test("switching mate provider clears scoped values unless the same update supplies a complete tuple", () => {
+  withHome((home) => {
+    const settings = new FleetSettings({ PERCH_HOME: home } as NodeJS.ProcessEnv);
+    settings.updateMateDefaults({ agent: "claude", model: "opus" }, codexEfforts, modelAgents);
+    assert.deepEqual(
+      settings.updateMateDefaults({ agent: "codex" }, codexEfforts, modelAgents),
+      { agent: "codex", model: MATE_MODEL_AUTO, effort: MATE_CODEX_FALLBACK.effort }
+    );
+    assert.deepEqual(
+      settings.updateMateDefaults(
+        { agent: "claude", model: "opus", effort: null },
+        codexEfforts,
+        modelAgents
+      ),
+      { agent: "claude", model: "opus" }
+    );
+    assert.deepEqual(
+      settings.updateMateDefaults(
+        { agent: "codex", model: "gpt-5.5" },
+        codexEfforts,
+        modelAgents
+      ),
+      { agent: "codex", model: MATE_MODEL_AUTO, effort: MATE_CODEX_FALLBACK.effort }
+    );
+    assert.deepEqual(
+      settings.updateMateDefaults(
+        { agent: "codex", model: "gpt-5.5", effort: "high" },
+        codexEfforts,
+        modelAgents
+      ),
+      { agent: "codex", model: "gpt-5.5", effort: "high" }
+    );
   });
 });
 

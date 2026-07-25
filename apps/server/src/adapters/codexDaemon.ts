@@ -56,6 +56,9 @@ export interface CodexDaemonProcess {
   readonly pid?: number;
   onExit(callback: (code: number | null) => void): void;
   kill(signal?: NodeJS.Signals): void;
+  // Real/adopted process handles expose an exact-process exit barrier.
+  // Test doubles may omit it when kill() is synchronous.
+  waitForExit?(): Promise<void>;
 }
 
 export type CodexDaemonSpawn = (args: {
@@ -84,7 +87,9 @@ export type CodexDaemonManagerOptions = {
   runtimeFingerprint?: () => string | undefined;
   // Stops an orphaned daemon found by sweepOrphans. The default re-verifies the
   // pid is still a `codex app-server` before signalling. Injectable for tests.
-  killOrphan?: (pid: number) => void;
+  killOrphan?: (pid: number, signal?: NodeJS.Signals) => void;
+  // Grace period before an exact owned process escalates from TERM to KILL.
+  shutdownGraceMs?: number;
 };
 
 type DaemonEntry = {
@@ -100,7 +105,8 @@ export class CodexDaemonManager {
   private readonly waitHealthy: (socketPath: string, timeoutMs: number) => Promise<void>;
   private readonly startupTimeoutMs: number;
   private readonly runtimeFingerprint: () => string | undefined;
-  private readonly killOrphan: (pid: number) => void;
+  private readonly killOrphan: (pid: number, signal?: NodeJS.Signals) => void;
+  private readonly shutdownGraceMs: number;
 
   private readonly daemons = new Map<string, DaemonEntry>();
   // Single-flight: concurrent acquires of the same cwd share one startup.
@@ -118,6 +124,7 @@ export class CodexDaemonManager {
     this.startupTimeoutMs = options.startupTimeoutMs ?? 10_000;
     this.runtimeFingerprint = options.runtimeFingerprint ?? codexRuntimeFingerprint;
     this.killOrphan = options.killOrphan ?? defaultKillOrphan;
+    this.shutdownGraceMs = options.shutdownGraceMs ?? 5_000;
   }
 
   // Socket path for a workdir: $PERCH_HOME/codex-daemons/<short-hash>.sock. A
@@ -273,9 +280,13 @@ export class CodexDaemonManager {
       onExit() {
         /* not spawned by this handle; exits surface via health checks */
       },
-      kill() {
+      kill(signal) {
         if (pid === undefined) return;
-        killOrphan(pid);
+        killOrphan(pid, signal);
+      },
+      async waitForExit() {
+        if (pid === undefined) return;
+        await waitForPidExit(pid);
       }
     };
   }
@@ -323,15 +334,11 @@ export class CodexDaemonManager {
   // A session-scoped daemon belongs to the control session that acquired it.
   // Stop it when that session detaches so sequential tasks do not accumulate
   // one live process per historical hook identity.
-  release(socketPath: string): void {
+  async release(socketPath: string): Promise<void> {
     for (const [key, entry] of this.daemons) {
       if (entry.handle.socketPath !== socketPath) continue;
-      try {
-        entry.process.kill("SIGTERM");
-      } catch {
-        /* ignore */
-      }
       this.daemons.delete(key);
+      await stopOwnedProcess(entry.process, this.shutdownGraceMs);
       removeDaemonFiles(socketPath);
       return;
     }
@@ -392,24 +399,23 @@ export class CodexDaemonManager {
     }
   }
 
-  // Stop every daemon this manager spawned (server shutdown). `keep` excludes
-  // sockets of live app-server-owned sessions: their daemons deliberately
-  // outlive a graceful restart so the next life can rebind without losing the
-  // in-memory thread (their pidfiles stay for a later sweep/adopt decision).
-  stopAll(keep?: ReadonlySet<string>): void {
+  // Stop every daemon this manager spawned (server shutdown). `keep` is used
+  // only by abnormal-recovery-specific callers. Graceful server shutdown
+  // passes no keep set and awaits every exact owned process exit.
+  async stopAll(keep?: ReadonlySet<string>): Promise<void> {
+    const stopping: Promise<void>[] = [];
     for (const [key, entry] of this.daemons) {
       if (keep?.has(entry.handle.socketPath)) {
         this.daemons.delete(key);
         continue;
       }
-      try {
-        entry.process.kill("SIGTERM");
-      } catch {
-        /* ignore */
-      }
       this.daemons.delete(key);
-      removeDaemonFiles(entry.handle.socketPath);
+      stopping.push(
+        stopOwnedProcess(entry.process, this.shutdownGraceMs)
+          .then(() => removeDaemonFiles(entry.handle.socketPath))
+      );
     }
+    await Promise.all(stopping);
     this.starting.clear();
     this.latestProcess.clear();
   }
@@ -443,7 +449,7 @@ function removeDaemonFiles(socketPath: string): void {
 // SIGTERM an orphaned daemon by recorded pid, but only after re-verifying the
 // pid still belongs to a `codex app-server` process - a recycled pid must
 // never receive the signal.
-function defaultKillOrphan(pid: number): void {
+function defaultKillOrphan(pid: number, signal: NodeJS.Signals = "SIGTERM"): void {
   if (!Number.isInteger(pid) || pid <= 1) return;
   try {
     const command = execFileSync("ps", ["-o", "command=", "-p", String(pid)], {
@@ -451,7 +457,7 @@ function defaultKillOrphan(pid: number): void {
       timeout: 2_000
     });
     if (!command.includes("codex") || !command.includes("app-server")) return;
-    process.kill(pid, "SIGTERM");
+    process.kill(pid, signal);
   } catch {
     /* pid already gone (or ps unavailable): nothing to stop */
   }
@@ -527,6 +533,16 @@ function defaultDaemonSpawn(baseEnv: NodeJS.ProcessEnv): CodexDaemonSpawn {
       detached: false,
       windowsHide: true
     });
+    const exit = new Promise<void>((resolve) => {
+      let settled = false;
+      const finish = () => {
+        if (settled) return;
+        settled = true;
+        resolve();
+      };
+      child.once("exit", finish);
+      child.once("error", finish);
+    });
     return {
       get pid() {
         return child.pid;
@@ -537,9 +553,59 @@ function defaultDaemonSpawn(baseEnv: NodeJS.ProcessEnv): CodexDaemonSpawn {
       },
       kill(signal) {
         child.kill(signal);
+      },
+      waitForExit() {
+        return exit;
       }
     };
   };
+}
+
+async function waitForPidExit(pid: number): Promise<void> {
+  const deadline = Date.now() + 10_000;
+  while (Date.now() < deadline) {
+    try {
+      process.kill(pid, 0);
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "ESRCH") return;
+    }
+    await new Promise((resolve) => setTimeout(resolve, 25));
+  }
+  throw new Error(`owned codex app-server pid ${pid} did not exit within 10s`);
+}
+
+async function stopOwnedProcess(owned: CodexDaemonProcess, graceMs: number): Promise<void> {
+  try {
+    owned.kill("SIGTERM");
+  } catch {
+    /* already gone */
+  }
+  if (!owned.waitForExit) return;
+  if (await settlesWithin(owned.waitForExit(), graceMs)) return;
+  try {
+    owned.kill("SIGKILL");
+  } catch {
+    /* already gone */
+  }
+  if (!(await settlesWithin(owned.waitForExit(), graceMs))) {
+    throw new Error(`owned codex app-server pid ${owned.pid ?? "unknown"} did not exit after SIGKILL`);
+  }
+}
+
+async function settlesWithin(work: Promise<void>, timeoutMs: number): Promise<boolean> {
+  return new Promise<boolean>((resolve) => {
+    const timer = setTimeout(() => resolve(false), timeoutMs);
+    work.then(
+      () => {
+        clearTimeout(timer);
+        resolve(true);
+      },
+      () => {
+        clearTimeout(timer);
+        resolve(false);
+      }
+    );
+  });
 }
 
 // Default health probe: open a control connection over the WS `/rpc` transport

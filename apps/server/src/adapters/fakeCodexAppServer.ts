@@ -406,6 +406,7 @@ export class FakeCodexOwnedAdapter {
   historyReadError: Error | null = null;
   // Reported by runtimeFingerprint() (rebind invariant tests set it).
   fakeRuntimeFingerprint: string | undefined;
+  effectiveModel: string | undefined;
   autoCompleteAcknowledgedTurns = true;
 
   private readonly sessions = new Map<string, FakeOwnedSession>();
@@ -427,6 +428,10 @@ export class FakeCodexOwnedAdapter {
 
   socketPathOf(sessionId: string): string | undefined {
     return this.sessions.get(sessionId)?.socketPath;
+  }
+
+  modelOf(sessionId: string): string | undefined {
+    return this.sessions.has(sessionId) ? this.effectiveModel : undefined;
   }
 
   runtimeFingerprint(): string | undefined {
@@ -471,6 +476,7 @@ export class FakeCodexOwnedAdapter {
       ...(request.labels ? { labels: request.labels } : {}),
       kind: "terminal" as const,
       status: "idle" as const,
+      ...(this.effectiveModel ? { model: this.effectiveModel } : {}),
       lastActivityAt: new Date().toISOString(),
       ...(opts.deferAttachCommand !== true
         ? {

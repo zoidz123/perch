@@ -319,10 +319,11 @@ export async function startManagedAgent(
     const codexThreadId = isCodexLaunch ? options.codexOwned?.threadIdOf(session.id) : null;
     const codexSocketPath = isCodexLaunch ? options.codexOwned?.socketPathOf(session.id) : undefined;
     const codexRuntimeFingerprint = isCodexLaunch ? options.codexOwned?.runtimeFingerprint() : undefined;
+    const effectiveModel = isCodexLaunch ? session.model ?? request.model : request.model;
 
     if (runtime) {
       options.runtimeManager?.markLive(runtime, session.id, options.adapter.runtimeProcess?.(session.id), {
-        ...(request.model ? { model: request.model } : {}),
+        ...(effectiveModel ? { model: effectiveModel } : {}),
         ...(lease ? { worktreeId: lease.id, leaseId: lease.id, worktreePath: lease.path } : {}),
         ...(isCodexLaunch
           ? {
@@ -345,6 +346,7 @@ export async function startManagedAgent(
         options.adapter.runtimeProcess?.(session.id),
         isCodexLaunch
           ? {
+              ...(effectiveModel ? { model: effectiveModel } : {}),
               metadata: {
                 source: "mate-launch",
                 codexDriver: "app-server-owned",
@@ -372,7 +374,7 @@ export async function startManagedAgent(
     options.monitor.setSessionModel(
       session.id,
       resolveSessionModel(session.agent, {
-        model: request.model,
+        model: effectiveModel,
         effort: request.effort
       })
     );
