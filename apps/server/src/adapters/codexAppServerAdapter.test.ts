@@ -12,7 +12,7 @@ import { websocketUnixTransport } from "./wsUnixTransport.js";
 
 // The adapter suite runs against the fake daemon over the REAL ws-unix
 // transport and protocol engine, so what passes here is the wire behavior
-// verified against codex 0.144.6, not a hand-rolled stub's opinion.
+// verified against codex 0.144.6 and 0.145.0, not a hand-rolled stub's opinion.
 
 const tick = (ms = 20) => new Promise((resolve) => setTimeout(resolve, ms));
 
@@ -544,11 +544,51 @@ test("startOwned resume rebinds to a surviving daemon socket without a respawn a
     assert.deepEqual(f.daemons.adopts, [f.socketPath]);
     assert.equal(f.daemons.acquires, 1); // only the original launch
     // The stale in-flight turn is represented truthfully as interrupted.
+    await until(2_000, () =>
+      f.events.timeline.some(
+        (entry) => entry.item.kind === "system" && /interrupted/.test(entry.item.text ?? "")
+      )
+    );
     const interrupted = f.events.timeline.find(
       (entry) => entry.item.kind === "system" && /interrupted/.test(entry.item.text ?? "")
     );
     assert.ok(interrupted, "interrupted turn marker replayed");
     assert.equal(interrupted?.live, false);
+  } finally {
+    await f.close();
+  }
+});
+
+test("startOwned recovery does not wait for full thread history before claiming ownership", async () => {
+  const f = await fixture("pxa-metadata-resume-");
+  try {
+    await f.adapter.startOwned({ command: "codex", agent: "codex", cwd: f.dir, sessionId: "pty:old" });
+    await f.adapter.submitAcknowledgedTurn("pty:old", "kick", { clientUserMessageId: "k1" });
+    f.adapter.stop({ keepDaemons: true });
+    await f.fake.restart();
+    f.fake.blockFullHistoryResume = true;
+
+    const session = await Promise.race([
+      f.adapter.startOwned(
+        { command: "codex", agent: "codex", cwd: f.dir, sessionId: "pty:new", args: ["resume", "thr_1"] },
+        { resume: { threadId: "thr_1", socketPath: f.socketPath } }
+      ),
+      tick(500).then(() => {
+        throw new Error("recovery waited for full thread history");
+      })
+    ]);
+
+    assert.equal(session.id, "pty:new");
+    const resume = f.fake.requestLog.findLast((entry) => entry.method === "thread/resume");
+    assert.equal(resume?.params.excludeTurns, true);
+    assert.ok(
+      await until(2_000, () =>
+        f.events.timeline.some(
+          (entry) => entry.item.kind === "system" && /interrupted/.test(entry.item.text ?? "")
+        )
+      ),
+      "interrupted turn marker replayed through paginated background history"
+    );
   } finally {
     await f.close();
   }

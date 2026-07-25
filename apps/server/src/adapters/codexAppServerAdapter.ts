@@ -130,6 +130,7 @@ type OwnedSession = {
   pendingRaw: string;
   stopped: boolean;
   reconnecting: boolean;
+  historyReplayEpoch: number;
   attachCommandReady: boolean;
 };
 
@@ -317,6 +318,7 @@ export class CodexAppServerAdapter implements AgentAdapter {
       pendingRaw: "",
       stopped: false,
       reconnecting: false,
+      historyReplayEpoch: 0,
       attachCommandReady: opts.deferAttachCommand !== true
     };
     session.client = this.createClient({
@@ -328,10 +330,13 @@ export class CodexAppServerAdapter implements AgentAdapter {
     try {
       await session.client.connect();
       if (opts.resume) {
-        const resumed = await session.client.resumeThread({ threadId: opts.resume.threadId, cwd });
+        const resumed = await session.client.resumeThread({
+          threadId: opts.resume.threadId,
+          cwd,
+          excludeTurns: true
+        });
         session.threadId = resumed.threadId;
         session.model = resumed.model;
-        this.replayHistory(session, threadTurns(resumed.result));
       } else {
         const started = await session.client.startThread({ cwd, model: request.model });
         session.threadId = started.threadId;
@@ -352,6 +357,7 @@ export class CodexAppServerAdapter implements AgentAdapter {
     this.invalidateTopology("codex.owned-session.added", sessionId);
     this.events.onThreadStarted?.(sessionId, session.threadId!, socketPath);
     if (session.model) this.events.onModelResolved?.(sessionId, session.model);
+    if (opts.resume) this.replayHistoryInBackground(session);
     return this.toAgentSession(session);
   }
 
@@ -613,9 +619,14 @@ export class CodexAppServerAdapter implements AgentAdapter {
     await session.client.disconnect().catch(() => {});
     await session.client.connect();
     if (session.threadId) {
-      const resumed = await session.client.resumeThread({ threadId: session.threadId, cwd: session.cwd });
+      const resumed = await session.client.resumeThread({
+        threadId: session.threadId,
+        cwd: session.cwd,
+        excludeTurns: true
+      });
       session.threadId = resumed.threadId;
-      this.replayHistory(session, threadTurns(resumed.result));
+      session.model = resumed.model;
+      this.replayHistoryInBackground(session);
     }
   }
 
@@ -679,6 +690,48 @@ export class CodexAppServerAdapter implements AgentAdapter {
         );
       }
     }
+  }
+
+  // History catch-up is deliberately outside the ownership transaction.
+  // A slow, unsupported, or failed page never rolls back a live session.
+  private replayHistoryInBackground(session: OwnedSession): void {
+    const threadId = session.threadId;
+    if (!threadId) return;
+    const epoch = ++session.historyReplayEpoch;
+    void (async () => {
+      let cursor: string | null = null;
+      do {
+        if (
+          session.stopped ||
+          session.threadId !== threadId ||
+          session.historyReplayEpoch !== epoch ||
+          !session.client.isConnected()
+        ) {
+          return;
+        }
+        const page = await session.client.listThreadTurns({
+          threadId,
+          cursor,
+          limit: 20,
+          sortDirection: "asc",
+          itemsView: "full"
+        });
+        if (
+          session.stopped ||
+          session.threadId !== threadId ||
+          session.historyReplayEpoch !== epoch
+        ) {
+          return;
+        }
+        this.replayHistory(session, page.data);
+        const nextCursor = page.nextCursor;
+        if (nextCursor === cursor) return;
+        cursor = nextCursor;
+      } while (cursor);
+    })().catch(() => {
+      // Perch's durable timeline and live notifications remain authoritative.
+      // History replay is best-effort catch-up, never an ownership condition.
+    });
   }
 
   private handlersFor(session: OwnedSession): Parameters<CreateOwnedClient>[0]["handlers"] {
