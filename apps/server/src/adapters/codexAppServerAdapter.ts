@@ -55,7 +55,8 @@ export type CodexOwnedEventSink = {
   onTimelineBackfillStart?: (
     sessionId: string,
     syncId: string,
-    stopAtAnchor: boolean
+    stopAtAnchor: boolean,
+    restartsFromHead: boolean
   ) => void;
   onTimelineBackfillPage?: (
     sessionId: string,
@@ -445,7 +446,8 @@ export class CodexAppServerAdapter implements AgentAdapter {
     this.events.onTimelineBackfillStart?.(
       session.id,
       request.syncId,
-      request.stopAtAnchor === true
+      request.stopAtAnchor === true,
+      request.stopAtAnchor !== true && request.cursor === null
     );
     this.replayHistoryInBackground(session, epoch, request);
     return true;

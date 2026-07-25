@@ -286,8 +286,8 @@ monitor.setPushRouter(pushRouter);
 codexOwned.wireEvents({
   onTimelineItem: (item, live) => timeline.ingest(item, { live }),
   onTimelineGapOpened: (sessionId) => timeline.openBackfillGap(sessionId),
-  onTimelineBackfillStart: (sessionId, token, stopAtAnchor) =>
-    timeline.beginBackfill(sessionId, token, stopAtAnchor),
+  onTimelineBackfillStart: (sessionId, token, stopAtAnchor, restartsFromHead) =>
+    timeline.beginBackfill(sessionId, token, stopAtAnchor, restartsFromHead),
   onTimelineBackfillPage: (sessionId, token, items) =>
     timeline.ingestBackfill(sessionId, token, items),
   onTimelineBackfillEnd: (sessionId, syncId, complete) =>

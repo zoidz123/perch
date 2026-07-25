@@ -129,8 +129,8 @@ async function fixture(
       timeline.ingest(item, { live });
     },
     onTimelineGapOpened: (sessionId) => timeline.openBackfillGap(sessionId),
-    onTimelineBackfillStart: (sessionId, token, stopAtAnchor) =>
-      timeline.beginBackfill(sessionId, token, stopAtAnchor),
+    onTimelineBackfillStart: (sessionId, token, stopAtAnchor, restartsFromHead) =>
+      timeline.beginBackfill(sessionId, token, stopAtAnchor, restartsFromHead),
     onTimelineBackfillPage: (sessionId, token, items) => {
       events.timeline.push(...items.map((item) => ({ item, live: false })));
       return timeline.ingestBackfill(sessionId, token, items);

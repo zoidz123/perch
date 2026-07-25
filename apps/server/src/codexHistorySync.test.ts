@@ -110,6 +110,36 @@ test("failed Codex history retries the same durable cursor without a reconnect",
   rmSync(home, { recursive: true, force: true });
 });
 
+test("a full retry from the head absorbs its pending reconnect gap", async () => {
+  const home = mkdtempSync(join(tmpdir(), "perch-history-head-retry-"));
+  const db = new StateDb({ PERCH_HOME: home } as NodeJS.ProcessEnv);
+  const adapter = new HistoryAdapter();
+  const coordinator = new CodexHistorySyncCoordinator(
+    db,
+    adapter as unknown as CodexAppServerAdapter,
+    { retryDelaysMs: [] }
+  );
+  const receipt = coordinator.startForTaskRuntime(liveRuntime())!;
+  adapter.requests[0]!.request.onTerminal({
+    state: "failed",
+    error: "connection lost before first page"
+  });
+
+  const resumed = coordinator.resumeForSession("pty:live")!;
+
+  assert.equal(resumed.id, receipt.id);
+  assert.equal(adapter.requests.length, 2);
+  assert.equal(adapter.requests[1]!.request.cursor, null);
+  assert.equal(adapter.requests[1]!.request.stopAtAnchor, false);
+  adapter.requests[1]!.request.onTerminal({ state: "succeeded" });
+  await new Promise((resolve) => setTimeout(resolve, 5));
+  assert.equal(adapter.requests.length, 2);
+
+  coordinator.stop();
+  db.close();
+  rmSync(home, { recursive: true, force: true });
+});
+
 test("a completed sync starts an anchored gap receipt on control reconnect", () => {
   const home = mkdtempSync(join(tmpdir(), "perch-history-complete-"));
   const db = new StateDb({ PERCH_HOME: home } as NodeJS.ProcessEnv);

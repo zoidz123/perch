@@ -241,7 +241,13 @@ export class TimelineStore {
     this.pendingBackfillLanes.set(sessionId, lane);
   }
 
-  beginBackfill(sessionId: string, syncId: string, stopAtAnchor = false): void {
+  beginBackfill(
+    sessionId: string,
+    syncId: string,
+    stopAtAnchor = false,
+    restartsFromHead = false
+  ): void {
+    if (restartsFromHead) this.pendingBackfillLanes.delete(sessionId);
     if (this.backfills.get(sessionId)?.syncId === syncId) return;
     const pending = this.pendingBackfillLanes.get(sessionId);
     const lane = pending ?? this.reserveBackfillLane(sessionId);

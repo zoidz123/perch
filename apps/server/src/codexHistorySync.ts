@@ -144,6 +144,12 @@ export class CodexHistorySyncCoordinator {
     this.clearRetryTimer(receipt.id);
     const running = this.stateDb.codexHistorySyncs.start(receipt.id);
     if (!running) return;
+    const mode = this.receiptModes.get(running.id);
+    const cursor = running.cursor ?? null;
+    const retiredPendingGap =
+      mode === "full" &&
+      cursor === null &&
+      this.pendingGaps.delete(running.perchSessionId);
     const run = Symbol(running.id);
     this.runs.set(running.id, run);
     const finish = (
@@ -171,8 +177,8 @@ export class CodexHistorySyncCoordinator {
       const started = this.adapter.startHistoryCatchUp(running.perchSessionId, {
         syncId: running.id,
         threadId: running.providerSessionId,
-        cursor: running.cursor ?? null,
-        stopAtAnchor: this.receiptModes.get(running.id) === "gap",
+        cursor,
+        stopAtAnchor: mode === "gap",
         onPage: ({ cursor, accepted }) => {
           if (!this.stateDb.codexHistorySyncs.recordPage(running.id, cursor, accepted)) {
             throw new Error(`codex history sync receipt is no longer running: ${running.id}`);
@@ -181,9 +187,11 @@ export class CodexHistorySyncCoordinator {
         onTerminal: ({ state, error, retryable }) => finish(state, error, retryable)
       });
       if (!started) {
+        if (retiredPendingGap) this.pendingGaps.add(running.perchSessionId);
         finish("failed", `codex session is not live: ${running.perchSessionId}`, false);
       }
     } catch (error) {
+      if (retiredPendingGap) this.pendingGaps.add(running.perchSessionId);
       finish("failed", error instanceof Error ? error.message : String(error), false);
     }
   }

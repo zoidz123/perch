@@ -250,6 +250,45 @@ test("an anchored gap inserts only missed rows before post-reconnect live output
   store.stop();
 });
 
+test("a full replay restarting from its head retires an empty disconnect anchor", () => {
+  const store = new TimelineStore();
+  const item = (id: string) => ({
+    seq: 0,
+    id,
+    sessionId: "pty:head-retry",
+    kind: "assistant" as const,
+    text: id,
+    at: "2026-07-25T00:00:00.000Z"
+  });
+
+  store.beginBackfill("pty:head-retry", "sync-full", false, true);
+  store.openBackfillGap("pty:head-retry");
+  store.endBackfill("pty:head-retry", "sync-full", false);
+  store.beginBackfill("pty:head-retry", "sync-full", false, true);
+  store.ingestBackfill("pty:head-retry", "sync-full", [
+    item("full-1"),
+    item("full-2")
+  ]);
+  store.endBackfill("pty:head-retry", "sync-full", true);
+
+  store.openBackfillGap("pty:head-retry");
+  store.beginBackfill("pty:head-retry", "sync-gap", true);
+  assert.deepEqual(
+    store.ingestBackfill("pty:head-retry", "sync-gap", [
+      item("too-old"),
+      item("full-1"),
+      item("full-2")
+    ]),
+    { accepted: 0, done: true }
+  );
+  store.endBackfill("pty:head-retry", "sync-gap", true);
+  assert.deepEqual(
+    store.fetch("pty:head-retry", 0, 10).items.map((candidate) => candidate.id),
+    ["full-1", "full-2"]
+  );
+  store.stop();
+});
+
 test("an anchored gap evicts pre-gap rows from a full timeline", () => {
   const store = new TimelineStore();
   const item = (id: string) => ({
