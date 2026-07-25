@@ -124,10 +124,12 @@ import { listCodexModelsOnce } from "./adapters/codexAppServer.js";
 import {
   collectCliModelRegistry,
   collectModelRegistry,
+  collectModels,
   DISPATCH_CODEX_FALLBACK,
   listClaudeModels,
   MATE_CLAUDE_FALLBACK_MODEL,
   MATE_CODEX_FALLBACK,
+  modelAgentsForIdentifier,
   resolveMateLaunch,
   resolveSessionModel,
   supportedEffortsForModel
@@ -136,6 +138,7 @@ import type {
   CodexEffortResolver,
   DispatchDefaultsUpdate,
   FleetSettings,
+  ModelAgentResolver,
   MateDefaultsUpdate
 } from "./settings.js";
 import type { CodexAppServerAdapter } from "./adapters/codexAppServerAdapter.js";
@@ -340,7 +343,7 @@ export function createControlServer(options: HttpServerOptions) {
 }
 
 function sessionModelFallback(
-  session: { agent?: AgentKind; labels?: Record<string, string>; model?: string | null; modelLabel?: string | null; effort?: CodexReasoningEffort | null },
+  session: { id: string; agent?: AgentKind; labels?: Record<string, string>; model?: string | null; modelLabel?: string | null; effort?: CodexReasoningEffort | null },
   options: HttpServerOptions
 ) {
   if (session.labels?.role !== "mate") {
@@ -348,10 +351,18 @@ function sessionModelFallback(
   }
   if (session.agent === "codex") {
     const defaults = options.settings?.mateDefaults() ?? {};
-    const configured = defaults.agent === "codex" ? defaults.model?.trim() : undefined;
-    const model = configured && configured.toLowerCase() !== "auto" ? configured : MATE_CODEX_FALLBACK.model;
-    const effort = defaults.agent === "codex" ? defaults.effort : MATE_CODEX_FALLBACK.effort;
-    return resolveSessionModel("codex", { model, effort });
+    const owner = options.ownerManager?.snapshot();
+    const durableModel =
+      owner?.provider === "codex" && owner.ptySessionId === session.id ? owner.model : undefined;
+    const resolved = resolveMateLaunch(
+      {
+        agent: "codex",
+        model: durableModel ?? (defaults.agent === "codex" ? defaults.model?.trim() : undefined),
+        effort: defaults.agent === "codex" ? defaults.effort : MATE_CODEX_FALLBACK.effort
+      },
+      collectModels()
+    );
+    return resolveSessionModel("codex", { model: resolved.model, effort: resolved.effort });
   }
   if (session.agent === "claude") {
     const defaults = options.settings?.mateDefaults() ?? {};
@@ -375,17 +386,22 @@ async function loadModelRegistry(options: HttpServerOptions): Promise<ModelsResp
 // /config rejects an effort the selected codex model does not support (e.g.
 // `ultra` on gpt-5.5) while accepting the full per-model set (max/ultra for
 // gpt-5.6). GET /models stays the single source of effort truth.
-async function codexEffortResolver(options: HttpServerOptions): Promise<CodexEffortResolver> {
+async function modelConfigResolvers(options: HttpServerOptions): Promise<{
+  efforts: CodexEffortResolver;
+  agents: ModelAgentResolver;
+}> {
   const registry = await loadModelRegistry(options);
-  return (model) => supportedEffortsForModel(registry, "codex", model);
+  return {
+    efforts: (model) => supportedEffortsForModel(registry, "codex", model),
+    agents: (model) => modelAgentsForIdentifier(registry, model)
+  };
 }
 
 async function resolveMateLaunchNow(
   input: { agent: AgentKind; model?: string; effort?: CodexReasoningEffort },
   options: HttpServerOptions
 ): Promise<MateLaunchResolution> {
-  const model = input.model?.trim();
-  const registry = !model || model.toLowerCase() === "auto" ? await loadModelRegistry(options) : undefined;
+  const registry = await loadModelRegistry(options);
   return resolveMateLaunch(input, registry);
 }
 
@@ -847,14 +863,14 @@ async function dispatchWebSocketRpc(
     }
     try {
       const update = strictConfigPatch(body);
-      const resolveEfforts = await codexEffortResolver(options);
+      const resolvers = await modelConfigResolvers(options);
       const responseBody = await buildConfigResponse(options, {
         dispatchDefaults: update.dispatchDefaults === undefined
           ? options.settings.dispatchDefaults()
-          : options.settings.updateDispatchDefaults(update.dispatchDefaults, resolveEfforts),
+          : options.settings.updateDispatchDefaults(update.dispatchDefaults, resolvers.efforts, resolvers.agents),
         mateDefaults: update.mateDefaults === undefined
           ? options.settings.mateDefaults()
-          : options.settings.updateMateDefaults(update.mateDefaults, resolveEfforts)
+          : options.settings.updateMateDefaults(update.mateDefaults, resolvers.efforts, resolvers.agents)
       });
       await audit(options.auditLog, { action: "set_config", ...auditPeer });
       return rpcOk(200, responseBody);
@@ -1663,13 +1679,13 @@ async function route(
       let mateDefaults: ConfigResponse["mateDefaults"];
       try {
         const update = strictConfigPatch(body);
-        const resolveEfforts = await codexEffortResolver(options);
+        const resolvers = await modelConfigResolvers(options);
         dispatchDefaults = update.dispatchDefaults === undefined
           ? options.settings.dispatchDefaults()
-          : options.settings.updateDispatchDefaults(update.dispatchDefaults, resolveEfforts);
+          : options.settings.updateDispatchDefaults(update.dispatchDefaults, resolvers.efforts, resolvers.agents);
         mateDefaults = update.mateDefaults === undefined
           ? options.settings.mateDefaults()
-          : options.settings.updateMateDefaults(update.mateDefaults, resolveEfforts);
+          : options.settings.updateMateDefaults(update.mateDefaults, resolvers.efforts, resolvers.agents);
       } catch (error) {
         writeJson(response, 400, { error: error instanceof Error ? error.message : String(error) });
         return;

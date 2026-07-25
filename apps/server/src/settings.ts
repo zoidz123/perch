@@ -1,7 +1,7 @@
 import { chmodSync, existsSync, readFileSync, renameSync, statSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
-import type { DispatchDefaults, MateDefaults } from "@perch/shared";
+import type { AgentKind, DispatchDefaults, MateDefaults } from "@perch/shared";
 import { DISPATCH_CODEX_FALLBACK, MATE_CODEX_FALLBACK, MATE_MODEL_AUTO } from "./models.js";
 
 // Fleet-level user settings, persisted in $PERCH_HOME/settings.json. Same
@@ -36,6 +36,7 @@ export const DISPATCH_EFFORTS = new Set(["none", "minimal", "low", "medium", "hi
 // (unknown/freshly-pinned id) - the baseline DISPATCH_EFFORTS check still
 // applies, but no per-model narrowing happens (append-only tolerance).
 export type CodexEffortResolver = (model: string | undefined) => readonly string[] | undefined;
+export type ModelAgentResolver = (model: string | undefined) => readonly AgentKind[];
 
 // A write-side update: string sets, null clears, undefined leaves untouched.
 export type DispatchDefaultsUpdate = {
@@ -106,7 +107,8 @@ export class FleetSettings {
   // narrows the accepted effort to the SELECTED model's supported set.
   updateDispatchDefaults(
     update: DispatchDefaultsUpdate,
-    resolveEfforts?: CodexEffortResolver
+    resolveEfforts?: CodexEffortResolver,
+    resolveAgents?: ModelAgentResolver
   ): DispatchDefaults {
     const next: DispatchDefaults = { ...(this.load().dispatchDefaults ?? {}) };
     if (update.agent !== undefined) {
@@ -122,6 +124,7 @@ export class FleetSettings {
         next.agent = update.agent as DispatchDefaults["agent"];
       }
     }
+    validateEffortUpdate("default", update.effort);
     if (update.model !== undefined) {
       if (update.model === null || update.model.trim().length === 0) {
         delete next.model;
@@ -132,10 +135,6 @@ export class FleetSettings {
     if (update.effort !== undefined) {
       if (update.effort === null) {
         delete next.effort;
-      } else if (!DISPATCH_EFFORTS.has(update.effort)) {
-        throw new Error(
-          `invalid default effort "${update.effort}" (expected ${[...DISPATCH_EFFORTS].join(" | ")})`
-        );
       } else {
         next.effort = update.effort as DispatchDefaults["effort"];
       }
@@ -144,6 +143,7 @@ export class FleetSettings {
     next.agent = completed.agent;
     next.model = completed.model;
     next.effort = completed.effort;
+    assertModelSupported("dispatch", next, resolveAgents);
     assertEffortSupported("dispatch", next, resolveEfforts);
     this.persist({ ...this.load(), dispatchDefaults: next });
     return this.dispatchDefaults();
@@ -169,11 +169,14 @@ export class FleetSettings {
   // narrows the accepted effort to the SELECTED model's supported set.
   updateMateDefaults(
     update: MateDefaultsUpdate,
-    resolveEfforts?: CodexEffortResolver
+    resolveEfforts?: CodexEffortResolver,
+    resolveAgents?: ModelAgentResolver
   ): MateDefaults {
     const next: MateDefaults = { ...(this.load().mateDefaults ?? {}) };
+    let providerChanged = false;
     if (update.agent !== undefined) {
       if (update.agent === null) {
+        providerChanged = next.agent !== undefined;
         delete next.agent;
         delete next.model;
         delete next.effort;
@@ -182,23 +185,27 @@ export class FleetSettings {
           `invalid mate agent "${update.agent}" (expected ${[...DISPATCH_AGENTS].join(" | ")})`
         );
       } else {
+        if (next.agent !== update.agent) {
+          providerChanged = true;
+          delete next.model;
+          delete next.effort;
+        }
         next.agent = update.agent as MateDefaults["agent"];
       }
     }
-    if (update.model !== undefined) {
+    validateEffortUpdate("mate", update.effort);
+    const applyScopedUpdate =
+      !providerChanged || hasCompleteScopedUpdate(next.agent, update.model, update.effort);
+    if (applyScopedUpdate && update.model !== undefined) {
       if (update.model === null || update.model.trim().length === 0) {
         delete next.model;
       } else {
         next.model = update.model.trim();
       }
     }
-    if (update.effort !== undefined) {
+    if (applyScopedUpdate && update.effort !== undefined) {
       if (update.effort === null) {
         delete next.effort;
-      } else if (!DISPATCH_EFFORTS.has(update.effort)) {
-        throw new Error(
-          `invalid mate effort "${update.effort}" (expected ${[...DISPATCH_EFFORTS].join(" | ")})`
-        );
       } else {
         next.effort = update.effort as MateDefaults["effort"];
       }
@@ -207,6 +214,7 @@ export class FleetSettings {
     next.agent = completed.agent;
     next.model = completed.model;
     next.effort = completed.effort;
+    assertModelSupported("mate", next, resolveAgents);
     assertEffortSupported("mate", next, resolveEfforts);
     this.persist({ ...this.load(), mateDefaults: next });
     return this.mateDefaults();
@@ -243,6 +251,23 @@ function compactDefaults(values: Record<string, string | undefined>): Record<str
   return Object.fromEntries(Object.entries(values).filter((entry): entry is [string, string] => Boolean(entry[1])));
 }
 
+function validateEffortUpdate(layer: "default" | "mate", effort: string | null | undefined): void {
+  if (effort === undefined || effort === null || DISPATCH_EFFORTS.has(effort)) return;
+  throw new Error(
+    `invalid ${layer} effort "${effort}" (expected ${[...DISPATCH_EFFORTS].join(" | ")})`
+  );
+}
+
+function hasCompleteScopedUpdate(
+  agent: DispatchDefaults["agent"] | MateDefaults["agent"] | undefined,
+  model: string | null | undefined,
+  effort: string | null | undefined
+): boolean {
+  const hasModel = typeof model === "string" && model.trim().length > 0;
+  if (!agent || !hasModel) return false;
+  return agent === "codex" ? typeof effort === "string" : true;
+}
+
 // Reject an effort the SELECTED codex model does not support. Only applies to
 // codex (Claude has no reasoning effort) and only when the resolver classifies
 // the model - an unknown/"auto" model leaves the baseline DISPATCH_EFFORTS
@@ -259,6 +284,20 @@ function assertEffortSupported(
   const noun = layer === "mate" ? "mate" : "default";
   throw new Error(
     `invalid ${noun} effort "${defaults.effort}" for model "${defaults.model}" (expected ${allowed.join(" | ")})`
+  );
+}
+
+function assertModelSupported(
+  layer: "dispatch" | "mate",
+  defaults: DispatchDefaults | MateDefaults,
+  resolveAgents?: ModelAgentResolver
+): void {
+  if (!resolveAgents || !defaults.agent || !defaults.model || defaults.model === MATE_MODEL_AUTO) return;
+  const knownAgents = resolveAgents(defaults.model);
+  if (knownAgents.length === 0 || knownAgents.includes(defaults.agent)) return;
+  const noun = layer === "mate" ? "mate" : "default";
+  throw new Error(
+    `invalid ${noun} model "${defaults.model}" for agent "${defaults.agent}" (model belongs to ${knownAgents.join(" | ")})`
   );
 }
 

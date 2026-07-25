@@ -192,6 +192,7 @@ export class MateRecoveryCoordinator {
         sessionId: launchedSessionId,
         provider: claimed.provider,
         providerSessionId,
+        ...(result.session.model ? { model: result.session.model } : {}),
         ownership: this.options.adapter.runtimeProcess?.(launchedSessionId),
         ...(bindFacts ? { metadata: bindFacts.metadata } : {})
       });

@@ -686,6 +686,7 @@ test("Codex mate recovery resumes the exact thread over the app-server and binds
   const runtimeManager = new RuntimeManager(tasks);
   const adapter = new MateRecoveryAdapter();
   const codexOwned = new FakeCodexOwnedAdapter();
+  codexOwned.effectiveModel = "gpt-5.6-sol";
   const routing = new RoutingAgentAdapter(
     adapter as unknown as PtyAgentAdapter,
     codexOwned as unknown as CodexAppServerAdapter
@@ -740,6 +741,7 @@ test("Codex mate recovery resumes the exact thread over the app-server and binds
       agent: "codex",
       sessionId: "pty:old-codex-mate",
       cwd: home,
+      model: "opus",
       labels: { role: "mate" }
     });
     ownerManager.markLive(starting, "pty:old-codex-mate");
@@ -763,6 +765,12 @@ test("Codex mate recovery resumes the exact thread over the app-server and binds
     assert.equal(ownerManager.snapshot()?.provider, "codex");
     assert.equal(ownerManager.snapshot()?.providerSessionId, MATE_CONVERSATION);
     assert.equal(ownerManager.snapshot()?.generation, 1);
+    assert.equal(ownerManager.snapshot()?.model, "gpt-5.6-sol");
+    assert.equal(
+      tasks.stateDb.ownerRuntimes.findBySession("pty:old-codex-mate")?.model,
+      "opus",
+      "recovery does not rewrite the historical owner generation"
+    );
   } finally {
     server.closeAllConnections?.();
     if (server.listening) await new Promise<void>((resolve) => server.close(() => resolve()));

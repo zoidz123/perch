@@ -46,7 +46,7 @@ test("acquire spawns one daemon per workdir and reuses a healthy one", async () 
   assert.equal(spawns.length, 2);
   assert.equal(spawns[0]?.cwd, "/repo/one");
   assert.equal(spawns[1]?.cwd, "/repo/two");
-  manager.stopAll();
+  await manager.stopAll();
 });
 
 test("acquire does not reuse a daemon across distinct session-scoped hook identities", async () => {
@@ -79,7 +79,7 @@ test("acquire does not reuse a daemon across distinct session-scoped hook identi
   assert.equal(spawns.length, 2);
   assert.deepEqual(spawns[0]?.env, firstEnv);
   assert.deepEqual(spawns[1]?.env, secondEnv);
-  manager.stopAll();
+  await manager.stopAll();
 });
 
 test("acquire threads config overrides to the spawn and keys distinct daemons per override", async () => {
@@ -110,7 +110,7 @@ test("acquire threads config overrides to the spawn and keys distinct daemons pe
   assert.equal(spawns.length, 2);
   assert.deepEqual(spawns[0]?.configOverrides, []);
   assert.deepEqual(spawns[1]?.configOverrides, ['model_reasoning_effort="xhigh"']);
-  manager.stopAll();
+  await manager.stopAll();
 });
 
 test("acquire restarts a daemon that stopped answering the health probe", async () => {
@@ -132,7 +132,7 @@ test("acquire restarts a daemon that stopped answering the health probe", async 
   await manager.acquire("/repo/x");
   await manager.acquire("/repo/x"); // reuse probe fails -> respawn
   assert.equal(spawns.length, 2);
-  manager.stopAll();
+  await manager.stopAll();
 });
 
 test("acquire kills the process and rejects when the daemon never becomes healthy", async () => {
@@ -147,7 +147,7 @@ test("acquire kills the process and rejects when the daemon never becomes health
 
   await assert.rejects(() => manager.acquire("/repo/dead"), /never healthy/);
   assert.equal(proc.killed, true);
-  manager.stopAll();
+  await manager.stopAll();
 });
 
 test("release stops the daemon owned by a detached session and removes its socket artifacts", async () => {
@@ -164,9 +164,80 @@ test("release stops the daemon owned by a detached session and removes its socke
   writeFileSync(handle.socketPath, "");
   assert.equal(existsSync(`${handle.socketPath}.pid`), true);
 
-  manager.release(handle.socketPath);
+  await manager.release(handle.socketPath);
 
   assert.equal(proc.killed, true);
+  assert.equal(existsSync(handle.socketPath), false);
+  assert.equal(existsSync(`${handle.socketPath}.pid`), false);
+  rmSync(home, { recursive: true, force: true });
+});
+
+test("release remains pending until the exact owned daemon exits", async () => {
+  const home = mkdtempSync(join(tmpdir(), "perch-daemon-exit-barrier-"));
+  let resolveExit!: () => void;
+  let killed = false;
+  const exited = new Promise<void>((resolve) => {
+    resolveExit = resolve;
+  });
+  const manager = new CodexDaemonManager({
+    env: { PERCH_HOME: home },
+    spawn: () => ({
+      pid: 4242,
+      onExit() {},
+      kill() {
+        killed = true;
+      },
+      waitForExit: () => exited
+    }),
+    waitHealthy: async () => {}
+  });
+  const handle = await manager.acquire("/repo/session");
+  writeFileSync(handle.socketPath, "");
+
+  let settled = false;
+  const release = manager.release(handle.socketPath).then(() => {
+    settled = true;
+  });
+  await new Promise((resolve) => setTimeout(resolve, 20));
+  assert.equal(killed, true);
+  assert.equal(settled, false);
+  assert.equal(existsSync(handle.socketPath), true);
+  assert.equal(existsSync(`${handle.socketPath}.pid`), true);
+
+  resolveExit();
+  await release;
+  assert.equal(existsSync(handle.socketPath), false);
+  assert.equal(existsSync(`${handle.socketPath}.pid`), false);
+  rmSync(home, { recursive: true, force: true });
+});
+
+test("release escalates a hung exact owned daemon from SIGTERM to SIGKILL", async () => {
+  const home = mkdtempSync(join(tmpdir(), "perch-daemon-exit-escalation-"));
+  const signals: Array<NodeJS.Signals | undefined> = [];
+  let resolveExit!: () => void;
+  const exited = new Promise<void>((resolve) => {
+    resolveExit = resolve;
+  });
+  const manager = new CodexDaemonManager({
+    env: { PERCH_HOME: home },
+    shutdownGraceMs: 10,
+    spawn: () => ({
+      pid: 4242,
+      onExit() {},
+      kill(signal) {
+        signals.push(signal);
+        if (signal === "SIGKILL") resolveExit();
+      },
+      waitForExit: () => exited
+    }),
+    waitHealthy: async () => {}
+  });
+  const handle = await manager.acquire("/repo/session");
+  writeFileSync(handle.socketPath, "");
+
+  await manager.release(handle.socketPath);
+
+  assert.deepEqual(signals, ["SIGTERM", "SIGKILL"]);
   assert.equal(existsSync(handle.socketPath), false);
   assert.equal(existsSync(`${handle.socketPath}.pid`), false);
   rmSync(home, { recursive: true, force: true });
@@ -200,7 +271,7 @@ test("adopting a live socket recovers its recorded pid so release still stops th
   assert.equal(handle.socketPath, socketPath);
   assert.equal(spawned, 0, "a healthy same-identity socket is adopted, not respawned");
 
-  manager.release(socketPath);
+  await manager.release(socketPath);
 
   assert.deepEqual(killed, [31337], "release signals the adopted daemon's recorded pid");
   assert.equal(existsSync(socketPath), false);
@@ -238,7 +309,7 @@ test("replacing an unresponsive socket retires its recorded pid and both files b
   assert.equal(handle.socketPath, socketPath);
   assert.deepEqual(killed, [40001], "the hung predecessor's recorded pid is retired");
   assert.equal(readFileSync(`${socketPath}.pid`, "utf8"), "4242", "the pidfile now records the successor");
-  manager.stopAll();
+  await manager.stopAll();
   rmSync(home, { recursive: true, force: true });
 });
 
@@ -283,7 +354,7 @@ test("a replaced daemon's delayed exit cannot delete its successor's files durin
     "5002",
     "the successor's pidfile survives the predecessor's delayed exit"
   );
-  manager.stopAll();
+  await manager.stopAll();
   assert.equal(existsSync(`${second.socketPath}.pid`), false, "the successor is still registered and cleaned by stopAll");
   rmSync(home, { recursive: true, force: true });
 });
@@ -339,7 +410,7 @@ test("adoptExisting enforces the recorded runtime fingerprint: match adopts, mis
   const legacy = await manager.adoptExisting(socketPath, "/repo/one");
   assert.equal(legacy?.socketPath, socketPath);
 
-  manager.stopAll();
+  await manager.stopAll();
   rmSync(home, { recursive: true, force: true });
 });
 
@@ -378,7 +449,7 @@ test("sweepOrphans retires stale sockets and recorded pids without touching owne
   assert.equal(existsSync(owned.socketPath), true);
   assert.equal(existsSync(`${owned.socketPath}.pid`), true);
 
-  manager.stopAll();
+  await manager.stopAll();
   rmSync(home, { recursive: true, force: true });
 });
 

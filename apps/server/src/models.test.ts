@@ -300,6 +300,31 @@ test("mate auto resolves through the registry orchestrator role default", () => 
   assert.equal(resolveMateLaunch({ agent: "codex", model: "auto" }, undefined).model, MATE_CODEX_FALLBACK.model);
 });
 
+test("mate launch rejects known cross-provider tuples but preserves unknown future ids", () => {
+  const registry = collectModels({
+    readClaudeSettings: () => null,
+    readCodexConfig: () => null,
+    codexModelList: LIVE_CODEX_MODELS
+  });
+  assert.deepEqual(resolveMateLaunch({ agent: "codex", model: "opus", effort: "high" }, registry), {
+    agent: "codex",
+    model: "gpt-5.6-sol",
+    effort: "high",
+    modelSource: "auto"
+  });
+  assert.deepEqual(resolveMateLaunch({ agent: "claude", model: "gpt-5.6-sol" }, registry), {
+    agent: "claude",
+    model: "fable",
+    modelSource: "auto"
+  });
+  assert.deepEqual(resolveMateLaunch({ agent: "codex", model: "gpt-9-future", effort: "ultra" }, registry), {
+    agent: "codex",
+    model: "gpt-9-future",
+    effort: "ultra",
+    modelSource: "pinned"
+  });
+});
+
 test("model registry serves stale cache when codex runtime refresh fails", async () => {
   const home = mkdtempSync(join(tmpdir(), "perch-model-registry-"));
   const cachePath = join(home, "model-registry.json");

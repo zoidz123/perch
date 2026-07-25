@@ -72,6 +72,7 @@ export class OwnerManager {
       // mate recovery reads these to rebind to the same daemon socket, exactly
       // like worker runtimes.
       metadata?: Record<string, unknown>;
+      model?: string;
     } = {}
   ): OwnerRuntimeRecord {
     const live = this.tasks.stateDb.ownerRuntimes.compareAndSwap(
@@ -99,6 +100,36 @@ export class OwnerManager {
       runtime.state,
       runtime.state,
       { providerSessionId }
+    );
+  }
+
+  recordEffectiveModel(input: {
+    ownerId: string;
+    generation: number;
+    provider: string;
+    providerSessionId: string;
+    sessionId: string;
+    model: string;
+  }): OwnerRuntimeRecord | undefined {
+    const current = this.tasks.stateDb.ownerRuntimes.latest(input.ownerId);
+    if (
+      !current ||
+      current.generation !== input.generation ||
+      (current.state !== "starting" && current.state !== "live") ||
+      current.provider !== input.provider ||
+      current.providerSessionId !== input.providerSessionId ||
+      current.ptySessionId !== input.sessionId
+    ) {
+      return undefined;
+    }
+    const model = input.model.trim();
+    if (!model) return undefined;
+    return this.tasks.stateDb.ownerRuntimes.compareAndSwap(
+      current.ownerId,
+      current.generation,
+      current.state,
+      current.state,
+      { model }
     );
   }
 
@@ -162,6 +193,7 @@ export class OwnerManager {
       sessionId: string;
       provider: string;
       providerSessionId: string;
+      model?: string;
       ownership?: RuntimeProcessOwnership;
       metadata?: Record<string, unknown>;
     }
@@ -192,7 +224,7 @@ export class OwnerManager {
         ptySessionId: input.sessionId,
         ...(input.ownership ?? {}),
         cwd: recovering.cwd,
-        ...(recovering.model ? { model: recovering.model } : {}),
+        ...(input.model ? { model: input.model } : {}),
         ownerInstanceId: this.instanceId,
         metadata: {
           source: "mate-provider-recovery",

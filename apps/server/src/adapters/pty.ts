@@ -104,6 +104,8 @@ export type SpawnPty = (
 
 type PtySessionState = {
   process: PtyProcess;
+  exit: Promise<void>;
+  resolveExit: () => void;
   session: AgentSession;
   // When this PTY process was spawned - the process ownership birth marker
   // persisted on the runtime row (never an activity timestamp).
@@ -232,6 +234,7 @@ export class PtyAgentAdapter implements AgentAdapter {
     if (state.endedAt !== undefined) {
       return;
     }
+    state.resolveExit();
     this.flush(sessionId, state);
     state.endedAt = Date.now();
     // Capture the death context before the buffers are released below.
@@ -578,8 +581,14 @@ export class PtyAgentAdapter implements AgentAdapter {
     const serialize = new SerializeAddon();
     terminal.loadAddon(serialize);
 
+    let resolveExit!: () => void;
+    const exit = new Promise<void>((resolve) => {
+      resolveExit = resolve;
+    });
     const state: PtySessionState = {
       process: child,
+      exit,
+      resolveExit,
       session,
       spawnedAt: new Date().toISOString(),
       command,
@@ -606,6 +615,7 @@ export class PtyAgentAdapter implements AgentAdapter {
         this.scheduleFlush(id, state);
       }),
       child.onExit((event) => {
+        state.resolveExit();
         this.markEnded(id, state, event.exitCode === 0 ? "done" : "error", event.exitCode);
       })
     );
@@ -657,23 +667,27 @@ export class PtyAgentAdapter implements AgentAdapter {
     };
   }
 
-  stop(): void {
-    for (const [sessionId, state] of this.sessions) {
+  async stop(opts: { waitForExit?: boolean } = {}): Promise<void> {
+    const exits: Promise<void>[] = [];
+    const sessions = [...this.sessions];
+    for (const [, state] of sessions) {
       if (state.flushTimer) {
         clearTimeout(state.flushTimer);
       }
-      for (const disposable of state.disposables) {
-        disposable.dispose();
-      }
       if (state.endedAt === undefined) {
         state.terminal.dispose();
-        try {
-          state.process.kill();
-        } catch {
-          // Process already exited.
-        }
+        exits.push(stopPtyProcess(state.process, state.exit, opts.waitForExit === true));
       }
-      this.sessions.delete(sessionId);
+    }
+    try {
+      await Promise.all(exits);
+    } finally {
+      for (const [sessionId, state] of sessions) {
+        for (const disposable of state.disposables) {
+          disposable.dispose();
+        }
+        this.sessions.delete(sessionId);
+      }
     }
   }
 
@@ -774,6 +788,42 @@ export class PtyAgentAdapter implements AgentAdapter {
   private emitAgentEvent(event: AgentEvent): void {
     this.events.emit("agent", event);
   }
+}
+
+async function stopPtyProcess(child: PtyProcess, exit: Promise<void>, waitForExit: boolean): Promise<void> {
+  if (!waitForExit) {
+    try {
+      child.kill();
+    } catch {
+      // Process already exited.
+    }
+    return;
+  }
+  try {
+    child.kill("SIGTERM");
+  } catch {
+    return;
+  }
+  if (!(await settlesWithin(exit, 5_000))) {
+    try {
+      child.kill("SIGKILL");
+    } catch {
+      return;
+    }
+    if (!(await settlesWithin(exit, 5_000))) {
+      throw new Error(`owned PTY provider pid ${child.pid} did not exit after SIGKILL`);
+    }
+  }
+}
+
+async function settlesWithin(work: Promise<void>, timeoutMs: number): Promise<boolean> {
+  return new Promise<boolean>((resolve) => {
+    const timer = setTimeout(() => resolve(false), timeoutMs);
+    work.then(() => {
+      clearTimeout(timer);
+      resolve(true);
+    });
+  });
 }
 
 function validateStartRequest(request: StartAgentRequest): void {

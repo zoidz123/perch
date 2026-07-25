@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { randomUUID } from "node:crypto";
-import { existsSync, lstatSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { existsSync, lstatSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import type { AddressInfo } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -19,6 +19,7 @@ import { DeviceRegistry } from "./pairing.js";
 import { PrPoller } from "./prPoller.js";
 import { ProjectRegistry } from "./projects.js";
 import { FleetSettings } from "./settings.js";
+import { OwnerManager } from "./ownerManager.js";
 import { TaskStore } from "./tasks.js";
 import { TimelineStore } from "./timeline.js";
 import { WorktreePool } from "./worktrees.js";
@@ -60,7 +61,7 @@ class FakePtyAdapter implements AgentAdapter {
   }
 }
 
-function serverFixture(home: string) {
+function serverFixture(home: string, opts: { durableOwner?: boolean } = {}) {
   const env = { PERCH_HOME: home } as NodeJS.ProcessEnv;
   const adapter = new FakePtyAdapter();
   // A Codex mate routes to the app-server owning adapter; mirror its launches
@@ -74,6 +75,7 @@ function serverFixture(home: string) {
     return session;
   };
   const tasks = new TaskStore(env);
+  const ownerManager = opts.durableOwner ? new OwnerManager(tasks) : undefined;
   const timeline = new TimelineStore();
   const monitor = new FleetMonitor(adapter, { broadcastMs: 5 });
   const server = createControlServer({
@@ -90,12 +92,13 @@ function serverFixture(home: string) {
     projects: new ProjectRegistry(env),
     worktrees: new WorktreePool({ env }),
     tasks,
+    ...(ownerManager ? { ownerManager } : {}),
     prPoller: new PrPoller(tasks, async () => {
       throw new Error("gh disabled in tests");
     }),
     settings: new FleetSettings(env)
   });
-  return { adapter, codexOwned, monitor, timeline, server };
+  return { adapter, codexOwned, monitor, ownerManager, tasks, timeline, server };
 }
 
 test("GET /sessions returns the latest observed Codex runtime effort instead of the launch stamp", async () => {
@@ -306,6 +309,51 @@ test("POST /mate/start materializes a fresh Codex mate before returning its nati
   }
 });
 
+test("legacy codex/opus Mate settings launch and persist the provider-reported Codex model", async () => {
+  const home = mkdtempSync(join(tmpdir(), "perch-mate-authoritative-model-"));
+  const priorHome = process.env.PERCH_HOME;
+  process.env.PERCH_HOME = home;
+  writeFileSync(
+    join(home, "settings.json"),
+    `${JSON.stringify({ mateDefaults: { agent: "codex", model: "opus", effort: "high" } })}\n`
+  );
+  const { adapter, codexOwned, ownerManager, timeline, server } = serverFixture(home, { durableOwner: true });
+  assert.ok(ownerManager);
+  codexOwned.effectiveModel = "gpt-5.6-sol";
+  await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+  const port = (server.address() as AddressInfo).port;
+  const authed = { headers: { authorization: "Bearer test-token", "content-type": "application/json" } };
+
+  try {
+    const started = await fetch(`http://127.0.0.1:${port}/mate/start`, {
+      ...authed,
+      method: "POST",
+      body: "{}"
+    });
+    assert.equal(started.status, 201, await started.text());
+    assert.equal(adapter.requests[0]?.model, "gpt-5.6-sol");
+    assert.equal(ownerManager.snapshot()?.model, "gpt-5.6-sol");
+
+    const mate = await (await fetch(`http://127.0.0.1:${port}/mate`, authed)).json() as {
+      mateOwner?: { model?: string };
+      session?: AgentSession;
+    };
+    assert.equal(mate.mateOwner?.model, "gpt-5.6-sol");
+    assert.equal(mate.session?.model, "gpt-5.6-sol");
+    const sessions = await (await fetch(`http://127.0.0.1:${port}/sessions`, authed)).json() as {
+      sessions: AgentSession[];
+    };
+    assert.equal(sessions.sessions.find((session) => session.labels?.role === "mate")?.modelLabel, "GPT 5.6 Sol");
+  } finally {
+    timeline.stop();
+    server.closeAllConnections?.();
+    await new Promise<void>((resolve) => server.close(() => resolve()));
+    if (priorHome === undefined) delete process.env.PERCH_HOME;
+    else process.env.PERCH_HOME = priorHome;
+    rmSync(home, { recursive: true, force: true });
+  }
+});
+
 // The Claude CLI's global default drifts (any session's /model switch saves
 // itself as the default), so a Claude mate must never launch without an
 // explicit model. Precedence: request model > configured mate default >
@@ -345,7 +393,7 @@ test("POST /mate/start uses the Claude registry role default when nothing names 
     const repatched = await fetch(`http://127.0.0.1:${port}/config`, {
       ...authed,
       method: "PATCH",
-      body: JSON.stringify({ mateDefaults: { agent: "codex", model: "gpt-5.5" } })
+      body: JSON.stringify({ mateDefaults: { agent: "codex", model: "gpt-5.5", effort: "high" } })
     });
     assert.equal(repatched.status, 200);
     adapter.sessions[1] = { ...adapter.sessions[1]!, status: "done" };
@@ -461,6 +509,40 @@ test("GET /sessions fills missing Codex mate model from effective mate defaults"
     await new Promise<void>((resolve) => server.close(() => resolve()));
     if (priorHome === undefined) delete process.env.PERCH_HOME;
     else process.env.PERCH_HOME = priorHome;
+    rmSync(home, { recursive: true, force: true });
+  }
+});
+
+test("GET /sessions never labels a missing-model Codex Mate from legacy Claude model settings", async () => {
+  const home = mkdtempSync(join(tmpdir(), "perch-mate-legacy-label-"));
+  writeFileSync(
+    join(home, "settings.json"),
+    `${JSON.stringify({ mateDefaults: { agent: "codex", model: "opus", effort: "high" } })}\n`
+  );
+  const { adapter, timeline, server } = serverFixture(home);
+  adapter.sessions.push({
+    id: "pty:legacy-codex-mate",
+    title: "mate",
+    agent: "codex",
+    labels: { role: "mate" },
+    kind: "terminal",
+    status: "running",
+    lastActivityAt: new Date().toISOString()
+  });
+  await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+  const port = (server.address() as AddressInfo).port;
+  try {
+    const body = await (await fetch(`http://127.0.0.1:${port}/sessions`, {
+      headers: { authorization: "Bearer test-token" }
+    })).json() as { sessions: AgentSession[] };
+    const mate = body.sessions.find((session) => session.labels?.role === "mate");
+    assert.equal(mate?.model, MATE_CODEX_FALLBACK.model);
+    assert.equal(mate?.modelLabel, "GPT 5.6 Sol");
+    assert.notEqual(mate?.modelLabel, "Opus 4.8");
+  } finally {
+    timeline.stop();
+    server.closeAllConnections?.();
+    await new Promise<void>((resolve) => server.close(() => resolve()));
     rmSync(home, { recursive: true, force: true });
   }
 });
