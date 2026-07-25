@@ -49,11 +49,7 @@ The generic PTY adapter and every Claude behavior are preserved byte-for-byte.
 
 ## Stage 3: recovery
 
-- On Perch restart with a healthy daemon: reconnect to the recorded socket, `thread/resume` the recorded thread, replay history into the timeline deduped by protocol item id, and rebind the runtime generation without killing the daemon.
-- The boot orphan-daemon sweep skips sockets recorded on recoverable app-server-owned runtimes.
-- If the daemon died: respawn it, resume the rollout-backed thread, represent the stale in-flight turn as interrupted, and use the existing continuation-turn recovery behavior.
-- The merged missing-rollout classifier (`-32600` + exact message) and stale-mate retirement semantics from PR #36 are preserved under the app-server driver.
-- A turn whose acceptance is unknown is never blindly repeated; reconciliation reads thread history first.
+The current recovery ordering and history catch-up contract are owned by [Perch architecture](../architecture.md#recovery).
 
 ## Stage 4: native desktop attachment
 

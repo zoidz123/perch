@@ -14,6 +14,7 @@ import { isTrustedProviderIdentity } from "./runtimeManager.js";
 import type { RuntimeRecord, OperationRecord } from "./stateDb.js";
 import type { OperationExecutionContext } from "./taskScheduler.js";
 import { terminateMatchingOrphan } from "./orphanProcess.js";
+import type { CodexHistorySyncCoordinator } from "./codexHistorySync.js";
 
 const DEFAULT_IDENTITY_TIMEOUT_MS = 30_000;
 
@@ -40,6 +41,7 @@ export type RecoveryProviderDriver = {
 export type RecoveryCoordinatorOptions = ManagedAgentLauncherOptions & {
   identityTimeoutMs?: number;
   providers?: readonly RecoveryProviderDriver[];
+  codexHistorySync?: CodexHistorySyncCoordinator;
 };
 
 type RecoveryPayload = {
@@ -268,7 +270,7 @@ export class RecoveryCoordinator {
         runtime,
         prepared.launchInput?.codexOwnedResume
       );
-      this.options.runtimeManager?.bindRecoveredRuntime(runtime, {
+      const bound = this.options.runtimeManager?.bindRecoveredRuntime(runtime, {
         sessionId: result.session.id,
         provider: driver.provider,
         providerSessionId,
@@ -277,6 +279,17 @@ export class RecoveryCoordinator {
       });
       if (bindFacts?.aliasSessionId) {
         this.options.hooks.aliasSession(bindFacts.aliasSessionId, result.session.id);
+      }
+      if (bound) {
+        try {
+          this.options.codexHistorySync?.startForTaskRuntime(bound);
+        } catch (error) {
+          console.warn(
+            `codex history catch-up could not start for ${bound.ptySessionId}: ${
+              error instanceof Error ? error.message : String(error)
+            }`
+          );
+        }
       }
     } catch (error) {
       let cleanupError: unknown;

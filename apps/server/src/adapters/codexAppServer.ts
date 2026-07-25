@@ -50,6 +50,8 @@ import type {
   SandboxMode,
   ThreadReadResult,
   ThreadResult,
+  ThreadTurnsListParams,
+  ThreadTurnsListResult,
   TurnStartParams,
   TurnSteerParams
 } from "./codexAppServerTypes.js";
@@ -463,14 +465,16 @@ export class CodexAppServerClient {
   }
 
   // Rejoin an existing thread (the daemon/`--remote` case: the TUI already owns
-  // the thread; the control client thread/resume-rejoins to steer it). The raw
-  // `result` carries the replayed turn history for owners that ingest it.
+  // the thread; the control client thread/resume-rejoins to steer it).
+  // Owners use excludeTurns so ownership is not blocked on rollout hydration.
+  // Native peers can omit it when they intentionally need history inline.
   async resumeThread(opts: {
     threadId?: string;
     model?: string;
     cwd?: string;
     approvalPolicy?: ApprovalPolicy;
     sandbox?: SandboxMode;
+    excludeTurns?: boolean;
   }): Promise<{ threadId: string; model: string; result: ThreadResult }> {
     const threadId = opts.threadId ?? this._threadId;
     if (!threadId) throw new Error("No thread available to resume.");
@@ -481,7 +485,8 @@ export class CodexAppServerClient {
       cwd: opts.cwd ?? defaults.cwd ?? process.cwd(),
       approvalPolicy: opts.approvalPolicy ?? defaults.approvalPolicy ?? null,
       sandbox: opts.sandbox ?? defaults.sandbox ?? null,
-      persistExtendedHistory: true
+      persistExtendedHistory: true,
+      ...(opts.excludeTurns === undefined ? {} : { excludeTurns: opts.excludeTurns })
     };
     const result = (await this.request("thread/resume", params)) as ThreadResult;
     this._threadId = result.thread.id;
@@ -496,13 +501,20 @@ export class CodexAppServerClient {
     return { threadId: result.thread.id, model: result.model, result };
   }
 
+  async listThreadTurns(
+    opts: ThreadTurnsListParams,
+    timeoutMs?: number
+  ): Promise<ThreadTurnsListResult> {
+    return (await this.request("thread/turns/list", opts, timeoutMs)) as ThreadTurnsListResult;
+  }
+
   private async reconnectAndResumeThread(): Promise<boolean> {
     const threadId = this._threadId;
     await this.disconnectInternal({ preserveThreadState: !!threadId });
     await this.connect();
     if (!threadId) return false;
     try {
-      await this.resumeThread({ threadId });
+      await this.resumeThread({ threadId, excludeTurns: true });
       return true;
     } catch {
       this._threadId = null;
@@ -615,7 +627,7 @@ export class CodexAppServerClient {
 
   // Authoritative thread history (`thread/read` with includeTurns), rebuilt by
   // the daemon from the rollout. Used to reconcile inputs whose response was
-  // lost and to replay history after a resume.
+  // lost; recovery catch-up uses bounded thread/turns/list pages instead.
   async readThread(threadId?: string): Promise<ThreadReadResult> {
     const id = threadId ?? this._threadId;
     if (!id) throw new Error("No thread available to read.");

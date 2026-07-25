@@ -766,6 +766,12 @@ test("Codex mate recovery resumes the exact thread over the app-server and binds
     assert.equal(ownerManager.snapshot()?.providerSessionId, MATE_CONVERSATION);
     assert.equal(ownerManager.snapshot()?.generation, 1);
     assert.equal(ownerManager.snapshot()?.model, "gpt-5.6-sol");
+    const liveMateSession = ownerManager.latestMate()?.ptySessionId;
+    assert.deepEqual(codexOwned.historyCatchUps, [liveMateSession]);
+    assert.equal(
+      tasks.stateDb.codexHistorySyncs.latestForSession(liveMateSession!)?.state,
+      "succeeded"
+    );
     assert.equal(
       tasks.stateDb.ownerRuntimes.findBySession("pty:old-codex-mate")?.model,
       "opus",

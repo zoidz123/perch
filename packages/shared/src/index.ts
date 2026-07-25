@@ -300,6 +300,12 @@ export type AgentEvent =
       at: string;
     }
   | {
+      type: "timeline_resync";
+      sessionId: string;
+      revision: number;
+      at: string;
+    }
+  | {
       // Live, incremental assistant text for an in-flight turn. Codex emits its
       // response as `item/agentMessage/delta` app-server notifications that the
       // desktop TUI renders live but that never reach the rollout JSONL (only
@@ -1131,6 +1137,7 @@ export type TimelineItem = {
 export type TimelineResponse = {
   items: TimelineItem[];
   lastSeq: number;
+  revision: number;
 };
 
 

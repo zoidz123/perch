@@ -10,6 +10,7 @@ import type { OwnerRuntimeRecord, RuntimeRecord } from "./stateDb.js";
 import type { TaskScheduler } from "./taskScheduler.js";
 import { stripTerminalControls } from "./terminalText.js";
 import { terminateMatchingOrphan } from "./orphanProcess.js";
+import type { CodexHistorySyncCoordinator } from "./codexHistorySync.js";
 
 export type MateFleetRecoveryResult = {
   session: AgentSession;
@@ -27,6 +28,7 @@ type MateRecoveryOptions = ManagedAgentLauncherOptions & {
   taskScheduler: TaskScheduler;
   identityTimeoutMs?: number;
   mateProviders?: readonly RecoveryProviderDriver[];
+  codexHistorySync?: CodexHistorySyncCoordinator;
 };
 
 type IdentityExpectation = {
@@ -198,6 +200,15 @@ export class MateRecoveryCoordinator {
       });
       if (bindFacts?.aliasSessionId) {
         this.options.hooks.aliasSession(bindFacts.aliasSessionId, launchedSessionId);
+      }
+      try {
+        this.options.codexHistorySync?.startForOwnerRuntime(bound);
+      } catch (error) {
+        console.warn(
+          `codex history catch-up could not start for ${bound.ptySessionId}: ${
+            error instanceof Error ? error.message : String(error)
+          }`
+        );
       }
       return bound;
     } catch (error) {

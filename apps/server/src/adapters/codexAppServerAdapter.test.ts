@@ -3,7 +3,8 @@ import assert from "node:assert/strict";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import type { AgentSessionStatus, PendingServerRequest, TimelineItem } from "@perch/shared";
+import type { AgentSessionStatus, FleetEvent, PendingServerRequest, TimelineItem } from "@perch/shared";
+import { TimelineStore } from "../timeline.js";
 import { CodexAppServerAdapter, CodexDeliveryUnknownError } from "./codexAppServerAdapter.js";
 import { CodexAppServerClient, isCodexRpcError } from "./codexAppServer.js";
 import type { CodexDaemonManager } from "./codexDaemon.js";
@@ -12,7 +13,7 @@ import { websocketUnixTransport } from "./wsUnixTransport.js";
 
 // The adapter suite runs against the fake daemon over the REAL ws-unix
 // transport and protocol engine, so what passes here is the wire behavior
-// verified against codex 0.144.6, not a hand-rolled stub's opinion.
+// verified against codex 0.144.6 and 0.145.0, not a hand-rolled stub's opinion.
 
 const tick = (ms = 20) => new Promise((resolve) => setTimeout(resolve, ms));
 
@@ -30,6 +31,7 @@ type Fixture = {
   socketPath: string;
   fake: FakeCodexAppServer;
   adapter: CodexAppServerAdapter;
+  timeline: TimelineStore;
   daemons: {
     acquires: number;
     releases: string[];
@@ -44,11 +46,24 @@ type Fixture = {
     turnCompletes: Array<{ sessionId: string; message: string }>;
     threads: Array<{ sessionId: string; threadId: string; socketPath: string }>;
     exits: Array<{ sessionId: string; status: string }>;
+    fleet: FleetEvent[];
   };
+  startHistoryCatchUp: (
+    sessionId: string,
+    cursor?: string | null,
+    stopAtAnchor?: boolean
+  ) => boolean;
   close: () => Promise<void>;
 };
 
-async function fixture(prefix: string, opts: { reconnectDelaysMs?: number[] } = {}): Promise<Fixture> {
+async function fixture(
+  prefix: string,
+  opts: {
+    reconnectDelaysMs?: number[];
+    historyReplayRetryDelaysMs?: number[];
+    historyPageTimeoutMs?: number;
+  } = {}
+): Promise<Fixture> {
   const dir = mkdtempSync(join(tmpdir(), prefix));
   const socketPath = join(dir, "s");
   const fake = new FakeCodexAppServer();
@@ -95,15 +110,33 @@ async function fixture(prefix: string, opts: { reconnectDelaysMs?: number[] } = 
     turnStarts: [],
     turnCompletes: [],
     threads: [],
-    exits: []
+    exits: [],
+    fleet: []
   };
+  const timeline = new TimelineStore();
   const adapter = new CodexAppServerAdapter({
     daemons: fakeManager,
     reconnectDelaysMs: opts.reconnectDelaysMs ?? [40, 80],
+    ...(opts.historyReplayRetryDelaysMs
+      ? { historyReplayRetryDelaysMs: opts.historyReplayRetryDelaysMs }
+      : {}),
+    ...(opts.historyPageTimeoutMs ? { historyPageTimeoutMs: opts.historyPageTimeoutMs } : {}),
     sessionEnv: () => ({ PERCH_SESSION_ID: "wired" })
   });
   adapter.wireEvents({
-    onTimelineItem: (item, live) => events.timeline.push({ item, live }),
+    onTimelineItem: (item, live) => {
+      events.timeline.push({ item, live });
+      timeline.ingest(item, { live });
+    },
+    onTimelineGapOpened: (sessionId) => timeline.openBackfillGap(sessionId),
+    onTimelineBackfillStart: (sessionId, token, stopAtAnchor, restartsFromHead) =>
+      timeline.beginBackfill(sessionId, token, stopAtAnchor, restartsFromHead),
+    onTimelineBackfillPage: (sessionId, token, items) => {
+      events.timeline.push(...items.map((item) => ({ item, live: false })));
+      return timeline.ingestBackfill(sessionId, token, items);
+    },
+    onTimelineBackfillEnd: (sessionId, syncId, complete) =>
+      timeline.endBackfill(sessionId, syncId, complete),
     onStatus: (sessionId, status) => events.statuses.push({ sessionId, status }),
     onServerRequest: (_sessionId, request) => events.serverRequests.push(request),
     onServerRequestResolved: (_sessionId, request) => events.serverRequestsResolved.push(request),
@@ -112,15 +145,37 @@ async function fixture(prefix: string, opts: { reconnectDelaysMs?: number[] } = 
     onThreadStarted: (sessionId, threadId, socket) => events.threads.push({ sessionId, threadId, socketPath: socket }),
     onSessionExit: (sessionId, context) => events.exits.push({ sessionId, status: context.status })
   });
+  adapter.subscribeFleetEvents((event) => events.fleet.push(event));
+  let historySync = 0;
+  const startHistoryCatchUp = (
+    sessionId: string,
+    cursor: string | null = null,
+    stopAtAnchor = false
+  ) =>
+    adapter.startHistoryCatchUp(sessionId, {
+      syncId: `sync-${++historySync}`,
+      threadId: adapter.threadIdOf(sessionId)!,
+      cursor,
+      stopAtAnchor,
+      restartsFromHead: !stopAtAnchor && cursor === null,
+      onPage: () => {},
+      onTerminal: () => {}
+    });
+  adapter.setHistoryCatchUpRequester((sessionId, hasUsableAnchor) => {
+    startHistoryCatchUp(sessionId, null, hasUsableAnchor);
+  });
   return {
     dir,
     socketPath,
     fake,
     adapter,
+    timeline,
     daemons,
     events,
+    startHistoryCatchUp,
     close: async () => {
       adapter.stop();
+      timeline.stop();
       await fake.stop().catch(() => {});
       rmSync(dir, { recursive: true, force: true });
     }
@@ -131,6 +186,18 @@ function userClientIds(turns: FakeTurn[]): string[] {
   return turns.flatMap((turn) =>
     turn.items.filter((item) => item.type === "userMessage").map((item) => String(item.clientId))
   );
+}
+
+function timelineItems(store: TimelineStore, sessionId: string): TimelineItem[] {
+  const items: TimelineItem[] = [];
+  let after = 0;
+  while (true) {
+    const page = store.fetch(sessionId, after, 500);
+    if (page.items.length === 0) return items;
+    items.push(...page.items);
+    after = page.items.at(-1)!.seq;
+    if (after >= page.lastSeq) return items;
+  }
 }
 
 test("startOwned captures the thread id from the thread/start response and surfaces the attach command", async () => {
@@ -543,12 +610,210 @@ test("startOwned resume rebinds to a surviving daemon socket without a respawn a
     // Rebind adopted the recorded socket instead of acquiring a fresh daemon.
     assert.deepEqual(f.daemons.adopts, [f.socketPath]);
     assert.equal(f.daemons.acquires, 1); // only the original launch
+    assert.equal(f.startHistoryCatchUp("pty:new"), true);
     // The stale in-flight turn is represented truthfully as interrupted.
+    await until(2_000, () =>
+      f.events.timeline.some(
+        (entry) => entry.item.kind === "system" && /interrupted/.test(entry.item.text ?? "")
+      )
+    );
     const interrupted = f.events.timeline.find(
       (entry) => entry.item.kind === "system" && /interrupted/.test(entry.item.text ?? "")
     );
     assert.ok(interrupted, "interrupted turn marker replayed");
     assert.equal(interrupted?.live, false);
+  } finally {
+    await f.close();
+  }
+});
+
+test("startOwned recovery does not wait for full thread history before claiming ownership", async () => {
+  const f = await fixture("pxa-metadata-resume-", {
+    historyReplayRetryDelaysMs: [1, 1],
+    historyPageTimeoutMs: 30
+  });
+  try {
+    await f.adapter.startOwned({ command: "codex", agent: "codex", cwd: f.dir, sessionId: "pty:old" });
+    await f.adapter.submitAcknowledgedTurn("pty:old", "kick", { clientUserMessageId: "k1" });
+    f.adapter.stop({ keepDaemons: true });
+    await f.fake.restart();
+    f.fake.blockFullHistoryResume = true;
+    f.fake.threadTurnsListFailuresRemaining = 1;
+    f.fake.threadTurnsListTimeoutsRemaining = 1;
+
+    const session = await Promise.race([
+      f.adapter.startOwned(
+        { command: "codex", agent: "codex", cwd: f.dir, sessionId: "pty:new", args: ["resume", "thr_1"] },
+        { resume: { threadId: "thr_1", socketPath: f.socketPath } }
+      ),
+      tick(500).then(() => {
+        throw new Error("recovery waited for full thread history");
+      })
+    ]);
+
+    assert.equal(session.id, "pty:new");
+    const resume = f.fake.requestLog.findLast((entry) => entry.method === "thread/resume");
+    assert.equal(resume?.params.excludeTurns, true);
+    assert.equal(
+      f.fake.requestLog.filter((entry) => entry.method === "thread/turns/list").length,
+      0
+    );
+    assert.equal(f.startHistoryCatchUp("pty:new"), true);
+    assert.ok(
+      await until(2_000, () =>
+        f.events.timeline.some(
+          (entry) => entry.item.kind === "system" && /interrupted/.test(entry.item.text ?? "")
+        )
+      ),
+      "interrupted turn marker replayed through paginated background history"
+    );
+    assert.equal(
+      f.fake.requestLog.filter((entry) => entry.method === "thread/turns/list").length,
+      3
+    );
+    assert.equal(
+      f.events.fleet.filter((event) => event.name === "codex.history-catchup.retry").length,
+      2
+    );
+    assert.ok(
+      f.events.fleet.some((event) => event.name === "codex.history-catchup.completed")
+    );
+  } finally {
+    await f.close();
+  }
+});
+
+test("background history keeps provider order and cannot evict live recovery output", async () => {
+  const f = await fixture("pxa-history-order-", {
+    historyReplayRetryDelaysMs: [1],
+    historyPageTimeoutMs: 30
+  });
+  try {
+    const turns: FakeTurn[] = Array.from({ length: 2_105 }, (_, index) => ({
+      id: `old-turn-${index}`,
+      status: "completed",
+      items: [{
+        id: `old-item-${index}`,
+        type: "agentMessage",
+        text: `old-${index}`,
+        createdAt: new Date(Date.UTC(2026, 0, 1, 0, 0, index)).toISOString()
+      }]
+    }));
+    f.fake.seedThread("thr_big", turns);
+    f.fake.threadTurnsListTimeoutsRemaining = 1;
+
+    await f.adapter.startOwned(
+      {
+        command: "codex",
+        agent: "codex",
+        cwd: f.dir,
+        sessionId: "pty:recovered",
+        args: ["resume", "thr_big"]
+      },
+      { resume: { threadId: "thr_big", socketPath: f.socketPath } }
+    );
+    assert.equal(f.startHistoryCatchUp("pty:recovered"), true);
+    await f.adapter.submitAcknowledgedTurn("pty:recovered", "live recovery", {
+      clientUserMessageId: "live-message"
+    });
+    f.fake.completeActiveTurn("thr_big", "live answer");
+
+    assert.ok(
+      await until(3_000, () =>
+        f.events.fleet.some((event) => event.name === "codex.history-catchup.completed")
+      )
+    );
+    const items = timelineItems(f.timeline, "pty:recovered");
+    assert.equal(items.length, 2_000);
+    assert.equal(items.at(-2)?.id, "cx-item-live-message");
+    assert.equal(items.at(-1)?.text, "live answer");
+
+    const oldItems = items.filter((item) => item.text?.startsWith("old-"));
+    assert.equal(oldItems.length, 1_998);
+    const oldIndexes = oldItems.map((item) => Number(item.text!.slice(4)));
+    assert.ok(oldIndexes.every((value, index) => index === 0 || value > oldIndexes[index - 1]!));
+    assert.ok(oldItems.every((item, index) =>
+      index === 0 || Date.parse(item.at) > Date.parse(oldItems[index - 1]!.at)
+    ));
+  } finally {
+    await f.close();
+  }
+});
+
+test("terminal history catch-up failure is observable without rolling back the live session", async () => {
+  const f = await fixture("pxa-history-failed-", {
+    historyReplayRetryDelaysMs: [1],
+    historyPageTimeoutMs: 30
+  });
+  try {
+    f.fake.seedThread("thr_failed", []);
+    f.fake.threadTurnsListFailuresRemaining = 2;
+    const session = await f.adapter.startOwned(
+      {
+        command: "codex",
+        agent: "codex",
+        cwd: f.dir,
+        sessionId: "pty:failed-history",
+        args: ["resume", "thr_failed"]
+      },
+      { resume: { threadId: "thr_failed", socketPath: f.socketPath } }
+    );
+    assert.equal(f.startHistoryCatchUp("pty:failed-history"), true);
+
+    assert.equal(session.id, "pty:failed-history");
+    assert.ok(
+      await until(2_000, () =>
+        f.events.fleet.some((event) => event.name === "codex.history-catchup.failed")
+      )
+    );
+    assert.equal(f.adapter.has("pty:failed-history"), true);
+    assert.deepEqual(f.events.exits, []);
+  } finally {
+    await f.close();
+  }
+});
+
+test("a control drop records the active history receipt as failed", async () => {
+  const f = await fixture("pxa-history-disconnect-", {
+    reconnectDelaysMs: [1_000],
+    historyPageTimeoutMs: 500
+  });
+  try {
+    f.fake.seedThread("thr_disconnect", []);
+    f.fake.threadTurnsListTimeoutsRemaining = 1;
+    await f.adapter.startOwned(
+      {
+        command: "codex",
+        agent: "codex",
+        cwd: f.dir,
+        sessionId: "pty:history-disconnect",
+        args: ["resume", "thr_disconnect"]
+      },
+      { resume: { threadId: "thr_disconnect", socketPath: f.socketPath } }
+    );
+    const terminal: Array<{ state: string; error?: string }> = [];
+    assert.equal(
+      f.adapter.startHistoryCatchUp("pty:history-disconnect", {
+        syncId: "sync-disconnect",
+        threadId: "thr_disconnect",
+        cursor: null,
+        onPage: () => {},
+        onTerminal: (result) => terminal.push(result)
+      }),
+      true
+    );
+    assert.ok(
+      await until(500, () =>
+        f.fake.requestLog.some((entry) => entry.method === "thread/turns/list")
+      )
+    );
+
+    await f.fake.stop();
+
+    assert.ok(await until(500, () => terminal.length === 1));
+    assert.equal(terminal[0]?.state, "failed");
+    assert.match(terminal[0]?.error ?? "", /connection lost/i);
+    assert.equal(f.adapter.has("pty:history-disconnect"), true);
   } finally {
     await f.close();
   }

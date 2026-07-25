@@ -1,10 +1,11 @@
 // Test harness: a stateful fake `codex app-server` daemon speaking the v2
 // JSON-RPC protocol over WebSocket-on-unix-socket, faithful to the semantics
-// verified live against codex-cli 0.144.6 for the app-server-owned design
+// verified live against codex-cli 0.144.6 and 0.145.0 for the app-server-owned design
 // (docs/plans/2026-07-22-app-server-owned-codex.md):
 //   - unlimited concurrent clients, each with its own initialize;
 //   - turn/item events go only to thread subscribers; thread/started broadcasts;
-//   - thread/resume subscribes and replays turn history in the response;
+//   - thread/resume can return metadata only, with paginated turn history read
+//     separately through thread/turns/list;
 //   - a second turn/start steers into the active turn (never errors);
 //   - turn/steer carries a real expectedTurnId CAS;
 //   - clientUserMessageId persists into history as the userMessage clientId;
@@ -20,7 +21,10 @@
 
 import { createServer, type Server } from "node:http";
 import { WebSocketServer, type WebSocket } from "ws";
-import type { CodexOwnedEventSink } from "./codexAppServerAdapter.js";
+import type {
+  CodexHistoryCatchUpRequest,
+  CodexOwnedEventSink
+} from "./codexAppServerAdapter.js";
 
 type JsonRpc = {
   jsonrpc?: "2.0";
@@ -71,6 +75,11 @@ export class FakeCodexAppServer {
   // Thread ids whose rollout "was never written": thread/resume fails with
   // the exact permanent -32600 condition the classifier matches.
   readonly missingRollouts = new Set<string>();
+  // Simulates a large rollout whose full-history thread/resume never returns.
+  // Metadata-only resume must still establish ownership immediately.
+  blockFullHistoryResume = false;
+  threadTurnsListFailuresRemaining = 0;
+  threadTurnsListTimeoutsRemaining = 0;
   model = "gpt-5.5-codex";
 
   private http: Server | null = null;
@@ -271,7 +280,38 @@ export class FakeCodexAppServer {
         const thread = this.threads.get(threadId);
         if (!thread) return fail(-32600, `no rollout found for thread id: ${threadId}`);
         thread.subscribers.add(ws);
-        return reply({ thread: { id: thread.id, turns: structuredClone(thread.turns) }, model: this.model });
+        if (this.blockFullHistoryResume && params.excludeTurns !== true) return;
+        return reply({
+          thread: {
+            id: thread.id,
+            turns: params.excludeTurns === true ? [] : structuredClone(thread.turns)
+          },
+          model: this.model
+        });
+      }
+      case "thread/turns/list": {
+        if (this.threadTurnsListFailuresRemaining > 0) {
+          this.threadTurnsListFailuresRemaining -= 1;
+          return fail(-32000, "transient history page failure");
+        }
+        if (this.threadTurnsListTimeoutsRemaining > 0) {
+          this.threadTurnsListTimeoutsRemaining -= 1;
+          return;
+        }
+        const thread = this.threads.get(String(params.threadId ?? ""));
+        if (!thread) return fail(-32600, "unknown thread id");
+        const limit = typeof params.limit === "number" ? params.limit : 20;
+        const cursor = typeof params.cursor === "string" ? Number(params.cursor) : 0;
+        const ordered = params.sortDirection === "desc"
+          ? [...thread.turns].reverse()
+          : thread.turns;
+        const data = ordered.slice(cursor, cursor + limit);
+        const next = cursor + data.length;
+        return reply({
+          data: structuredClone(data),
+          nextCursor: next < ordered.length ? String(next) : null,
+          backwardsCursor: data.length > 0 ? String(cursor) : null
+        });
       }
       case "thread/read": {
         const thread = this.threads.get(String(params.threadId ?? ""));
@@ -391,6 +431,7 @@ export class FakeCodexOwnedAdapter {
   modelSwitches: Array<{ sessionId: string; model: string; effort?: string }> = [];
   serverResponses: Array<{ sessionId: string; response: Record<string, unknown> }> = [];
   stopped: string[] = [];
+  historyCatchUps: string[] = [];
   events: CodexOwnedEventSink = {};
   // Knobs
   failStart: Error | null = null;
@@ -413,9 +454,23 @@ export class FakeCodexOwnedAdapter {
   private readonly turnCompletionWaiters = new Map<string, () => void>();
   private threadCounter = 0;
   private turnCounter = 0;
+  private historyCatchUpRequester?: (sessionId: string, hasUsableAnchor: boolean) => void;
 
   wireEvents(events: CodexOwnedEventSink): void {
     this.events = events;
+  }
+
+  setHistoryCatchUpRequester(
+    requester: (sessionId: string, hasUsableAnchor: boolean) => void
+  ): void {
+    this.historyCatchUpRequester = requester;
+  }
+
+  startHistoryCatchUp(sessionId: string, request: CodexHistoryCatchUpRequest): boolean {
+    if (this.sessions.get(sessionId)?.threadId !== request.threadId) return false;
+    this.historyCatchUps.push(sessionId);
+    request.onTerminal({ state: "succeeded" });
+    return true;
   }
 
   has(sessionId: string): boolean {

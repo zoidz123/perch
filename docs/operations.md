@@ -160,8 +160,11 @@ The default server URL is `http://127.0.0.1:8787` from the CLI, while the server
 Use `PERCH_SERVER_URL` to select another loopback port for development or isolated checks.
 Never expose the server port directly to the public internet.
 
-Stopping the server interrupts its owned PTYs; app-server-owned Codex daemons keep running so the next start can rebind their live threads.
+Stopping the server interrupts its owned PTYs and stops its app-server-owned Codex daemons.
+The next start respawns those daemons and resumes their exact recorded threads, while recovery after an ungraceful server exit can instead rebind a daemon that survived.
 Managed workers and Mate are recoverable only when Perch has persisted a verified provider conversation identity and can either rebind a surviving Codex daemon or prove the old process is gone.
+Codex recovery makes the exact recorded thread live before it catches up older timeline rows in bounded background pages, so a large rollout does not delay Mate or worker availability.
+The iPhone refetches the timeline when background catch-up changes it.
 Solo sessions and arbitrary `perch run` commands do not have managed task recovery.
 
 ## Recovery and worktrees
@@ -204,7 +207,7 @@ Important paths are:
 | `devices.json` | Paired devices and revocable tokens |
 | `settings.json` | Worker and Mate defaults |
 | `projects.json` | Project registry and delivery modes |
-| `state.sqlite` | Tasks, events, PR, completion-verification, and review facts, runtimes, owners, operations, and notification outbox |
+| `state.sqlite` | Durable control-plane database described in [Architecture](architecture.md#durable-task-state) |
 | `worktrees/` | Isolated git worktree pool |
 | `mate/` | Mate home and managed instructions |
 | `charts/` | Canonical registered charts |

@@ -22,7 +22,7 @@ test("fresh startup creates the versioned WAL database with foreign keys enabled
 
   assert.equal(state.path, join(root, "state.sqlite"));
   assert.equal(existsSync(state.path), true);
-  assert.equal(state.schemaVersion(), 13);
+  assert.equal(state.schemaVersion(), 14);
   assert.equal(state.journalMode(), "wal");
   assert.equal(state.foreignKeysEnabled(), true);
 
@@ -40,7 +40,8 @@ test("fresh startup creates the versioned WAL database with foreign keys enabled
     { version: 10, name: "separate-task-pr-and-verification-facts" },
     { version: 11, name: "task-review-facts" },
     { version: 12, name: "durable-prompt-deliveries" },
-    { version: 13, name: "distinguish-unsubmitted-prompts" }
+    { version: 13, name: "distinguish-unsubmitted-prompts" },
+    { version: 14, name: "durable-codex-history-syncs" }
   ]);
   assert.deepEqual(
     inspect
@@ -53,6 +54,7 @@ test("fresh startup creates the versioned WAL database with foreign keys enabled
       "claude_interactions",
       "claude_questions",
       "claude_tool_occurrences",
+      "codex_history_syncs",
       "durable_owners",
       "legacy_imports",
       "notification_outbox",
@@ -122,13 +124,14 @@ test("version 13 migrates an earlier prompt delivery schema without losing rows"
       ON prompt_deliveries(perch_session_id, state, created_at);
     CREATE INDEX prompt_deliveries_task_idx
       ON prompt_deliveries(task_id, created_at);
-    DELETE FROM schema_migrations WHERE version = 13;
+    DROP TABLE codex_history_syncs;
+    DELETE FROM schema_migrations WHERE version IN (13, 14);
     PRAGMA user_version = 12;
   `);
   legacy.close();
 
   const migrated = new StateDb(env(root));
-  assert.equal(migrated.schemaVersion(), 13);
+  assert.equal(migrated.schemaVersion(), 14);
   assert.deepEqual(migrated.promptDeliveries.find("legacy-delivery"), {
     id: "legacy-delivery",
     perchSessionId: "pty:legacy",

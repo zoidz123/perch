@@ -6,7 +6,7 @@ import type { Task, TaskEvent, TaskEventKind, TaskEventSource, TaskPr } from "@p
 import Database from "better-sqlite3";
 import type { TaskDeliverable, TaskReviewFacts, TaskVerificationFacts } from "./taskPresentation.js";
 
-const LATEST_SCHEMA_VERSION = 13;
+const LATEST_SCHEMA_VERSION = 14;
 const LEGACY_TASK_IMPORT = "tasks-json-v1";
 
 const MIGRATIONS = [
@@ -527,6 +527,34 @@ const MIGRATIONS = [
       CREATE INDEX prompt_deliveries_task_idx
         ON prompt_deliveries(task_id, created_at);
     `
+  },
+  {
+    version: 14,
+    name: "durable-codex-history-syncs",
+    sql: `
+      CREATE TABLE codex_history_syncs (
+        id TEXT PRIMARY KEY,
+        runtime_kind TEXT NOT NULL CHECK (runtime_kind IN ('task', 'owner')),
+        runtime_id TEXT NOT NULL,
+        runtime_generation INTEGER NOT NULL CHECK (runtime_generation >= 0),
+        attempt INTEGER NOT NULL CHECK (attempt > 0),
+        perch_session_id TEXT NOT NULL,
+        provider_session_id TEXT NOT NULL,
+        state TEXT NOT NULL CHECK (state IN ('pending', 'running', 'succeeded', 'truncated', 'failed')),
+        cursor TEXT,
+        pages INTEGER NOT NULL DEFAULT 0 CHECK (pages >= 0),
+        items INTEGER NOT NULL DEFAULT 0 CHECK (items >= 0),
+        last_error TEXT,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        finished_at TEXT,
+        UNIQUE(runtime_kind, runtime_id, runtime_generation, attempt)
+      ) STRICT;
+      CREATE INDEX codex_history_syncs_session_idx
+        ON codex_history_syncs(perch_session_id, created_at DESC);
+      CREATE INDEX codex_history_syncs_runtime_idx
+        ON codex_history_syncs(runtime_kind, runtime_id, runtime_generation, attempt DESC);
+    `
   }
 ] as const;
 
@@ -805,6 +833,26 @@ export type PromptDeliverySurfaceRecord = Pick<
   | "updatedAt"
 >;
 
+export type CodexHistorySyncState = "pending" | "running" | "succeeded" | "truncated" | "failed";
+
+export type CodexHistorySyncRecord = {
+  id: string;
+  runtimeKind: "task" | "owner";
+  runtimeId: string;
+  runtimeGeneration: number;
+  attempt: number;
+  perchSessionId: string;
+  providerSessionId: string;
+  state: CodexHistorySyncState;
+  cursor?: string;
+  pages: number;
+  items: number;
+  lastError?: string;
+  createdAt: string;
+  updatedAt: string;
+  finishedAt?: string;
+};
+
 const PROMPT_DELIVERY_LINEAGE_SCOPE_SQL = `(
   pd.perch_session_id = @sessionId
   OR pd.task_id IN (
@@ -861,6 +909,7 @@ export class StateDb {
   readonly claudeToolOccurrences: ClaudeToolOccurrenceRepository;
   readonly claudeInbox: ClaudeInboxRepository;
   readonly promptDeliveries: PromptDeliveryRepository;
+  readonly codexHistorySyncs: CodexHistorySyncRepository;
   private readonly db: Database.Database;
 
   constructor(env: NodeJS.ProcessEnv = process.env) {
@@ -884,6 +933,7 @@ export class StateDb {
     this.claudeToolOccurrences = new ClaudeToolOccurrenceRepository(this.db);
     this.claudeInbox = new ClaudeInboxRepository(this.db);
     this.promptDeliveries = new PromptDeliveryRepository(this.db);
+    this.codexHistorySyncs = new CodexHistorySyncRepository(this.db);
     this.importLegacyTasks(join(home, "tasks"));
   }
 
@@ -1525,6 +1575,104 @@ export class OwnerRuntimeRepository {
       updated.updatedAt, updated.endedAt ?? null, ownerId, generation, ...expectedStates
     );
     return result.changes === 1 ? updated : undefined;
+  }
+}
+
+export class CodexHistorySyncRepository {
+  constructor(private readonly db: Database.Database) {}
+
+  create(input: {
+    runtimeKind: CodexHistorySyncRecord["runtimeKind"];
+    runtimeId: string;
+    runtimeGeneration: number;
+    perchSessionId: string;
+    providerSessionId: string;
+  }): CodexHistorySyncRecord {
+    return this.db.transaction(() => {
+      const latest = this.db.prepare(
+        `SELECT max(attempt) AS attempt FROM codex_history_syncs
+         WHERE runtime_kind = ? AND runtime_id = ? AND runtime_generation = ?`
+      ).get(input.runtimeKind, input.runtimeId, input.runtimeGeneration) as { attempt: number | null };
+      const now = new Date().toISOString();
+      const record: CodexHistorySyncRecord = {
+        id: randomUUID(),
+        ...input,
+        attempt: (latest.attempt ?? 0) + 1,
+        state: "pending",
+        pages: 0,
+        items: 0,
+        createdAt: now,
+        updatedAt: now
+      };
+      this.db.prepare(
+        `INSERT INTO codex_history_syncs(
+           id, runtime_kind, runtime_id, runtime_generation, attempt, perch_session_id,
+           provider_session_id, state, pages, items, created_at, updated_at
+         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+      ).run(
+        record.id,
+        record.runtimeKind,
+        record.runtimeId,
+        record.runtimeGeneration,
+        record.attempt,
+        record.perchSessionId,
+        record.providerSessionId,
+        record.state,
+        record.pages,
+        record.items,
+        record.createdAt,
+        record.updatedAt
+      );
+      return record;
+    })();
+  }
+
+  find(id: string): CodexHistorySyncRecord | undefined {
+    const row = this.db.prepare("SELECT * FROM codex_history_syncs WHERE id = ?").get(id) as
+      | CodexHistorySyncRow
+      | undefined;
+    return row ? codexHistorySyncFromRow(row) : undefined;
+  }
+
+  latestForSession(perchSessionId: string): CodexHistorySyncRecord | undefined {
+    const row = this.db.prepare(
+      "SELECT * FROM codex_history_syncs WHERE perch_session_id = ? ORDER BY rowid DESC LIMIT 1"
+    ).get(perchSessionId) as CodexHistorySyncRow | undefined;
+    return row ? codexHistorySyncFromRow(row) : undefined;
+  }
+
+  start(id: string): CodexHistorySyncRecord | undefined {
+    const now = new Date().toISOString();
+    this.db.prepare(
+      `UPDATE codex_history_syncs
+       SET state = 'running', last_error = NULL, finished_at = NULL, updated_at = ?
+       WHERE id = ? AND state IN ('pending', 'running', 'failed')`
+    ).run(now, id);
+    return this.find(id);
+  }
+
+  recordPage(id: string, cursor: string | null, accepted: number): CodexHistorySyncRecord | undefined {
+    const now = new Date().toISOString();
+    const result = this.db.prepare(
+      `UPDATE codex_history_syncs
+       SET cursor = ?, pages = pages + 1, items = items + ?, updated_at = ?
+       WHERE id = ? AND state = 'running'`
+    ).run(cursor, accepted, now, id);
+    return result.changes === 1 ? this.find(id) : undefined;
+  }
+
+  finish(
+    id: string,
+    state: Extract<CodexHistorySyncState, "succeeded" | "truncated" | "failed">,
+    error?: string
+  ): CodexHistorySyncRecord | undefined {
+    const now = new Date().toISOString();
+    const result = this.db.prepare(
+      `UPDATE codex_history_syncs
+       SET state = ?, last_error = ?, updated_at = ?, finished_at = ?
+       WHERE id = ? AND state IN ('pending', 'running', 'failed')`
+    ).run(state, error ?? null, now, now, id);
+    return result.changes === 1 ? this.find(id) : undefined;
   }
 }
 
@@ -2748,6 +2896,24 @@ type PromptDeliverySurfaceRow = Pick<
   | "updated_at"
 >;
 
+type CodexHistorySyncRow = {
+  id: string;
+  runtime_kind: CodexHistorySyncRecord["runtimeKind"];
+  runtime_id: string;
+  runtime_generation: number;
+  attempt: number;
+  perch_session_id: string;
+  provider_session_id: string;
+  state: CodexHistorySyncState;
+  cursor: string | null;
+  pages: number;
+  items: number;
+  last_error: string | null;
+  created_at: string;
+  updated_at: string;
+  finished_at: string | null;
+};
+
 function taskEventFromRow(row: TaskEventRow): TaskEvent {
   return {
     seq: row.seq,
@@ -2824,6 +2990,26 @@ function ownerRuntimeFromRow(row: OwnerRuntimeRow): OwnerRuntimeRecord {
     createdAt: row.created_at,
     updatedAt: row.updated_at,
     ...(row.ended_at ? { endedAt: row.ended_at } : {})
+  };
+}
+
+function codexHistorySyncFromRow(row: CodexHistorySyncRow): CodexHistorySyncRecord {
+  return {
+    id: row.id,
+    runtimeKind: row.runtime_kind,
+    runtimeId: row.runtime_id,
+    runtimeGeneration: row.runtime_generation,
+    attempt: row.attempt,
+    perchSessionId: row.perch_session_id,
+    providerSessionId: row.provider_session_id,
+    state: row.state,
+    ...(row.cursor ? { cursor: row.cursor } : {}),
+    pages: row.pages,
+    items: row.items,
+    ...(row.last_error ? { lastError: row.last_error } : {}),
+    createdAt: row.created_at,
+    updatedAt: row.updated_at,
+    ...(row.finished_at ? { finishedAt: row.finished_at } : {})
   };
 }
 

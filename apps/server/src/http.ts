@@ -165,6 +165,7 @@ import {
 import { ClaudeQuestionCoordinator, publicQuestion } from "./claudeQuestions.js";
 import { ClaudeInteractionCoordinator, publicInteraction } from "./claudeInteractions.js";
 import type { PromptDeliveryTracker } from "./promptDeliveries.js";
+import { CodexHistorySyncCoordinator } from "./codexHistorySync.js";
 
 export { markTaskWorkingFromActivity } from "./agentLauncher.js";
 
@@ -225,6 +226,7 @@ export type HttpServerOptions = {
   recoveryContinuationCoordinator?: RecoveryContinuationCoordinator;
   ownerManager?: OwnerManager;
   mateRecoveryCoordinator?: MateRecoveryCoordinator;
+  codexHistorySync?: CodexHistorySyncCoordinator;
   claudeApprovals?: ClaudeApprovalCoordinator;
   claudeQuestions?: ClaudeQuestionCoordinator;
   claudeInteractions?: ClaudeInteractionCoordinator;
@@ -278,6 +280,9 @@ export function createControlServer(options: HttpServerOptions) {
   options.monitor.setClaudeManualGateHandler((sessionId, approval) => {
     options.claudeInteractions!.recordManualGate(sessionId, approval.summary, approval.id);
   });
+  if (!options.codexHistorySync && options.codexOwned) {
+    options.codexHistorySync = new CodexHistorySyncCoordinator(options.tasks.stateDb, options.codexOwned);
+  }
   options.recoveryCoordinator ??= new RecoveryCoordinator(options);
   options.recoveryContinuationCoordinator ??= new RecoveryContinuationCoordinator(options);
   if (!options.mateRecoveryCoordinator && options.ownerManager && options.taskScheduler) {

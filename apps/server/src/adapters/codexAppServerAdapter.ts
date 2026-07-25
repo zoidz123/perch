@@ -28,6 +28,7 @@ import type {
   TopologyResponse
 } from "@perch/shared";
 import type { UsageLimit } from "../usageLimitDetect.js";
+import type { TimelineBackfillResult } from "../timeline.js";
 import { CodexAppServerClient, isCodexRpcError, type CodexRpcError } from "./codexAppServer.js";
 import type { CodexDaemonManager } from "./codexDaemon.js";
 import type { ThreadHistoryTurn } from "./codexAppServerTypes.js";
@@ -47,9 +48,22 @@ export class CodexDeliveryUnknownError extends Error {
 }
 
 export type CodexOwnedEventSink = {
-  // `live` is false for history replayed by thread/resume (catch-up rows must
-  // not flood the fleet WebSocket; clients page them via GET /timeline).
+  // `live` is false for authoritative history emitted during lost-delivery
+  // reconciliation, which updates storage without fleet WebSocket fan-out.
   onTimelineItem?: (item: TimelineItem, live: boolean) => void;
+  onTimelineGapOpened?: (sessionId: string) => boolean;
+  onTimelineBackfillStart?: (
+    sessionId: string,
+    syncId: string,
+    stopAtAnchor: boolean,
+    restartsFromHead: boolean
+  ) => void;
+  onTimelineBackfillPage?: (
+    sessionId: string,
+    syncId: string,
+    items: TimelineItem[]
+  ) => TimelineBackfillResult;
+  onTimelineBackfillEnd?: (sessionId: string, syncId: string, complete: boolean) => void;
   onStatus?: (sessionId: string, status: AgentSessionStatus) => void;
   onServerRequest?: (sessionId: string, request: PendingServerRequest) => void;
   onServerRequestResolved?: (sessionId: string, request: PendingServerRequest) => void;
@@ -60,6 +74,20 @@ export type CodexOwnedEventSink = {
   onModelResolved?: (sessionId: string, model: string) => void;
   onUsageLimit?: (sessionId: string, limit: UsageLimit) => void;
   onSessionExit?: (sessionId: string, context: SessionExitContext) => void;
+};
+
+export type CodexHistoryCatchUpRequest = {
+  syncId: string;
+  threadId: string;
+  cursor: string | null;
+  stopAtAnchor?: boolean;
+  restartsFromHead?: boolean;
+  onPage: (progress: { cursor: string | null; accepted: number }) => void;
+  onTerminal: (result: {
+    state: "succeeded" | "truncated" | "failed";
+    error?: string;
+    retryable?: boolean;
+  }) => void;
 };
 
 export type CreateOwnedClient = (args: {
@@ -87,6 +115,8 @@ export type CodexAppServerAdapterOptions = {
   createClient?: CreateOwnedClient;
   // Bounded reconnect backoff after an unexpected control-connection drop.
   reconnectDelaysMs?: number[];
+  historyReplayRetryDelaysMs?: number[];
+  historyPageTimeoutMs?: number;
 };
 
 export type StartOwnedOptions = {
@@ -130,10 +160,15 @@ type OwnedSession = {
   pendingRaw: string;
   stopped: boolean;
   reconnecting: boolean;
+  historyReplayEpoch: number;
+  historyGapHasAnchor: boolean;
+  historyCatchUp?: { epoch: number; request: CodexHistoryCatchUpRequest };
   attachCommandReady: boolean;
 };
 
 const DEFAULT_RECONNECT_DELAYS_MS = [500, 2_000];
+const DEFAULT_HISTORY_REPLAY_RETRY_DELAYS_MS = [250, 1_000];
+const DEFAULT_HISTORY_PAGE_TIMEOUT_MS = 10_000;
 
 export class CodexAppServerAdapter implements AgentAdapter {
   readonly name = "codex-app-server";
@@ -143,13 +178,19 @@ export class CodexAppServerAdapter implements AgentAdapter {
   private readonly sessionEnv?: (sessionId: string, request: StartAgentRequest) => Record<string, string>;
   private readonly createClient: CreateOwnedClient;
   private readonly reconnectDelaysMs: number[];
+  private readonly historyReplayRetryDelaysMs: number[];
+  private readonly historyPageTimeoutMs: number;
   private readonly fleetHandlers = new Set<(event: FleetEvent) => void>();
   private events: CodexOwnedEventSink = {};
+  private historyCatchUpRequester?: (sessionId: string, hasUsableAnchor: boolean) => void;
 
   constructor(options: CodexAppServerAdapterOptions) {
     this.daemons = options.daemons;
     this.sessionEnv = options.sessionEnv;
     this.reconnectDelaysMs = options.reconnectDelaysMs ?? DEFAULT_RECONNECT_DELAYS_MS;
+    this.historyReplayRetryDelaysMs =
+      options.historyReplayRetryDelaysMs ?? DEFAULT_HISTORY_REPLAY_RETRY_DELAYS_MS;
+    this.historyPageTimeoutMs = options.historyPageTimeoutMs ?? DEFAULT_HISTORY_PAGE_TIMEOUT_MS;
     this.createClient =
       options.createClient ??
       (({ sessionId, socketPath, handlers }) =>
@@ -172,6 +213,12 @@ export class CodexAppServerAdapter implements AgentAdapter {
   // Wired once at boot, after the consumers (monitor, tasks, timeline) exist.
   wireEvents(events: CodexOwnedEventSink): void {
     this.events = events;
+  }
+
+  setHistoryCatchUpRequester(
+    requester: (sessionId: string, hasUsableAnchor: boolean) => void
+  ): void {
+    this.historyCatchUpRequester = requester;
   }
 
   has(sessionId: string): boolean {
@@ -317,6 +364,8 @@ export class CodexAppServerAdapter implements AgentAdapter {
       pendingRaw: "",
       stopped: false,
       reconnecting: false,
+      historyReplayEpoch: 0,
+      historyGapHasAnchor: false,
       attachCommandReady: opts.deferAttachCommand !== true
     };
     session.client = this.createClient({
@@ -328,10 +377,13 @@ export class CodexAppServerAdapter implements AgentAdapter {
     try {
       await session.client.connect();
       if (opts.resume) {
-        const resumed = await session.client.resumeThread({ threadId: opts.resume.threadId, cwd });
+        const resumed = await session.client.resumeThread({
+          threadId: opts.resume.threadId,
+          cwd,
+          excludeTurns: true
+        });
         session.threadId = resumed.threadId;
         session.model = resumed.model;
-        this.replayHistory(session, threadTurns(resumed.result));
       } else {
         const started = await session.client.startThread({ cwd, model: request.model });
         session.threadId = started.threadId;
@@ -358,6 +410,7 @@ export class CodexAppServerAdapter implements AgentAdapter {
   async stopSession(sessionId: string): Promise<void> {
     const session = this.sessions.get(sessionId);
     if (!session || session.stopped) return;
+    this.cancelHistoryCatchUp(session);
     session.stopped = true;
     await session.client.disconnect().catch(() => {});
     await this.daemons.release(session.socketPath);
@@ -370,6 +423,7 @@ export class CodexAppServerAdapter implements AgentAdapter {
     const hadSessions = this.sessions.size > 0;
     const stopping: Promise<void>[] = [];
     for (const session of this.sessions.values()) {
+      this.cancelHistoryCatchUp(session);
       session.stopped = true;
       stopping.push(session.client.disconnect().catch(() => {}));
       if (!opts.keepDaemons) stopping.push(this.daemons.release(session.socketPath));
@@ -380,6 +434,29 @@ export class CodexAppServerAdapter implements AgentAdapter {
   }
 
   // ─── Codex-owned control surface (beyond AgentAdapter) ─────
+
+  startHistoryCatchUp(sessionId: string, request: CodexHistoryCatchUpRequest): boolean {
+    const session = this.sessions.get(sessionId);
+    if (
+      !session?.threadId ||
+      session.threadId !== request.threadId ||
+      session.stopped ||
+      !session.client.isConnected() ||
+      session.historyCatchUp
+    ) {
+      return false;
+    }
+    const epoch = ++session.historyReplayEpoch;
+    session.historyCatchUp = { epoch, request };
+    this.events.onTimelineBackfillStart?.(
+      session.id,
+      request.syncId,
+      request.stopAtAnchor === true,
+      request.restartsFromHead === true
+    );
+    this.replayHistoryInBackground(session, epoch, request);
+    return true;
+  }
 
   switchModel(sessionId: string, model: string, effort?: CodexReasoningEffort): boolean {
     const session = this.sessions.get(sessionId);
@@ -613,9 +690,22 @@ export class CodexAppServerAdapter implements AgentAdapter {
     await session.client.disconnect().catch(() => {});
     await session.client.connect();
     if (session.threadId) {
-      const resumed = await session.client.resumeThread({ threadId: session.threadId, cwd: session.cwd });
+      const resumed = await session.client.resumeThread({
+        threadId: session.threadId,
+        cwd: session.cwd,
+        excludeTurns: true
+      });
       session.threadId = resumed.threadId;
-      this.replayHistory(session, threadTurns(resumed.result));
+      session.model = resumed.model;
+      try {
+        this.historyCatchUpRequester?.(session.id, session.historyGapHasAnchor);
+      } catch (error) {
+        console.warn(
+          `codex history catch-up could not be scheduled for ${session.id}: ${
+            error instanceof Error ? error.message : String(error)
+          }`
+        );
+      }
     }
   }
 
@@ -624,6 +714,7 @@ export class CodexAppServerAdapter implements AgentAdapter {
   // interruption and the recovery flow own what happens next.
   private handleDisconnect(session: OwnedSession): void {
     if (session.stopped || session.reconnecting) return;
+    session.historyGapHasAnchor = this.events.onTimelineGapOpened?.(session.id) === true;
     session.reconnecting = true;
     void (async () => {
       try {
@@ -638,6 +729,7 @@ export class CodexAppServerAdapter implements AgentAdapter {
           }
         }
         if (session.stopped) return;
+        this.cancelHistoryCatchUp(session);
         session.stopped = true;
         session.status = "error";
         await session.client.disconnect().catch(() => {});
@@ -654,31 +746,171 @@ export class CodexAppServerAdapter implements AgentAdapter {
     })();
   }
 
-  // Replay resumed turn history into the timeline, deduped downstream by
-  // protocol item id. An interrupted in-flight turn is represented truthfully
-  // as a system row instead of pretending the turn is still running.
-  private replayHistory(session: OwnedSession, turns: ThreadHistoryTurn[]): void {
-    if (!this.events.onTimelineItem) return;
+  private historyTimelineItems(session: OwnedSession, turns: ThreadHistoryTurn[]): TimelineItem[] {
+    const items: TimelineItem[] = [];
+    const fallbackAt = new Date(Math.max(0, Date.parse(session.createdAt) - 1)).toISOString();
     for (const turn of turns) {
+      const turnAt = historyTimestamp(turn) ?? fallbackAt;
       for (const item of turn.items ?? []) {
-        for (const timelineItem of historyItemToTimeline(session.id, item)) {
-          this.events.onTimelineItem(timelineItem, false);
-        }
+        items.push(...historyItemToTimeline(session.id, item, historyTimestamp(item) ?? turnAt));
       }
       if (turn.status === "interrupted" && turn.id) {
-        this.events.onTimelineItem(
-          {
-            seq: 0,
-            id: `cx-item-${turn.id}:interrupted`,
-            sessionId: session.id,
-            kind: "system",
-            text: "This turn was interrupted by a runtime restart; recovery resumed the thread from persisted history.",
-            at: new Date().toISOString()
-          },
-          false
-        );
+        items.push({
+          seq: 0,
+          id: `cx-item-${turn.id}:interrupted`,
+          sessionId: session.id,
+          kind: "system",
+          text: "This turn was interrupted by a runtime restart; recovery resumed the thread from persisted history.",
+          at: turnAt
+        });
       }
     }
+    return items;
+  }
+
+  private replayHistoryInBackground(
+    session: OwnedSession,
+    epoch: number,
+    request: CodexHistoryCatchUpRequest
+  ): void {
+    const threadId = session.threadId;
+    if (!threadId) return;
+    this.emitFleetEvent("activity", "codex.history-catchup.started", session.id);
+    let complete = false;
+    void (async () => {
+      let cursor = request.cursor;
+      do {
+        if (!this.historyReplayOwns(session, threadId, epoch)) return;
+        if (!session.client.isConnected()) {
+          throw new Error("codex app-server connection lost during history catch-up");
+        }
+        const page = await this.listHistoryPageWithRetry(session, threadId, cursor, epoch);
+        if (!page) {
+          if (this.historyReplayOwns(session, threadId, epoch)) {
+            throw new Error("codex app-server connection lost during history catch-up");
+          }
+          return;
+        }
+        if (!this.historyReplayIsCurrent(session, threadId, epoch)) {
+          if (this.historyReplayOwns(session, threadId, epoch)) {
+            throw new Error("codex app-server connection lost during history catch-up");
+          }
+          return;
+        }
+        const turns = [...page.data].reverse();
+        const result = this.events.onTimelineBackfillPage?.(
+          session.id,
+          request.syncId,
+          this.historyTimelineItems(session, turns)
+        );
+        const nextCursor = page.nextCursor;
+        request.onPage({ cursor: nextCursor, accepted: result?.accepted ?? 0 });
+        if (result?.done) {
+          request.onTerminal({ state: nextCursor ? "truncated" : "succeeded" });
+          complete = true;
+          this.emitFleetEvent("activity", "codex.history-catchup.completed", session.id);
+          return;
+        }
+        if (nextCursor === cursor) {
+          request.onTerminal({ state: "succeeded" });
+          complete = true;
+          this.emitFleetEvent("activity", "codex.history-catchup.completed", session.id);
+          return;
+        }
+        cursor = nextCursor;
+      } while (cursor);
+      if (this.historyReplayIsCurrent(session, threadId, epoch)) {
+        request.onTerminal({ state: "succeeded" });
+        complete = true;
+        this.emitFleetEvent("activity", "codex.history-catchup.completed", session.id);
+      }
+    })().catch((error) => {
+      if (!this.historyReplayOwns(session, threadId, epoch)) return;
+      const message = error instanceof Error ? error.message : String(error);
+      console.warn(`codex history catch-up failed for ${session.id}: ${message}`);
+      try {
+        request.onTerminal({ state: "failed", error: message });
+      } catch (terminalError) {
+        console.warn(
+          `codex history catch-up failure receipt could not be recorded for ${session.id}: ${
+            terminalError instanceof Error ? terminalError.message : String(terminalError)
+          }`
+        );
+      }
+      this.emitFleetEvent("activity", "codex.history-catchup.failed", session.id);
+    }).finally(() => {
+      if (session.historyCatchUp?.epoch !== epoch) return;
+      session.historyCatchUp = undefined;
+      this.events.onTimelineBackfillEnd?.(session.id, request.syncId, complete);
+    });
+  }
+
+  private cancelHistoryCatchUp(session: OwnedSession): void {
+    const active = session.historyCatchUp;
+    if (!active) return;
+    session.historyReplayEpoch += 1;
+    session.historyCatchUp = undefined;
+    try {
+      active.request.onTerminal({
+        state: "failed",
+        error: "codex session stopped before history catch-up completed",
+        retryable: false
+      });
+    } catch (error) {
+      console.warn(
+        `codex history catch-up cancellation could not be recorded for ${session.id}: ${
+          error instanceof Error ? error.message : String(error)
+        }`
+      );
+    }
+    this.events.onTimelineBackfillEnd?.(session.id, active.request.syncId, false);
+  }
+
+  private async listHistoryPageWithRetry(
+    session: OwnedSession,
+    threadId: string,
+    cursor: string | null,
+    epoch: number
+  ) {
+    for (let attempt = 0; ; attempt += 1) {
+      try {
+        return await session.client.listThreadTurns(
+          {
+            threadId,
+            cursor,
+            limit: 20,
+            sortDirection: "desc",
+            itemsView: "full"
+          },
+          this.historyPageTimeoutMs
+        );
+      } catch (error) {
+        if (!this.historyReplayOwns(session, threadId, epoch)) return undefined;
+        if (!session.client.isConnected()) {
+          throw new Error("codex app-server connection lost during history catch-up");
+        }
+        const delayMs = this.historyReplayRetryDelaysMs[attempt];
+        if (delayMs === undefined) throw error;
+        this.emitFleetEvent("activity", "codex.history-catchup.retry", session.id);
+        await sleep(delayMs);
+      }
+    }
+  }
+
+  private historyReplayIsCurrent(session: OwnedSession, threadId: string, epoch: number): boolean {
+    return (
+      this.historyReplayOwns(session, threadId, epoch) &&
+      session.client.isConnected()
+    );
+  }
+
+  private historyReplayOwns(session: OwnedSession, threadId: string, epoch: number): boolean {
+    return (
+      !session.stopped &&
+      session.threadId === threadId &&
+      session.historyReplayEpoch === epoch &&
+      session.historyCatchUp?.epoch === epoch
+    );
   }
 
   private handlersFor(session: OwnedSession): Parameters<CreateOwnedClient>[0]["handlers"] {
@@ -714,8 +946,12 @@ export class CodexAppServerAdapter implements AgentAdapter {
   }
 
   private invalidateTopology(name: string, sessionId?: string): void {
+    this.emitFleetEvent("topology", name, sessionId);
+  }
+
+  private emitFleetEvent(kind: FleetEvent["kind"], name: string, sessionId?: string): void {
     const event: FleetEvent = {
-      kind: "topology",
+      kind,
       at: new Date().toISOString(),
       agent: "codex",
       name,
@@ -792,10 +1028,13 @@ function findUserMessageByClientMessageId(
 // Project a thread/read (or resume-replayed) history item into perch's
 // timeline shape. Stable `cx-item-<protocol id>` ids make the replay
 // idempotent against rows already ingested live.
-function historyItemToTimeline(sessionId: string, item: Record<string, unknown>): TimelineItem[] {
+function historyItemToTimeline(
+  sessionId: string,
+  item: Record<string, unknown>,
+  at = new Date().toISOString()
+): TimelineItem[] {
   const id = typeof item.id === "string" && item.id.length > 0 ? item.id : undefined;
   const type = typeof item.type === "string" ? item.type : "";
-  const at = new Date().toISOString();
   if (type === "userMessage") {
     const text = userMessageText(item);
     if (!text) return [];
@@ -855,6 +1094,21 @@ function historyItemToTimeline(sessionId: string, item: Record<string, unknown>)
     return items;
   }
   return [];
+}
+
+function historyTimestamp(record: Record<string, unknown>): string | undefined {
+  for (const key of ["timestamp", "createdAt", "startedAt", "completedAt", "updatedAt"]) {
+    const value = record[key];
+    if (typeof value === "string" && Number.isFinite(Date.parse(value))) {
+      return new Date(value).toISOString();
+    }
+    if (typeof value === "number" && Number.isFinite(value)) {
+      const milliseconds = value < 10_000_000_000 ? value * 1_000 : value;
+      const date = new Date(milliseconds);
+      if (Number.isFinite(date.getTime())) return date.toISOString();
+    }
+  }
+  return undefined;
 }
 
 function stringifyHistoryCommand(command: unknown): string | undefined {

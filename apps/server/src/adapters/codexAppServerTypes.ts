@@ -54,6 +54,9 @@ export type ResumeConversationParams = {
   approvalPolicy: ApprovalPolicy | null;
   sandbox: SandboxMode | null;
   persistExtendedHistory: boolean;
+  // Codex 0.145.0: establish the live subscription without rebuilding the
+  // entire rollout into thread.turns.
+  excludeTurns?: boolean;
 };
 
 // turn/start params. Only `threadId` + `input` are required; every override is
@@ -117,6 +120,22 @@ export type ThreadReadResult = {
     [key: string]: unknown;
   };
   [key: string]: unknown;
+};
+
+// Codex 0.145.0: bounded history pages for catch-up after a metadata-only
+// thread/resume.
+export type ThreadTurnsListParams = {
+  threadId: ThreadId;
+  cursor?: string | null;
+  limit?: number | null;
+  sortDirection?: "asc" | "desc" | null;
+  itemsView?: "notLoaded" | "summary" | "full" | null;
+};
+
+export type ThreadTurnsListResult = {
+  data: ThreadHistoryTurn[];
+  nextCursor: string | null;
+  backwardsCursor: string | null;
 };
 
 export type InterruptConversationParams = {

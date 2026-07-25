@@ -33,6 +33,7 @@ import type { PromptDeliveryTracker } from "./promptDeliveries.js";
 import type { MateRecoveryCoordinator } from "./mateRecovery.js";
 import type { TimelineStore } from "./timeline.js";
 import type { WorktreeLease, WorktreePool } from "./worktrees.js";
+import type { CodexHistorySyncCoordinator } from "./codexHistorySync.js";
 
 type LaunchAuditMeta = Pick<AuditRecord, "deviceId" | "remoteAddress">;
 
@@ -65,6 +66,7 @@ export type ManagedAgentLauncherOptions = {
   ownerManager?: OwnerManager;
   mateRecoveryCoordinator?: MateRecoveryCoordinator;
   promptDeliveries?: PromptDeliveryTracker;
+  codexHistorySync?: CodexHistorySyncCoordinator;
 };
 
 export type StartManagedAgentInput = {
@@ -369,6 +371,24 @@ export async function startManagedAgent(
       options.ownerManager?.recordProviderSession(session.id, "codex", codexThreadId);
       options.recoveryCoordinator?.observeSessionStart(session.id, "codex", codexThreadId);
       options.mateRecoveryCoordinator?.observeSessionStart(session.id, "codex", codexThreadId);
+      if (codexOwnedResume) {
+        try {
+          if (runtime) {
+            const live = options.tasks.stateDb.runtimes.findBySession(session.id);
+            if (live) options.codexHistorySync?.startForTaskRuntime(live);
+          }
+          if (ownerRuntime) {
+            const live = options.tasks.stateDb.ownerRuntimes.findBySession(session.id);
+            if (live) options.codexHistorySync?.startForOwnerRuntime(live);
+          }
+        } catch (error) {
+          console.warn(
+            `codex history catch-up could not start for ${session.id}: ${
+              error instanceof Error ? error.message : String(error)
+            }`
+          );
+        }
+      }
     }
 
     options.monitor.setSessionModel(

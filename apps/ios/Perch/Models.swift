@@ -519,6 +519,7 @@ enum AgentEvent: Identifiable, Equatable {
     case terminalSnapshot(sessionId: String, data: String, cols: Int, rows: Int, seq: Int, at: String)
     // Structured timeline entry recovered from the agent's session file.
     case timelineItem(sessionId: String, item: TimelineItem, at: String)
+    case timelineResync(sessionId: String, revision: Int, at: String)
     // Live, incremental assistant text for an in-flight turn (codex). `text` is
     // the full accumulated reply so far for `itemId`; `done` marks the last
     // frame. Ephemeral preview - the finished message still arrives as a
@@ -541,6 +542,8 @@ enum AgentEvent: Identifiable, Equatable {
             "\(sessionId)-snapshot-\(at)-\(seq)"
         case let .timelineItem(sessionId, item, _):
             "\(sessionId)-timeline-\(item.seq)"
+        case let .timelineResync(sessionId, revision, at):
+            "\(sessionId)-timeline-resync-\(revision)-\(at)"
         case let .assistantStream(sessionId, itemId, text, done, _):
             "\(sessionId)-stream-\(itemId)-\(done ? "done" : "\(text.count)")"
         case let .approvalRequest(sessionId, id, _, _, at):
@@ -558,6 +561,7 @@ enum AgentEvent: Identifiable, Equatable {
              let .terminalOutput(sessionId, _, _, _, _),
              let .terminalSnapshot(sessionId, _, _, _, _, _),
              let .timelineItem(sessionId, _, _),
+             let .timelineResync(sessionId, _, _),
              let .assistantStream(sessionId, _, _, _, _),
              let .approvalRequest(sessionId, _, _, _, _),
              let .status(sessionId, _, _),
@@ -601,6 +605,7 @@ extension AgentEvent: Decodable {
         case chartId
         case name
         case reason
+        case revision
     }
 
     init(from decoder: Decoder) throws {
@@ -636,6 +641,12 @@ extension AgentEvent: Decodable {
             self = .timelineItem(
                 sessionId: try container.decode(String.self, forKey: .sessionId),
                 item: try container.decode(TimelineItem.self, forKey: .item),
+                at: try container.decode(String.self, forKey: .at)
+            )
+        case "timeline_resync":
+            self = .timelineResync(
+                sessionId: try container.decode(String.self, forKey: .sessionId),
+                revision: try container.decode(Int.self, forKey: .revision),
                 at: try container.decode(String.self, forKey: .at)
             )
         case "assistant_stream":
@@ -931,6 +942,7 @@ struct OptimisticMessage: Identifiable, Equatable {
 struct TimelineResponse: Decodable {
     let items: [TimelineItem]
     let lastSeq: Int
+    let revision: Int?
 }
 
 struct SubmitResult: Decodable {
