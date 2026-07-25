@@ -105,6 +105,7 @@ final class PerchStore: ObservableObject {
     @Published var openPlan: ChartPlanDoc?
     // In-flight timeline hole fetches (gap detection), per session.
     private var timelineCatchUps = Set<String>()
+    private var timelineRevisionsBySession: [String: Int] = [:]
 
     private var webSocketTask: URLSessionWebSocketTask?
     private let decoder = JSONDecoder()
@@ -328,6 +329,7 @@ final class PerchStore: ObservableObject {
         selectionToken = nil
         openSessionRef = nil
         timelinesBySession = [:]
+        timelineRevisionsBySession = [:]
         streamingBySession = [:]
         optimisticBySession = [:]
         modelSwitchHintBySession = [:]
@@ -462,6 +464,14 @@ final class PerchStore: ObservableObject {
                 let response: TimelineResponse = try await request(
                     path: "/sessions/\(escapePath(sessionId))/timeline?after=\(after)&limit=\(limit)"
                 )
+                let revision = response.revision ?? 0
+                let knownRevision = timelineRevisionsBySession[sessionId] ?? 0
+                if after > 0, revision != knownRevision {
+                    timelineRevisionsBySession[sessionId] = revision
+                    after = 0
+                    continue
+                }
+                timelineRevisionsBySession[sessionId] = revision
                 if !response.items.isEmpty {
                     mergeTimelineItems(sessionId, response.items)
                 }
@@ -2136,6 +2146,10 @@ final class PerchStore: ObservableObject {
         switch event {
         case let .timelineItem(sessionId, item, _):
             handleLiveTimelineItem(sessionId, item)
+        case let .timelineResync(sessionId, _, _):
+            Task { [weak self] in
+                await self?.loadTimeline(sessionId, after: 0)
+            }
         case let .assistantStream(sessionId, itemId, text, done, _):
             handleAssistantStream(sessionId, itemId: itemId, text: text, done: done)
         case let .status(sessionId, status, _):

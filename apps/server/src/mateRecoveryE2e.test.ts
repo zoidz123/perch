@@ -17,6 +17,7 @@ const serverEntry = join(repoRoot, "apps/server/dist/index.js");
 const perchBin = fileURLToPath(new URL("../../../bin/perch.mjs", import.meta.url));
 const execFileAsync = promisify(execFile);
 const requested = (process.env.PERCH_REAL_MATE_E2E ?? "").toLowerCase();
+const LONG_LIVED_MATE_TURNS = 24;
 
 for (const provider of ["claude", "codex"] as const) {
   test(`private-home E2E: real ${provider} mate and two-child fleet survive a server crash`, {
@@ -176,6 +177,16 @@ test("private-home E2E: graceful Codex Mate and two-child fleet preserve exact t
       })
     });
     await waitForAssistantText(port, token, oldSession, "MATE_GRACEFUL_E2E_READY");
+    for (let index = 0; index < LONG_LIVED_MATE_TURNS; index += 1) {
+      const marker = `MATE_GRACEFUL_HISTORY_${String(index + 1).padStart(2, "0")}`;
+      await request(port, token, `/sessions/${encodeURIComponent(oldSession)}/submit`, {
+        method: "POST",
+        body: JSON.stringify({
+          text: `Reply with exactly ${marker}.`
+        })
+      });
+      await waitForAssistantText(port, token, oldSession, marker);
+    }
 
     const originals: Task[] = [];
     for (let index = 0; index < 2; index += 1) {
@@ -291,6 +302,8 @@ test("private-home E2E: graceful Codex Mate and two-child fleet preserve exact t
       recovered.session!.id,
       "MATE_GRACEFUL_E2E_RECOVERED"
     );
+    const mateHistorySync = await waitForHistorySync(home, recovered.session!.id);
+    assert.ok(mateHistorySync.pages >= 2);
 
     for (const original of originals) {
       const recoveredChild = await waitForTask(
@@ -312,6 +325,7 @@ test("private-home E2E: graceful Codex Mate and two-child fleet preserve exact t
       assert.equal(recoveredChild.workerName, original.workerName);
       assert.equal(recoveredChild.worktreeId, original.worktreeId);
       await waitForRecoveredTurn(port, token, original.id, recoveredChild.sessionId!);
+      await waitForHistorySync(home, recoveredChild.sessionId!);
       await request(port, token, `/tasks/${encodeURIComponent(original.id)}/teardown`, {
         method: "POST",
         body: JSON.stringify({ force: true })
@@ -553,6 +567,26 @@ function mateRecoveryOperationCount(home: string): number {
   } finally {
     db.close();
   }
+}
+
+async function waitForHistorySync(
+  home: string,
+  sessionId: string
+): Promise<{ state: string; pages: number; items: number }> {
+  for (let attempt = 0; attempt < 400; attempt += 1) {
+    const db = new Database(join(home, "state.sqlite"), { readonly: true });
+    try {
+      const row = db.prepare(
+        `SELECT state, pages, items FROM codex_history_syncs
+         WHERE perch_session_id = ? ORDER BY created_at DESC LIMIT 1`
+      ).get(sessionId) as { state: string; pages: number; items: number } | undefined;
+      if (row && ["succeeded", "truncated"].includes(row.state)) return row;
+    } finally {
+      db.close();
+    }
+    await delay(250);
+  }
+  throw new Error(`history sync did not finish for ${sessionId}`);
 }
 
 function daemonPid(socketPath: string): number {

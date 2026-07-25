@@ -288,7 +288,8 @@ codexOwned.wireEvents({
   onTimelineBackfillStart: (sessionId, token) => timeline.beginBackfill(sessionId, token),
   onTimelineBackfillPage: (sessionId, token, items) =>
     timeline.ingestBackfill(sessionId, token, items),
-  onTimelineBackfillEnd: (sessionId, token) => timeline.endBackfill(sessionId, token),
+  onTimelineBackfillEnd: (sessionId, syncId, complete) =>
+    timeline.endBackfill(sessionId, syncId, complete),
   onStatus: (sessionId, status) => {
     // Status alone never recovers a blocked task: approval resolution also
     // transitions back to `running` mid-turn (see onTurnStarted below).
@@ -436,6 +437,15 @@ timeline.subscribe((item) => {
     sessionId: item.sessionId,
     item,
     at: item.at
+  });
+});
+
+timeline.observeBackfill((sessionId, revision) => {
+  monitor.publish({
+    type: "timeline_resync",
+    sessionId,
+    revision,
+    at: new Date().toISOString()
   });
 });
 

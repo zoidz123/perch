@@ -169,6 +169,54 @@ test("transcript appearing after attach backfills without listener fan-out", asy
   rmSync(dir, { recursive: true, force: true });
 });
 
+test("late backfill revisions remain resyncable and a failed sync resumes before existing rows", () => {
+  const store = new TimelineStore();
+  const revisions: number[] = [];
+  store.observeBackfill((_sessionId, revision) => revisions.push(revision));
+  const item = (id: string, text: string) => ({
+    seq: 0,
+    id,
+    sessionId: "pty:backfill",
+    kind: "assistant" as const,
+    text,
+    at: `2026-07-25T00:00:0${text.slice(-1)}.000Z`
+  });
+
+  store.beginBackfill("pty:backfill", "sync-1");
+  assert.deepEqual(
+    store.ingestBackfill("pty:backfill", "sync-1", [
+      item("old-3", "old-3"),
+      item("old-4", "old-4")
+    ]),
+    { accepted: 2, done: false }
+  );
+  store.ingest(item("live", "live"), { live: true });
+  const liveSeq = store.fetch("pty:backfill", 0, 10).items.at(-1)!.seq;
+  store.endBackfill("pty:backfill", "sync-1", false);
+
+  store.beginBackfill("pty:backfill", "sync-1");
+  assert.deepEqual(
+    store.ingestBackfill("pty:backfill", "sync-1", [
+      item("old-1", "old-1"),
+      item("old-2", "old-2")
+    ]),
+    { accepted: 2, done: false }
+  );
+  store.endBackfill("pty:backfill", "sync-1", true);
+
+  assert.deepEqual(revisions, [1, 2]);
+  assert.deepEqual(
+    store.fetch("pty:backfill", 0, 10).items.map((candidate) => candidate.text),
+    ["old-1", "old-2", "old-3", "old-4", "live"]
+  );
+  assert.deepEqual(store.fetch("pty:backfill", liveSeq, 10), {
+    items: [],
+    lastSeq: liveSeq,
+    revision: 2
+  });
+  store.stop();
+});
+
 test("catch-up waits for an unterminated transcript row to finish", async () => {
   const dir = mkdtempSync(join(tmpdir(), "perch-tl-partial-catchup-"));
   const transcript = join(dir, "session.jsonl");

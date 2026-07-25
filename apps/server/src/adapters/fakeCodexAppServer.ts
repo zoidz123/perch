@@ -21,7 +21,10 @@
 
 import { createServer, type Server } from "node:http";
 import { WebSocketServer, type WebSocket } from "ws";
-import type { CodexOwnedEventSink } from "./codexAppServerAdapter.js";
+import type {
+  CodexHistoryCatchUpRequest,
+  CodexOwnedEventSink
+} from "./codexAppServerAdapter.js";
 
 type JsonRpc = {
   jsonrpc?: "2.0";
@@ -428,6 +431,7 @@ export class FakeCodexOwnedAdapter {
   modelSwitches: Array<{ sessionId: string; model: string; effort?: string }> = [];
   serverResponses: Array<{ sessionId: string; response: Record<string, unknown> }> = [];
   stopped: string[] = [];
+  historyCatchUps: string[] = [];
   events: CodexOwnedEventSink = {};
   // Knobs
   failStart: Error | null = null;
@@ -450,9 +454,21 @@ export class FakeCodexOwnedAdapter {
   private readonly turnCompletionWaiters = new Map<string, () => void>();
   private threadCounter = 0;
   private turnCounter = 0;
+  private historyCatchUpRequester?: (sessionId: string) => void;
 
   wireEvents(events: CodexOwnedEventSink): void {
     this.events = events;
+  }
+
+  setHistoryCatchUpRequester(requester: (sessionId: string) => void): void {
+    this.historyCatchUpRequester = requester;
+  }
+
+  startHistoryCatchUp(sessionId: string, request: CodexHistoryCatchUpRequest): boolean {
+    if (this.sessions.get(sessionId)?.threadId !== request.threadId) return false;
+    this.historyCatchUps.push(sessionId);
+    request.onTerminal({ state: "succeeded" });
+    return true;
   }
 
   has(sessionId: string): boolean {

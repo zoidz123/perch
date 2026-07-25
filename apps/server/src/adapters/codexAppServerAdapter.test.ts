@@ -48,6 +48,7 @@ type Fixture = {
     exits: Array<{ sessionId: string; status: string }>;
     fleet: FleetEvent[];
   };
+  startHistoryCatchUp: (sessionId: string, cursor?: string | null) => boolean;
   close: () => Promise<void>;
 };
 
@@ -128,7 +129,8 @@ async function fixture(
       events.timeline.push(...items.map((item) => ({ item, live: false })));
       return timeline.ingestBackfill(sessionId, token, items);
     },
-    onTimelineBackfillEnd: (sessionId, token) => timeline.endBackfill(sessionId, token),
+    onTimelineBackfillEnd: (sessionId, syncId, complete) =>
+      timeline.endBackfill(sessionId, syncId, complete),
     onStatus: (sessionId, status) => events.statuses.push({ sessionId, status }),
     onServerRequest: (_sessionId, request) => events.serverRequests.push(request),
     onServerRequestResolved: (_sessionId, request) => events.serverRequestsResolved.push(request),
@@ -138,6 +140,18 @@ async function fixture(
     onSessionExit: (sessionId, context) => events.exits.push({ sessionId, status: context.status })
   });
   adapter.subscribeFleetEvents((event) => events.fleet.push(event));
+  let historySync = 0;
+  const startHistoryCatchUp = (sessionId: string, cursor: string | null = null) =>
+    adapter.startHistoryCatchUp(sessionId, {
+      syncId: `sync-${++historySync}`,
+      threadId: adapter.threadIdOf(sessionId)!,
+      cursor,
+      onPage: () => {},
+      onTerminal: () => {}
+    });
+  adapter.setHistoryCatchUpRequester((sessionId) => {
+    startHistoryCatchUp(sessionId);
+  });
   return {
     dir,
     socketPath,
@@ -146,6 +160,7 @@ async function fixture(
     timeline,
     daemons,
     events,
+    startHistoryCatchUp,
     close: async () => {
       adapter.stop();
       timeline.stop();
@@ -583,6 +598,7 @@ test("startOwned resume rebinds to a surviving daemon socket without a respawn a
     // Rebind adopted the recorded socket instead of acquiring a fresh daemon.
     assert.deepEqual(f.daemons.adopts, [f.socketPath]);
     assert.equal(f.daemons.acquires, 1); // only the original launch
+    assert.equal(f.startHistoryCatchUp("pty:new"), true);
     // The stale in-flight turn is represented truthfully as interrupted.
     await until(2_000, () =>
       f.events.timeline.some(
@@ -626,6 +642,11 @@ test("startOwned recovery does not wait for full thread history before claiming 
     assert.equal(session.id, "pty:new");
     const resume = f.fake.requestLog.findLast((entry) => entry.method === "thread/resume");
     assert.equal(resume?.params.excludeTurns, true);
+    assert.equal(
+      f.fake.requestLog.filter((entry) => entry.method === "thread/turns/list").length,
+      0
+    );
+    assert.equal(f.startHistoryCatchUp("pty:new"), true);
     assert.ok(
       await until(2_000, () =>
         f.events.timeline.some(
@@ -679,6 +700,7 @@ test("background history keeps provider order and cannot evict live recovery out
       },
       { resume: { threadId: "thr_big", socketPath: f.socketPath } }
     );
+    assert.equal(f.startHistoryCatchUp("pty:recovered"), true);
     await f.adapter.submitAcknowledgedTurn("pty:recovered", "live recovery", {
       clientUserMessageId: "live-message"
     });
@@ -724,6 +746,7 @@ test("terminal history catch-up failure is observable without rolling back the l
       },
       { resume: { threadId: "thr_failed", socketPath: f.socketPath } }
     );
+    assert.equal(f.startHistoryCatchUp("pty:failed-history"), true);
 
     assert.equal(session.id, "pty:failed-history");
     assert.ok(

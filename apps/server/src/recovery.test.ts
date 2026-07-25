@@ -23,6 +23,7 @@ import { RuntimeManager } from "./runtimeManager.js";
 import type { OperationRecord } from "./stateDb.js";
 import { TaskStore } from "./tasks.js";
 import { TaskScheduler } from "./taskScheduler.js";
+import { CodexHistorySyncCoordinator } from "./codexHistorySync.js";
 import { TimelineStore } from "./timeline.js";
 import { WorktreePool } from "./worktrees.js";
 
@@ -97,6 +98,10 @@ function harness(providerSessionId = CODEX_THREAD_ID, agent: "claude" | "codex" 
   // Codex recovery drives the app-server owning adapter; the routing facade
   // is what the coordinator sees, exactly like production.
   const codexOwned = new FakeCodexOwnedAdapter();
+  const codexHistorySync = new CodexHistorySyncCoordinator(
+    tasks.stateDb,
+    codexOwned as unknown as CodexAppServerAdapter
+  );
   const routing = new RoutingAgentAdapter(
     adapter as unknown as PtyAgentAdapter,
     codexOwned as unknown as CodexAppServerAdapter
@@ -142,6 +147,7 @@ function harness(providerSessionId = CODEX_THREAD_ID, agent: "claude" | "codex" 
     tasks,
     port: 8787,
     runtimeManager,
+    codexHistorySync,
     identityTimeoutMs: 100,
     providers: [driver]
   };
@@ -199,6 +205,8 @@ test("Codex recovery resumes the exact thread and atomically binds g+1 without c
   // The resume went through the owning adapter against the exact thread.
   assert.equal(h.codexOwned.launches.length, 1);
   assert.deepEqual(h.codexOwned.launches[0]?.resume, { threadId: CODEX_THREAD_ID });
+  assert.deepEqual(h.codexOwned.historyCatchUps, [task.sessionId]);
+  assert.equal(h.tasks.stateDb.codexHistorySyncs.latestForSession(task.sessionId!)?.state, "succeeded");
   assert.equal(
     h.tasks.stateDb.operations.findByIdempotencyKey(`continuation:${h.task.id}:g1`)?.state,
     "pending",
