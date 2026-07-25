@@ -78,6 +78,7 @@ export type CodexHistoryCatchUpRequest = {
   onTerminal: (result: {
     state: "succeeded" | "truncated" | "failed";
     error?: string;
+    retryable?: boolean;
   }) => void;
 };
 
@@ -428,7 +429,8 @@ export class CodexAppServerAdapter implements AgentAdapter {
       !session?.threadId ||
       session.threadId !== request.threadId ||
       session.stopped ||
-      !session.client.isConnected()
+      !session.client.isConnected() ||
+      session.historyCatchUp
     ) {
       return false;
     }
@@ -760,9 +762,23 @@ export class CodexAppServerAdapter implements AgentAdapter {
     void (async () => {
       let cursor = request.cursor;
       do {
-        if (!this.historyReplayIsCurrent(session, threadId, epoch)) return;
+        if (!this.historyReplayOwns(session, threadId, epoch)) return;
+        if (!session.client.isConnected()) {
+          throw new Error("codex app-server connection lost during history catch-up");
+        }
         const page = await this.listHistoryPageWithRetry(session, threadId, cursor, epoch);
-        if (!page || !this.historyReplayIsCurrent(session, threadId, epoch)) return;
+        if (!page) {
+          if (this.historyReplayOwns(session, threadId, epoch)) {
+            throw new Error("codex app-server connection lost during history catch-up");
+          }
+          return;
+        }
+        if (!this.historyReplayIsCurrent(session, threadId, epoch)) {
+          if (this.historyReplayOwns(session, threadId, epoch)) {
+            throw new Error("codex app-server connection lost during history catch-up");
+          }
+          return;
+        }
         const turns = [...page.data].reverse();
         const result = this.events.onTimelineBackfillPage?.(
           session.id,
@@ -791,7 +807,7 @@ export class CodexAppServerAdapter implements AgentAdapter {
         this.emitFleetEvent("activity", "codex.history-catchup.completed", session.id);
       }
     })().catch((error) => {
-      if (!this.historyReplayIsCurrent(session, threadId, epoch)) return;
+      if (!this.historyReplayOwns(session, threadId, epoch)) return;
       const message = error instanceof Error ? error.message : String(error);
       console.warn(`codex history catch-up failed for ${session.id}: ${message}`);
       try {
@@ -819,7 +835,8 @@ export class CodexAppServerAdapter implements AgentAdapter {
     try {
       active.request.onTerminal({
         state: "failed",
-        error: "codex session stopped before history catch-up completed"
+        error: "codex session stopped before history catch-up completed",
+        retryable: false
       });
     } catch (error) {
       console.warn(
@@ -850,7 +867,10 @@ export class CodexAppServerAdapter implements AgentAdapter {
           this.historyPageTimeoutMs
         );
       } catch (error) {
-        if (!this.historyReplayIsCurrent(session, threadId, epoch)) return undefined;
+        if (!this.historyReplayOwns(session, threadId, epoch)) return undefined;
+        if (!session.client.isConnected()) {
+          throw new Error("codex app-server connection lost during history catch-up");
+        }
         const delayMs = this.historyReplayRetryDelaysMs[attempt];
         if (delayMs === undefined) throw error;
         this.emitFleetEvent("activity", "codex.history-catchup.retry", session.id);
@@ -861,10 +881,17 @@ export class CodexAppServerAdapter implements AgentAdapter {
 
   private historyReplayIsCurrent(session: OwnedSession, threadId: string, epoch: number): boolean {
     return (
+      this.historyReplayOwns(session, threadId, epoch) &&
+      session.client.isConnected()
+    );
+  }
+
+  private historyReplayOwns(session: OwnedSession, threadId: string, epoch: number): boolean {
+    return (
       !session.stopped &&
       session.threadId === threadId &&
       session.historyReplayEpoch === epoch &&
-      session.client.isConnected()
+      session.historyCatchUp?.epoch === epoch
     );
   }
 

@@ -761,6 +761,52 @@ test("terminal history catch-up failure is observable without rolling back the l
   }
 });
 
+test("a control drop records the active history receipt as failed", async () => {
+  const f = await fixture("pxa-history-disconnect-", {
+    reconnectDelaysMs: [1_000],
+    historyPageTimeoutMs: 500
+  });
+  try {
+    f.fake.seedThread("thr_disconnect", []);
+    f.fake.threadTurnsListTimeoutsRemaining = 1;
+    await f.adapter.startOwned(
+      {
+        command: "codex",
+        agent: "codex",
+        cwd: f.dir,
+        sessionId: "pty:history-disconnect",
+        args: ["resume", "thr_disconnect"]
+      },
+      { resume: { threadId: "thr_disconnect", socketPath: f.socketPath } }
+    );
+    const terminal: Array<{ state: string; error?: string }> = [];
+    assert.equal(
+      f.adapter.startHistoryCatchUp("pty:history-disconnect", {
+        syncId: "sync-disconnect",
+        threadId: "thr_disconnect",
+        cursor: null,
+        onPage: () => {},
+        onTerminal: (result) => terminal.push(result)
+      }),
+      true
+    );
+    assert.ok(
+      await until(500, () =>
+        f.fake.requestLog.some((entry) => entry.method === "thread/turns/list")
+      )
+    );
+
+    await f.fake.stop();
+
+    assert.ok(await until(500, () => terminal.length === 1));
+    assert.equal(terminal[0]?.state, "failed");
+    assert.match(terminal[0]?.error ?? "", /connection lost/i);
+    assert.equal(f.adapter.has("pty:history-disconnect"), true);
+  } finally {
+    await f.close();
+  }
+});
+
 test("startOwned resume adopts the recorded daemon when its runtime fingerprint still matches", async () => {
   const f = await fixture("pxa-fp-match-");
   try {
