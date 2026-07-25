@@ -144,6 +144,22 @@ export class OwnerManager {
     );
   }
 
+  recordSessionExit(
+    sessionId: string,
+    status: "done" | "error"
+  ): OwnerRuntimeRecord | undefined {
+    if (status === "error") return this.interruptSession(sessionId);
+    const runtime = this.tasks.stateDb.ownerRuntimes.findBySession(sessionId);
+    if (!runtime || (runtime.state !== "starting" && runtime.state !== "live")) return undefined;
+    return this.tasks.stateDb.ownerRuntimes.compareAndSwap(
+      runtime.ownerId,
+      runtime.generation,
+      ["starting", "live"],
+      "ended",
+      { metadata: { ...runtime.metadata, endedReason: "provider-session-exited" } }
+    );
+  }
+
   reconcile(liveSessionIds: ReadonlySet<string>, owns: (sessionId: string) => boolean): OwnerRuntimeRecord[] {
     const changed: OwnerRuntimeRecord[] = [];
     for (const runtime of this.tasks.stateDb.ownerRuntimes.active()) {

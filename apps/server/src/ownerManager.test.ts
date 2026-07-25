@@ -78,3 +78,30 @@ test("effective mate model writes require the current provider, thread, session,
     rmSync(home, { recursive: true, force: true });
   }
 });
+
+test("a clean Mate exit ends its generation while a provider failure stays recoverable", () => {
+  const home = mkdtempSync(join(tmpdir(), "perch-owner-exit-"));
+  const tasks = new TaskStore({ PERCH_HOME: home } as NodeJS.ProcessEnv);
+  try {
+    const owners = new OwnerManager(tasks);
+    const clean = owners.beginMateLaunch({
+      command: "claude",
+      agent: "claude",
+      sessionId: "pty:clean"
+    });
+    owners.markLive(clean, "pty:clean");
+    assert.equal(owners.recordSessionExit("pty:clean", "done")?.state, "ended");
+    assert.equal(owners.latestMate()?.metadata?.endedReason, "provider-session-exited");
+
+    const failed = owners.beginMateLaunch({
+      command: "claude",
+      agent: "claude",
+      sessionId: "pty:failed"
+    });
+    owners.markLive(failed, "pty:failed");
+    assert.equal(owners.recordSessionExit("pty:failed", "error")?.state, "recoverable");
+  } finally {
+    tasks.close();
+    rmSync(home, { recursive: true, force: true });
+  }
+});

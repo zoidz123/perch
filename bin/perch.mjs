@@ -894,7 +894,6 @@ async function runConfigCommand(args, options) {
     else console.log(formatConfigValue(entry.storedValue));
     return;
   }
-  entries = { ...entries, ...await roleDiagnosticEntries(config, options) };
   const selected = entries;
   if (parsed.json) {
     console.log(JSON.stringify(selected, null, 2));
@@ -1036,40 +1035,6 @@ function editDistance(left, right) {
     previous.splice(0, previous.length, ...current);
   }
   return previous[right.length];
-}
-
-async function roleDiagnosticEntries(config, options) {
-  let registry;
-  try {
-    registry = await fetchModels(options);
-  } catch (error) {
-    const value = `model registry unavailable: ${error instanceof Error ? error.message : String(error)}`;
-    return Object.fromEntries(["dispatch", "mate"].map((role) => [`${role}.warning`, syntheticConfigEntry(value)]));
-  }
-  const result = {};
-  for (const role of ["dispatch", "mate"]) {
-    const defaults = config[role === "mate" ? "mateDefaults" : "dispatchDefaults"] ?? {};
-    const configuredModel = defaults.model;
-    if (!configuredModel || configuredModel === "auto" || !defaults.agent) continue;
-    if (!modelCandidates(registry, configuredModel, defaults.agent).length) {
-      const otherAgents = [...new Set(modelCandidates(registry, configuredModel).map((candidate) => candidate.agent))];
-      const detail = otherAgents.length ? `; model resolves to ${otherAgents.join(", ")}` : "";
-      result[`${role}.warning`] = syntheticConfigEntry(`invalid ${defaults.agent}/${configuredModel} tuple${detail}`);
-    }
-  }
-  return result;
-}
-
-function syntheticConfigEntry(value) {
-  return {
-    effectiveValue: value,
-    source: "automatic",
-    scope: "global",
-    storedValue: value,
-    defaultValue: null,
-    overriddenBy: null,
-    readOnly: true
-  };
 }
 
 function requireConfigKey(key, entries) {

@@ -285,6 +285,29 @@ test("partial persisted Codex mate defaults read back as the full launch tuple",
   });
 });
 
+test("legacy known cross-provider defaults are repaired with the saved agent authoritative", () => {
+  withHome((home) => {
+    writeFileSync(
+      join(home, "settings.json"),
+      `${JSON.stringify({
+        dispatchDefaults: { agent: "claude", model: "gpt-5.6-sol", effort: "high" },
+        mateDefaults: { agent: "codex", model: "opus", effort: "low" }
+      })}\n`
+    );
+    const settings = new FleetSettings({ PERCH_HOME: home } as NodeJS.ProcessEnv);
+    assert.deepEqual(settings.dispatchDefaults(), { agent: "claude" });
+    assert.deepEqual(settings.mateDefaults(), {
+      agent: "codex",
+      model: MATE_MODEL_AUTO,
+      effort: "low"
+    });
+    assert.deepEqual(JSON.parse(readFileSync(join(home, "settings.json"), "utf8")), {
+      dispatchDefaults: { agent: "claude" },
+      mateDefaults: { agent: "codex", effort: "low" }
+    });
+  });
+});
+
 test("mate defaults: null clears a key; untouched keys survive a partial update", () => {
   withHome((home) => {
     const settings = new FleetSettings({ PERCH_HOME: home } as NodeJS.ProcessEnv);

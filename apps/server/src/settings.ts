@@ -2,7 +2,13 @@ import { chmodSync, existsSync, readFileSync, renameSync, statSync, writeFileSyn
 import { homedir } from "node:os";
 import { join } from "node:path";
 import type { AgentKind, DispatchDefaults, MateDefaults } from "@perch/shared";
-import { DISPATCH_CODEX_FALLBACK, MATE_CODEX_FALLBACK, MATE_MODEL_AUTO } from "./models.js";
+import {
+  collectModels,
+  DISPATCH_CODEX_FALLBACK,
+  MATE_CODEX_FALLBACK,
+  MATE_MODEL_AUTO,
+  modelAgentsForIdentifier
+} from "./models.js";
 
 // Fleet-level user settings, persisted in $PERCH_HOME/settings.json. Same
 // conventions as the other config surfaces: env overrides win over the
@@ -57,6 +63,8 @@ export type SettingsFile = {
   dispatchDefaults?: DispatchDefaults;
   mateDefaults?: MateDefaults;
 };
+
+const STORED_MODEL_REGISTRY = collectModels();
 
 export class FleetSettings {
   private readonly path: string;
@@ -221,30 +229,69 @@ export class FleetSettings {
   }
 
   private load(): SettingsFile {
+    let file: SettingsFile;
+    let mtimeMs: number;
     try {
-      const mtimeMs = statSync(this.path).mtimeMs;
+      mtimeMs = statSync(this.path).mtimeMs;
       if (this.cache && this.cache.mtimeMs === mtimeMs) {
         return this.cache.file;
       }
       const parsed = JSON.parse(readFileSync(this.path, "utf8")) as SettingsFile;
-      const file = parsed && typeof parsed === "object" ? parsed : {};
-      this.cache = { file, mtimeMs };
-      return file;
+      file = parsed && typeof parsed === "object" ? parsed : {};
     } catch {
       return this.cache?.file ?? {};
     }
+    const repaired = repairKnownCrossProviderSettings(file);
+    if (repaired !== file) {
+      this.persist(repaired);
+      return repaired;
+    }
+    this.cache = { file, mtimeMs };
+    return file;
   }
 
   private persist(file: SettingsFile): void {
+    const repaired = repairKnownCrossProviderSettings(file);
     const tmp = `${this.path}.tmp`;
-    writeFileSync(tmp, `${JSON.stringify(file, null, 2)}\n`, { mode: 0o600 });
+    writeFileSync(tmp, `${JSON.stringify(repaired, null, 2)}\n`, { mode: 0o600 });
     chmodSync(tmp, 0o600);
     renameSync(tmp, this.path);
     chmodSync(this.path, 0o600);
     if (existsSync(this.path)) {
-      this.cache = { file, mtimeMs: statSync(this.path).mtimeMs };
+      this.cache = { file: repaired, mtimeMs: statSync(this.path).mtimeMs };
     }
   }
+}
+
+function repairKnownCrossProviderSettings(file: SettingsFile): SettingsFile {
+  const dispatchDefaults = repairKnownCrossProviderDefaults(file.dispatchDefaults);
+  const mateDefaults = repairKnownCrossProviderDefaults(file.mateDefaults);
+  if (dispatchDefaults === file.dispatchDefaults && mateDefaults === file.mateDefaults) return file;
+  return {
+    ...file,
+    ...(dispatchDefaults ? { dispatchDefaults } : {}),
+    ...(mateDefaults ? { mateDefaults } : {})
+  };
+}
+
+function repairKnownCrossProviderDefaults<T extends DispatchDefaults | MateDefaults>(
+  defaults: T | undefined
+): T | undefined {
+  if (!defaults?.agent) return defaults;
+  let repaired: DispatchDefaults | MateDefaults = defaults;
+  if (defaults.agent !== "codex" && defaults.effort !== undefined) {
+    const { effort: _effort, ...withoutEffort } = repaired;
+    repaired = withoutEffort;
+  }
+  const model = defaults.model?.trim();
+  if (model && model.toLowerCase() !== MATE_MODEL_AUTO) {
+    const knownAgents = modelAgentsForIdentifier(STORED_MODEL_REGISTRY, model);
+    if (knownAgents.length > 0 && !knownAgents.includes(defaults.agent)) {
+      const { model: _model, ...withoutModel } = repaired;
+      repaired = withoutModel;
+    }
+  }
+  return repaired === defaults ? defaults : repaired as T;
 }
 
 function compactDefaults(values: Record<string, string | undefined>): Record<string, string> {
