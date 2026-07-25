@@ -250,6 +250,54 @@ test("an anchored gap inserts only missed rows before post-reconnect live output
   store.stop();
 });
 
+test("an anchored gap evicts pre-gap rows from a full timeline", () => {
+  const store = new TimelineStore();
+  const item = (id: string) => ({
+    seq: 0,
+    id,
+    sessionId: "pty:full-gap",
+    kind: "assistant" as const,
+    text: id,
+    at: "2026-07-25T00:00:00.000Z"
+  });
+  for (let index = 0; index < 2_000; index += 1) {
+    store.ingest(item(`before-${index}`));
+  }
+  store.openBackfillGap("pty:full-gap");
+  store.ingest(item("after-1"));
+  store.beginBackfill("pty:full-gap", "sync-full-gap", true);
+
+  assert.deepEqual(
+    store.ingestBackfill("pty:full-gap", "sync-full-gap", [
+      item("before-1999"),
+      item("missed")
+    ]),
+    { accepted: 1, done: true }
+  );
+  store.endBackfill("pty:full-gap", "sync-full-gap", true);
+  store.ingest(item("after-2"));
+
+  const retained = store.fetch("pty:full-gap", 0, 500).items;
+  let afterSeq = retained.at(-1)?.seq ?? 0;
+  while (retained.length < 2_000) {
+    const page = store.fetch("pty:full-gap", afterSeq, 500).items;
+    if (page.length === 0) break;
+    retained.push(...page);
+    afterSeq = page.at(-1)!.seq;
+  }
+  assert.equal(retained.length, 2_000);
+  assert.equal(retained.some((candidate) => candidate.id === "before-0"), false);
+  assert.equal(retained.some((candidate) => candidate.id === "before-1"), false);
+  assert.equal(retained.some((candidate) => candidate.id === "before-2"), false);
+  assert.equal(retained.some((candidate) => candidate.id === "missed"), true);
+  assert.deepEqual(retained.slice(-3).map((candidate) => candidate.id), [
+    "missed",
+    "after-1",
+    "after-2"
+  ]);
+  store.stop();
+});
+
 test("catch-up waits for an unterminated transcript row to finish", async () => {
   const dir = mkdtempSync(join(tmpdir(), "perch-tl-partial-catchup-"));
   const transcript = join(dir, "session.jsonl");

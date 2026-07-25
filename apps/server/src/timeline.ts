@@ -121,10 +121,16 @@ type TimelineBackfillState = {
   floor: number;
   ceiling: number;
   dirty: boolean;
+  stopAtAnchor: boolean;
+  insertedIds: Set<string>;
   anchorIds?: Set<string>;
 };
 
-type TimelineBackfillLane = Omit<TimelineBackfillState, "syncId" | "dirty">;
+type TimelineBackfillLane = {
+  floor: number;
+  ceiling: number;
+  anchorIds?: Set<string>;
+};
 
 // Resolve the origin of a user turn by its text, consuming the matching
 // buffered injection. Undefined means "not positively an agent turn" - the
@@ -245,6 +251,8 @@ export class TimelineStore {
       floor: lane.floor,
       ceiling: lane.ceiling,
       dirty: false,
+      stopAtAnchor,
+      insertedIds: new Set(),
       ...(stopAtAnchor
         ? { anchorIds: lane.anchorIds ?? new Set(this.seenIds.get(sessionId) ?? []) }
         : {})
@@ -288,6 +296,7 @@ export class TimelineStore {
     for (const item of sequenced) {
       this.rememberId(seen, item.id);
       backfillIds.add(item.id);
+      state.insertedIds.add(item.id);
     }
     this.seenIds.set(sessionId, seen);
     this.backfillIds.set(sessionId, backfillIds);
@@ -316,7 +325,14 @@ export class TimelineStore {
       state.dirty = false;
       for (const listener of this.backfillListeners) listener(sessionId, revision);
     }
-    if (complete) this.backfills.delete(sessionId);
+    if (complete) {
+      if (state.stopAtAnchor) {
+        const backfillIds = this.backfillIds.get(sessionId);
+        for (const id of state.insertedIds) backfillIds?.delete(id);
+        if (backfillIds?.size === 0) this.backfillIds.delete(sessionId);
+      }
+      this.backfills.delete(sessionId);
+    }
   }
 
   // Begin (or re-point) tailing a session's transcript. Called when the
@@ -628,12 +644,23 @@ export class TimelineStore {
 
   private trim(sessionId: string, list: TimelineItem[]): void {
     const backfillIds = this.backfillIds.get(sessionId);
+    const backfill = this.backfills.get(sessionId);
     while (list.length > MAX_ITEMS_PER_SESSION) {
-      const backfillIndex = backfillIds
-        ? list.findIndex((item) => backfillIds.has(item.id))
+      const preGapIndex = backfill?.stopAtAnchor
+        ? list.findIndex((item) => item.seq <= backfill.floor)
         : -1;
-      const [removed] = list.splice(backfillIndex >= 0 ? backfillIndex : 0, 1);
-      if (removed) backfillIds?.delete(removed.id);
+      const backfillIndex =
+        preGapIndex < 0 && backfillIds
+          ? list.findIndex((item) => backfillIds.has(item.id))
+          : -1;
+      const [removed] = list.splice(
+        preGapIndex >= 0 ? preGapIndex : backfillIndex >= 0 ? backfillIndex : 0,
+        1
+      );
+      if (removed) {
+        backfillIds?.delete(removed.id);
+        backfill?.insertedIds.delete(removed.id);
+      }
     }
   }
 }

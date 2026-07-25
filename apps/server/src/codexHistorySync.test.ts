@@ -141,6 +141,40 @@ test("a completed sync starts an anchored gap receipt on control reconnect", () 
   rmSync(home, { recursive: true, force: true });
 });
 
+test("a fresh runtime's first control reconnect starts an anchored gap receipt", () => {
+  const home = mkdtempSync(join(tmpdir(), "perch-history-first-gap-"));
+  const db = new StateDb({ PERCH_HOME: home } as NodeJS.ProcessEnv);
+  db.owners.ensure("owner:test", "mate");
+  db.ownerRuntimes.create({
+    ownerId: "owner:test",
+    generation: 0,
+    state: "live",
+    agent: "codex",
+    provider: "codex",
+    providerSessionId: "thread-fresh",
+    ptySessionId: "pty:fresh",
+    cwd: home
+  });
+  const adapter = new HistoryAdapter();
+  const coordinator = new CodexHistorySyncCoordinator(
+    db,
+    adapter as unknown as CodexAppServerAdapter,
+    { retryDelaysMs: [] }
+  );
+
+  const gap = coordinator.resumeForSession("pty:fresh")!;
+
+  assert.equal(gap.attempt, 1);
+  assert.equal(adapter.requests.length, 1);
+  assert.equal(adapter.requests[0]!.request.syncId, gap.id);
+  assert.equal(adapter.requests[0]!.request.stopAtAnchor, true);
+  adapter.requests[0]!.request.onTerminal({ state: "succeeded" });
+
+  coordinator.stop();
+  db.close();
+  rmSync(home, { recursive: true, force: true });
+});
+
 function liveRuntime(): RuntimeRecord {
   return {
     id: "runtime-live",

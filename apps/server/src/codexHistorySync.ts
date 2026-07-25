@@ -118,7 +118,10 @@ export class CodexHistorySyncCoordinator {
         return this.createAndStart(input, "gap");
       }
     }
-    return this.createAndStart(input, "full");
+    return this.createAndStart(
+      input,
+      this.pendingGaps.has(input.perchSessionId) ? "gap" : "full"
+    );
   }
 
   private createAndStart(
