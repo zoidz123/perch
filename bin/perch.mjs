@@ -48,7 +48,7 @@ const AGENTS = {
 // Mirrors MATE_CLAUDE_FALLBACK_MODEL in apps/server/src/models.ts; keep in
 // sync. A fresh Claude mate with no configured model pins this instead of
 // inheriting the Claude CLI's drifting global default.
-const MATE_CLAUDE_FALLBACK_MODEL = "best";
+const MATE_CLAUDE_FALLBACK_MODEL = "fable";
 
 // Mirrors MATE_CODEX_FALLBACK in apps/server/src/models.ts; keep in sync. A
 // fresh Codex mate without an applicable configured model pins this instead

@@ -5,6 +5,7 @@ import type { AgentKind, DispatchDefaults, MateDefaults } from "@perch/shared";
 import {
   collectModels,
   DISPATCH_CODEX_FALLBACK,
+  MATE_CLAUDE_FALLBACK_MODEL,
   MATE_CODEX_FALLBACK,
   MATE_MODEL_AUTO,
   modelAgentsForIdentifier
@@ -103,7 +104,7 @@ export class FleetSettings {
     const sameAgentLayer = !envAgent || envAgent === persisted.agent;
     const model = this.env.PERCH_DEFAULT_MODEL ?? (sameAgentLayer ? persisted.model : undefined);
     const effort = this.env.PERCH_DEFAULT_EFFORT ?? (sameAgentLayer ? persisted.effort : undefined);
-    return completeCodexDefaults("dispatch", {
+    return completeCodexDispatchDefaults({
       ...(agent ? { agent: agent as DispatchDefaults["agent"] } : {}),
       ...(model ? { model } : {}),
       ...(effort ? { effort: effort as DispatchDefaults["effort"] } : {})
@@ -147,7 +148,7 @@ export class FleetSettings {
         next.effort = update.effort as DispatchDefaults["effort"];
       }
     }
-    const completed = completeCodexDefaults("dispatch", next);
+    const completed = completeCodexDispatchDefaults(next);
     next.agent = completed.agent;
     next.model = completed.model;
     next.effort = completed.effort;
@@ -165,7 +166,7 @@ export class FleetSettings {
     const sameAgentLayer = !envAgent || envAgent === persisted.agent;
     const model = this.env.PERCH_MATE_MODEL ?? (sameAgentLayer ? persisted.model : undefined);
     const effort = this.env.PERCH_MATE_EFFORT ?? (sameAgentLayer ? persisted.effort : undefined);
-    return completeCodexDefaults("mate", {
+    return completeMateDefaults({
       ...(agent ? { agent: agent as MateDefaults["agent"] } : {}),
       ...(model ? { model } : {}),
       ...(effort ? { effort: effort as MateDefaults["effort"] } : {})
@@ -218,11 +219,11 @@ export class FleetSettings {
         next.effort = update.effort as MateDefaults["effort"];
       }
     }
-    const completed = completeCodexDefaults("mate", next);
+    assertModelSupported("mate", next, resolveAgents);
+    const completed = completeMateDefaults(next);
     next.agent = completed.agent;
     next.model = completed.model;
     next.effort = completed.effort;
-    assertModelSupported("mate", next, resolveAgents);
     assertEffortSupported("mate", next, resolveEfforts);
     this.persist({ ...this.load(), mateDefaults: next });
     return this.mateDefaults();
@@ -265,7 +266,10 @@ export class FleetSettings {
 
 function repairKnownCrossProviderSettings(file: SettingsFile): SettingsFile {
   const dispatchDefaults = repairKnownCrossProviderDefaults(file.dispatchDefaults);
-  const mateDefaults = repairKnownCrossProviderDefaults(file.mateDefaults);
+  const repairedMateDefaults = repairKnownCrossProviderDefaults(file.mateDefaults);
+  const mateDefaults = repairedMateDefaults?.agent
+    ? completeMateDefaults(repairedMateDefaults)
+    : repairedMateDefaults;
   if (dispatchDefaults === file.dispatchDefaults && mateDefaults === file.mateDefaults) return file;
   return {
     ...file,
@@ -348,19 +352,56 @@ function assertModelSupported(
   );
 }
 
-function completeCodexDefaults(layer: "dispatch", defaults: DispatchDefaults): DispatchDefaults;
-function completeCodexDefaults(layer: "mate", defaults: MateDefaults): MateDefaults;
-function completeCodexDefaults(
-  layer: "dispatch" | "mate",
-  defaults: DispatchDefaults | MateDefaults
-): DispatchDefaults | MateDefaults {
+function completeCodexDispatchDefaults(defaults: DispatchDefaults): DispatchDefaults {
   if (defaults.agent !== "codex") {
     return defaults;
   }
-  const fallback = layer === "mate" ? MATE_CODEX_FALLBACK : DISPATCH_CODEX_FALLBACK;
   return {
     agent: "codex",
-    model: defaults.model ?? (layer === "mate" ? MATE_MODEL_AUTO : fallback.model),
-    effort: defaults.effort ?? fallback.effort
+    model: defaults.model ?? DISPATCH_CODEX_FALLBACK.model,
+    effort: defaults.effort ?? DISPATCH_CODEX_FALLBACK.effort
   };
+}
+
+function completeMateDefaults(defaults: MateDefaults): MateDefaults {
+  if (!defaults.agent) return defaults;
+  const requestedModel = defaults.model?.trim();
+  const knownAgents = requestedModel
+    ? modelAgentsForIdentifier(STORED_MODEL_REGISTRY, requestedModel)
+    : [];
+  const automatic =
+    !requestedModel ||
+    requestedModel.toLowerCase() === MATE_MODEL_AUTO ||
+    (defaults.agent === "claude" && requestedModel.toLowerCase() === "best");
+  const crossedProvider =
+    knownAgents.length > 0 && !knownAgents.includes(defaults.agent);
+  const model =
+    automatic || crossedProvider
+      ? exactMateDefaultModel(defaults.agent)
+      : requestedModel;
+  const completed: MateDefaults =
+    defaults.agent === "codex"
+      ? {
+          agent: "codex",
+          model,
+          effort: defaults.effort ?? MATE_CODEX_FALLBACK.effort
+        }
+      : { agent: "claude", model };
+  if (
+    defaults.agent === completed.agent &&
+    defaults.model === completed.model &&
+    defaults.effort === completed.effort
+  ) {
+    return defaults;
+  }
+  return completed;
+}
+
+function exactMateDefaultModel(agent: AgentKind): string {
+  return (
+    STORED_MODEL_REGISTRY.providers
+      .find((provider) => provider.provider === agent)
+      ?.roleDefaults?.orchestrator?.model ??
+    (agent === "codex" ? MATE_CODEX_FALLBACK.model : MATE_CLAUDE_FALLBACK_MODEL)
+  );
 }

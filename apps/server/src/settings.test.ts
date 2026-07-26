@@ -3,7 +3,7 @@ import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
-import { DISPATCH_CODEX_FALLBACK, MATE_CODEX_FALLBACK, MATE_MODEL_AUTO } from "./models.js";
+import { DISPATCH_CODEX_FALLBACK, MATE_CLAUDE_FALLBACK_MODEL, MATE_CODEX_FALLBACK } from "./models.js";
 import { FleetSettings } from "./settings.js";
 
 function withHome(run: (home: string) => void): void {
@@ -179,7 +179,7 @@ test("switching mate provider clears scoped values unless the same update suppli
     settings.updateMateDefaults({ agent: "claude", model: "opus" }, codexEfforts, modelAgents);
     assert.deepEqual(
       settings.updateMateDefaults({ agent: "codex" }, codexEfforts, modelAgents),
-      { agent: "codex", model: MATE_MODEL_AUTO, effort: MATE_CODEX_FALLBACK.effort }
+      { agent: "codex", model: MATE_CODEX_FALLBACK.model, effort: MATE_CODEX_FALLBACK.effort }
     );
     assert.deepEqual(
       settings.updateMateDefaults(
@@ -195,7 +195,7 @@ test("switching mate provider clears scoped values unless the same update suppli
         codexEfforts,
         modelAgents
       ),
-      { agent: "codex", model: MATE_MODEL_AUTO, effort: MATE_CODEX_FALLBACK.effort }
+      { agent: "codex", model: MATE_CODEX_FALLBACK.model, effort: MATE_CODEX_FALLBACK.effort }
     );
     assert.deepEqual(
       settings.updateMateDefaults(
@@ -255,18 +255,18 @@ test("mate defaults persist to settings.json and round-trip through a fresh inst
     settings.updateMateDefaults({ agent: "codex" });
     assert.deepEqual(settings.mateDefaults(), {
       agent: "codex",
-      model: MATE_MODEL_AUTO,
+      model: MATE_CODEX_FALLBACK.model,
       effort: MATE_CODEX_FALLBACK.effort
     });
     // A fresh instance (new server boot) reads the same file.
     assert.deepEqual(new FleetSettings(env).mateDefaults(), {
       agent: "codex",
-      model: MATE_MODEL_AUTO,
+      model: MATE_CODEX_FALLBACK.model,
       effort: MATE_CODEX_FALLBACK.effort
     });
     const raw = JSON.parse(readFileSync(join(home, "settings.json"), "utf8"));
     assert.equal(raw.mateDefaults.agent, "codex");
-    assert.equal(raw.mateDefaults.model, MATE_MODEL_AUTO);
+    assert.equal(raw.mateDefaults.model, MATE_CODEX_FALLBACK.model);
     assert.equal(raw.mateDefaults.effort, MATE_CODEX_FALLBACK.effort);
     // The two layers are independent.
     assert.deepEqual(settings.dispatchDefaults(), {});
@@ -279,7 +279,7 @@ test("partial persisted Codex mate defaults read back as the full launch tuple",
     const settings = new FleetSettings({ PERCH_HOME: home } as NodeJS.ProcessEnv);
     assert.deepEqual(settings.mateDefaults(), {
       agent: "codex",
-      model: MATE_MODEL_AUTO,
+      model: MATE_CODEX_FALLBACK.model,
       effort: MATE_CODEX_FALLBACK.effort
     });
   });
@@ -298,12 +298,12 @@ test("legacy known cross-provider defaults are repaired with the saved agent aut
     assert.deepEqual(settings.dispatchDefaults(), { agent: "claude" });
     assert.deepEqual(settings.mateDefaults(), {
       agent: "codex",
-      model: MATE_MODEL_AUTO,
+      model: MATE_CODEX_FALLBACK.model,
       effort: "low"
     });
     assert.deepEqual(JSON.parse(readFileSync(join(home, "settings.json"), "utf8")), {
       dispatchDefaults: { agent: "claude" },
-      mateDefaults: { agent: "codex", effort: "low" }
+      mateDefaults: { agent: "codex", model: MATE_CODEX_FALLBACK.model, effort: "low" }
     });
   });
 });
@@ -313,7 +313,11 @@ test("mate defaults: null clears a key; untouched keys survive a partial update"
     const settings = new FleetSettings({ PERCH_HOME: home } as NodeJS.ProcessEnv);
     settings.updateMateDefaults({ agent: "codex", model: "opus", effort: "high" });
     settings.updateMateDefaults({ model: null });
-    assert.deepEqual(settings.mateDefaults(), { agent: "codex", model: MATE_MODEL_AUTO, effort: "high" });
+    assert.deepEqual(settings.mateDefaults(), {
+      agent: "codex",
+      model: MATE_CODEX_FALLBACK.model,
+      effort: "high"
+    });
     settings.updateMateDefaults({ agent: null });
     assert.deepEqual(settings.mateDefaults(), {});
   });
@@ -362,8 +366,41 @@ test("PERCH_MATE_AGENT=codex drops persisted Claude model before completing Code
     settings.updateMateDefaults({ agent: "claude", model: "opus" });
     assert.deepEqual(settings.mateDefaults(), {
       agent: "codex",
-      model: MATE_MODEL_AUTO,
+      model: MATE_CODEX_FALLBACK.model,
       effort: MATE_CODEX_FALLBACK.effort
     });
+  });
+});
+
+test("legacy automatic Mate models persist as exact provider model names", () => {
+  withHome((home) => {
+    writeFileSync(
+      join(home, "settings.json"),
+      `${JSON.stringify({ mateDefaults: { agent: "claude", model: "best" } })}\n`
+    );
+    const claude = new FleetSettings({ PERCH_HOME: home } as NodeJS.ProcessEnv);
+    assert.deepEqual(claude.mateDefaults(), {
+      agent: "claude",
+      model: MATE_CLAUDE_FALLBACK_MODEL
+    });
+    assert.equal(
+      JSON.parse(readFileSync(join(home, "settings.json"), "utf8")).mateDefaults.model,
+      MATE_CLAUDE_FALLBACK_MODEL
+    );
+
+    writeFileSync(
+      join(home, "settings.json"),
+      `${JSON.stringify({ mateDefaults: { agent: "codex", model: "auto", effort: "low" } })}\n`
+    );
+    const codex = new FleetSettings({ PERCH_HOME: home } as NodeJS.ProcessEnv);
+    assert.deepEqual(codex.mateDefaults(), {
+      agent: "codex",
+      model: MATE_CODEX_FALLBACK.model,
+      effort: "low"
+    });
+    assert.equal(
+      JSON.parse(readFileSync(join(home, "settings.json"), "utf8")).mateDefaults.model,
+      MATE_CODEX_FALLBACK.model
+    );
   });
 });
