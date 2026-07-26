@@ -85,7 +85,7 @@ const ptyAdapter = new PtyAgentAdapter(undefined, {
     hooks.unregister(sessionId);
     timeline.detach(sessionId);
     removeAttachments(sessionId);
-    ownerManager.interruptSession(sessionId);
+    ownerManager.recordSessionExit(sessionId, exitContext.status);
     // Process death updates runtime liveness without changing task meaning.
     // Worktree cleanup is task-aware: a task
     // lease stays protected unless the task-layer landed gate authorizes
@@ -334,7 +334,7 @@ codexOwned.wireEvents({
     hooks.unregister(sessionId);
     timeline.detach(sessionId);
     removeAttachments(sessionId);
-    ownerManager.interruptSession(sessionId);
+    ownerManager.recordSessionExit(sessionId, exitContext.status);
     void cleanupSessionExitWorktree(sessionId, exitContext, {
       tasks,
       worktrees,

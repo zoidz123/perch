@@ -417,7 +417,7 @@ test("models lists both agents, marks selected roles, emits JSON, and notes an a
   }
 });
 
-test("config show warns about invalid tuples without synthetic resolved-agent rows", async () => {
+test("config show contains only real configuration rows", async () => {
   const home = mkdtempSync(join(tmpdir(), "perch-config-home-"));
   try {
     await withStubServer(async (serverUrl, state) => {
@@ -425,7 +425,7 @@ test("config show warns about invalid tuples without synthetic resolved-agent ro
       const show = await runConfig(serverUrl, home, ["show", "--global"]);
       assert.equal(show.code, 0, show.stderr);
       assert.doesNotMatch(show.stdout, /resolved-agent/);
-      assert.match(show.stdout, /mate\.warning\s+invalid codex\/fable tuple; model resolves to claude/);
+      assert.doesNotMatch(show.stdout, /mate\.warning/);
       assert.deepEqual(state.patches, []);
     });
   } finally {

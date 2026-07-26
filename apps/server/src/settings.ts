@@ -2,7 +2,14 @@ import { chmodSync, existsSync, readFileSync, renameSync, statSync, writeFileSyn
 import { homedir } from "node:os";
 import { join } from "node:path";
 import type { AgentKind, DispatchDefaults, MateDefaults } from "@perch/shared";
-import { DISPATCH_CODEX_FALLBACK, MATE_CODEX_FALLBACK, MATE_MODEL_AUTO } from "./models.js";
+import {
+  collectModels,
+  DISPATCH_CODEX_FALLBACK,
+  MATE_CLAUDE_FALLBACK_MODEL,
+  MATE_CODEX_FALLBACK,
+  MATE_MODEL_AUTO,
+  modelAgentsForIdentifier
+} from "./models.js";
 
 // Fleet-level user settings, persisted in $PERCH_HOME/settings.json. Same
 // conventions as the other config surfaces: env overrides win over the
@@ -58,6 +65,8 @@ export type SettingsFile = {
   mateDefaults?: MateDefaults;
 };
 
+const STORED_MODEL_REGISTRY = collectModels();
+
 export class FleetSettings {
   private readonly path: string;
   private readonly env: NodeJS.ProcessEnv;
@@ -95,7 +104,7 @@ export class FleetSettings {
     const sameAgentLayer = !envAgent || envAgent === persisted.agent;
     const model = this.env.PERCH_DEFAULT_MODEL ?? (sameAgentLayer ? persisted.model : undefined);
     const effort = this.env.PERCH_DEFAULT_EFFORT ?? (sameAgentLayer ? persisted.effort : undefined);
-    return completeCodexDefaults("dispatch", {
+    return completeCodexDispatchDefaults({
       ...(agent ? { agent: agent as DispatchDefaults["agent"] } : {}),
       ...(model ? { model } : {}),
       ...(effort ? { effort: effort as DispatchDefaults["effort"] } : {})
@@ -139,7 +148,7 @@ export class FleetSettings {
         next.effort = update.effort as DispatchDefaults["effort"];
       }
     }
-    const completed = completeCodexDefaults("dispatch", next);
+    const completed = completeCodexDispatchDefaults(next);
     next.agent = completed.agent;
     next.model = completed.model;
     next.effort = completed.effort;
@@ -157,7 +166,7 @@ export class FleetSettings {
     const sameAgentLayer = !envAgent || envAgent === persisted.agent;
     const model = this.env.PERCH_MATE_MODEL ?? (sameAgentLayer ? persisted.model : undefined);
     const effort = this.env.PERCH_MATE_EFFORT ?? (sameAgentLayer ? persisted.effort : undefined);
-    return completeCodexDefaults("mate", {
+    return completeMateDefaults({
       ...(agent ? { agent: agent as MateDefaults["agent"] } : {}),
       ...(model ? { model } : {}),
       ...(effort ? { effort: effort as MateDefaults["effort"] } : {})
@@ -210,41 +219,83 @@ export class FleetSettings {
         next.effort = update.effort as MateDefaults["effort"];
       }
     }
-    const completed = completeCodexDefaults("mate", next);
+    assertModelSupported("mate", next, resolveAgents);
+    const completed = completeMateDefaults(next);
     next.agent = completed.agent;
     next.model = completed.model;
     next.effort = completed.effort;
-    assertModelSupported("mate", next, resolveAgents);
     assertEffortSupported("mate", next, resolveEfforts);
     this.persist({ ...this.load(), mateDefaults: next });
     return this.mateDefaults();
   }
 
   private load(): SettingsFile {
+    let file: SettingsFile;
+    let mtimeMs: number;
     try {
-      const mtimeMs = statSync(this.path).mtimeMs;
+      mtimeMs = statSync(this.path).mtimeMs;
       if (this.cache && this.cache.mtimeMs === mtimeMs) {
         return this.cache.file;
       }
       const parsed = JSON.parse(readFileSync(this.path, "utf8")) as SettingsFile;
-      const file = parsed && typeof parsed === "object" ? parsed : {};
-      this.cache = { file, mtimeMs };
-      return file;
+      file = parsed && typeof parsed === "object" ? parsed : {};
     } catch {
       return this.cache?.file ?? {};
     }
+    const repaired = repairKnownCrossProviderSettings(file);
+    if (repaired !== file) {
+      this.persist(repaired);
+      return repaired;
+    }
+    this.cache = { file, mtimeMs };
+    return file;
   }
 
   private persist(file: SettingsFile): void {
+    const repaired = repairKnownCrossProviderSettings(file);
     const tmp = `${this.path}.tmp`;
-    writeFileSync(tmp, `${JSON.stringify(file, null, 2)}\n`, { mode: 0o600 });
+    writeFileSync(tmp, `${JSON.stringify(repaired, null, 2)}\n`, { mode: 0o600 });
     chmodSync(tmp, 0o600);
     renameSync(tmp, this.path);
     chmodSync(this.path, 0o600);
     if (existsSync(this.path)) {
-      this.cache = { file, mtimeMs: statSync(this.path).mtimeMs };
+      this.cache = { file: repaired, mtimeMs: statSync(this.path).mtimeMs };
     }
   }
+}
+
+function repairKnownCrossProviderSettings(file: SettingsFile): SettingsFile {
+  const dispatchDefaults = repairKnownCrossProviderDefaults(file.dispatchDefaults);
+  const repairedMateDefaults = repairKnownCrossProviderDefaults(file.mateDefaults);
+  const mateDefaults = repairedMateDefaults?.agent
+    ? completeMateDefaults(repairedMateDefaults)
+    : repairedMateDefaults;
+  if (dispatchDefaults === file.dispatchDefaults && mateDefaults === file.mateDefaults) return file;
+  return {
+    ...file,
+    ...(dispatchDefaults ? { dispatchDefaults } : {}),
+    ...(mateDefaults ? { mateDefaults } : {})
+  };
+}
+
+function repairKnownCrossProviderDefaults<T extends DispatchDefaults | MateDefaults>(
+  defaults: T | undefined
+): T | undefined {
+  if (!defaults?.agent) return defaults;
+  let repaired: DispatchDefaults | MateDefaults = defaults;
+  if (defaults.agent !== "codex" && defaults.effort !== undefined) {
+    const { effort: _effort, ...withoutEffort } = repaired;
+    repaired = withoutEffort;
+  }
+  const model = defaults.model?.trim();
+  if (model && model.toLowerCase() !== MATE_MODEL_AUTO) {
+    const knownAgents = modelAgentsForIdentifier(STORED_MODEL_REGISTRY, model);
+    if (knownAgents.length > 0 && !knownAgents.includes(defaults.agent)) {
+      const { model: _model, ...withoutModel } = repaired;
+      repaired = withoutModel;
+    }
+  }
+  return repaired === defaults ? defaults : repaired as T;
 }
 
 function compactDefaults(values: Record<string, string | undefined>): Record<string, string> {
@@ -301,19 +352,56 @@ function assertModelSupported(
   );
 }
 
-function completeCodexDefaults(layer: "dispatch", defaults: DispatchDefaults): DispatchDefaults;
-function completeCodexDefaults(layer: "mate", defaults: MateDefaults): MateDefaults;
-function completeCodexDefaults(
-  layer: "dispatch" | "mate",
-  defaults: DispatchDefaults | MateDefaults
-): DispatchDefaults | MateDefaults {
+function completeCodexDispatchDefaults(defaults: DispatchDefaults): DispatchDefaults {
   if (defaults.agent !== "codex") {
     return defaults;
   }
-  const fallback = layer === "mate" ? MATE_CODEX_FALLBACK : DISPATCH_CODEX_FALLBACK;
   return {
     agent: "codex",
-    model: defaults.model ?? (layer === "mate" ? MATE_MODEL_AUTO : fallback.model),
-    effort: defaults.effort ?? fallback.effort
+    model: defaults.model ?? DISPATCH_CODEX_FALLBACK.model,
+    effort: defaults.effort ?? DISPATCH_CODEX_FALLBACK.effort
   };
+}
+
+function completeMateDefaults(defaults: MateDefaults): MateDefaults {
+  if (!defaults.agent) return defaults;
+  const requestedModel = defaults.model?.trim();
+  const knownAgents = requestedModel
+    ? modelAgentsForIdentifier(STORED_MODEL_REGISTRY, requestedModel)
+    : [];
+  const automatic =
+    !requestedModel ||
+    requestedModel.toLowerCase() === MATE_MODEL_AUTO ||
+    (defaults.agent === "claude" && requestedModel.toLowerCase() === "best");
+  const crossedProvider =
+    knownAgents.length > 0 && !knownAgents.includes(defaults.agent);
+  const model =
+    automatic || crossedProvider
+      ? exactMateDefaultModel(defaults.agent)
+      : requestedModel;
+  const completed: MateDefaults =
+    defaults.agent === "codex"
+      ? {
+          agent: "codex",
+          model,
+          effort: defaults.effort ?? MATE_CODEX_FALLBACK.effort
+        }
+      : { agent: "claude", model };
+  if (
+    defaults.agent === completed.agent &&
+    defaults.model === completed.model &&
+    defaults.effort === completed.effort
+  ) {
+    return defaults;
+  }
+  return completed;
+}
+
+function exactMateDefaultModel(agent: AgentKind): string {
+  return (
+    STORED_MODEL_REGISTRY.providers
+      .find((provider) => provider.provider === agent)
+      ?.roleDefaults?.orchestrator?.model ??
+    (agent === "codex" ? MATE_CODEX_FALLBACK.model : MATE_CLAUDE_FALLBACK_MODEL)
+  );
 }

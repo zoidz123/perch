@@ -580,7 +580,7 @@ test("GET /sessions fills missing Claude mate model with a friendly label and no
     const mate = body.sessions.find((session) => session.labels?.role === "mate");
     assert.equal(mate?.model, MATE_CLAUDE_FALLBACK_MODEL);
     // The internal `best` alias maps to its catalog label, never the raw id.
-    assert.equal(mate?.modelLabel, "Best available");
+    assert.equal(mate?.modelLabel, "Fable 5");
     assert.equal(mate?.effort, undefined);
   } finally {
     timeline.stop();

@@ -94,7 +94,7 @@ test("claude CLI /model output supplies the live runtime catalog", () => {
   // The live `fable` alias now carries its versioned label, not "Fable".
   assert.equal(claude.options.find((o) => o.id === "fable")?.label, "Fable 5");
   assert.equal(claude.options.find((o) => o.id === "nebula")?.label, "Nebula");
-  assert.equal(claude.roleDefaults?.orchestrator?.model, "best");
+  assert.equal(claude.roleDefaults?.orchestrator?.model, "fable");
   assert.equal(claude.roleDefaults?.crew?.model, "opus");
 });
 
@@ -149,10 +149,10 @@ test("CLI model registry uses bundled Claude rows and live Codex without Claude 
   assert.deepEqual(registry.sources?.map((source) => source.name), ["codex-app-server", "claude-bundled"]);
 });
 
-test("mate fallback uses Claude's frontier-tracking best alias (bin/perch.mjs mirrors it)", () => {
+test("mate fallback uses Claude's exact frontier model name (bin/perch.mjs mirrors it)", () => {
   // The literal matters: bin/perch.mjs carries a mirrored copy that cannot
   // import this constant, so a catalog reorder must update both.
-  assert.equal(MATE_CLAUDE_FALLBACK_MODEL, "best");
+  assert.equal(MATE_CLAUDE_FALLBACK_MODEL, "fable");
 });
 
 test("codex options carry versioned names + grounded descriptions (no fabricated context)", () => {
@@ -589,8 +589,8 @@ test("only the hardcoded visible trio is selectable; hidden entries keep resolvi
     claude.options.filter((o) => o.hidden !== true).map((o) => o.id),
     ["fable", "opus", "sonnet"]
   );
-  // Internal role defaults still resolve through the hidden `best` alias.
-  assert.equal(claude.roleDefaults?.orchestrator?.model, "best");
+  // Internal role defaults resolve to the exact visible frontier model.
+  assert.equal(claude.roleDefaults?.orchestrator?.model, "fable");
 
   // Static Claude fallback: haiku stays resolvable but hidden.
   const fallbackClaude = providerOf(collectModels(baseDeps), "claude");

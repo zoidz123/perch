@@ -124,9 +124,10 @@ const CLAUDE_BUNDLED_MODELS: ModelCatalogEntry[] = Object.entries(CLAUDE_ALIAS_C
 // (~/.claude/settings.json `model`): the CLI's /model command saves any
 // per-session switch as that global default, so one session switched to a
 // cheap model would silently downgrade the next fresh mate. Pinned to the
-// catalog's top-tier entry so the catalog stays the one source of truth.
+// catalog's concrete top-tier entry so settings and launches always name the
+// exact model instead of a moving meta-alias.
 // Mirrored in bin/perch.mjs (MATE_CLAUDE_FALLBACK_MODEL); keep them in sync.
-export const MATE_CLAUDE_FALLBACK_MODEL = "best";
+export const MATE_CLAUDE_FALLBACK_MODEL = "fable";
 
 // Codex reasoning-effort ladders. Reasoning efforts are PER-MODEL, not a shared
 // constant: newer models raise the ceiling. These arrays are ONLY the offline
@@ -607,7 +608,7 @@ function codexCatalogFromModelList(
 // highest-capability entry first and its worker entry is Opus.
 function roleDefaultsFor(agent: AgentKind, options: ModelCatalogEntry[]): Partial<Record<"orchestrator" | "crew", PerchModelRoleDefault>> {
   if (agent === "claude") {
-    const orchestrator = options.find((option) => option.id === "best") ?? options.find((option) => option.id === "fable") ?? options[0];
+    const orchestrator = options.find((option) => option.id === MATE_CLAUDE_FALLBACK_MODEL) ?? options[0];
     const crew = options.find((option) => option.id === "opus") ?? options[0];
     return {
       ...(orchestrator ? { orchestrator: { model: orchestrator.runtimeId ?? orchestrator.id } } : {}),
