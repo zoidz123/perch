@@ -10,7 +10,8 @@ const execFileAsync = promisify(execFile);
 // (or the task closes). Emits
 // checks_green when the status rollup goes green, merge_ready when GitHub says
 // the PR is policy-ready to merge, and merged when the PR lands. gh handles
-// auth; failures are silent and retried next tick (offline is normal).
+// auth; failures are non-fatal, clear volatile readiness, and retry next tick
+// (offline is normal).
 //
 // Cadence is adaptive (G5): 5 min is the resting baseline, but a PR that is
 // "expecting change" - just attached, checks unsettled, or a sibling PR in the
@@ -341,10 +342,24 @@ export class PrPoller {
         task = this.bootstrapAwaitingMerge(current);
         if (view) {
           this.apply(task, view, expectedRepo);
+        } else {
+          this.clearUnavailableReadiness(task);
         }
       }
     } finally {
       this.inFlight = false;
+    }
+  }
+
+  private clearUnavailableReadiness(task: Task): void {
+    const pr: TaskPr = { ...task.pr! };
+    const changed =
+      pr.checks !== undefined || pr.checkDetails !== undefined || pr.mergeReady !== false;
+    delete pr.checks;
+    delete pr.checkDetails;
+    pr.mergeReady = false;
+    if (changed) {
+      this.tasks.update(task.id, { pr });
     }
   }
 
@@ -444,14 +459,22 @@ export class PrPoller {
       changed = true;
     }
     const checks = rollupState(view.statusCheckRollup);
-    if (checks && checks !== pr.checks) {
-      pr.checks = checks;
+    if (checks !== pr.checks) {
+      if (checks) {
+        pr.checks = checks;
+      } else {
+        delete pr.checks;
+      }
       changed = true;
       checksTurnedGreen = checks === "passing";
     }
     const checkDetails = rollupDetails(view.statusCheckRollup);
-    if (checkDetails && !sameCheckDetails(checkDetails, pr.checkDetails)) {
-      pr.checkDetails = checkDetails;
+    if (!sameCheckDetails(checkDetails, pr.checkDetails)) {
+      if (checkDetails) {
+        pr.checkDetails = checkDetails;
+      } else {
+        delete pr.checkDetails;
+      }
       changed = true;
     }
     // Record the head only once identity holds, so an unvalidated head can
@@ -559,9 +582,10 @@ function shouldDiscover(task: Task): boolean {
 function rollupState(
   rollup: GhPrView["statusCheckRollup"]
 ): TaskPr["checks"] | undefined {
-  if (!rollup || rollup.length === 0) {
+  if (!rollup) {
     return undefined;
   }
+  if (rollup.length === 0) return "passing";
   const states = rollup.map(checkState);
   if (states.some((state) => state === "failing")) {
     return "failing";
@@ -600,8 +624,8 @@ function checkState(check: NonNullable<GhPrView["statusCheckRollup"]>[number]): 
   return value ? "unknown" : "pending";
 }
 
-function sameCheckDetails(a: TaskPrCheck[], b: TaskPrCheck[] | undefined): boolean {
-  return JSON.stringify(a) === JSON.stringify(b ?? []);
+function sameCheckDetails(a: TaskPrCheck[] | undefined, b: TaskPrCheck[] | undefined): boolean {
+  return JSON.stringify(a) === JSON.stringify(b);
 }
 
 function prPolicyFields(view: GhPrView): Partial<TaskPr> {

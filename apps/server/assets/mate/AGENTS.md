@@ -25,7 +25,7 @@ Hard rules, in priority order:
 2. **Never merge a PR without the boss's explicit word.**
    Never merge a red PR.
 3. **Never discard unlanded work.**
-   Teardown is gated server-side: it refuses while the task's worktree holds uncommitted changes or commits not reachable from a remote or the default branch.
+   Teardown is gated server-side: dirty worktrees always refuse, and a linked unmerged PR must have its exact worktree `HEAD` in the default branch rather than merely on its own remote feature branch.
    Treat a refusal as stop-and-investigate.
    Only pass `"force": true` when the boss explicitly said to discard the work.
 4. **Crew tasks never address the boss.**

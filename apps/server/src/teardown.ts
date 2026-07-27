@@ -74,6 +74,29 @@ export async function landedGate(
     // pool release path's fetch-only behavior: local branches are untouched,
     // and an unavailable remote degrades to the last-known tracking ref.
     const defaultBranch = await fetchDefaultBranch(path);
+    // A linked, unmerged PR is still active work. Its head will normally be
+    // reachable from its own remote feature branch, which proves backup but
+    // not landing. Only the default branch (or an authoritative merged PR
+    // observation above) can close linked PR work.
+    const remoteDefaultRef = defaultBranch.base ?? (await defaultRef(path));
+    if (task.pr) {
+      if (remoteDefaultRef) {
+        try {
+          await git(path, ["merge-base", "--is-ancestor", "HEAD", remoteDefaultRef]);
+          return {
+            landed: true,
+            reason: `HEAD is contained in ${remoteDefaultRef}`,
+            defaultBranch
+          };
+        } catch {
+          // Not landed on the default branch.
+        }
+      }
+      return {
+        landed: false,
+        reason: `linked PR is not merged and HEAD is not contained in the default branch: ${task.pr.url}`
+      };
+    }
     // HEAD reachable from any remote ref: pushed, safe.
     const { stdout: remotes } = await git(path, ["branch", "-r", "--contains", "HEAD"]);
     if (remotes.trim().length > 0) {
@@ -86,7 +109,7 @@ export async function landedGate(
     // HEAD an ancestor of the default branch: landed locally. origin/HEAD
     // when a remote exists, the project root's HEAD otherwise (plain local
     // repos are first-class, matching the pool's own base rule).
-    const base = defaultBranch.base ?? (await defaultRef(path)) ?? (await headCommit(task.project));
+    const base = remoteDefaultRef ?? (await headCommit(task.project));
     if (base) {
       try {
         await git(path, ["merge-base", "--is-ancestor", "HEAD", base]);
