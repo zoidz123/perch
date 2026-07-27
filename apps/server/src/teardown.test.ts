@@ -381,6 +381,68 @@ test("gate refuses committed-but-unlanded work with no merged PR", async () => {
   h.cleanup();
 });
 
+test("gate refuses an open linked PR whose HEAD is only on its remote feature branch", async () => {
+  const { base, clone } = makeRemoteFixture();
+  const home = mkdtempSync(join(tmpdir(), "perch-td-home-"));
+  const tasks = new TaskStore({ PERCH_HOME: home } as NodeJS.ProcessEnv);
+  const task = tasks.create({ title: "ready but unmerged", project: clone });
+  tasks.recordEvent(task.id, { kind: "working", source: "worker" });
+  tasks.recordEvent(task.id, { kind: "done", source: "worker" });
+
+  inSlot(clone, ["checkout", "-q", "-b", "perch/ready"]);
+  writeFileSync(join(clone, "ready.txt"), "ready to merge\n");
+  inSlot(clone, ["add", "."]);
+  inSlot(clone, ["commit", "-qm", "ready work"]);
+  inSlot(clone, ["push", "-q", "-u", "origin", "perch/ready"]);
+  tasks.update(task.id, {
+    branch: "perch/ready",
+    pr: {
+      url: "https://github.com/o/r/pull/40",
+      repo: "o/r",
+      headRepo: "o/r",
+      head: "perch/ready",
+      mergeReady: true
+    }
+  });
+
+  const verdict = await landedGate(tasks.find(task.id)!, clone);
+  assert.equal(verdict.landed, false);
+  assert.match(verdict.reason, /linked PR is not merged/);
+
+  rmSync(home, { recursive: true, force: true });
+  rmSync(base, { recursive: true, force: true });
+});
+
+test("gate accepts linked PR work already contained in the default branch", async () => {
+  const { base, clone } = makeRemoteFixture();
+  const home = mkdtempSync(join(tmpdir(), "perch-td-home-"));
+  const tasks = new TaskStore({ PERCH_HOME: home } as NodeJS.ProcessEnv);
+  const task = tasks.create({ title: "landed before PR observation", project: clone });
+  tasks.recordEvent(task.id, { kind: "working", source: "worker" });
+  tasks.recordEvent(task.id, { kind: "done", source: "worker" });
+
+  writeFileSync(join(clone, "landed-linked.txt"), "landed\n");
+  inSlot(clone, ["add", "."]);
+  inSlot(clone, ["commit", "-qm", "landed linked work"]);
+  inSlot(clone, ["push", "-q", "origin", "HEAD:main"]);
+  tasks.update(task.id, {
+    branch: "perch/landed-linked",
+    pr: {
+      url: "https://github.com/o/r/pull/41",
+      repo: "o/r",
+      headRepo: "o/r",
+      head: "perch/landed-linked"
+    }
+  });
+
+  const verdict = await landedGate(tasks.find(task.id)!, clone);
+  assert.equal(verdict.landed, true);
+  assert.match(verdict.reason, /origin\/main/);
+
+  rmSync(home, { recursive: true, force: true });
+  rmSync(base, { recursive: true, force: true });
+});
+
 test("gate resolves and fetches origin/main without a local origin/HEAD", async () => {
   const { base, seed, clone } = makeRemoteFixture();
   const home = mkdtempSync(join(tmpdir(), "perch-td-home-"));

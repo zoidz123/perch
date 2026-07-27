@@ -310,6 +310,141 @@ test("merge readiness turns true and emits merge_ready for a green ready PR", as
   rmSync(home, { recursive: true, force: true });
 });
 
+test("explicit zero checks and exact-head acceptance derive Ready to merge", async () => {
+  const home = mkdtempSync(join(tmpdir(), "perch-poller-"));
+  const tasks = new TaskStore({ PERCH_HOME: home } as NodeJS.ProcessEnv);
+  const task = tasks.create({ title: "zero-check ready pr", project: "/tmp/repo" });
+  tasks.recordEvent(task.id, { kind: "working", source: "worker" });
+  tasks.update(task.id, {
+    branch: "perch/zero-check-ready",
+    pr: {
+      url: "https://github.com/o/r/pull/28",
+      repo: "o/r",
+      headRepo: "o/r",
+      head: "perch/zero-check-ready",
+      headOid: "head-a"
+    }
+  });
+  tasks.recordEvent(task.id, {
+    kind: "completion_requested",
+    source: "worker",
+    data: { deliverable: { kind: "pr", headOid: "head-a" } }
+  });
+  const requestSeq = tasks.events(task.id).at(-1)!.seq;
+  tasks.recordEvent(task.id, {
+    kind: "completion_accepted",
+    source: "system",
+    data: { completionDecision: { requestSeq } }
+  });
+
+  const poller = new PrPoller(
+    tasks,
+    async () =>
+      view({
+        headRefName: "perch/zero-check-ready",
+        headRefOid: "head-a",
+        statusCheckRollup: [],
+        isDraft: false,
+        mergeable: "MERGEABLE",
+        mergeStateStatus: "CLEAN"
+      }),
+    { resolveLocalRepo: async () => "o/r" }
+  );
+
+  await poller.tick();
+  const updated = tasks.find(task.id);
+  assert.equal(updated?.pr?.checks, "passing");
+  assert.deepEqual(updated?.pr?.checkDetails, []);
+  assert.equal(updated?.pr?.mergeReady, true);
+  assert.equal(updated?.presentation?.state, "ready_to_merge");
+
+  rmSync(home, { recursive: true, force: true });
+});
+
+test("absent check rollup clears historical readiness and remains unknown", async () => {
+  const home = mkdtempSync(join(tmpdir(), "perch-poller-"));
+  const tasks = new TaskStore({ PERCH_HOME: home } as NodeJS.ProcessEnv);
+  const task = tasks.create({ title: "unknown checks", project: "/tmp/repo" });
+  tasks.recordEvent(task.id, { kind: "working", source: "worker" });
+  tasks.update(task.id, {
+    branch: "perch/unknown-checks",
+    pr: {
+      url: "https://github.com/o/r/pull/29",
+      repo: "o/r",
+      headRepo: "o/r",
+      head: "perch/unknown-checks",
+      headOid: "head-a",
+      checks: "passing",
+      checkDetails: [{ name: "ci", state: "passing" }],
+      mergeReady: true
+    }
+  });
+  tasks.recordEvent(task.id, {
+    kind: "completion_requested",
+    source: "worker",
+    data: { deliverable: { kind: "pr", headOid: "head-a" } }
+  });
+  const requestSeq = tasks.events(task.id).at(-1)!.seq;
+  tasks.recordEvent(task.id, {
+    kind: "completion_accepted",
+    source: "system",
+    data: { completionDecision: { requestSeq } }
+  });
+
+  const poller = new PrPoller(
+    tasks,
+    async () =>
+      view({
+        headRefName: "perch/unknown-checks",
+        headRefOid: "head-a",
+        isDraft: false,
+        mergeable: "MERGEABLE",
+        mergeStateStatus: "CLEAN"
+      }),
+    { resolveLocalRepo: async () => "o/r" }
+  );
+
+  await poller.tick();
+  const updated = tasks.find(task.id);
+  assert.equal(updated?.pr?.checks, undefined);
+  assert.equal(updated?.pr?.checkDetails, undefined);
+  assert.equal(updated?.pr?.mergeReady, false);
+  assert.equal(updated?.presentation?.state, "working");
+
+  rmSync(home, { recursive: true, force: true });
+});
+
+test("merge readiness stays false for a conflicting PR", async () => {
+  const home = mkdtempSync(join(tmpdir(), "perch-poller-"));
+  const tasks = new TaskStore({ PERCH_HOME: home } as NodeJS.ProcessEnv);
+  const task = tasks.create({ title: "conflicting pr", project: "/tmp/repo" });
+  tasks.recordEvent(task.id, { kind: "working", source: "worker" });
+  tasks.recordEvent(task.id, { kind: "done", source: "worker" });
+  tasks.update(task.id, {
+    branch: "perch/conflicting-pr",
+    pr: { url: "https://github.com/o/r/pull/30" }
+  });
+
+  const poller = new PrPoller(
+    tasks,
+    async () =>
+      view({
+        headRefName: "perch/conflicting-pr",
+        statusCheckRollup: [{ conclusion: "SUCCESS" }],
+        isDraft: false,
+        mergeable: "CONFLICTING",
+        mergeStateStatus: "DIRTY"
+      }),
+    { resolveLocalRepo: async () => "o/r" }
+  );
+
+  await poller.tick();
+  assert.equal(tasks.find(task.id)?.pr?.mergeReady, false);
+  assert.equal(tasks.find(task.id)?.presentation?.state, "working");
+
+  rmSync(home, { recursive: true, force: true });
+});
+
 test("gh failures are silent and non-fatal", async () => {
   const home = mkdtempSync(join(tmpdir(), "perch-poller-"));
   const tasks = new TaskStore({ PERCH_HOME: home } as NodeJS.ProcessEnv);
