@@ -53,6 +53,9 @@ SQLite records every task change and the state of each worker.
 The Task API carries structured updates between Mate and workers, and a worker's completion request becomes done only after Mate verifies and accepts it.
 Every task has an explicit owner, which makes coordination more predictable even though agent execution is not deterministic.
 
+Perch was inspired by [Kun Chen's FirstMate](https://github.com/kunchenguid/firstmate) and its first-mate-and-crew model for coordinating isolated coding agents.
+Perch is a distinct Mac-hosted durable control plane with an iPhone client.
+
 The server starts Mate in a dedicated home and dispatches project work to workers. A pool leases each parallel task an isolated Git worktree and returns it only after the report is delivered or the code is safely landed. This reduces overlapping edits and keeps the orchestrator coordinating instead of becoming another uncontrolled coding worker.
 
 On a trusted LAN, the iPhone connects directly to the authenticated Mac server; off-LAN, the phone and Mac connect outbound through a stateless, content-blind relay with end-to-end encrypted application content, although the relay can observe connection metadata. See [Architecture](docs/architecture.md) and [Security](docs/security.md) for the exact system and trust boundaries.
