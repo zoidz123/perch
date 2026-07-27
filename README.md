@@ -54,7 +54,7 @@ The Task API carries structured updates between Mate and workers, and a worker's
 Every task has an explicit owner, which makes coordination more predictable even though agent execution is not deterministic.
 
 Perch was inspired by [Kun Chen's FirstMate](https://github.com/kunchenguid/firstmate) and its first-mate-and-crew model for coordinating isolated coding agents.
-Perch is a distinct Mac-hosted durable control plane with an iPhone client.
+Perch is a distinct Mac-hosted durable control plane with an iPhone client, designed to make long-running multi-agent work easier to resume and verify: FirstMate coordinates agents through visible terminal and harness backends, while Perch's local server owns provider sessions and durable task state.
 
 The server starts Mate in a dedicated home and dispatches project work to workers. A pool leases each parallel task an isolated Git worktree and returns it only after the report is delivered or the code is safely landed. This reduces overlapping edits and keeps the orchestrator coordinating instead of becoming another uncontrolled coding worker.
 
