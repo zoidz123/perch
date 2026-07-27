@@ -78,12 +78,16 @@ export async function landedGate(
     // reachable from its own remote feature branch, which proves backup but
     // not landing. Only the default branch (or an authoritative merged PR
     // observation above) can close linked PR work.
-    const base = defaultBranch.base ?? (await defaultRef(path)) ?? (await headCommit(task.project));
+    const remoteDefaultRef = defaultBranch.base ?? (await defaultRef(path));
     if (task.pr) {
-      if (base) {
+      if (remoteDefaultRef) {
         try {
-          await git(path, ["merge-base", "--is-ancestor", "HEAD", base]);
-          return { landed: true, reason: `HEAD is contained in ${base}`, defaultBranch };
+          await git(path, ["merge-base", "--is-ancestor", "HEAD", remoteDefaultRef]);
+          return {
+            landed: true,
+            reason: `HEAD is contained in ${remoteDefaultRef}`,
+            defaultBranch
+          };
         } catch {
           // Not landed on the default branch.
         }
@@ -105,6 +109,7 @@ export async function landedGate(
     // HEAD an ancestor of the default branch: landed locally. origin/HEAD
     // when a remote exists, the project root's HEAD otherwise (plain local
     // repos are first-class, matching the pool's own base rule).
+    const base = remoteDefaultRef ?? (await headCommit(task.project));
     if (base) {
       try {
         await git(path, ["merge-base", "--is-ancestor", "HEAD", base]);

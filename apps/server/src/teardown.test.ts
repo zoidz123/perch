@@ -413,6 +413,34 @@ test("gate refuses an open linked PR whose HEAD is only on its remote feature br
   rmSync(base, { recursive: true, force: true });
 });
 
+test("gate refuses an open linked PR when no remote default branch can be resolved", async () => {
+  const h = harness();
+  const task = h.tasks.create({ title: "linked without default branch", project: h.repo });
+  h.tasks.recordEvent(task.id, { kind: "working", source: "worker" });
+  h.tasks.recordEvent(task.id, { kind: "done", source: "worker" });
+
+  const sessionId = "pty:no-default";
+  const lease = await h.pool.acquire(h.repo, sessionId);
+  h.tasks.update(task.id, {
+    sessionId,
+    worktreeId: lease.id,
+    branch: "perch/no-default",
+    pr: {
+      url: "https://github.com/o/r/pull/42",
+      repo: "o/r",
+      headRepo: "o/r",
+      head: "perch/no-default"
+    }
+  });
+
+  const verdict = await landedGate(h.tasks.find(task.id)!, lease.path);
+  assert.equal(verdict.landed, false);
+  assert.match(verdict.reason, /linked PR is not merged/);
+  assert.equal(h.pool.find(lease.id)?.leasedBy, sessionId);
+
+  h.cleanup();
+});
+
 test("gate accepts linked PR work already contained in the default branch", async () => {
   const { base, clone } = makeRemoteFixture();
   const home = mkdtempSync(join(tmpdir(), "perch-td-home-"));
