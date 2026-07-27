@@ -341,10 +341,24 @@ export class PrPoller {
         task = this.bootstrapAwaitingMerge(current);
         if (view) {
           this.apply(task, view, expectedRepo);
+        } else {
+          this.clearUnavailableReadiness(task);
         }
       }
     } finally {
       this.inFlight = false;
+    }
+  }
+
+  private clearUnavailableReadiness(task: Task): void {
+    const pr: TaskPr = { ...task.pr! };
+    const changed =
+      pr.checks !== undefined || pr.checkDetails !== undefined || pr.mergeReady !== false;
+    delete pr.checks;
+    delete pr.checkDetails;
+    pr.mergeReady = false;
+    if (changed) {
+      this.tasks.update(task.id, { pr });
     }
   }
 

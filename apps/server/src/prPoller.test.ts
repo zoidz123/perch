@@ -414,6 +414,54 @@ test("absent check rollup clears historical readiness and remains unknown", asyn
   rmSync(home, { recursive: true, force: true });
 });
 
+test("unavailable PR view clears historical readiness and remains unknown", async () => {
+  const home = mkdtempSync(join(tmpdir(), "perch-poller-"));
+  const tasks = new TaskStore({ PERCH_HOME: home } as NodeJS.ProcessEnv);
+  const task = tasks.create({ title: "unavailable checks", project: "/tmp/repo" });
+  tasks.recordEvent(task.id, { kind: "working", source: "worker" });
+  tasks.update(task.id, {
+    branch: "perch/unavailable-checks",
+    pr: {
+      url: "https://github.com/o/r/pull/30",
+      repo: "o/r",
+      headRepo: "o/r",
+      head: "perch/unavailable-checks",
+      headOid: "head-a",
+      checks: "passing",
+      checkDetails: [{ name: "ci", state: "passing" }],
+      mergeReady: true,
+      isDraft: false,
+      mergeable: "MERGEABLE",
+      mergeStateStatus: "CLEAN"
+    }
+  });
+  tasks.recordEvent(task.id, {
+    kind: "completion_requested",
+    source: "worker",
+    data: { deliverable: { kind: "pr", headOid: "head-a" } }
+  });
+  const requestSeq = tasks.events(task.id).at(-1)!.seq;
+  tasks.recordEvent(task.id, {
+    kind: "completion_accepted",
+    source: "system",
+    data: { completionDecision: { requestSeq } }
+  });
+
+  const poller = new PrPoller(tasks, async () => undefined, {
+    resolveLocalRepo: async () => "o/r"
+  });
+
+  assert.equal(tasks.find(task.id)?.presentation?.state, "ready_to_merge");
+  await poller.tick();
+  const updated = tasks.find(task.id);
+  assert.equal(updated?.pr?.checks, undefined);
+  assert.equal(updated?.pr?.checkDetails, undefined);
+  assert.equal(updated?.pr?.mergeReady, false);
+  assert.equal(updated?.presentation?.state, "working");
+
+  rmSync(home, { recursive: true, force: true });
+});
+
 test("merge readiness stays false for a conflicting PR", async () => {
   const home = mkdtempSync(join(tmpdir(), "perch-poller-"));
   const tasks = new TaskStore({ PERCH_HOME: home } as NodeJS.ProcessEnv);
