@@ -214,6 +214,7 @@ test("release remains pending until the exact owned daemon exits", async () => {
 test("release escalates a hung exact owned daemon from SIGTERM to SIGKILL", async () => {
   const home = mkdtempSync(join(tmpdir(), "perch-daemon-exit-escalation-"));
   const signals: Array<NodeJS.Signals | undefined> = [];
+  const logs: string[] = [];
   let resolveExit!: () => void;
   const exited = new Promise<void>((resolve) => {
     resolveExit = resolve;
@@ -230,7 +231,8 @@ test("release escalates a hung exact owned daemon from SIGTERM to SIGKILL", asyn
       },
       waitForExit: () => exited
     }),
-    waitHealthy: async () => {}
+    waitHealthy: async () => {},
+    onLog: (message) => logs.push(message)
   });
   const handle = await manager.acquire("/repo/session");
   writeFileSync(handle.socketPath, "");
@@ -238,6 +240,9 @@ test("release escalates a hung exact owned daemon from SIGTERM to SIGKILL", asyn
   await manager.release(handle.socketPath);
 
   assert.deepEqual(signals, ["SIGTERM", "SIGKILL"]);
+  assert.match(logs[0] ?? "", /status=start pid=4242 socket=.* signal=SIGTERM/);
+  assert.match(logs[1] ?? "", /status=escalate pid=4242 socket=.* signal=SIGKILL durationMs=\d+/);
+  assert.match(logs[2] ?? "", /status=end pid=4242 socket=.* durationMs=\d+/);
   assert.equal(existsSync(handle.socketPath), false);
   assert.equal(existsSync(`${handle.socketPath}.pid`), false);
   rmSync(home, { recursive: true, force: true });

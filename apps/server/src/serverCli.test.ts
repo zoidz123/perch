@@ -51,6 +51,43 @@ test("server stop remains pending for provider cleanup before one immediate rest
   }
 });
 
+test("server stop waits beyond 15s and does not confuse an early transport disconnect with PID exit", async () => {
+  const fixture = await createCliFixture(15_250);
+
+  try {
+    await runCli(fixture, "start");
+    const oldPid = readPid(fixture);
+    assert.ok(oldPid);
+    assert.equal(existsSync(join(fixture.home, "transport.alive")), true);
+
+    const startedAt = Date.now();
+    const stopping = runCli(fixture, "stop");
+    await waitForFileRemoval(join(fixture.home, "transport.alive"));
+    assert.equal(isAlive(oldPid), true, "mobile transport can be offline while the server PID is still cleaning up");
+
+    const stopped = await stopping;
+    assert.match(stopped.stdout, new RegExp(`stopped \\(pid ${oldPid}\\)`));
+    assert.ok(Date.now() - startedAt >= 15_000, "regression must exercise cleanup beyond the old 15s budget");
+    assert.equal(isAlive(oldPid), false);
+  } finally {
+    await cleanupFixture(fixture);
+  }
+});
+
+test("server stop reports an exact-PID cleanup failure as non-successful", async () => {
+  const fixture = await createCliFixture(20, "codex");
+
+  try {
+    await runCli(fixture, "start");
+    const pid = readPid(fixture);
+    assert.ok(pid);
+    await assert.rejects(runCli(fixture, "stop"), /failed phases: codex/);
+    assert.equal(isAlive(pid), false);
+  } finally {
+    await cleanupFixture(fixture);
+  }
+});
+
 test("concurrent server starts converge on one healthy server", async () => {
   const fixture = await createCliFixture(0);
 
@@ -100,7 +137,7 @@ type CliFixture = {
   port: number;
 };
 
-async function createCliFixture(shutdownDelayMs: number): Promise<CliFixture> {
+async function createCliFixture(shutdownDelayMs: number, failurePhase?: string): Promise<CliFixture> {
   const root = mkdtempSync(join(tmpdir(), "perch-server-stop-"));
   const home = join(root, "home");
   const bin = join(root, "bin", "perch.mjs");
@@ -134,12 +171,18 @@ async function createCliFixture(shutdownDelayMs: number): Promise<CliFixture> {
       'server.listen(Number(process.env.PORT), "127.0.0.1", () => {',
       '  writeFileSync(join(process.env.PERCH_HOME, "perch.pid"), String(process.pid));',
       '  writeFileSync(join(process.env.PERCH_HOME, "provider.alive"), "owned");',
+      '  writeFileSync(join(process.env.PERCH_HOME, "transport.alive"), "connected");',
       '  console.log("fixture listening");',
       "});",
       'process.on("SIGTERM", () => {',
+      '  rmSync(join(process.env.PERCH_HOME, "transport.alive"), { force: true });',
+      '  writeFileSync(join(process.env.PERCH_HOME, "shutdown-result.json"), JSON.stringify({ pid: process.pid, status: "stopping", failedPhases: [] }));',
       `  setTimeout(() => {`,
       '    rmSync(join(process.env.PERCH_HOME, "provider.alive"), { force: true });',
-      '    server.close(() => process.exit(0));',
+      `    const failedPhases = ${JSON.stringify(failurePhase ? [failurePhase] : [])};`,
+      '    const status = failedPhases.length === 0 ? "success" : "error";',
+      '    writeFileSync(join(process.env.PERCH_HOME, "shutdown-result.json"), JSON.stringify({ pid: process.pid, status, failedPhases }));',
+      '    server.close(() => process.exit(status === "success" ? 0 : 1));',
       `  }, ${shutdownDelayMs});`,
       "});"
     ].join("\n")
@@ -214,6 +257,15 @@ async function waitForPort(port: number): Promise<void> {
     await new Promise((resolve) => setTimeout(resolve, 20));
   }
   throw new Error(`fixture server did not listen on port ${port}`);
+}
+
+async function waitForFileRemoval(path: string): Promise<void> {
+  const deadline = Date.now() + 2_000;
+  while (Date.now() < deadline) {
+    if (!existsSync(path)) return;
+    await new Promise((resolve) => setTimeout(resolve, 20));
+  }
+  throw new Error(`fixture file was not removed: ${path}`);
 }
 
 async function assertPortCanBind(port: number): Promise<void> {

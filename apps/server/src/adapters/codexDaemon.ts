@@ -90,6 +90,9 @@ export type CodexDaemonManagerOptions = {
   killOrphan?: (pid: number, signal?: NodeJS.Signals) => void;
   // Grace period before an exact owned process escalates from TERM to KILL.
   shutdownGraceMs?: number;
+  // Lifecycle diagnostics. Messages contain only exact process/socket identity
+  // and timing, never hook credentials or process environment.
+  onLog?: (message: string) => void;
 };
 
 type DaemonEntry = {
@@ -107,6 +110,7 @@ export class CodexDaemonManager {
   private readonly runtimeFingerprint: () => string | undefined;
   private readonly killOrphan: (pid: number, signal?: NodeJS.Signals) => void;
   private readonly shutdownGraceMs: number;
+  private readonly onLog?: (message: string) => void;
 
   private readonly daemons = new Map<string, DaemonEntry>();
   // Single-flight: concurrent acquires of the same cwd share one startup.
@@ -125,6 +129,7 @@ export class CodexDaemonManager {
     this.runtimeFingerprint = options.runtimeFingerprint ?? codexRuntimeFingerprint;
     this.killOrphan = options.killOrphan ?? defaultKillOrphan;
     this.shutdownGraceMs = options.shutdownGraceMs ?? 5_000;
+    this.onLog = options.onLog;
   }
 
   // Socket path for a workdir: $PERCH_HOME/codex-daemons/<short-hash>.sock. A
@@ -338,7 +343,7 @@ export class CodexDaemonManager {
     for (const [key, entry] of this.daemons) {
       if (entry.handle.socketPath !== socketPath) continue;
       this.daemons.delete(key);
-      await stopOwnedProcess(entry.process, this.shutdownGraceMs);
+      await stopOwnedProcess(entry.process, this.shutdownGraceMs, socketPath, this.onLog);
       removeDaemonFiles(socketPath);
       return;
     }
@@ -411,7 +416,7 @@ export class CodexDaemonManager {
       }
       this.daemons.delete(key);
       stopping.push(
-        stopOwnedProcess(entry.process, this.shutdownGraceMs)
+        stopOwnedProcess(entry.process, this.shutdownGraceMs, entry.handle.socketPath, this.onLog)
           .then(() => removeDaemonFiles(entry.handle.socketPath))
       );
     }
@@ -574,22 +579,42 @@ async function waitForPidExit(pid: number): Promise<void> {
   throw new Error(`owned codex app-server pid ${pid} did not exit within 10s`);
 }
 
-async function stopOwnedProcess(owned: CodexDaemonProcess, graceMs: number): Promise<void> {
+async function stopOwnedProcess(
+  owned: CodexDaemonProcess,
+  graceMs: number,
+  socketPath: string,
+  onLog?: (message: string) => void
+): Promise<void> {
+  const startedAt = Date.now();
+  const identity = `pid=${owned.pid ?? "unknown"} socket=${socketPath}`;
+  onLog?.(`shutdown: codex-daemon status=start ${identity} signal=SIGTERM`);
   try {
     owned.kill("SIGTERM");
   } catch {
     /* already gone */
   }
-  if (!owned.waitForExit) return;
-  if (await settlesWithin(owned.waitForExit(), graceMs)) return;
+  if (!owned.waitForExit) {
+    onLog?.(`shutdown: codex-daemon status=end ${identity} durationMs=${Date.now() - startedAt}`);
+    return;
+  }
+  if (await settlesWithin(owned.waitForExit(), graceMs)) {
+    onLog?.(`shutdown: codex-daemon status=end ${identity} durationMs=${Date.now() - startedAt}`);
+    return;
+  }
+  onLog?.(
+    `shutdown: codex-daemon status=escalate ${identity} signal=SIGKILL durationMs=${Date.now() - startedAt}`
+  );
   try {
     owned.kill("SIGKILL");
   } catch {
     /* already gone */
   }
   if (!(await settlesWithin(owned.waitForExit(), graceMs))) {
-    throw new Error(`owned codex app-server pid ${owned.pid ?? "unknown"} did not exit after SIGKILL`);
+    const error = `owned codex app-server pid ${owned.pid ?? "unknown"} did not exit after SIGKILL`;
+    onLog?.(`shutdown: codex-daemon status=error ${identity} durationMs=${Date.now() - startedAt} error=${error}`);
+    throw new Error(error);
   }
+  onLog?.(`shutdown: codex-daemon status=end ${identity} durationMs=${Date.now() - startedAt}`);
 }
 
 async function settlesWithin(work: Promise<void>, timeoutMs: number): Promise<boolean> {

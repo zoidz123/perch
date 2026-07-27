@@ -28,6 +28,10 @@ export function logPath(env: NodeJS.ProcessEnv = process.env): string {
   return join(perchHome(env), "server.log");
 }
 
+export function shutdownResultPath(env: NodeJS.ProcessEnv = process.env): string {
+  return join(perchHome(env), "shutdown-result.json");
+}
+
 export function ensurePerchHome(env: NodeJS.ProcessEnv = process.env): string {
   const home = perchHome(env);
   mkdirSync(home, { recursive: true, mode: 0o700 });
@@ -56,7 +60,21 @@ export function readOrCreateToken(env: NodeJS.ProcessEnv = process.env): string 
 
 export function writePidFile(env: NodeJS.ProcessEnv = process.env): void {
   ensurePerchHome(env);
+  rmSync(shutdownResultPath(env), { force: true });
   writeFileSync(pidPath(env), `${process.pid}\n`, { mode: 0o600 });
+}
+
+export function writeShutdownResult(
+  status: "stopping" | "success" | "error",
+  failedPhases: string[] = [],
+  env: NodeJS.ProcessEnv = process.env
+): void {
+  ensurePerchHome(env);
+  writeFileSync(
+    shutdownResultPath(env),
+    `${JSON.stringify({ pid: process.pid, status, failedPhases, at: new Date().toISOString() })}\n`,
+    { mode: 0o600 }
+  );
 }
 
 export function removePidFile(env: NodeJS.ProcessEnv = process.env): void {
