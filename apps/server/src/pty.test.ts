@@ -698,12 +698,16 @@ test("PTY adapter stopSession kills the process and marks the session done", asy
 
 test("PTY adapter graceful stop waits for the exact provider exit", async () => {
   let child: FakePtyProcess | undefined;
-  const adapter = new PtyAgentAdapter(() => {
-    child = new FakePtyProcess();
-    child.autoExitOnKill = false;
-    return child;
-  });
-  await adapter.startAgent({ command: "claude", title: "Mate" });
+  const logs: string[] = [];
+  const adapter = new PtyAgentAdapter(
+    () => {
+      child = new FakePtyProcess();
+      child.autoExitOnKill = false;
+      return child;
+    },
+    { onLog: (message) => logs.push(message) }
+  );
+  const session = await adapter.startAgent({ command: "claude", title: "Mate" });
 
   let settled = false;
   const stopping = adapter.stop({ waitForExit: true }).then(() => {
@@ -716,4 +720,6 @@ test("PTY adapter graceful stop waits for the exact provider exit", async () => 
   child?.emitExit(0);
   await stopping;
   assert.equal(settled, true);
+  assert.match(logs[0] ?? "", new RegExp(`status=start session=${session.id} pid=${process.pid} signal=SIGTERM`));
+  assert.match(logs[1] ?? "", new RegExp(`status=end session=${session.id} pid=${process.pid} durationMs=\\d+`));
 });

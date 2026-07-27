@@ -27,7 +27,10 @@ const TERMINAL_MODE_RESET =
   "\x1b[?1004l\x1b[?2031l\x1b[?2004l\x1b[?25h";
 const HEALTH_TIMEOUT_MS = 700;
 const STARTUP_TIMEOUT_MS = 8000;
-const STOP_TIMEOUT_MS = 15000;
+// Graceful server shutdown has three independently bounded 10s phases
+// (scheduler/outbox drain, Codex TERM-to-KILL, and PTY TERM-to-KILL), plus
+// ancillary, database, and HTTP-close work. Keep 15s of contract headroom.
+const STOP_TIMEOUT_MS = 45_000;
 const PACKAGE_ROOT = dirname(dirname(fileURLToPath(import.meta.url)));
 const PACKAGE_VERSION = JSON.parse(readFileSync(join(PACKAGE_ROOT, "package.json"), "utf8")).version;
 const NO_MISTAKES_MANIFEST = JSON.parse(
@@ -39,6 +42,7 @@ const PERCH_HOME = process.env.PERCH_HOME ?? join(homedir(), ".perch");
 const TOKEN_PATH = join(PERCH_HOME, "token");
 const PID_PATH = join(PERCH_HOME, "perch.pid");
 const LOG_PATH = join(PERCH_HOME, "server.log");
+const SHUTDOWN_RESULT_PATH = join(PERCH_HOME, "shutdown-result.json");
 
 const AGENTS = {
   codex: { command: "codex", agent: "codex", label: "Codex" },
@@ -392,6 +396,7 @@ async function runServerCommand(action, options) {
     if (processState === "unknown") {
       throw new Error(`could not verify server pid ${pid} before stopping it`);
     }
+    rmSync(SHUTDOWN_RESULT_PATH, { force: true });
     try {
       process.kill(pid, "SIGTERM");
     } catch (error) {
@@ -403,6 +408,14 @@ async function runServerCommand(action, options) {
     }
     if (!(await waitForPerchServerExit(pid))) {
       throw new Error(`server pid ${pid} did not stop within ${STOP_TIMEOUT_MS / 1000}s`);
+    }
+    const result = readShutdownResult(pid);
+    if (result?.status !== "success") {
+      const detail =
+        result?.status === "error" && result.failedPhases.length > 0
+          ? `; failed phases: ${result.failedPhases.join(", ")}`
+          : "";
+      throw new Error(`server pid ${pid} exited without completing graceful shutdown${detail}`);
     }
     console.log(`stopped (pid ${pid})`);
     return;
@@ -484,6 +497,22 @@ async function waitForPerchServerExit(pid) {
     throw new Error(`could not verify whether server pid ${pid} exited`);
   }
   return processState === "absent" || processState === "other";
+}
+
+function readShutdownResult(pid) {
+  try {
+    const result = JSON.parse(readFileSync(SHUTDOWN_RESULT_PATH, "utf8"));
+    if (result?.pid !== pid) return undefined;
+    if (!["stopping", "success", "error"].includes(result.status)) return undefined;
+    return {
+      status: result.status,
+      failedPhases: Array.isArray(result.failedPhases)
+        ? result.failedPhases.filter((phase) => typeof phase === "string")
+        : []
+    };
+  } catch {
+    return undefined;
+  }
 }
 
 // ---------------------------------------------------------------------------

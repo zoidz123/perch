@@ -21,7 +21,7 @@ import {
   repairVerifiedPrelaunchDispatchFailures
 } from "./dispatchFailures.js";
 import { FleetMonitor } from "./fleetMonitor.js";
-import { removeAttachments, removePidFile, writePidFile } from "./home.js";
+import { removeAttachments, removePidFile, writePidFile, writeShutdownResult } from "./home.js";
 import { HookRegistry, installClaudeHooks, installCodexHooks } from "./hooks.js";
 import { labelForClaudeModelId, resolveSessionModel } from "./models.js";
 import { createControlServer } from "./http.js";
@@ -60,7 +60,7 @@ const metrics = new StateMetrics();
 // session workdir on a private unix socket and is its sole standing
 // authoritative client. There is no Codex PTY and no keystroke path; rollback
 // is by release or commit, not a runtime switch.
-const codexDaemons = new CodexDaemonManager();
+const codexDaemons = new CodexDaemonManager({ onLog: (message) => console.log(message) });
 const codexOwned = new CodexAppServerAdapter({
   daemons: codexDaemons,
   // The daemon process runs the agent's tool shells, so it carries the same
@@ -106,7 +106,8 @@ const ptyAdapter = new PtyAgentAdapter(undefined, {
     });
     // A dead mate while crew tasks are live is a push-once backstop moment.
     pushRouter.sessionExited(sessionId);
-  }
+  },
+  onLog: (message) => console.log(message)
 });
 const adapter = new RoutingAgentAdapter(ptyAdapter, codexOwned);
 const auditLog = new AuditLog(config.auditLogPath);
@@ -705,52 +706,98 @@ async function shutdown(): Promise<void> {
     // A second SIGINT/SIGTERM means "stop waiting": a hung in-flight launch
     // must never make the server unkillable short of SIGKILL.
     console.error("perch: forced shutdown on repeated signal");
+    writeShutdownResult("error", ["repeated-signal"]);
     process.exit(1);
   }
   shuttingDown = true;
-  removePidFile();
+  writeShutdownResult("stopping");
+  const failures: string[] = [];
+  const phase = async (name: string, work: () => Promise<void> | void): Promise<void> => {
+    const startedAt = Date.now();
+    console.log(`shutdown: phase=${name} status=start`);
+    try {
+      await work();
+      console.log(`shutdown: phase=${name} status=end durationMs=${Date.now() - startedAt}`);
+    } catch (error) {
+      failures.push(name);
+      const errorType = error instanceof Error ? error.name : "UnknownError";
+      console.error(
+        `shutdown: phase=${name} status=error durationMs=${Date.now() - startedAt} errorType=${errorType}`
+      );
+    }
+  };
   // Durable state makes waiting optional: an unfinished dispatch or outbox
   // delivery resumes from SQLite on the next start, so the graceful drain is
   // bounded rather than open-ended.
-  await withTimeout(Promise.all([taskScheduler.stop(), outboxWorker.stop()]), 10_000);
-  timeline.stop();
-  promptDeliveries.stop();
-  prPoller.stop();
-  reconciler.stop();
-  taskWatchdog?.stop();
-  pushRouter.stop();
-  charts.stop();
-  relayClient?.stop();
-  monitor.stop();
-  for (const runtime of tasks.stateDb.runtimes.active()) {
-    if (runtime.ptySessionId) {
-      runtimeManager.interruptSession(runtime.ptySessionId, "server shutdown interrupted runtime");
+  await phase("scheduler-outbox", async () => {
+    await withTimeout(Promise.all([taskScheduler.stop(), outboxWorker.stop()]), 10_000);
+  });
+  await phase("ancillary-relay", () => {
+    timeline.stop();
+    promptDeliveries.stop();
+    prPoller.stop();
+    reconciler.stop();
+    taskWatchdog?.stop();
+    pushRouter.stop();
+    charts.stop();
+    relayClient?.stop();
+    monitor.stop();
+    for (const runtime of tasks.stateDb.runtimes.active()) {
+      if (runtime.ptySessionId) {
+        runtimeManager.interruptSession(runtime.ptySessionId, "server shutdown interrupted runtime");
+      }
     }
-  }
-  for (const runtime of tasks.stateDb.ownerRuntimes.active()) {
-    if (runtime.ptySessionId) ownerManager.interruptSession(runtime.ptySessionId);
-  }
+    for (const runtime of tasks.stateDb.ownerRuntimes.active()) {
+      if (runtime.ptySessionId) ownerManager.interruptSession(runtime.ptySessionId);
+    }
+  });
   // Graceful shutdown keeps the durable provider thread identity but retires
   // every exact Perch-owned app-server process. A SIGKILL never reaches this
   // path, so abnormal-crash recovery can still adopt its surviving daemon.
   // Await the provider exit barrier before closing the HTTP server: `perch
   // server stop` does not succeed while an owned provider or its socket/pid
   // artifacts remain.
-  await codexOwned.stop();
-  await codexDaemons.stopAll();
+  await phase("codex", async () => {
+    await codexOwned.stop();
+    await codexDaemons.stopAll();
+  });
   // server.close() waits for open connections; drop WebSocket clients so a
   // connected phone cannot hang the shutdown.
-  monitor.closeAllClients();
-  await adapter.stop({ waitForExit: true });
-  tasks.close();
-  server.close(() => {
-    process.exit(0);
+  await phase("pty", async () => {
+    monitor.closeAllClients();
+    await adapter.stop({ waitForExit: true });
   });
+  await phase("database", () => tasks.close());
+  await phase("http-close", async () => {
+    await withTimeout(
+      new Promise<void>((resolve, reject) => {
+        server.close((error) => (error ? reject(error) : resolve()));
+      }),
+      5_000
+    );
+  });
+  if (failures.includes("http-close")) server.closeAllConnections?.();
+  writeShutdownResult(failures.length === 0 ? "success" : "error", failures);
+  console[failures.length === 0 ? "log" : "error"](
+    `shutdown: status=${failures.length === 0 ? "success" : "error"} failedPhases=${
+      failures.length === 0 ? "none" : failures.join(",")
+    }`
+  );
+  process.exit(failures.length === 0 ? 0 : 1);
 }
 
 function withTimeout(work: Promise<unknown>, ms: number): Promise<unknown> {
-  return Promise.race([
-    work.catch(() => {}),
-    new Promise((resolve) => setTimeout(resolve, ms))
-  ]);
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => reject(new Error(`shutdown phase timed out after ${ms}ms`)), ms);
+    work.then(
+      (value) => {
+        clearTimeout(timer);
+        resolve(value);
+      },
+      (error) => {
+        clearTimeout(timer);
+        reject(error);
+      }
+    );
+  });
 }

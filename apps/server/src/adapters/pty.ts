@@ -147,6 +147,8 @@ export type PtyAdapterOptions = {
   // Fired when a session's process exits, for cleanup outside the adapter
   // (hook token revocation, timeline tailer teardown, task bookkeeping).
   onSessionExit?: (sessionId: string, context: SessionExitContext) => void;
+  // Graceful-shutdown identity and timing diagnostics.
+  onLog?: (message: string) => void;
 };
 
 export class PtyAgentAdapter implements AgentAdapter {
@@ -670,13 +672,21 @@ export class PtyAgentAdapter implements AgentAdapter {
   async stop(opts: { waitForExit?: boolean } = {}): Promise<void> {
     const exits: Promise<void>[] = [];
     const sessions = [...this.sessions];
-    for (const [, state] of sessions) {
+    for (const [sessionId, state] of sessions) {
       if (state.flushTimer) {
         clearTimeout(state.flushTimer);
       }
       if (state.endedAt === undefined) {
         state.terminal.dispose();
-        exits.push(stopPtyProcess(state.process, state.exit, opts.waitForExit === true));
+        exits.push(
+          stopPtyProcess(
+            state.process,
+            state.exit,
+            opts.waitForExit === true,
+            sessionId,
+            this.options.onLog
+          )
+        );
       }
     }
     try {
@@ -790,7 +800,13 @@ export class PtyAgentAdapter implements AgentAdapter {
   }
 }
 
-async function stopPtyProcess(child: PtyProcess, exit: Promise<void>, waitForExit: boolean): Promise<void> {
+async function stopPtyProcess(
+  child: PtyProcess,
+  exit: Promise<void>,
+  waitForExit: boolean,
+  sessionId: string,
+  onLog?: (message: string) => void
+): Promise<void> {
   if (!waitForExit) {
     try {
       child.kill();
@@ -799,21 +815,32 @@ async function stopPtyProcess(child: PtyProcess, exit: Promise<void>, waitForExi
     }
     return;
   }
+  const startedAt = Date.now();
+  const identity = `session=${sessionId} pid=${child.pid}`;
+  onLog?.(`shutdown: pty-provider status=start ${identity} signal=SIGTERM`);
   try {
     child.kill("SIGTERM");
   } catch {
+    onLog?.(`shutdown: pty-provider status=end ${identity} durationMs=${Date.now() - startedAt}`);
     return;
   }
   if (!(await settlesWithin(exit, 5_000))) {
+    onLog?.(
+      `shutdown: pty-provider status=escalate ${identity} signal=SIGKILL durationMs=${Date.now() - startedAt}`
+    );
     try {
       child.kill("SIGKILL");
     } catch {
+      onLog?.(`shutdown: pty-provider status=end ${identity} durationMs=${Date.now() - startedAt}`);
       return;
     }
     if (!(await settlesWithin(exit, 5_000))) {
-      throw new Error(`owned PTY provider pid ${child.pid} did not exit after SIGKILL`);
+      const error = `owned PTY provider pid ${child.pid} did not exit after SIGKILL`;
+      onLog?.(`shutdown: pty-provider status=error ${identity} durationMs=${Date.now() - startedAt} error=${error}`);
+      throw new Error(error);
     }
   }
+  onLog?.(`shutdown: pty-provider status=end ${identity} durationMs=${Date.now() - startedAt}`);
 }
 
 async function settlesWithin(work: Promise<void>, timeoutMs: number): Promise<boolean> {
