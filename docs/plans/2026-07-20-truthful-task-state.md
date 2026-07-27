@@ -21,7 +21,7 @@ Lifecycle facts record work, blocking, failure, completion requests, acceptance,
 PR facts record the attached PR, its current head SHA, required-check state, and GitHub mergeability.
 Verification facts bind a mate acceptance or rejection to the immutable completion request and its exact deliverable identity.
 
-For direct-PR and no-mistakes tasks, Ready to Merge is true only when the mate accepted the latest completion request for the current PR head SHA, that exact head has green required checks, and GitHub says it is mergeable.
+For direct-PR and no-mistakes tasks, use the authoritative Ready to Merge criteria in [Worker task API and turn lifecycle](../worker-task-api.md#post-tasksidcompletion).
 Any later rejection, work-resumption event, or PR head change invalidates the earlier acceptance.
 No-mistakes additionally cannot request completion until its pipeline has completed.
 

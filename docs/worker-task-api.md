@@ -279,7 +279,8 @@ After a trusted `done` PR is first observed as merge-ready, the server keeps it 
 A temporary readiness regression or server restart does not return that PR to the baseline cadence.
 
 Every completion request is bound to the exact deliverable it claims: the current PR head SHA for PR modes, or the exact checkout HEAD commit SHA for `local-only`.
-The derived `ready_to_merge` presentation holds only while the mate's acceptance of the latest completion request still matches the current PR head and that head has passing checks and GitHub mergeability.
+The derived `ready_to_merge` presentation holds only while the mate's acceptance of the latest completion request still matches the current PR head and GitHub currently reports an open, non-draft PR with `MERGEABLE` mergeability, `CLEAN` merge state, no blocking review decision, and either passing checks or an explicit empty check rollup.
+An absent check rollup or unavailable PR observation is unknown, clears any previously derived readiness, and never counts as a zero-check repository.
 `ready_to_apply` requires the acceptance to have recorded the same checkout HEAD commit the completion request pinned; if either revision cannot be read or they differ, readiness stays absent.
 The local checkout is not re-observed after acceptance, so `ready_to_apply` reflects the accept-time observation rather than live checkout state.
 A rejection, resumed work, or a changed PR head therefore withdraws readiness instead of leaving a stale ready badge.
@@ -345,6 +346,8 @@ The normal body is `{}`.
 
 Teardown stops the worker, releases its worktree, and records task closure only after the landed gate proves that work is safe to release.
 Dirty or unlanded work and live holders cause refusal rather than silent data loss.
+For a linked PR, reachability from its own remote feature branch is not landing proof: normal teardown requires either an authoritative merged-PR observation or exact `HEAD` ancestry in the default branch.
+Non-PR and local work may still use reachability from another remote ref as external preservation proof.
 The verified pre-launch dispatch failures defined above may pass normal teardown because they prove that no worker resources exist.
 Before using commit reachability as landing proof, the gate refreshes only the default remote-tracking branch and never moves a local branch.
 If that fetch is unavailable, the gate falls back to the last-known remote-tracking ref.

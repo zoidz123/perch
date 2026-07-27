@@ -10,7 +10,8 @@ const execFileAsync = promisify(execFile);
 // (or the task closes). Emits
 // checks_green when the status rollup goes green, merge_ready when GitHub says
 // the PR is policy-ready to merge, and merged when the PR lands. gh handles
-// auth; failures are silent and retried next tick (offline is normal).
+// auth; failures are non-fatal, clear volatile readiness, and retry next tick
+// (offline is normal).
 //
 // Cadence is adaptive (G5): 5 min is the resting baseline, but a PR that is
 // "expecting change" - just attached, checks unsettled, or a sibling PR in the
