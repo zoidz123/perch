@@ -156,7 +156,6 @@ perch server start
 ```
 
 `perch server stop` waits up to 45 seconds for bounded graceful cleanup and reports success only after the verified server process exits with a successful shutdown receipt, so an immediate start can reuse the configured port.
-The server log records start, end, error, and elapsed time for scheduler/outbox, ancillary/relay, Codex, PTY, database, and HTTP-close phases.
 The default server URL is `http://127.0.0.1:8787` from the CLI, while the server itself listens on all Mac interfaces for direct phone access.
 Use `PERCH_SERVER_URL` to select another loopback port for development or isolated checks.
 Never expose the server port directly to the public internet.
