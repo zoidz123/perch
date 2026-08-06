@@ -16,6 +16,9 @@ final class PerchStore: ObservableObject {
         }
     }
     @Published private(set) var sessionsById: [String: AgentSession] = [:]
+    // Set only after an authenticated fleet snapshot. This makes a valid empty
+    // fleet distinguishable from a cold launch with no server content yet.
+    @Published private(set) var hasUsableFleetSnapshot = false
     @Published private(set) var terminalTaskLinks: [WorkspaceTerminalTaskLink] = []
     @Published var tasks: [AgentTask] = [] {
         didSet {
@@ -163,6 +166,29 @@ final class PerchStore: ObservableObject {
 
     var isConnectingToServer: Bool {
         presentedServerAvailability == .connecting
+    }
+
+    var workspaceContentPresentation: ConnectionContentPresentation {
+        ConnectionContentPresentation(
+            availability: presentedServerAvailability,
+            hasCachedContent: hasUsableFleetSnapshot
+        )
+    }
+
+    func sessionContentPresentation(for sessionId: String) -> ConnectionContentPresentation {
+        let hasCachedContent = sessionsById[sessionId] != nil
+            || !(timelinesBySession[sessionId] ?? []).isEmpty
+            || !(optimisticBySession[sessionId] ?? []).isEmpty
+            || streamingBySession[sessionId] != nil
+        return ConnectionContentPresentation(
+            availability: presentedServerAvailability,
+            hasCachedContent: hasCachedContent
+        )
+    }
+
+    private func applyUsableFleetSnapshot(_ snapshot: [AgentSession]) {
+        sessions = snapshot
+        hasUsableFleetSnapshot = true
     }
 
     private func beginConnectionReadiness() {
@@ -319,6 +345,7 @@ final class PerchStore: ObservableObject {
 
     private func clearServerOwnedState() {
         sessions = []
+        hasUsableFleetSnapshot = false
         terminalTaskLinks = []
         tasks = []
         recoveryActions = [:]
@@ -740,7 +767,7 @@ final class PerchStore: ObservableObject {
 
         do {
             let response: SessionsResponse = try await request(path: "/sessions")
-            sessions = response.sessions
+            applyUsableFleetSnapshot(response.sessions)
             // The crew ledger rides the same refresh; its absence (older
             // server) must never break the fleet.
             await refreshTaskSnapshot()
@@ -1051,6 +1078,10 @@ final class PerchStore: ObservableObject {
 
     func sendDraftAndEnter() async {
         guard let selectedSessionId else {
+            return
+        }
+        guard isServerLive else {
+            errorMessage = Self.serverOfflineMessage
             return
         }
         let attachments = pendingAttachmentsBySession.values(for: selectedSessionId)
@@ -1398,7 +1429,7 @@ final class PerchStore: ObservableObject {
         guard let response: SessionsResponse = try? await request(path: "/sessions") else {
             return false
         }
-        sessions = response.sessions
+        applyUsableFleetSnapshot(response.sessions)
         await refreshTaskSnapshot()
         if let response: ProjectsResult = try? await request(path: "/projects") {
             projects = response.projects
@@ -1998,7 +2029,7 @@ final class PerchStore: ObservableObject {
                 self.appendEvent(event)
             case let .fleet(sessions):
                 hasReceivedFleetSnapshotForSocket = true
-                self.sessions = sessions
+                self.applyUsableFleetSnapshot(sessions)
                 if fleetReconciliationTask != nil {
                     latestFleetSessionsWhileReconciling = sessions
                 }
@@ -2130,7 +2161,7 @@ final class PerchStore: ObservableObject {
     private func finishFleetReconciliation(_ reconciliationID: UUID) {
         guard fleetReconciliationID == reconciliationID else { return }
         if let latestFleetSessionsWhileReconciling {
-            sessions = latestFleetSessionsWhileReconciling
+            applyUsableFleetSnapshot(latestFleetSessionsWhileReconciling)
         }
         latestFleetSessionsWhileReconciling = nil
         fleetReconciliationTask = nil

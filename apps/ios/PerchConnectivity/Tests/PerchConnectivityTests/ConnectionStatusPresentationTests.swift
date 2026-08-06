@@ -63,13 +63,81 @@ final class ConnectionStatusPresentationTests: XCTestCase {
         XCTAssertEqual(status.presentedAvailability, .online)
     }
 
-    func testReconnectRevokesOnlinePresentationUntilFreshEvidence() {
+    func testForegroundRefreshKeepsCachedWorkspaceVisibleAndReadOnly() {
         var status = ConnectionStatusHysteresis(initialAvailability: .online, readinessTimeout: 8)
 
         XCTAssertTrue(status.beginConnecting(at: 20))
         XCTAssertEqual(status.presentedAvailability, .connecting)
-        XCTAssertFalse(status.presentedAvailability.showsFreshServerData)
-        XCTAssertFalse(status.presentedAvailability.permitsServerActions)
+        let presentation = ConnectionContentPresentation(
+            availability: status.presentedAvailability,
+            hasCachedContent: true
+        )
+
+        XCTAssertEqual(presentation.mode, .cachedReadOnly)
+        XCTAssertFalse(presentation.usesBlockingPlaceholder)
+        XCTAssertTrue(presentation.showsConnectionIndicator)
+        XCTAssertFalse(presentation.permitsOutboundActions)
+    }
+
+    func testTransientRelayLossKeepsCachedHomeAndSessionContentReadable() {
+        let home = ConnectionContentPresentation(availability: .connecting, hasCachedContent: true)
+        let session = ConnectionContentPresentation(availability: .offline, hasCachedContent: true)
+
+        XCTAssertEqual(home.mode, .cachedReadOnly)
+        XCTAssertEqual(session.mode, .cachedReadOnly)
+        XCTAssertTrue(home.showsConnectionIndicator)
+        XCTAssertTrue(session.showsConnectionIndicator)
+        XCTAssertFalse(home.permitsOutboundActions)
+        XCTAssertFalse(session.permitsOutboundActions)
+    }
+
+    func testColdStartWithoutCacheUsesBlockingBootstrap() {
+        let presentation = ConnectionContentPresentation(availability: .connecting, hasCachedContent: false)
+
+        XCTAssertEqual(presentation.mode, .blockingBootstrap)
+        XCTAssertTrue(presentation.usesBlockingPlaceholder)
+        XCTAssertFalse(presentation.showsConnectionIndicator)
+        XCTAssertFalse(presentation.permitsOutboundActions)
+    }
+
+    func testReadinessDeadlineOfflineKeepsCachedContentReadOnly() {
+        var status = ConnectionStatusHysteresis(readinessTimeout: 8)
+
+        status.beginConnecting(at: 10)
+        XCTAssertTrue(status.advance(to: 18))
+        let presentation = ConnectionContentPresentation(
+            availability: status.presentedAvailability,
+            hasCachedContent: true
+        )
+
+        XCTAssertEqual(status.presentedAvailability, .offline)
+        XCTAssertEqual(presentation.mode, .cachedReadOnly)
+        XCTAssertTrue(presentation.showsConnectionIndicator)
+        XCTAssertFalse(presentation.permitsOutboundActions)
+    }
+
+    func testOutboundControlsRequireOnlinePresentation() {
+        let connecting = ConnectionContentPresentation(availability: .connecting, hasCachedContent: true)
+        let offline = ConnectionContentPresentation(availability: .offline, hasCachedContent: true)
+        let online = ConnectionContentPresentation(availability: .online, hasCachedContent: true)
+
+        XCTAssertFalse(connecting.permitsOutboundActions)
+        XCTAssertFalse(offline.permitsOutboundActions)
+        XCTAssertTrue(online.permitsOutboundActions)
+    }
+
+    func testRecoveryRestoresInteractiveContentWithoutChangingCachedSessionOrTimeline() {
+        let selectedSessionID = "pty:cached-session"
+        let cachedTimelineSequences = [41, 42]
+        let reconnecting = ConnectionContentPresentation(availability: .connecting, hasCachedContent: true)
+        let recovered = ConnectionContentPresentation(availability: .online, hasCachedContent: true)
+
+        XCTAssertEqual(reconnecting.mode, .cachedReadOnly)
+        XCTAssertEqual(recovered.mode, .interactive)
+        XCTAssertFalse(recovered.showsConnectionIndicator)
+        XCTAssertTrue(recovered.permitsOutboundActions)
+        XCTAssertEqual(selectedSessionID, "pty:cached-session")
+        XCTAssertEqual(cachedTimelineSequences, [41, 42])
     }
 
     func testUnpairResetClearsPriorReadinessDeadline() {

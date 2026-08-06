@@ -14,6 +14,40 @@ enum PresentedServerAvailability: Equatable {
     }
 }
 
+enum ConnectionContentMode: Equatable {
+    case blockingBootstrap
+    case cachedReadOnly
+    case interactive
+}
+
+// Readiness is the source of truth for outbound actions, but an authenticated
+// snapshot remains safe to review while a later foreground check reconnects.
+struct ConnectionContentPresentation: Equatable {
+    let availability: PresentedServerAvailability
+    let hasCachedContent: Bool
+
+    var mode: ConnectionContentMode {
+        switch availability {
+        case .online:
+            .interactive
+        case .connecting, .offline:
+            hasCachedContent ? .cachedReadOnly : .blockingBootstrap
+        }
+    }
+
+    var usesBlockingPlaceholder: Bool {
+        mode == .blockingBootstrap
+    }
+
+    var showsConnectionIndicator: Bool {
+        mode == .cachedReadOnly
+    }
+
+    var permitsOutboundActions: Bool {
+        mode == .interactive && availability.permitsServerActions
+    }
+}
+
 struct ConnectionRefreshGate {
     private(set) var generation = 0
     private(set) var isReplacingPairing = false
