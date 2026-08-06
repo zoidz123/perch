@@ -24,8 +24,22 @@ Claude's initial worker brief rides the spawn argv as the CLI's positional query
 
 Codex sessions are app-server-owned: Perch spawns one `codex app-server` daemon per session workdir on a private unix socket and remains its sole standing authoritative client.
 The daemon key also includes launch overrides, the session-scoped hook identity, and the Codex runtime fingerprint, so managed workers normally have one isolated daemon and one thread each; the thread ID identifies the conversation, while the daemon boundary isolates process state and credentials.
+The daemon inherits the server's ordinary `CODEX_HOME`, so nonsecret user Codex capability settings remain available without Perch copying configuration or credentials.
 Perch creates or resumes the thread itself, captures the thread id from the protocol response, serializes all programmatic input (`turn/start` when idle, `turn/steer` with `expectedTurnId` while a turn is active), and stamps every input with a `clientUserMessageId` so a lost response reconciles against `thread/read` history instead of resending blind.
 There is no Codex PTY and no keystroke injection; a desktop human attaches the real native TUI as an additional same-user client with the session's surfaced `attachCommand` (`codex resume <threadId> --remote unix://<socket>`), which `perch attach` execs directly (argv, no shell) when the session record carries it.
+
+## Native Codex multi-agent observation
+
+When a managed Codex root turn exposes native multi-agent V2, Codex itself invokes its model-side collaboration tools and owns child creation, follow-up, waiting, closure, and recovery.
+Perch never sends `spawnAgent`, `sendInput`, `wait`, `resumeAgent`, or `closeAgent` as a collaboration RPC.
+Perch feature-detects known root-thread `subAgentActivity` and `collabAgentToolCall` item shapes instead of guessing from a Codex version string.
+Unsupported, disabled, unknown, and optional-method-error cases preserve the prior root-only behavior.
+Perch stores only a durable content-free child observation keyed to the outer runtime generation, with child and parent thread IDs, path or depth, role when supplied, observed state, timestamps, and protocol metadata.
+Child observations are not Tasks, Runtimes, AgentSessions, fleet rows, worktrees, attach targets, chat timelines, or task-completion authorities.
+Root lifecycle and completion callbacks reject child-thread notifications before they can alter root state, prompt delivery, or task lifecycle.
+Perch intentionally offers no direct child interruption because the verified Codex 0.146.0 probe interrupted the root workflow too.
+Native children share the root worktree, so work is decomposed read-only where possible and concurrent writes are unsafe.
+The real native-collaboration contract test remains opt-in (`PERCH_CODEX_NATIVE_MULTI_AGENT_E2E=1` plus an explicitly dedicated `PERCH_CODEX_NATIVE_MULTI_AGENT_E2E_HOME`) because it performs model work and writes only to that supplied test home.
 
 `perch claude` and `perch codex` launch real provider sessions.
 `perch run` can host another command, but arbitrary processes do not gain provider timelines or managed recovery.

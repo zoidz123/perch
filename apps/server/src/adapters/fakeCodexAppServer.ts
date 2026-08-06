@@ -174,6 +174,13 @@ export class FakeCodexAppServer {
     this.notifySubscribers(thread, "item/agentMessage/delta", { threadId, itemId, delta });
   }
 
+  // Test-only protocol injection for events multiplexed onto a root client.
+  // The params are intentionally caller-controlled so isolation tests can
+  // prove a child thread cannot mutate its root session.
+  emitNotification(rootThreadId: string, method: string, params: Record<string, unknown>): void {
+    this.notifySubscribers(this.thread(rootThreadId), method, params);
+  }
+
   // Fan an approval request out to every subscriber with ONE request id.
   // Resolves with the first answer; every other subscriber gets
   // serverRequest/resolved for the same id.

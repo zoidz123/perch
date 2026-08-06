@@ -22,7 +22,7 @@ test("fresh startup creates the versioned WAL database with foreign keys enabled
 
   assert.equal(state.path, join(root, "state.sqlite"));
   assert.equal(existsSync(state.path), true);
-  assert.equal(state.schemaVersion(), 14);
+  assert.equal(state.schemaVersion(), 15);
   assert.equal(state.journalMode(), "wal");
   assert.equal(state.foreignKeysEnabled(), true);
 
@@ -41,7 +41,8 @@ test("fresh startup creates the versioned WAL database with foreign keys enabled
     { version: 11, name: "task-review-facts" },
     { version: 12, name: "durable-prompt-deliveries" },
     { version: 13, name: "distinguish-unsubmitted-prompts" },
-    { version: 14, name: "durable-codex-history-syncs" }
+    { version: 14, name: "durable-codex-history-syncs" },
+    { version: 15, name: "native-codex-child-run-observations" }
   ]);
   assert.deepEqual(
     inspect
@@ -57,6 +58,7 @@ test("fresh startup creates the versioned WAL database with foreign keys enabled
       "codex_history_syncs",
       "durable_owners",
       "legacy_imports",
+      "native_child_runs",
       "notification_outbox",
       "operations",
       "owner_operations",
@@ -125,13 +127,14 @@ test("version 13 migrates an earlier prompt delivery schema without losing rows"
     CREATE INDEX prompt_deliveries_task_idx
       ON prompt_deliveries(task_id, created_at);
     DROP TABLE codex_history_syncs;
-    DELETE FROM schema_migrations WHERE version IN (13, 14);
+    DROP TABLE native_child_runs;
+    DELETE FROM schema_migrations WHERE version IN (13, 14, 15);
     PRAGMA user_version = 12;
   `);
   legacy.close();
 
   const migrated = new StateDb(env(root));
-  assert.equal(migrated.schemaVersion(), 14);
+  assert.equal(migrated.schemaVersion(), 15);
   assert.deepEqual(migrated.promptDeliveries.find("legacy-delivery"), {
     id: "legacy-delivery",
     perchSessionId: "pty:legacy",
@@ -407,6 +410,99 @@ test("task API state plus runtime and idempotent operation repositories persist 
   assert.equal(restarted.stateDb.runtimes.latestForTask(task.id)?.id, runtime.id);
   assert.equal(restarted.stateDb.runtimes.latestForTask(task.id)?.providerSessionId, "thread-123");
   assert.equal(restarted.stateDb.operations.findByIdempotencyKey("dispatch:request-123")?.id, operation.id);
+
+  restarted.close();
+  rmSync(root, { recursive: true, force: true });
+});
+
+test("native child runs dedupe identity and preserve terminal status unless a new native turn is observed", () => {
+  const root = home();
+  const state = new StateDb(env(root));
+  const outer = { outerRuntimeKind: "task" as const, outerRuntimeId: "runtime-1", outerRuntimeGeneration: 3 };
+
+  const running = state.nativeChildRuns.upsert({
+    ...outer,
+    childThreadId: "child-1",
+    parentThreadId: "root-1",
+    path: "0",
+    state: "running",
+    observedAt: "2026-08-06T12:00:00.000Z",
+    protocol: { itemType: "subAgentActivity", itemId: "activity-1", event: "started" }
+  });
+  const completed = state.nativeChildRuns.upsert({
+    ...outer,
+    childThreadId: "child-1",
+    state: "completed",
+    observedAt: "2026-08-06T12:00:01.000Z",
+    protocol: { itemType: "collabAgentToolCall", itemId: "collab-1", event: "completed" }
+  });
+  const duplicate = state.nativeChildRuns.upsert({
+    ...outer,
+    childThreadId: "child-1",
+    state: "running",
+    observedAt: "2026-08-06T12:00:02.000Z",
+    protocol: { itemType: "subAgentActivity", itemId: "collab-1", event: "interacted" }
+  });
+  const followUp = state.nativeChildRuns.upsert({
+    ...outer,
+    childThreadId: "child-1",
+    state: "running",
+    observedAt: "2026-08-06T12:00:03.000Z",
+    protocol: { itemType: "collabAgentToolCall", itemId: "collab-2", event: "inProgress" }
+  });
+  const stale = state.nativeChildRuns.upsert({
+    ...outer,
+    childThreadId: "child-1",
+    state: "failed",
+    observedAt: "2026-08-06T11:59:59.000Z",
+    protocol: { itemType: "subAgentActivity", itemId: "activity-old", event: "interrupted" }
+  });
+
+  assert.equal(running.childThreadId, completed.childThreadId);
+  assert.equal(completed.state, "completed");
+  assert.equal(duplicate.state, "completed");
+  assert.equal(followUp.state, "running");
+  assert.equal(stale.state, "running");
+  assert.deepEqual(state.nativeChildRuns.listForOuter("task", "runtime-1", 3), [
+    {
+      childThreadId: "child-1",
+      parentThreadId: "root-1",
+      path: "0",
+      state: "running",
+      observedAt: "2026-08-06T12:00:03.000Z",
+      protocol: { itemType: "collabAgentToolCall", itemId: "collab-2", event: "inProgress" }
+    }
+  ]);
+
+  state.close();
+  rmSync(root, { recursive: true, force: true });
+});
+
+test("native child observations survive restart without claiming liveness", () => {
+  const root = home();
+  const first = new StateDb(env(root));
+  first.nativeChildRuns.upsert({
+    outerRuntimeKind: "owner",
+    outerRuntimeId: "mate-runtime",
+    outerRuntimeGeneration: 1,
+    childThreadId: "child-done",
+    parentThreadId: "root",
+    state: "completed",
+    observedAt: "2026-08-06T12:00:00.000Z",
+    protocol: { itemType: "subAgentActivity", itemId: "activity-done", event: "interacted" }
+  });
+  first.close();
+
+  const restarted = new StateDb(env(root));
+  const child = restarted.nativeChildRuns.listForOuter("owner", "mate-runtime", 1)[0];
+  assert.deepEqual(child, {
+    childThreadId: "child-done",
+    parentThreadId: "root",
+    state: "completed",
+    observedAt: "2026-08-06T12:00:00.000Z",
+    protocol: { itemType: "subAgentActivity", itemId: "activity-done", event: "interacted" }
+  });
+  assert.equal("live" in (child ?? {}), false);
 
   restarted.close();
   rmSync(root, { recursive: true, force: true });

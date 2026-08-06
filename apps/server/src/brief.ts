@@ -1,6 +1,14 @@
 import type { AgentKind, Task } from "@perch/shared";
 import { CHART_CAPABILITY_NOTE } from "./hooks.js";
 
+export const CODEX_NATIVE_CHILD_GUIDANCE = [
+  "Native Codex multi-agent guidance:",
+  "- If native children are available, they report back only through their native parent result path.",
+  "- Native children must not call Perch task outcome hooks or task event endpoints.",
+  "- This is defense in depth, not thread authentication: native children can inherit the root hook credential, so Mate verification remains authoritative for task completion.",
+  "- Native children share the root worktree by default. Prefer read-only or decomposed work and never perform concurrent writes in that worktree."
+].join("\n");
+
 // The dispatch brief: Perch task reporting and delivery instructions.
 // Appended to the user's kickoff prompt when a task is dispatched, it tells
 // the worker where it is, how to name its branch, and how to report - the
@@ -156,5 +164,5 @@ export function dispatchBrief(
     "The done: reporting verb requests mate verification; it does not mark the task done by itself.",
     "Never request completion until the definition of done above is actually met."
   ].join("\n");
-  return agent === "codex" ? `${brief}\n\n${CHART_CAPABILITY_NOTE}` : brief;
+  return agent === "codex" ? `${brief}\n\n${CODEX_NATIVE_CHILD_GUIDANCE}\n\n${CHART_CAPABILITY_NOTE}` : brief;
 }

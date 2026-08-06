@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import type { Task } from "@perch/shared";
-import { dispatchBrief } from "./brief.js";
+import { CODEX_NATIVE_CHILD_GUIDANCE, dispatchBrief } from "./brief.js";
 import { CHART_CAPABILITY_NOTE } from "./hooks.js";
 
 function task(overrides: Partial<Task> = {}): Task {
@@ -142,5 +142,15 @@ test("codex worker briefs append the canonical chart note while Claude briefs st
   const codex = dispatchBrief(task(), "/tmp/wt", {}, "codex");
 
   assert.equal(claude, existing);
-  assert.equal(codex, `${claude}\n\n${CHART_CAPABILITY_NOTE}`);
+  assert.equal(codex, `${claude}\n\n${CODEX_NATIVE_CHILD_GUIDANCE}\n\n${CHART_CAPABILITY_NOTE}`);
+});
+
+test("codex worker briefs keep native children inside the native parent and warn about inherited hook credentials", () => {
+  const brief = dispatchBrief(task(), "/tmp/wt", {}, "codex");
+  assert.match(brief, /report back only through their native parent result path/);
+  assert.match(brief, /must not call Perch task outcome hooks or task event endpoints/);
+  assert.match(brief, /inherit the root hook credential/);
+  assert.match(brief, /Mate verification remains authoritative/);
+  assert.match(brief, /share the root worktree by default/);
+  assert.match(brief, /never perform concurrent writes/);
 });

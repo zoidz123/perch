@@ -44,6 +44,7 @@ import { WorktreePool } from "./worktrees.js";
 import { ApnsPushSender, apnsConfigFromEnv, NoopPushSender } from "./push.js";
 import { PushRouter } from "./pushRouter.js";
 import { TimelineStore } from "./timeline.js";
+import { nativeChildRunSummary, recordNativeChildRunObservation } from "./nativeChildRuns.js";
 import { TaskScheduler } from "./taskScheduler.js";
 import { OutboxWorker } from "./outboxWorker.js";
 import { RuntimeManager } from "./runtimeManager.js";
@@ -63,6 +64,15 @@ const metrics = new StateMetrics();
 const codexDaemons = new CodexDaemonManager({ onLog: (message) => console.log(message) });
 const codexOwned = new CodexAppServerAdapter({
   daemons: codexDaemons,
+  // Native collaboration is an observational auto-gate. The managed daemon
+  // inherits the server's ordinary CODEX_HOME, so enabled nonsecret user
+  // settings remain available without copying config or credentials.
+  nativeMultiAgentObservation: ["0", "false", "disabled"].includes(
+    process.env.PERCH_CODEX_NATIVE_MULTI_AGENT?.trim().toLowerCase() ?? ""
+  )
+    ? "disabled"
+    : "auto",
+  nativeChildSummary: (sessionId) => nativeChildRunSummary(tasks.stateDb, sessionId),
   // The daemon process runs the agent's tool shells, so it carries the same
   // per-session hook wiring a PTY session would.
   sessionEnv: (sessionId, request) => ({
@@ -321,6 +331,8 @@ codexOwned.wireEvents({
     markTaskWorkingFromActivity({ tasks }, sessionId);
     taskCompletion.onTurnCompleted(sessionId, "codex");
   },
+  onNativeChildObservation: (sessionId, observation) =>
+    recordNativeChildRunObservation(tasks.stateDb, sessionId, observation),
   onThreadStarted: (sessionId, threadId) => {
     runtimeManager.recordProviderSession(sessionId, "codex", threadId);
     ownerManager.recordProviderSession(sessionId, "codex", threadId);

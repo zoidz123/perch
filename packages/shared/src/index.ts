@@ -10,6 +10,26 @@ export type AgentSessionStatus =
   | "done"
   | "error";
 
+// A provider-native child remains inside its root provider thread.
+// Perch exposes this as an optional, content-free observation only.
+// It is deliberately not an AgentSession, Task, Runtime, or attach target.
+export type NativeChildRunState = "unknown" | "waiting" | "running" | "completed" | "failed" | "interrupted";
+
+export type NativeChildRunSummary = {
+  childThreadId: string;
+  parentThreadId?: string;
+  depth?: number;
+  path?: string;
+  role?: string;
+  state: NativeChildRunState;
+  observedAt: string;
+  protocol: {
+    itemType: "subAgentActivity" | "collabAgentToolCall";
+    itemId?: string;
+    event?: string;
+  };
+};
+
 export type AgentSession = {
   id: string;
   title: string;
@@ -90,6 +110,9 @@ export type AgentSession = {
   // generations; this snapshot survives reconnects and is separate from the
   // task's semantic state.
   runtime?: RuntimeSnapshot;
+  // Native Codex multi-agent observations for this root session.
+  // Append-only and optional so older clients keep decoding the session shape.
+  nativeChildren?: NativeChildRunSummary[];
 };
 
 export type PendingApproval = {

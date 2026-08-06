@@ -18,6 +18,10 @@ Workers receive these values in their process environment (the PTY for Claude, t
 | `PERCH_HOOK_URL` | Points to the server's `POST /hooks` endpoint. |
 | `PERCH_HOOK_TOKEN` | Authenticates only that session's hook and worker requests. |
 
+Native Codex children can inherit the root daemon's hook credential, so that credential alone does not mechanically prove root-thread authority.
+The standard worker brief therefore tells native children to report only through their native parent result path and never call Perch task outcome hooks.
+This is defense in depth, not the task-completion security boundary: Mate verification remains authoritative.
+
 Workers derive the server base URL with `${PERCH_HOOK_URL%/hooks}`.
 They never receive the server bearer token.
 

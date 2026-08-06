@@ -3,13 +3,14 @@ import assert from "node:assert/strict";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import type { AgentSessionStatus, FleetEvent, PendingServerRequest, TimelineItem } from "@perch/shared";
+import type { AgentSessionStatus, FleetEvent, NativeChildRunSummary, PendingServerRequest, TimelineItem } from "@perch/shared";
 import { TimelineStore } from "../timeline.js";
 import { CodexAppServerAdapter, CodexDeliveryUnknownError } from "./codexAppServerAdapter.js";
 import { CodexAppServerClient, isCodexRpcError } from "./codexAppServer.js";
 import type { CodexDaemonManager } from "./codexDaemon.js";
 import { FakeCodexAppServer, type FakeTurn } from "./fakeCodexAppServer.js";
 import { websocketUnixTransport } from "./wsUnixTransport.js";
+import type { NativeChildRunObservation } from "../nativeChildRuns.js";
 
 // The adapter suite runs against the fake daemon over the REAL ws-unix
 // transport and protocol engine, so what passes here is the wire behavior
@@ -44,6 +45,7 @@ type Fixture = {
     serverRequestsResolved: PendingServerRequest[];
     turnStarts: string[];
     turnCompletes: Array<{ sessionId: string; message: string }>;
+    nativeChildren: Array<{ sessionId: string; observation: NativeChildRunObservation }>;
     threads: Array<{ sessionId: string; threadId: string; socketPath: string }>;
     exits: Array<{ sessionId: string; status: string }>;
     fleet: FleetEvent[];
@@ -62,6 +64,7 @@ async function fixture(
     reconnectDelaysMs?: number[];
     historyReplayRetryDelaysMs?: number[];
     historyPageTimeoutMs?: number;
+    nativeChildSummary?: (sessionId: string) => NativeChildRunSummary[];
   } = {}
 ): Promise<Fixture> {
   const dir = mkdtempSync(join(tmpdir(), prefix));
@@ -109,6 +112,7 @@ async function fixture(
     serverRequestsResolved: [],
     turnStarts: [],
     turnCompletes: [],
+    nativeChildren: [],
     threads: [],
     exits: [],
     fleet: []
@@ -121,6 +125,7 @@ async function fixture(
       ? { historyReplayRetryDelaysMs: opts.historyReplayRetryDelaysMs }
       : {}),
     ...(opts.historyPageTimeoutMs ? { historyPageTimeoutMs: opts.historyPageTimeoutMs } : {}),
+    ...(opts.nativeChildSummary ? { nativeChildSummary: opts.nativeChildSummary } : {}),
     sessionEnv: () => ({ PERCH_SESSION_ID: "wired" })
   });
   adapter.wireEvents({
@@ -142,6 +147,7 @@ async function fixture(
     onServerRequestResolved: (_sessionId, request) => events.serverRequestsResolved.push(request),
     onTurnStarted: (sessionId) => events.turnStarts.push(sessionId),
     onTurnComplete: (sessionId, ev) => events.turnCompletes.push({ sessionId, message: ev.message }),
+    onNativeChildObservation: (sessionId, observation) => events.nativeChildren.push({ sessionId, observation }),
     onThreadStarted: (sessionId, threadId, socket) => events.threads.push({ sessionId, threadId, socketPath: socket }),
     onSessionExit: (sessionId, context) => events.exits.push({ sessionId, status: context.status })
   });
@@ -212,6 +218,58 @@ test("startOwned captures the thread id from the thread/start response and surfa
     assert.deepEqual(f.events.threads, [{ sessionId: "pty:s1", threadId: "thr_1", socketPath: f.socketPath }]);
     // The daemon env carried the per-session hook wiring request.
     assert.equal(f.daemons.acquires, 1);
+  } finally {
+    await f.close();
+  }
+});
+
+test("native children stay inside the owned root session and never become fleet or attach targets", async () => {
+  const f = await fixture("pxa-native-child-");
+  try {
+    await f.adapter.startOwned({ command: "codex", agent: "codex", cwd: f.dir, sessionId: "pty:root" });
+    f.fake.emitNotification("thr_1", "item/completed", {
+      threadId: "thr_1",
+      item: {
+        type: "collabAgentToolCall",
+        id: "collab-1",
+        senderThreadId: "thr_1",
+        receiverThreadIds: ["child-1"],
+        status: "inProgress",
+        tool: "spawnAgent",
+        prompt: "must not become a Perch task"
+      }
+    });
+    f.fake.emitNotification("thr_1", "turn/started", { threadId: "child-1", turn: { id: "child-turn" } });
+    await tick();
+
+    assert.deepEqual(f.events.nativeChildren.map((event) => event.observation.childThreadId), ["child-1"]);
+    const sessions = await f.adapter.listSessions();
+    assert.deepEqual(sessions.map((session) => session.id), ["pty:root"]);
+    assert.equal(f.adapter.has("child-1"), false);
+    assert.equal(f.adapter.threadIdOf("child-1"), null);
+    assert.equal(sessions[0]?.attachThreadId, "thr_1");
+    assert.notEqual(sessions[0]?.attachThreadId, "child-1");
+    assert.equal(f.events.turnStarts.includes("pty:root"), false, "child turn did not call root lifecycle");
+    await assert.rejects(() => f.adapter.interrupt("child-1"), /unknown codex app-server session: child-1/);
+  } finally {
+    await f.close();
+  }
+});
+
+test("native child summaries are optional and remain nested on the root session", async () => {
+  const summary: NativeChildRunSummary = {
+    childThreadId: "child-1",
+    parentThreadId: "thr_1",
+    state: "completed",
+    observedAt: "2026-08-06T12:00:00.000Z",
+    protocol: { itemType: "collabAgentToolCall", itemId: "collab-1", event: "completed" }
+  };
+  const f = await fixture("pxa-native-summary-", { nativeChildSummary: () => [summary] });
+  try {
+    const root = await f.adapter.startOwned({ command: "codex", agent: "codex", cwd: f.dir, sessionId: "pty:root" });
+    assert.deepEqual(root.nativeChildren, [summary]);
+    assert.deepEqual((await f.adapter.listSessions())[0]?.nativeChildren, [summary]);
+    assert.equal(f.adapter.has("child-1"), false);
   } finally {
     await f.close();
   }

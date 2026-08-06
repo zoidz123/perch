@@ -38,6 +38,7 @@ import type {
   TimelineItemKind
 } from "@perch/shared";
 import { assertLocalRuntimeModelId } from "../modelSwitch.js";
+import { parseNativeChildRunObservations, type NativeChildRunObservation } from "../nativeChildRuns.js";
 import type {
   ApprovalPolicy,
   InputItem,
@@ -148,6 +149,12 @@ export type CodexAppServerOptions = {
   // which also transition to `running` mid-turn. This is the only signal the
   // launcher accepts to recover a blocked task back to working.
   onTurnStarted?: () => void;
+  // Provider-native multi-agent remains inside the root provider thread.
+  // Perch only observes the safe, content-free child projection.
+  onNativeChildObservation?: (observation: NativeChildRunObservation) => void;
+  // "auto" starts disabled until a known native item is observed.
+  // "disabled" preserves the exact pre-v2 root-only path.
+  nativeMultiAgentObservation?: "auto" | "disabled";
   onUsageLimit?: (limit: UsageLimit) => void;
   // Fired when the CURRENT transport drops out from under a connected client
   // (daemon exit, socket churn) - never for a deliberate disconnect(). The
@@ -257,6 +264,8 @@ export class CodexAppServerClient {
   private readonly onAssistantStream?: (ev: { itemId: string; text: string; done: boolean }) => void;
   private readonly onTurnComplete?: (ev: { message: string }) => void;
   private readonly onTurnStarted?: () => void;
+  private readonly onNativeChildObservation?: (observation: NativeChildRunObservation) => void;
+  private readonly nativeMultiAgentObservation: "auto" | "disabled";
   private readonly onUsageLimit?: (limit: UsageLimit) => void;
   private readonly onDisconnected?: () => void;
   private readonly clientName: string;
@@ -325,6 +334,8 @@ export class CodexAppServerClient {
     this.onAssistantStream = options.onAssistantStream;
     this.onTurnComplete = options.onTurnComplete;
     this.onTurnStarted = options.onTurnStarted;
+    this.onNativeChildObservation = options.onNativeChildObservation;
+    this.nativeMultiAgentObservation = options.nativeMultiAgentObservation ?? "auto";
     this.onUsageLimit = options.onUsageLimit;
     this.onDisconnected = options.onDisconnected;
     this.clientName = options.clientName ?? "perch";
@@ -1150,6 +1161,15 @@ export class CodexAppServerClient {
     if (this.notificationProtocol === "legacy") return false;
     if (this.notificationProtocol === "unknown") this.notificationProtocol = "raw";
 
+    // App-server multi-agent events can be multiplexed onto the root client's
+    // transport. Existing root lifecycle callbacks are only allowed to see
+    // the owned root thread. A child notification is still consumed here so
+    // it cannot become a timeline item, status change, delivery receipt, or
+    // task-completion boundary by accident.
+    const notificationThreadId = this.extractThreadId(params);
+    const isRootThread = !this._threadId || !notificationThreadId || notificationThreadId === this._threadId;
+    if (!isRootThread) return true;
+
     // Any turn or item traffic is observed turn progress; it arms the
     // thread/status/changed idle handler below to report a completion even
     // when the daemon never sends turn/completed for a TUI-driven turn.
@@ -1230,6 +1250,16 @@ export class CodexAppServerClient {
     const itemType = typeof item.type === "string" ? item.type : "";
     const protocolItemId = typeof item.id === "string" && item.id.length > 0 ? item.id : undefined;
     const stagedId = (stage: string) => (protocolItemId ? `${protocolItemId}:${stage}` : undefined);
+
+    if (itemType === "subAgentActivity" || itemType === "collabAgentToolCall") {
+      if (this.nativeMultiAgentObservation === "auto" && this._threadId) {
+        for (const observation of parseNativeChildRunObservations({ item, rootThreadId: this._threadId })) {
+          this.onNativeChildObservation?.(observation);
+        }
+      }
+      // Native child activity is never part of the root chat timeline.
+      return true;
+    }
 
     if ((method === "item/started" || method === "item/completed") && itemType === "userMessage") {
       const text = rawUserMessageText(item);

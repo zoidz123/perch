@@ -8,7 +8,9 @@ import { CodexAppServerClient, type CodexTransport } from "./codexAppServer.js";
 import { TaskCompletionReconciler } from "../taskCompletion.js";
 import { TaskStore } from "../tasks.js";
 import { reportUsageLimitToTask } from "../taskWatchdog.js";
+import { PromptDeliveryTracker } from "../promptDeliveries.js";
 import type { TimelineItem, AgentSessionStatus, PendingServerRequest } from "@perch/shared";
+import type { NativeChildRunObservation } from "../nativeChildRuns.js";
 
 // A scripted codex app-server over PassThrough streams: parses the client's
 // NDJSON requests, auto-replies to lifecycle methods, and can push arbitrary
@@ -49,6 +51,9 @@ class MockCodexServer {
   }
   reply(id: string | number, result: unknown): void {
     this.toClient.write(JSON.stringify({ jsonrpc: "2.0", id, result }) + "\n");
+  }
+  replyError(id: string | number, error: { code: number; message: string }): void {
+    this.toClient.write(JSON.stringify({ jsonrpc: "2.0", id, error }) + "\n");
   }
   push(method: string, params: unknown): void {
     this.toClient.write(JSON.stringify({ jsonrpc: "2.0", method, params }) + "\n");
@@ -331,6 +336,140 @@ test("raw v2 userMessage from a native TUI enters the mobile timeline", async ()
   });
   await tick();
   assert.ok(items.some((i) => i.kind === "user" && i.id === "cx-item-native_1" && i.text === "from the TUI"));
+});
+
+test("native collaboration items become safe child observations, never root timeline rows", async () => {
+  const items: TimelineItem[] = [];
+  const observations: NativeChildRunObservation[] = [];
+  const { client, server } = await connectedClient({
+    onTimelineItem: (item) => items.push(item),
+    onNativeChildObservation: (observation) => observations.push(observation)
+  });
+  await client.startThread();
+  server.push("item/completed", {
+    threadId: "thr_1",
+    item: {
+      type: "collabAgentToolCall",
+      id: "collab-1",
+      senderThreadId: "thr_1",
+      receiverThreadIds: ["child-1"],
+      status: "completed",
+      tool: "spawnAgent",
+      prompt: "private child prompt",
+      agentsStates: { "child-1": { status: "running", message: "private child output" } }
+    }
+  });
+  server.push("item/completed", {
+    threadId: "thr_1",
+    item: {
+      type: "subAgentActivity",
+      id: "activity-1",
+      agentThreadId: "child-1",
+      agentPath: "0",
+      kind: "interrupted"
+    }
+  });
+  await tick();
+
+  assert.deepEqual(items, []);
+  assert.equal(observations.length, 2);
+  assert.equal(observations[0]?.childThreadId, "child-1");
+  assert.equal(observations[0]?.state, "running");
+  assert.equal(observations[1]?.state, "interrupted");
+  assert.equal(JSON.stringify(observations).includes("private child"), false);
+  assert.equal(JSON.stringify(observations).includes("spawnAgent"), false);
+  assert.deepEqual(
+    server.requests.filter((request) => ["spawnAgent", "sendInput", "wait", "closeAgent"].includes(request.method ?? "")),
+    [],
+    "Perch never issues native collaboration RPCs"
+  );
+});
+
+test("child-thread lifecycle traffic cannot mutate root turn, prompt delivery, timeline, or task completion", async () => {
+  const home = mkdtempSync(join(tmpdir(), "perch-codex-child-root-scope-"));
+  const tasks = new TaskStore({ PERCH_HOME: home } as NodeJS.ProcessEnv);
+  const task = tasks.create({ title: "root-owned completion", project: "/tmp/repo" });
+  tasks.update(task.id, { sessionId: "sess_1" });
+  tasks.recordEvent(task.id, { kind: "working", source: "system", message: "root is active" });
+  const completion = new TaskCompletionReconciler({ tasks });
+  const deliveries = new PromptDeliveryTracker(tasks.stateDb);
+  const delivery = deliveries.create("sess_1", "root delivery must remain pending", "human");
+  deliveries.markSubmitted(delivery.id, null);
+  const taskEventCount = tasks.events(task.id).length;
+  const items: TimelineItem[] = [];
+  const streams: Array<{ itemId: string; text: string; done: boolean }> = [];
+  let rootTurnStarts = 0;
+  let rootTurnCompletions = 0;
+  try {
+    const { client, server } = await connectedClient({
+      onTimelineItem: (item) => {
+        items.push(item);
+        deliveries.acknowledgeTimeline(item);
+      },
+      onAssistantStream: (stream) => streams.push(stream),
+      onTurnStarted: () => {
+        rootTurnStarts += 1;
+        completion.onTurnStarted("sess_1", "codex");
+      },
+      onTurnComplete: () => {
+        rootTurnCompletions += 1;
+        completion.onTurnCompleted("sess_1", "codex");
+      }
+    });
+    await client.startThread();
+    server.push("turn/started", { threadId: "child-1", turn: { id: "child-turn" } });
+    server.push("item/agentMessage/delta", { threadId: "child-1", itemId: "child-message", delta: "hidden" });
+    server.push("item/completed", {
+      threadId: "child-1",
+      item: { type: "agentMessage", id: "child-message", text: "hidden child answer", phase: "final_answer" }
+    });
+    server.push("item/completed", {
+      threadId: "child-1",
+      item: {
+        type: "userMessage",
+        id: "child-user-message",
+        content: [{ type: "text", text: "root delivery must remain pending" }]
+      }
+    });
+    server.push("turn/completed", { threadId: "child-1", turn: { id: "child-turn", status: "completed" } });
+    server.push("thread/status/changed", { threadId: "child-1", status: { type: "idle" } });
+    await tick();
+
+    assert.equal(client.turnId, null);
+    assert.equal(rootTurnStarts, 0);
+    assert.equal(rootTurnCompletions, 0);
+    assert.deepEqual(items, []);
+    assert.deepEqual(streams, []);
+    assert.equal(tasks.stateDb.promptDeliveries.find(delivery.id)?.state, "submitted");
+    assert.equal(tasks.events(task.id).length, taskEventCount);
+  } finally {
+    deliveries.stop();
+    tasks.close();
+    rmSync(home, { recursive: true, force: true });
+  }
+});
+
+test("disabled or unsupported native collaboration leaves the existing root-only path unchanged", async () => {
+  const items: TimelineItem[] = [];
+  const observations: unknown[] = [];
+  const { client, server } = await connectedClient({
+    onTimelineItem: (item) => items.push(item),
+    onNativeChildObservation: (observation) => observations.push(observation),
+    nativeMultiAgentObservation: "disabled"
+  });
+  await client.startThread();
+  server.push("item/completed", {
+    threadId: "thr_1",
+    item: { type: "subAgentActivity", id: "activity-1", agentThreadId: "child-1", agentPath: "0", kind: "started" }
+  });
+  // A -32601 response belongs to an unsupported optional method. Perch does
+  // not issue collaboration RPCs, so it cannot affect the root turn.
+  server.replyError(900, { code: -32601, message: "method not found" });
+  await tick();
+
+  assert.deepEqual(observations, []);
+  assert.deepEqual(items, []);
+  assert.equal(client.threadId, "thr_1");
 });
 
 test("submitTurn echoes the user turn with provenance", async () => {

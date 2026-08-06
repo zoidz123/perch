@@ -2,11 +2,19 @@ import { createHash, randomUUID } from "node:crypto";
 import { chmodSync, existsSync, mkdirSync, readFileSync, readdirSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
-import type { Task, TaskEvent, TaskEventKind, TaskEventSource, TaskPr } from "@perch/shared";
+import type {
+  NativeChildRunState,
+  NativeChildRunSummary,
+  Task,
+  TaskEvent,
+  TaskEventKind,
+  TaskEventSource,
+  TaskPr
+} from "@perch/shared";
 import Database from "better-sqlite3";
 import type { TaskDeliverable, TaskReviewFacts, TaskVerificationFacts } from "./taskPresentation.js";
 
-const LATEST_SCHEMA_VERSION = 14;
+const LATEST_SCHEMA_VERSION = 15;
 const LEGACY_TASK_IMPORT = "tasks-json-v1";
 
 const MIGRATIONS = [
@@ -555,6 +563,30 @@ const MIGRATIONS = [
       CREATE INDEX codex_history_syncs_runtime_idx
         ON codex_history_syncs(runtime_kind, runtime_id, runtime_generation, attempt DESC);
     `
+  },
+  {
+    version: 15,
+    name: "native-codex-child-run-observations",
+    sql: `
+      CREATE TABLE native_child_runs (
+        outer_runtime_kind TEXT NOT NULL CHECK (outer_runtime_kind IN ('task', 'owner')),
+        outer_runtime_id TEXT NOT NULL,
+        outer_runtime_generation INTEGER NOT NULL CHECK (outer_runtime_generation >= 0),
+        child_thread_id TEXT NOT NULL,
+        parent_thread_id TEXT,
+        depth INTEGER CHECK (depth >= 0),
+        path TEXT,
+        role TEXT,
+        state TEXT NOT NULL CHECK (state IN ('unknown', 'waiting', 'running', 'completed', 'failed', 'interrupted')),
+        observed_at TEXT NOT NULL,
+        protocol_json TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        PRIMARY KEY (outer_runtime_kind, outer_runtime_id, outer_runtime_generation, child_thread_id)
+      ) STRICT;
+      CREATE INDEX native_child_runs_outer_idx
+        ON native_child_runs(outer_runtime_kind, outer_runtime_id, outer_runtime_generation, updated_at DESC);
+    `
   }
 ] as const;
 
@@ -618,6 +650,14 @@ export type OwnerRuntimeRecord = {
   createdAt: string;
   updatedAt: string;
   endedAt?: string;
+};
+
+export type NativeChildRunRecord = NativeChildRunSummary & {
+  outerRuntimeKind: "task" | "owner";
+  outerRuntimeId: string;
+  outerRuntimeGeneration: number;
+  createdAt: string;
+  updatedAt: string;
 };
 
 export type OwnerOperationRecord = {
@@ -910,6 +950,7 @@ export class StateDb {
   readonly claudeInbox: ClaudeInboxRepository;
   readonly promptDeliveries: PromptDeliveryRepository;
   readonly codexHistorySyncs: CodexHistorySyncRepository;
+  readonly nativeChildRuns: NativeChildRunRepository;
   private readonly db: Database.Database;
 
   constructor(env: NodeJS.ProcessEnv = process.env) {
@@ -934,6 +975,7 @@ export class StateDb {
     this.claudeInbox = new ClaudeInboxRepository(this.db);
     this.promptDeliveries = new PromptDeliveryRepository(this.db);
     this.codexHistorySyncs = new CodexHistorySyncRepository(this.db);
+    this.nativeChildRuns = new NativeChildRunRepository(this.db);
     this.importLegacyTasks(join(home, "tasks"));
   }
 
@@ -1575,6 +1617,112 @@ export class OwnerRuntimeRepository {
       updated.updatedAt, updated.endedAt ?? null, ownerId, generation, ...expectedStates
     );
     return result.changes === 1 ? updated : undefined;
+  }
+}
+
+const NATIVE_CHILD_TERMINAL_STATES = new Set<NativeChildRunState>(["completed", "failed", "interrupted"]);
+
+function nativeChildStateForUpdate(
+  current: NativeChildRunRecord,
+  next: NativeChildRunSummary
+): NativeChildRunState {
+  if (next.state === "unknown") return current.state;
+  if (!NATIVE_CHILD_TERMINAL_STATES.has(current.state)) return next.state;
+  if (NATIVE_CHILD_TERMINAL_STATES.has(next.state)) return next.state;
+  // A new protocol item can represent a later native follow-up turn for the
+  // same child thread. A duplicate or stale item must never make a completed
+  // child look live again.
+  if (next.protocol.itemId && next.protocol.itemId !== current.protocol.itemId) return next.state;
+  return current.state;
+}
+
+export class NativeChildRunRepository {
+  constructor(private readonly db: Database.Database) {}
+
+  upsert(input: Omit<NativeChildRunRecord, "createdAt" | "updatedAt">): NativeChildRunRecord {
+    const existing = this.find(
+      input.outerRuntimeKind,
+      input.outerRuntimeId,
+      input.outerRuntimeGeneration,
+      input.childThreadId
+    );
+    if (existing && input.observedAt < existing.observedAt) return existing;
+
+    const now = new Date().toISOString();
+    const record: NativeChildRunRecord = existing
+      ? {
+          ...existing,
+          ...(input.parentThreadId ? { parentThreadId: input.parentThreadId } : {}),
+          ...(input.depth !== undefined ? { depth: input.depth } : {}),
+          ...(input.path ? { path: input.path } : {}),
+          ...(input.role ? { role: input.role } : {}),
+          state: nativeChildStateForUpdate(existing, input),
+          observedAt: input.observedAt,
+          protocol: input.protocol,
+          updatedAt: now
+        }
+      : { ...input, createdAt: now, updatedAt: now };
+
+    this.db.prepare(
+      `INSERT INTO native_child_runs(
+         outer_runtime_kind, outer_runtime_id, outer_runtime_generation, child_thread_id,
+         parent_thread_id, depth, path, role, state, observed_at, protocol_json, created_at, updated_at
+       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+       ON CONFLICT(outer_runtime_kind, outer_runtime_id, outer_runtime_generation, child_thread_id)
+       DO UPDATE SET
+         parent_thread_id = excluded.parent_thread_id,
+         depth = excluded.depth,
+         path = excluded.path,
+         role = excluded.role,
+         state = excluded.state,
+         observed_at = excluded.observed_at,
+         protocol_json = excluded.protocol_json,
+         updated_at = excluded.updated_at`
+    ).run(
+      record.outerRuntimeKind,
+      record.outerRuntimeId,
+      record.outerRuntimeGeneration,
+      record.childThreadId,
+      record.parentThreadId ?? null,
+      record.depth ?? null,
+      record.path ?? null,
+      record.role ?? null,
+      record.state,
+      record.observedAt,
+      JSON.stringify(record.protocol),
+      record.createdAt,
+      record.updatedAt
+    );
+    return record;
+  }
+
+  find(
+    outerRuntimeKind: NativeChildRunRecord["outerRuntimeKind"],
+    outerRuntimeId: string,
+    outerRuntimeGeneration: number,
+    childThreadId: string
+  ): NativeChildRunRecord | undefined {
+    const row = this.db.prepare(
+      `SELECT * FROM native_child_runs
+       WHERE outer_runtime_kind = ? AND outer_runtime_id = ?
+         AND outer_runtime_generation = ? AND child_thread_id = ?`
+    ).get(outerRuntimeKind, outerRuntimeId, outerRuntimeGeneration, childThreadId) as NativeChildRunRow | undefined;
+    return row ? nativeChildRunFromRow(row) : undefined;
+  }
+
+  listForOuter(
+    outerRuntimeKind: NativeChildRunRecord["outerRuntimeKind"],
+    outerRuntimeId: string,
+    outerRuntimeGeneration: number
+  ): NativeChildRunSummary[] {
+    return (this.db.prepare(
+      `SELECT * FROM native_child_runs
+       WHERE outer_runtime_kind = ? AND outer_runtime_id = ? AND outer_runtime_generation = ?
+       ORDER BY updated_at DESC, child_thread_id ASC`
+    ).all(outerRuntimeKind, outerRuntimeId, outerRuntimeGeneration) as NativeChildRunRow[]).map((row) => {
+      const { outerRuntimeKind: _kind, outerRuntimeId: _id, outerRuntimeGeneration: _generation, createdAt: _createdAt, updatedAt: _updatedAt, ...summary } = nativeChildRunFromRow(row);
+      return summary;
+    });
   }
 }
 
@@ -2914,6 +3062,22 @@ type CodexHistorySyncRow = {
   finished_at: string | null;
 };
 
+type NativeChildRunRow = {
+  outer_runtime_kind: NativeChildRunRecord["outerRuntimeKind"];
+  outer_runtime_id: string;
+  outer_runtime_generation: number;
+  child_thread_id: string;
+  parent_thread_id: string | null;
+  depth: number | null;
+  path: string | null;
+  role: string | null;
+  state: NativeChildRunState;
+  observed_at: string;
+  protocol_json: string;
+  created_at: string;
+  updated_at: string;
+};
+
 function taskEventFromRow(row: TaskEventRow): TaskEvent {
   return {
     seq: row.seq,
@@ -3010,6 +3174,24 @@ function codexHistorySyncFromRow(row: CodexHistorySyncRow): CodexHistorySyncReco
     createdAt: row.created_at,
     updatedAt: row.updated_at,
     ...(row.finished_at ? { finishedAt: row.finished_at } : {})
+  };
+}
+
+function nativeChildRunFromRow(row: NativeChildRunRow): NativeChildRunRecord {
+  return {
+    outerRuntimeKind: row.outer_runtime_kind,
+    outerRuntimeId: row.outer_runtime_id,
+    outerRuntimeGeneration: row.outer_runtime_generation,
+    childThreadId: row.child_thread_id,
+    ...(row.parent_thread_id ? { parentThreadId: row.parent_thread_id } : {}),
+    ...(row.depth !== null ? { depth: row.depth } : {}),
+    ...(row.path ? { path: row.path } : {}),
+    ...(row.role ? { role: row.role } : {}),
+    state: row.state,
+    observedAt: row.observed_at,
+    protocol: JSON.parse(row.protocol_json) as NativeChildRunSummary["protocol"],
+    createdAt: row.created_at,
+    updatedAt: row.updated_at
   };
 }
 

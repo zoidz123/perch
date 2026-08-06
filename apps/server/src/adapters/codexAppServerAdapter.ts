@@ -20,6 +20,7 @@ import type {
   AgentSessionStatus,
   CodexReasoningEffort,
   FleetEvent,
+  NativeChildRunSummary,
   PendingServerRequest,
   RecentEventsResult,
   ServerRequestResponse,
@@ -27,6 +28,7 @@ import type {
   TimelineItem,
   TopologyResponse
 } from "@perch/shared";
+import type { NativeChildRunObservation } from "../nativeChildRuns.js";
 import type { UsageLimit } from "../usageLimitDetect.js";
 import type { TimelineBackfillResult } from "../timeline.js";
 import { CodexAppServerClient, isCodexRpcError, type CodexRpcError } from "./codexAppServer.js";
@@ -70,6 +72,7 @@ export type CodexOwnedEventSink = {
   onAssistantStream?: (sessionId: string, ev: { itemId: string; text: string; done: boolean }) => void;
   onTurnStarted?: (sessionId: string) => void;
   onTurnComplete?: (sessionId: string, ev: { message: string }) => void;
+  onNativeChildObservation?: (sessionId: string, observation: NativeChildRunObservation) => void;
   onThreadStarted?: (sessionId: string, threadId: string, socketPath: string) => void;
   onModelResolved?: (sessionId: string, model: string) => void;
   onUsageLimit?: (sessionId: string, limit: UsageLimit) => void;
@@ -101,6 +104,7 @@ export type CreateOwnedClient = (args: {
     onAssistantStream: (ev: { itemId: string; text: string; done: boolean }) => void;
     onTurnStarted: () => void;
     onTurnComplete: (ev: { message: string }) => void;
+    onNativeChildObservation: (observation: NativeChildRunObservation) => void;
     onUsageLimit: (limit: UsageLimit) => void;
     onDisconnected: () => void;
   };
@@ -117,6 +121,9 @@ export type CodexAppServerAdapterOptions = {
   reconnectDelaysMs?: number[];
   historyReplayRetryDelaysMs?: number[];
   historyPageTimeoutMs?: number;
+  // A state-backed, optional session projection for future clients.
+  nativeChildSummary?: (sessionId: string) => NativeChildRunSummary[];
+  nativeMultiAgentObservation?: "auto" | "disabled";
 };
 
 export type StartOwnedOptions = {
@@ -180,6 +187,8 @@ export class CodexAppServerAdapter implements AgentAdapter {
   private readonly reconnectDelaysMs: number[];
   private readonly historyReplayRetryDelaysMs: number[];
   private readonly historyPageTimeoutMs: number;
+  private readonly nativeChildSummary?: (sessionId: string) => NativeChildRunSummary[];
+  private readonly nativeMultiAgentObservation: "auto" | "disabled";
   private readonly fleetHandlers = new Set<(event: FleetEvent) => void>();
   private events: CodexOwnedEventSink = {};
   private historyCatchUpRequester?: (sessionId: string, hasUsableAnchor: boolean) => void;
@@ -191,6 +200,8 @@ export class CodexAppServerAdapter implements AgentAdapter {
     this.historyReplayRetryDelaysMs =
       options.historyReplayRetryDelaysMs ?? DEFAULT_HISTORY_REPLAY_RETRY_DELAYS_MS;
     this.historyPageTimeoutMs = options.historyPageTimeoutMs ?? DEFAULT_HISTORY_PAGE_TIMEOUT_MS;
+    this.nativeChildSummary = options.nativeChildSummary;
+    this.nativeMultiAgentObservation = options.nativeMultiAgentObservation ?? "auto";
     this.createClient =
       options.createClient ??
       (({ sessionId, socketPath, handlers }) =>
@@ -204,6 +215,8 @@ export class CodexAppServerAdapter implements AgentAdapter {
           onAssistantStream: handlers.onAssistantStream,
           onTurnStarted: handlers.onTurnStarted,
           onTurnComplete: handlers.onTurnComplete,
+          onNativeChildObservation: handlers.onNativeChildObservation,
+          nativeMultiAgentObservation: this.nativeMultiAgentObservation,
           onUsageLimit: handlers.onUsageLimit,
           onDisconnected: handlers.onDisconnected,
           clientName: "perch-owner"
@@ -940,6 +953,12 @@ export class CodexAppServerAdapter implements AgentAdapter {
         this.touch(session);
         this.events.onTurnComplete?.(session.id, ev);
       },
+      onNativeChildObservation: (observation) => {
+        this.events.onNativeChildObservation?.(session.id, observation);
+        // The only fleet surface is the existing root session summary.
+        // No child is ever added to the adapter's session map or topology.
+        this.emitFleetEvent("activity", "codex.native-child-observed", session.id);
+      },
       onUsageLimit: (limit) => this.events.onUsageLimit?.(session.id, limit),
       onDisconnected: () => this.handleDisconnect(session)
     };
@@ -961,6 +980,7 @@ export class CodexAppServerAdapter implements AgentAdapter {
   }
 
   private toAgentSession(session: OwnedSession): AgentSession {
+    const nativeChildren = this.nativeChildSummary?.(session.id);
     return {
       id: session.id,
       title: session.title,
@@ -979,6 +999,9 @@ export class CodexAppServerAdapter implements AgentAdapter {
             attachThreadId: session.threadId,
             attachSocketPath: session.socketPath
           }
+        : {}),
+      ...(nativeChildren && nativeChildren.length > 0
+        ? { nativeChildren }
         : {})
     };
   }
