@@ -243,6 +243,10 @@ struct HomeView: View {
     @State private var showRemoveConfirm = false
     @State private var removeRefusedMessage: String?
 
+    private var workspacePresentation: ConnectionContentPresentation {
+        store.workspaceContentPresentation
+    }
+
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
             // Before pairing there is nothing to act on, so the header
@@ -263,7 +267,6 @@ struct HomeView: View {
                     .padding(.bottom, 14)
             }
 
-            let workspacePresentation = store.workspaceContentPresentation
             if !store.isPaired {
                 PairPrompt(showPairSheet: $showPairSheet)
             } else {
@@ -309,12 +312,14 @@ struct HomeView: View {
             presenting: removeCandidate
         ) { candidate in
             Button("Remove", role: .destructive) {
+                guard workspacePresentation.permitsOutboundActions else { return }
                 Task {
                     if let message = await store.removeProject(candidate.path) {
                         removeRefusedMessage = message
                     }
                 }
             }
+            .disabled(!workspacePresentation.permitsOutboundActions)
             Button("Cancel", role: .cancel) {}
         } message: { _ in
             Text("This only takes the project off Perch's list. The repo on disk is untouched.")
@@ -516,10 +521,13 @@ struct HomeView: View {
                     // The mate manages its scope: long-press to register a new
                     // project under it (each project header removes itself).
                     .contextMenu {
-                        Button {
-                            showAddProject = true
-                        } label: {
-                            Label("Add project", systemImage: "folder.badge.plus")
+                        if workspacePresentation.permitsOutboundActions {
+                            Button {
+                                guard workspacePresentation.permitsOutboundActions else { return }
+                                showAddProject = true
+                            } label: {
+                                Label("Add project", systemImage: "folder.badge.plus")
+                            }
                         }
                     }
 
@@ -538,7 +546,11 @@ struct HomeView: View {
                 // solo agents it is the only way to start one.
                 soloSectionHeader
                 ForEach(orphanTasks) { task in
-                    TaskRow(task: task, session: session(for: task))
+                    TaskRow(
+                        task: task,
+                        session: session(for: task),
+                        permitsOutboundActions: workspacePresentation.permitsOutboundActions
+                    )
                         .environmentObject(store)
                 }
                 ForEach(otherSessions) { session in
@@ -582,8 +594,9 @@ struct HomeView: View {
         .padding(.bottom, 4)
         .contentShape(Rectangle())
         .contextMenu {
-            if project.hasPrefix("/") {
+            if project.hasPrefix("/"), workspacePresentation.permitsOutboundActions {
                 Button(role: .destructive) {
+                    guard workspacePresentation.permitsOutboundActions else { return }
                     removeCandidate = RemoveProjectCandidate(name: name, path: project)
                     showRemoveConfirm = true
                 } label: {
@@ -622,7 +635,12 @@ struct HomeView: View {
     // A crew row nested under its project header, tied back to it with a
     // thread line in the leading gutter.
     private func nestedTaskRow(_ task: AgentTask) -> some View {
-        TaskRow(task: task, session: session(for: task), showsProject: false)
+        TaskRow(
+            task: task,
+            session: session(for: task),
+            showsProject: false,
+            permitsOutboundActions: workspacePresentation.permitsOutboundActions
+        )
             .environmentObject(store)
             .padding(.leading, 22)
             .overlay(alignment: .leading) {
@@ -657,6 +675,7 @@ struct HomeView: View {
                     .foregroundStyle(Style.textPrimary)
                 Spacer()
                 Button {
+                    guard workspacePresentation.permitsOutboundActions else { return }
                     showNewAgent = true
                 } label: {
                     Image(systemName: "plus")
@@ -666,6 +685,8 @@ struct HomeView: View {
                         .background(Style.secondaryFill, in: Circle())
                 }
                 .accessibilityLabel("New agent")
+                .disabled(!workspacePresentation.permitsOutboundActions)
+                .opacity(workspacePresentation.permitsOutboundActions ? 1 : 0.45)
             }
             Text("Run an agent directly for one-off or exploratory tasks.")
                 .font(.system(size: 12.5))
@@ -1648,7 +1669,10 @@ struct SessionDetailView: View {
         } else if detailPresentation == .unavailable {
             UnavailableSessionShell(task: sessionTask)
         } else if hasChatSource {
-            TimelineChatView(sessionId: sessionId)
+            TimelineChatView(
+                sessionId: sessionId,
+                permitsOutboundActions: contentPresentation.permitsOutboundActions
+            )
                 .environmentObject(store)
         } else {
             AgentChatPlaceholder(agent: session?.agent ?? .unknown)

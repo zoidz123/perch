@@ -126,6 +126,28 @@ final class ConnectionStatusPresentationTests: XCTestCase {
         XCTAssertTrue(online.permitsOutboundActions)
     }
 
+    func testCachedTimelineRetryAndWorkspaceMutationsWaitForFreshReadiness() {
+        var status = ConnectionStatusHysteresis(initialAvailability: .online, readinessTimeout: 8)
+
+        status.beginConnecting(at: 20)
+        var presentation = ConnectionContentPresentation(
+            availability: status.presentedAvailability,
+            hasCachedContent: true
+        )
+
+        XCTAssertEqual(presentation.mode, .cachedReadOnly)
+        XCTAssertFalse(presentation.permitsOutboundActions)
+
+        XCTAssertTrue(status.observe(.directBootstrap))
+        presentation = ConnectionContentPresentation(
+            availability: status.presentedAvailability,
+            hasCachedContent: true
+        )
+
+        XCTAssertEqual(presentation.mode, .interactive)
+        XCTAssertTrue(presentation.permitsOutboundActions)
+    }
+
     func testRecoveryRestoresInteractiveContentWithoutChangingCachedSessionOrTimeline() {
         let selectedSessionID = "pty:cached-session"
         let cachedTimelineSequences = [41, 42]
