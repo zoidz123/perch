@@ -115,7 +115,10 @@ struct ContentView: View {
         // The chart room rides above whatever is open (home or a session):
         // card taps and future deep links both just set store.openChart.
         .fullScreenCover(item: $store.openChart) { chart in
-            ChartReviewView(chart: chart)
+            ChartReviewView(
+                chart: chart,
+                permitsOutboundActions: store.sessionContentPresentation(for: chart.sessionId).permitsOutboundActions
+            )
                 .environmentObject(store)
                 .preferredColorScheme(.dark)
         }
