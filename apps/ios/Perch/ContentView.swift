@@ -830,9 +830,8 @@ struct HomeView: View {
     }
 }
 
-// Connecting never reuses cached rows or leaves a disabled control in place.
-// The navigation shell remains, then the full interface appears after fresh
-// readiness evidence arrives.
+// A cold connection without authenticated cached content blocks the body.
+// Reconnects with cached content use ConnectionStatusIndicator instead.
 struct ConnectionWaitingState: View {
     var body: some View {
         HStack(spacing: 8) {
