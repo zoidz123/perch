@@ -879,7 +879,10 @@ export class CodexAppServerClient {
 
   private async handleServerRequest(id: string | number, method: string, params: Record<string, unknown>): Promise<void> {
     const requestThreadId = this.extractThreadId(params);
-    if (requestThreadId && requestThreadId !== this._threadId) return;
+    if (requestThreadId && requestThreadId !== this._threadId) {
+      this.declineServerRequest(id, method);
+      return;
+    }
 
     const structured = this.normalizeServerRequest(id, method, params);
     if (structured && this.onServerRequest) {
@@ -934,6 +937,30 @@ export class CodexAppServerClient {
     }
 
     // Unknown server request - respond so codex does not hang.
+    this.respond(id, {});
+  }
+
+  private declineServerRequest(id: string | number, method: string): void {
+    if (method === "item/commandExecution/requestApproval" || method === "item/fileChange/requestApproval") {
+      this.respond(id, { decision: "decline" });
+      return;
+    }
+    if (method === "execCommandApproval" || method === "applyPatchApproval") {
+      this.respond(id, { decision: "denied" });
+      return;
+    }
+    if (method === "item/permissions/requestApproval") {
+      this.respond(id, { permissions: {}, scope: "turn" });
+      return;
+    }
+    if (method === "mcpServer/elicitation/request") {
+      this.respond(id, { action: "decline", content: null, _meta: null });
+      return;
+    }
+    if (method === "item/tool/requestUserInput") {
+      this.respond(id, { answers: {} });
+      return;
+    }
     this.respond(id, {});
   }
 

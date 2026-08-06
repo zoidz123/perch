@@ -624,25 +624,32 @@ test("child-thread server requests cannot enter root approval or input state", a
   server.push("turn/started", { threadId: "thr_1", turn: { id: "root-turn" } });
   await tick();
 
-  server.requestToClient(81, "item/commandExecution/requestApproval", {
-    threadId: "child-1",
-    turnId: "child-turn",
-    itemId: "child-command",
-    command: "private child command"
-  });
-  server.requestToClient(82, "item/tool/requestUserInput", {
-    threadId: "child-1",
-    turnId: "child-turn",
-    itemId: "child-input",
-    questions: [{ id: "private", question: "private child question" }]
-  });
+  const cases = [
+    [81, "item/commandExecution/requestApproval", { decision: "decline" }],
+    [82, "item/fileChange/requestApproval", { decision: "decline" }],
+    [83, "item/permissions/requestApproval", { permissions: {}, scope: "turn" }],
+    [84, "mcpServer/elicitation/request", { action: "decline", content: null, _meta: null }],
+    [85, "item/tool/requestUserInput", { answers: {} }]
+  ] as const;
+  for (const [id, method] of cases) {
+    server.requestToClient(id, method, {
+      threadId: "child-1",
+      turnId: "child-turn",
+      itemId: `child-${id}`,
+      command: "private child command",
+      message: "private child message",
+      questions: [{ id: "private", question: "private child question" }]
+    });
+  }
   await tick();
 
   assert.deepEqual(opened, []);
   assert.equal(directApprovals, 0);
   assert.deepEqual(statuses, ["running"]);
-  assert.equal(client.respondToServerRequest(81, "accept"), false);
-  assert.equal(client.respondToServerRequest(82, undefined, { answers: {} }), false);
+  for (const [id, , expected] of cases) {
+    assert.deepEqual(server.requests.find((request) => request.id === id)?.result, expected);
+    assert.equal(client.respondToServerRequest(id, "accept", { answers: {} }), false);
+  }
 });
 
 test("turn completion cannot clear a structured request; disconnect cleanup can", async () => {
