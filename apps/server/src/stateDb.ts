@@ -961,6 +961,7 @@ export class StateDb {
     chmodSync(this.path, 0o600);
     this.configure();
     this.migrate();
+    this.db.prepare("UPDATE native_child_runs SET state = 'unknown' WHERE state IN ('waiting', 'running')").run();
     this.tasks = new TaskRepository(this.db);
     this.runtimes = new RuntimeRepository(this.db);
     this.operations = new OperationRepository(this.db);

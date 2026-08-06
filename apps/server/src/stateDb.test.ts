@@ -481,28 +481,30 @@ test("native child runs dedupe identity and preserve terminal status unless a ne
 test("native child observations survive restart without claiming liveness", () => {
   const root = home();
   const first = new StateDb(env(root));
-  first.nativeChildRuns.upsert({
-    outerRuntimeKind: "owner",
-    outerRuntimeId: "mate-runtime",
-    outerRuntimeGeneration: 1,
-    childThreadId: "child-done",
-    parentThreadId: "root",
-    state: "completed",
-    observedAt: "2026-08-06T12:00:00.000Z",
-    protocol: { itemType: "subAgentActivity", itemId: "activity-done", event: "interacted" }
-  });
+  const outer = { outerRuntimeKind: "owner" as const, outerRuntimeId: "mate-runtime", outerRuntimeGeneration: 1 };
+  for (const [childThreadId, state] of [
+    ["child-running", "running"],
+    ["child-waiting", "waiting"],
+    ["child-done", "completed"]
+  ] as const) {
+    first.nativeChildRuns.upsert({
+      ...outer,
+      childThreadId,
+      parentThreadId: "root",
+      state,
+      observedAt: "2026-08-06T12:00:00.000Z",
+      protocol: { itemType: "subAgentActivity", itemId: `activity-${childThreadId}`, event: "interacted" }
+    });
+  }
   first.close();
 
   const restarted = new StateDb(env(root));
-  const child = restarted.nativeChildRuns.listForOuter("owner", "mate-runtime", 1)[0];
-  assert.deepEqual(child, {
-    childThreadId: "child-done",
-    parentThreadId: "root",
-    state: "completed",
-    observedAt: "2026-08-06T12:00:00.000Z",
-    protocol: { itemType: "subAgentActivity", itemId: "activity-done", event: "interacted" }
-  });
-  assert.equal("live" in (child ?? {}), false);
+  const children = restarted.nativeChildRuns.listForOuter("owner", "mate-runtime", 1);
+  assert.deepEqual(
+    Object.fromEntries(children.map((child) => [child.childThreadId, child.state])),
+    { "child-done": "completed", "child-running": "unknown", "child-waiting": "unknown" }
+  );
+  assert.equal(children.every((child) => !("live" in child)), true);
 
   restarted.close();
   rmSync(root, { recursive: true, force: true });

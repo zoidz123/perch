@@ -878,6 +878,9 @@ export class CodexAppServerClient {
   }
 
   private async handleServerRequest(id: string | number, method: string, params: Record<string, unknown>): Promise<void> {
+    const requestThreadId = this.extractThreadId(params);
+    if (requestThreadId && requestThreadId !== this._threadId) return;
+
     const structured = this.normalizeServerRequest(id, method, params);
     if (structured && this.onServerRequest) {
       const key = requestKey(id);

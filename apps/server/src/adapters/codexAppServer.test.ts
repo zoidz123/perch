@@ -608,6 +608,43 @@ test("structured requests preserve identity, cover every 0.144.1 family, and cle
   assert.equal(opened[3]?.persistence?.always, true);
 });
 
+test("child-thread server requests cannot enter root approval or input state", async () => {
+  const opened: PendingServerRequest[] = [];
+  const statuses: AgentSessionStatus[] = [];
+  let directApprovals = 0;
+  const { client, server } = await connectedClient({
+    onServerRequest: (request) => opened.push(request),
+    onStatus: (status) => statuses.push(status),
+    approvalHandler: async () => {
+      directApprovals += 1;
+      return "approved";
+    }
+  });
+  await client.startThread();
+  server.push("turn/started", { threadId: "thr_1", turn: { id: "root-turn" } });
+  await tick();
+
+  server.requestToClient(81, "item/commandExecution/requestApproval", {
+    threadId: "child-1",
+    turnId: "child-turn",
+    itemId: "child-command",
+    command: "private child command"
+  });
+  server.requestToClient(82, "item/tool/requestUserInput", {
+    threadId: "child-1",
+    turnId: "child-turn",
+    itemId: "child-input",
+    questions: [{ id: "private", question: "private child question" }]
+  });
+  await tick();
+
+  assert.deepEqual(opened, []);
+  assert.equal(directApprovals, 0);
+  assert.deepEqual(statuses, ["running"]);
+  assert.equal(client.respondToServerRequest(81, "accept"), false);
+  assert.equal(client.respondToServerRequest(82, undefined, { answers: {} }), false);
+});
+
 test("turn completion cannot clear a structured request; disconnect cleanup can", async () => {
   const resolved: PendingServerRequest[] = [];
   const statuses: AgentSessionStatus[] = [];
