@@ -22,7 +22,11 @@ The manifest records the exact runtime bytes, source blobs, modes, and SHA-256 h
 
 The pinned upstream test suite and fixture files are not packaged.
 
-Bootstrap TruffleHog verified live credentials in two upstream test sources, so the manifest records all five excluded test-only paths and their exact upstream hashes without copying credential bytes into Perch.
+Bootstrap TruffleHog found four VERIFIED live Lob API credentials in two upstream test sources, `skills/autoreview/tests/test_autoreview_hardening.py` (three) and `skills/autoreview/scripts/autoreview_test.py` (one).
+
+The pinned helper is itself the bootstrap gate, it fails closed on verified secrets, and it cannot exclude paths, so vendoring those bytes would make a clean receipt structurally impossible.
+
+The manifest therefore records all five excluded test-only paths, their exact upstream blob ids and SHA-256 hashes, and the reason, without copying any credential bytes into Perch.
 
 The source tree retains upstream's `CLAUDE.md -> AGENTS.md` symlink.
 

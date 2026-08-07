@@ -134,7 +134,10 @@ export class AutoReviewService {
       const fallbackReason = codexAccessFallback(result.stdout, result.stderr)
         ? "sol_access_unavailable"
         : undefined;
-      const state = targetUnchanged && result.exitCode === 0 && findings.length === 0
+      // A clean receipt requires the helper's own structured report. An
+      // absent or unreadable one is indistinguishable from "no findings"
+      // here, so it fails closed rather than minting a false clean receipt.
+      const state = targetUnchanged && result.exitCode === 0 && result.report !== undefined && findings.length === 0
         ? "clean"
         : targetUnchanged && findings.length > 0
           ? "findings"
@@ -154,7 +157,11 @@ export class AutoReviewService {
           stdoutSha256: sha256(result.stdout),
           stderrSha256: sha256(result.stderr),
           ...(state === "failed" ? {
-            failureCode: targetUnchanged ? helperFailureCode(`${result.stdout}\n${result.stderr}`) : "review_target_changed"
+            failureCode: !targetUnchanged
+              ? "review_target_changed"
+              : result.report === undefined && result.exitCode === 0
+                ? "structured_report_missing"
+                : helperFailureCode(`${result.stdout}\n${result.stderr}`)
           } : {})
         }),
         duplicate: false

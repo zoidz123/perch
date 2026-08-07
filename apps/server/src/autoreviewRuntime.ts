@@ -110,8 +110,8 @@ function verifyExcludedFiles(root: string, manifest: AutoReviewManifest): void {
     if (
       included.has(excluded.path) ||
       EXPECTED_EXCLUDED_FILES.get(excluded.path) !== excluded.sha256 ||
-      excluded.reason !== "verified live credentials detected by TruffleHog during bootstrap" &&
-        excluded.reason !== "upstream test fixture excluded with the test suite after verified live credentials were detected by TruffleHog during bootstrap" ||
+      excluded.reason !== "four TruffleHog-verified live Lob API credentials in the upstream test bytes" &&
+        excluded.reason !== "upstream test fixture excluded with the test suite carrying the four TruffleHog-verified live Lob API credentials" ||
       existsSync(join(root, excluded.path))
     ) {
       throw new Error(`bundled AutoReview exclusion integrity mismatch: ${excluded.path}`);

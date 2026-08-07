@@ -196,6 +196,25 @@ test("helper failures and actionable findings never produce a clean receipt", as
   } finally {
     cleanup(finding);
   }
+
+  // A missing or unreadable structured report parses to zero findings, which
+  // must never be mistaken for a reviewed-and-clean result.
+  const silent = fixture();
+  try {
+    const review = new AutoReviewService(silent.tasks.stateDb, async () => ({
+      exitCode: 0, stdout: "", stderr: "", report: undefined
+    }));
+    const result = await review.run(input(silent, "no-structured-report"));
+    assert.equal(result.attempt.state, "failed");
+    assert.equal(result.attempt.failureCode, "structured_report_missing");
+    const delivery = new DeliveryService(silent.tasks.stateDb, async () => ({ url: "https://github.com/o/r/pull/2" }));
+    await assert.rejects(
+      delivery.createPr({ task: silent.task, runtime: silent.runtime, worktreePath: silent.repo, idempotencyKey: "delivery-silent" }),
+      /clean AutoReview receipt/
+    );
+  } finally {
+    cleanup(silent);
+  }
 });
 
 test("Terra is recorded only for the documented Sol access fallback and delivery stays exact-tree idempotent", async () => {
@@ -257,6 +276,50 @@ test("delivery refuses a clean receipt as soon as any source change alters its r
       /receipt is stale/
     );
     assert.equal(deliveryCalls, 0);
+  } finally {
+    cleanup(value);
+  }
+});
+
+test("a delivery retry after a failed attempt binds the PR to the receipt it actually delivered", async () => {
+  const value = fixture();
+  const git = (args: string[]) => execFileSync("git", ["-C", value.repo, ...args], { stdio: "pipe" });
+  try {
+    const review = new AutoReviewService(value.tasks.stateDb, async () => ({
+      exitCode: 0, stdout: "", stderr: "", report: { findings: [] }
+    }));
+    const first = (await review.run(input(value, "retry-1"))).attempt;
+    assert.equal(first.state, "clean");
+
+    let attempts = 0;
+    const delivery = new DeliveryService(value.tasks.stateDb, async () => {
+      attempts += 1;
+      if (attempts === 1) throw new Error("push rejected by remote");
+      return { url: "https://github.com/o/r/pull/73", number: 73 };
+    });
+    await assert.rejects(
+      delivery.createPr({ task: value.task, runtime: value.runtime, worktreePath: value.repo, idempotencyKey: "retry" }),
+      /push rejected/
+    );
+    assert.equal(value.tasks.stateDb.delivery.find(value.task.id)?.state, "failed");
+
+    // The worker keeps working, so the retry delivers a different tree that
+    // only the newer receipt covers.
+    writeFileSync(join(value.repo, "app.txt"), "second review target\n");
+    git(["commit", "-am", "second review target", "-q"]);
+    const second = (await review.run(input(value, "retry-2"))).attempt;
+    assert.equal(second.state, "clean");
+    assert.notEqual(second.id, first.id);
+
+    const retried = await delivery.createPr({ task: value.task, runtime: value.runtime, worktreePath: value.repo, idempotencyKey: "retry" });
+    assert.equal(attempts, 2);
+    assert.equal(retried.pr.number, 73);
+
+    const record = value.tasks.stateDb.delivery.find(value.task.id);
+    assert.equal(record?.state, "created");
+    assert.equal(record?.receiptId, second.id, "the durable row names the receipt that was actually delivered");
+    assert.equal(record?.headOid, second.headOid, "the durable row names the head that was actually pushed");
+    assert.equal(retried.pr.headOid, second.headOid, "the linked PR identity matches the delivered head");
   } finally {
     cleanup(value);
   }

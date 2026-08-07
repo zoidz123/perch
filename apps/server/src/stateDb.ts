@@ -1814,6 +1814,23 @@ export class DeliveryPrRepository {
     return this.find(attempt.taskId)!;
   }
 
+  // A retry after a failed attempt is a new delivery of whatever receipt is
+  // valid now. Rebinding before the push keeps the durable row's receipt and
+  // target identity the ones actually delivered, so the completion gates that
+  // compare against them stay satisfiable.
+  rebind(
+    taskId: string,
+    target: Pick<DeliveryPrAttemptRecord, "receiptId" | "baseOid" | "headOid" | "treeOid" | "diffSha256">
+  ): DeliveryPrAttemptRecord {
+    this.db.prepare(
+      `UPDATE delivery_pr_attempts
+       SET receipt_id = ?, base_oid = ?, head_oid = ?, tree_oid = ?, diff_sha256 = ?,
+           state = 'creating', failure_code = NULL, updated_at = ?
+       WHERE task_id = ? AND state != 'created'`
+    ).run(target.receiptId, target.baseOid, target.headOid, target.treeOid, target.diffSha256, new Date().toISOString(), taskId);
+    return this.find(taskId)!;
+  }
+
   complete(taskId: string, prUrl: string, prNumber: number | undefined): DeliveryPrAttemptRecord {
     this.db.prepare(
       "UPDATE delivery_pr_attempts SET state = 'created', pr_url = ?, pr_number = ?, failure_code = NULL, updated_at = ? WHERE task_id = ?"

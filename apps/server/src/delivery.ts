@@ -56,18 +56,24 @@ export class DeliveryService {
       throw new Error("AutoReview receipt is stale: the current base, HEAD, tree, diff, or worktree snapshot changed");
     }
     const now = new Date().toISOString();
-    const attempt = existing ?? this.state.delivery.create({
-      taskId: input.task.id, receiptId: receipt.id, idempotencyKey: input.idempotencyKey, state: "creating",
-      baseOid: current.baseOid, headOid: current.headOid, treeOid: current.treeOid, diffSha256: current.diffSha256,
-      createdAt: now, updatedAt: now
+    const target = {
+      receiptId: receipt.id, baseOid: current.baseOid, headOid: current.headOid,
+      treeOid: current.treeOid, diffSha256: current.diffSha256
+    };
+    // A reused row is retried against the receipt and target validated just
+    // now, never the ones its earlier failed attempt recorded.
+    if (existing) this.state.delivery.rebind(input.task.id, target);
+    else this.state.delivery.create({
+      taskId: input.task.id, idempotencyKey: input.idempotencyKey, state: "creating",
+      ...target, createdAt: now, updatedAt: now
     });
     try {
       const created = await this.runner({ cwd: input.worktreePath, branch: current.branch, baseRef: receipt.baseRef, title: input.task.title });
       const completed = this.state.delivery.complete(input.task.id, created.url, created.number);
       return {
-        pr: { url: created.url, ...(created.number ? { number: created.number } : {}), head: current.branch, headOid: current.headOid },
+        pr: { url: completed.prUrl ?? created.url, ...(completed.prNumber ? { number: completed.prNumber } : {}), head: current.branch, headOid: completed.headOid },
         receipt,
-        duplicate: attempt !== undefined && Boolean(existing && existing.state === "created")
+        duplicate: false
       };
     } catch (error) {
       this.state.delivery.fail(input.task.id, error instanceof Error ? error.message.slice(0, 240) : "delivery_failed");

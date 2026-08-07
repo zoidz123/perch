@@ -3,6 +3,8 @@
 import { spawn, spawnSync } from "node:child_process";
 import { createHash, randomBytes } from "node:crypto";
 import { chmodSync, existsSync, linkSync, mkdirSync, openSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { request as httpRequest } from "node:http";
+import { request as httpsRequest } from "node:https";
 import { homedir } from "node:os";
 import { basename, dirname, join, resolve } from "node:path";
 import process from "node:process";
@@ -1199,9 +1201,44 @@ function parseSubcommandFlags(args) {
   return { flags, positionals };
 }
 
-async function mailboxFetch(url, init) {
-  const response = await fetch(url, init);
-  const text = await response.text();
+// Node's global fetch (undici) gives up on a response after its 300s default
+// headers timeout. AutoReview and delivery legitimately hold one request open
+// for far longer, so those operations use node:http, which imposes no
+// response deadline of its own.
+function longRunningRequest(url, init) {
+  return new Promise((resolvePromise, reject) => {
+    const target = new URL(url);
+    const transport = target.protocol === "https:" ? httpsRequest : httpRequest;
+    const outbound = transport(
+      {
+        protocol: target.protocol,
+        hostname: target.hostname,
+        ...(target.port ? { port: target.port } : {}),
+        path: `${target.pathname}${target.search}`,
+        method: init?.method ?? "GET",
+        headers: init?.headers ?? {}
+      },
+      (response) => {
+        let body = "";
+        response.setEncoding("utf8");
+        response.on("data", (chunk) => { body += chunk; });
+        response.on("end", () => {
+          const status = response.statusCode ?? 0;
+          resolvePromise({ ok: status >= 200 && status < 300, status, text: body });
+        });
+      }
+    );
+    outbound.on("error", reject);
+    if (init?.body) outbound.write(init.body);
+    outbound.end();
+  });
+}
+
+async function mailboxFetch(url, init, transport = {}) {
+  const response = transport.longRunning
+    ? await longRunningRequest(url, init)
+    : await fetch(url, init).then(async (result) => ({ ok: result.ok, status: result.status, text: await result.text() }));
+  const text = response.text;
   if (!response.ok) {
     let detail = text;
     try {
@@ -1309,7 +1346,7 @@ async function runAutoReviewCommand(args, options) {
       ...(typeof flags["base-ref"] === "string" ? { baseRef: flags["base-ref"] } : {}),
       ...(typeof flags["supersedes-attempt-id"] === "string" ? { supersedesAttemptId: flags["supersedes-attempt-id"] } : {})
     })
-  });
+  }, { longRunning: true });
   console.log(JSON.stringify(result, null, 2));
 }
 
@@ -1326,7 +1363,7 @@ async function runDeliveryCommand(args, options) {
     method: "POST",
     headers: hookCredentialHeaders(),
     body: JSON.stringify({ idempotencyKey: idempotencyKey.trim() })
-  });
+  }, { longRunning: true });
   console.log(JSON.stringify(result, null, 2));
 }
 

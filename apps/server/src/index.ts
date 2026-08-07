@@ -1,5 +1,6 @@
 import { createHash } from "node:crypto";
 import { statSync } from "node:fs";
+import { request as httpRequest } from "node:http";
 import { basename } from "node:path";
 import { PtyAgentAdapter } from "./adapters/pty.js";
 import { CodexAppServerAdapter } from "./adapters/codexAppServerAdapter.js";
@@ -300,6 +301,46 @@ const pushRouter = new PushRouter(
 );
 monitor.setPushRouter(pushRouter);
 
+// The loopback relay for operations that legitimately run for many minutes.
+// Node's global fetch client abandons a response after its 300s default
+// headers deadline, which is far shorter than a focused-test plus review run,
+// so these calls speak node:http, which sets no response deadline of its own.
+function postLongRunningLocalJson(
+  serverConfig: { port: number; authToken: string },
+  path: string,
+  sessionId: string,
+  input: unknown
+): Promise<{ success: boolean; text: string }> {
+  return new Promise((resolvePromise) => {
+    const body = JSON.stringify(input ?? {});
+    const outbound = httpRequest(
+      {
+        hostname: "127.0.0.1",
+        port: serverConfig.port,
+        path,
+        method: "POST",
+        headers: {
+          authorization: `Bearer ${serverConfig.authToken}`,
+          "content-type": "application/json",
+          "content-length": Buffer.byteLength(body),
+          "x-perch-root-session": sessionId
+        }
+      },
+      (response) => {
+        let text = "";
+        response.setEncoding("utf8");
+        response.on("data", (chunk) => { text += chunk; });
+        response.on("end", () => {
+          const status = response.statusCode ?? 0;
+          resolvePromise({ success: status >= 200 && status < 300, text });
+        });
+      }
+    );
+    outbound.on("error", (error) => resolvePromise({ success: false, text: error.message }));
+    outbound.end(body);
+  });
+}
+
 // Protocol notifications own every app-server-owned Codex session's timeline,
 // status, approvals, streaming, and turn lifecycle. This is the single wiring
 // point from the owning adapter into the monitor/task/timeline world.
@@ -390,39 +431,28 @@ codexOwned.wireEvents({
   },
   // Typed delivery operations use the same root-thread relay as reports. The
   // worker sees Perch tools, while only the local server ever speaks HTTP.
+  // These two hold one request open for the whole review or push, well past
+  // the 300s default response deadline of the global fetch client, so they
+  // use the deadline-free local transport instead.
   onAutoReviewRun: async (sessionId, input) => {
     const runtime = tasks.stateDb.runtimes.findBySession(sessionId);
     if (!runtime) return { success: false, text: "No task runtime is bound to this root thread." };
-    const response = await fetch(
-      `http://127.0.0.1:${config.port}/tasks/${encodeURIComponent(runtime.taskId)}/autoreview`,
-      {
-        method: "POST",
-        headers: {
-          authorization: `Bearer ${config.authToken}`,
-          "content-type": "application/json",
-          "x-perch-root-session": sessionId
-        },
-        body: JSON.stringify(input)
-      }
+    return postLongRunningLocalJson(
+      config,
+      `/tasks/${encodeURIComponent(runtime.taskId)}/autoreview`,
+      sessionId,
+      input
     );
-    return { success: response.ok, text: await response.text() };
   },
   onDeliveryCreatePr: async (sessionId, input) => {
     const runtime = tasks.stateDb.runtimes.findBySession(sessionId);
     if (!runtime) return { success: false, text: "No task runtime is bound to this root thread." };
-    const response = await fetch(
-      `http://127.0.0.1:${config.port}/tasks/${encodeURIComponent(runtime.taskId)}/delivery/pr`,
-      {
-        method: "POST",
-        headers: {
-          authorization: `Bearer ${config.authToken}`,
-          "content-type": "application/json",
-          "x-perch-root-session": sessionId
-        },
-        body: JSON.stringify(input)
-      }
+    return postLongRunningLocalJson(
+      config,
+      `/tasks/${encodeURIComponent(runtime.taskId)}/delivery/pr`,
+      sessionId,
+      input
     );
-    return { success: response.ok, text: await response.text() };
   },
   onThreadStarted: (sessionId, threadId) => {
     runtimeManager.recordProviderSession(sessionId, "codex", threadId);
