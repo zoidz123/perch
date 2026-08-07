@@ -4,7 +4,13 @@ import type { HookEventPayload } from "./hooks.js";
 import { startManagedAgent, type ManagedAgentLauncherOptions } from "./agentLauncher.js";
 import { MATE_OWNER_ID, type OwnerManager } from "./ownerManager.js";
 import { claudeRecoveryDriver } from "./providerRecovery.js";
-import { codexOwnedBindFacts, codexRecoveryDriver, type RecoveryProviderDriver } from "./recovery.js";
+import {
+  codexMigrationHandoffFromMetadata,
+  codexOwnedBindFacts,
+  codexRecoveryDriver,
+  deliverCodexMigrationHandoff,
+  type RecoveryProviderDriver
+} from "./recovery.js";
 import { isTrustedProviderIdentity } from "./runtimeManager.js";
 import type { OwnerRuntimeRecord, RuntimeRecord } from "./stateDb.js";
 import type { TaskScheduler } from "./taskScheduler.js";
@@ -34,8 +40,9 @@ type MateRecoveryOptions = ManagedAgentLauncherOptions & {
 type IdentityExpectation = {
   provider: string;
   providerSessionId: string;
+  allowReplacementProviderSessionId: boolean;
   payload?: HookEventPayload;
-  recordSession: (sessionId: string) => void;
+  recordSession: (sessionId: string, providerSessionId: string) => void;
   resolve: () => void;
   reject: (error: Error) => void;
 };
@@ -60,7 +67,12 @@ export class MateRecoveryCoordinator {
     const expected = this.expectations.get(sessionId);
     if (!expected) return;
     const driver = this.providers.get(expected.provider);
-    const valid = provider === expected.provider && providerSessionId === expected.providerSessionId && (
+    const identityMatches = providerSessionId === expected.providerSessionId || (
+      expected.allowReplacementProviderSessionId &&
+      providerSessionId !== expected.providerSessionId &&
+      isTrustedProviderIdentity(provider, providerSessionId)
+    );
+    const valid = provider === expected.provider && identityMatches && (
       !driver?.verifySessionStart || Boolean(payload && driver.verifySessionStart(providerSessionId, payload))
     );
     if (!valid) {
@@ -70,7 +82,7 @@ export class MateRecoveryCoordinator {
       return;
     }
     try {
-      expected.recordSession(sessionId);
+      expected.recordSession(sessionId, providerSessionId);
       expected.resolve();
     } catch (error) {
       expected.reject(error instanceof Error ? error : new Error(String(error)));
@@ -102,6 +114,7 @@ export class MateRecoveryCoordinator {
 
     try {
       const mate = runtime.state === "live" ? runtime : await this.resumeMate(runtime);
+      await this.completeMigrationHandoff(mate);
       const session = (await this.options.adapter.listSessions()).find((candidate) => candidate.id === mate.ptySessionId);
       if (!session) throw new Error("restored mate PTY is not live");
       const children = await this.restoreChildren(mate, runtime.ptySessionId);
@@ -141,14 +154,22 @@ export class MateRecoveryCoordinator {
     let unsubscribe: (() => void) | undefined;
     try {
       const providerSessionId = claimed.providerSessionId!;
+      let recoveredProviderSessionId = providerSessionId;
       const prepared = await this.prepare(claimed);
       prepared.request.title = "mate";
       prepared.request.labels = { ...prepared.request.labels, role: "mate" };
       sessionId = prepared.request.sessionId!;
       launchedSessionId = sessionId;
-      const identity = this.expectIdentity(sessionId, claimed.provider, providerSessionId, (candidateSessionId) => {
-        claimed = this.options.ownerManager.recordRecoverySession(claimed, candidateSessionId);
-      });
+      const identity = this.expectIdentity(
+        sessionId,
+        claimed.provider,
+        providerSessionId,
+        prepared.allowReplacementProviderSessionId === true,
+        (candidateSessionId, observedProviderSessionId) => {
+          recoveredProviderSessionId = observedProviderSessionId;
+          claimed = this.options.ownerManager.recordRecoverySession(claimed, candidateSessionId);
+        }
+      );
       unsubscribe = this.options.adapter.subscribeAgentEvents?.((event) => {
         if (event.sessionId === launchedSessionId && event.type === "terminal_output") {
           const text = event.text ?? event.raw;
@@ -193,10 +214,26 @@ export class MateRecoveryCoordinator {
       const bound = this.options.ownerManager.bindRecoveredMate(claimed, {
         sessionId: launchedSessionId,
         provider: claimed.provider,
-        providerSessionId,
+        providerSessionId: recoveredProviderSessionId,
+        allowProviderSessionReplacement: prepared.allowReplacementProviderSessionId === true,
         ...(result.session.model ? { model: result.session.model } : {}),
         ownership: this.options.adapter.runtimeProcess?.(launchedSessionId),
-        ...(bindFacts ? { metadata: bindFacts.metadata } : {})
+        ...(bindFacts || prepared.postBindTurn
+          ? {
+              metadata: {
+                ...(bindFacts?.metadata ?? {}),
+                ...(prepared.postBindTurn
+                  ? {
+                      codexMigrationHandoff: {
+                        state: "pending",
+                        clientUserMessageId: prepared.postBindTurn.clientUserMessageId,
+                        handoff: prepared.postBindTurn.handoff
+                      }
+                    }
+                  : {})
+              }
+            }
+          : {})
       });
       if (bindFacts?.aliasSessionId) {
         this.options.hooks.aliasSession(bindFacts.aliasSessionId, launchedSessionId);
@@ -231,6 +268,30 @@ export class MateRecoveryCoordinator {
       this.expectations.delete(sessionId);
       this.expectations.delete(launchedSessionId);
     }
+  }
+
+  private async completeMigrationHandoff(runtime: OwnerRuntimeRecord): Promise<void> {
+    const handoff = codexMigrationHandoffFromMetadata(runtime.metadata);
+    if (!handoff || !runtime.ptySessionId) return;
+    if (!this.options.codexOwned) throw new Error("Codex ownership adapter is unavailable");
+    let current = runtime;
+    await deliverCodexMigrationHandoff({
+      codexOwned: this.options.codexOwned,
+      sessionId: runtime.ptySessionId,
+      text: "Perch migrated this owner to a fresh Codex thread to preserve root-only task authority. Inspect the current Perch task ledger and worktree state, then continue orchestration from durable state.",
+      handoff,
+      persist: (next) => {
+        const updated = this.options.tasks.stateDb.ownerRuntimes.compareAndSwap(
+          current.ownerId,
+          current.generation,
+          "live",
+          "live",
+          { metadata: { ...current.metadata, codexMigrationHandoff: next } }
+        );
+        if (!updated) throw new Error("mate migration handoff runtime ownership changed");
+        current = updated;
+      }
+    });
   }
 
   private async prepare(runtime: OwnerRuntimeRecord) {
@@ -323,7 +384,8 @@ export class MateRecoveryCoordinator {
     sessionId: string,
     provider: string,
     providerSessionId: string,
-    recordSession: (sessionId: string) => void
+    allowReplacementProviderSessionId: boolean,
+    recordSession: (sessionId: string, providerSessionId: string) => void
   ): Promise<void> {
     const identity = new Promise<void>((resolve, reject) => {
       const timer = setTimeout(
@@ -334,6 +396,7 @@ export class MateRecoveryCoordinator {
       this.expectations.set(sessionId, {
         provider,
         providerSessionId,
+        allowReplacementProviderSessionId,
         recordSession,
         resolve: () => { clearTimeout(timer); resolve(); },
         reject: (error) => { clearTimeout(timer); reject(error); }

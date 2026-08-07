@@ -155,6 +155,115 @@ test("worker summary claiming a missing deliverable requests verification withou
   });
 });
 
+test("Codex inherited hook credentials cannot report root task lifecycle events", async () => {
+  await withServer(async ({ port, tasks, hooks }) => {
+    const task = tasks.create({ title: "root-only Codex lifecycle", project: "/tmp/repo", kind: "scout" });
+    const sessionId = "pty:codex-root";
+    const { token } = hooks.register(sessionId);
+    tasks.update(task.id, { sessionId });
+    tasks.stateDb.runtimes.create({
+      id: "codex-root-runtime",
+      taskId: task.id,
+      generation: 0,
+      state: "live",
+      agent: "codex",
+      provider: "codex",
+      ptySessionId: sessionId,
+      metadata: { codexTaskReportingMode: "root_dynamic_tool" }
+    });
+
+    const inherited = await post(
+      port,
+      task.id,
+      { "x-perch-session": sessionId, "x-perch-token": token },
+      { kind: "failed", message: "child claim" }
+    );
+    assert.equal(inherited.status, 401);
+    assert.equal(tasks.find(task.id)?.state, "queued");
+
+    const root = await post(
+      port,
+      task.id,
+      { authorization: "Bearer test-token", "x-perch-root-session": sessionId },
+      { kind: "working", message: "root progress" }
+    );
+    assert.equal(root.status, 200);
+    assert.equal(tasks.find(task.id)?.state, "working");
+  });
+});
+
+test("legacy Codex runtimes retain hook lifecycle reporting", async () => {
+  await withServer(async ({ port, tasks, hooks }) => {
+    const task = tasks.create({ title: "legacy Codex lifecycle", project: "/tmp/repo", kind: "scout" });
+    const sessionId = "pty:legacy-codex";
+    const { token } = hooks.register(sessionId);
+    tasks.update(task.id, { sessionId });
+    tasks.stateDb.runtimes.create({
+      id: "legacy-codex-runtime",
+      taskId: task.id,
+      generation: 0,
+      state: "live",
+      agent: "codex",
+      provider: "codex",
+      ptySessionId: sessionId,
+      metadata: {
+        codexTaskReportingMode: "legacy_hook_compat",
+        codexNativeMultiAgentCapability: {
+          effective: "disabled",
+          persisted: "disabled",
+          model: "disabled"
+        }
+      }
+    });
+
+    const response = await post(
+      port,
+      task.id,
+      { "x-perch-session": sessionId, "x-perch-token": token },
+      { kind: "working", message: "legacy root progress" }
+    );
+
+    assert.equal(response.status, 200);
+    assert.equal(tasks.find(task.id)?.state, "working");
+  });
+});
+
+test("legacy Codex hook reporting rejects unproven child capability", async () => {
+  await withServer(async ({ port, tasks, hooks }) => {
+    const task = tasks.create({ title: "unsafe legacy Codex", project: "/tmp/repo", kind: "scout" });
+    const sessionId = "pty:unsafe-legacy";
+    const { token } = hooks.register(sessionId);
+    tasks.update(task.id, { sessionId });
+    tasks.stateDb.runtimes.create({
+      id: "unsafe-legacy-runtime",
+      taskId: task.id,
+      generation: 0,
+      state: "live",
+      agent: "codex",
+      provider: "codex",
+      ptySessionId: sessionId,
+      metadata: {
+        codexTaskReportingMode: "legacy_hook_compat",
+        codexNativeMultiAgentCapability: {
+          effective: "v2",
+          persisted: "v2",
+          model: "disabled"
+        }
+      }
+    });
+
+    const response = await post(
+      port,
+      task.id,
+      { "x-perch-session": sessionId, "x-perch-token": token },
+      { kind: "failed", message: "child claim" }
+    );
+
+    assert.equal(response.status, 401);
+    assert.equal(tasks.find(task.id)?.state, "queued");
+  });
+});
+
 test("mate accepts the exact completion request and duplicate acceptance is idempotent", async () => {
   await withServer(async ({ port, tasks, hooks }) => {
     const task = tasks.create({ title: "verified scout", project: "/tmp/repo", kind: "scout", prompt: "Return a report" });

@@ -20,13 +20,16 @@ import type {
   AgentSessionStatus,
   CodexReasoningEffort,
   FleetEvent,
+  NativeChildRunSummary,
   PendingServerRequest,
   RecentEventsResult,
   ServerRequestResponse,
   StartAgentRequest,
+  TaskEventRequest,
   TimelineItem,
   TopologyResponse
 } from "@perch/shared";
+import type { NativeChildRunObservation } from "../nativeChildRuns.js";
 import type { UsageLimit } from "../usageLimitDetect.js";
 import type { TimelineBackfillResult } from "../timeline.js";
 import { CodexAppServerClient, isCodexRpcError, type CodexRpcError } from "./codexAppServer.js";
@@ -70,6 +73,8 @@ export type CodexOwnedEventSink = {
   onAssistantStream?: (sessionId: string, ev: { itemId: string; text: string; done: boolean }) => void;
   onTurnStarted?: (sessionId: string) => void;
   onTurnComplete?: (sessionId: string, ev: { message: string }) => void;
+  onNativeChildObservation?: (sessionId: string, observation: NativeChildRunObservation) => void;
+  onTaskEvent?: (sessionId: string, event: TaskEventRequest) => Promise<{ success: boolean; text: string }>;
   onThreadStarted?: (sessionId: string, threadId: string, socketPath: string) => void;
   onModelResolved?: (sessionId: string, model: string) => void;
   onUsageLimit?: (sessionId: string, limit: UsageLimit) => void;
@@ -93,6 +98,7 @@ export type CodexHistoryCatchUpRequest = {
 export type CreateOwnedClient = (args: {
   sessionId: string;
   socketPath: string;
+  nativeMultiAgentObservation: "auto" | "disabled";
   handlers: {
     onTimelineItem: (item: TimelineItem) => void;
     onStatus: (status: AgentSessionStatus) => void;
@@ -101,6 +107,8 @@ export type CreateOwnedClient = (args: {
     onAssistantStream: (ev: { itemId: string; text: string; done: boolean }) => void;
     onTurnStarted: () => void;
     onTurnComplete: (ev: { message: string }) => void;
+    onNativeChildObservation: (observation: NativeChildRunObservation) => void;
+    onTaskEvent: (event: TaskEventRequest) => Promise<{ success: boolean; text: string }>;
     onUsageLimit: (limit: UsageLimit) => void;
     onDisconnected: () => void;
   };
@@ -117,6 +125,9 @@ export type CodexAppServerAdapterOptions = {
   reconnectDelaysMs?: number[];
   historyReplayRetryDelaysMs?: number[];
   historyPageTimeoutMs?: number;
+  // A state-backed, optional session projection for future clients.
+  nativeChildSummary?: (sessionId: string) => NativeChildRunSummary[];
+  nativeMultiAgentObservation?: "auto" | "disabled";
 };
 
 export type StartOwnedOptions = {
@@ -133,7 +144,20 @@ export type StartOwnedOptions = {
     // matches; a mismatch (codex upgraded between lives) falls through to a
     // fresh daemon resuming the rollout-backed thread.
     runtimeFingerprint?: string;
+    rootTaskReportingTool?: boolean;
+    legacyChildDisabled?: boolean;
+    migration?: {
+      reason: "unverified_native_multi_agent_capability";
+      handoff: "task_brief" | "mate_state";
+    };
   };
+};
+
+export type CodexTaskReportingMode = "root_dynamic_tool" | "legacy_hook_compat";
+export type CodexThreadMigration = {
+  fromThreadId: string;
+  reason: "unverified_native_multi_agent_capability";
+  handoff: "task_brief" | "mate_state";
 };
 
 type OwnedSession = {
@@ -164,6 +188,9 @@ type OwnedSession = {
   historyGapHasAnchor: boolean;
   historyCatchUp?: { epoch: number; request: CodexHistoryCatchUpRequest };
   attachCommandReady: boolean;
+  taskReportingMode: CodexTaskReportingMode;
+  nativeMultiAgentMode: "enabled" | "disabled" | "legacy_compatibility";
+  migration?: CodexThreadMigration;
 };
 
 const DEFAULT_RECONNECT_DELAYS_MS = [500, 2_000];
@@ -180,6 +207,8 @@ export class CodexAppServerAdapter implements AgentAdapter {
   private readonly reconnectDelaysMs: number[];
   private readonly historyReplayRetryDelaysMs: number[];
   private readonly historyPageTimeoutMs: number;
+  private readonly nativeChildSummary?: (sessionId: string) => NativeChildRunSummary[];
+  private readonly nativeMultiAgentObservation: "auto" | "disabled";
   private readonly fleetHandlers = new Set<(event: FleetEvent) => void>();
   private events: CodexOwnedEventSink = {};
   private historyCatchUpRequester?: (sessionId: string, hasUsableAnchor: boolean) => void;
@@ -191,9 +220,11 @@ export class CodexAppServerAdapter implements AgentAdapter {
     this.historyReplayRetryDelaysMs =
       options.historyReplayRetryDelaysMs ?? DEFAULT_HISTORY_REPLAY_RETRY_DELAYS_MS;
     this.historyPageTimeoutMs = options.historyPageTimeoutMs ?? DEFAULT_HISTORY_PAGE_TIMEOUT_MS;
+    this.nativeChildSummary = options.nativeChildSummary;
+    this.nativeMultiAgentObservation = options.nativeMultiAgentObservation ?? "auto";
     this.createClient =
       options.createClient ??
-      (({ sessionId, socketPath, handlers }) =>
+      (({ sessionId, socketPath, nativeMultiAgentObservation, handlers }) =>
         new CodexAppServerClient({
           sessionId,
           spawn: websocketUnixTransport({ socketPath }),
@@ -204,6 +235,9 @@ export class CodexAppServerAdapter implements AgentAdapter {
           onAssistantStream: handlers.onAssistantStream,
           onTurnStarted: handlers.onTurnStarted,
           onTurnComplete: handlers.onTurnComplete,
+          onNativeChildObservation: handlers.onNativeChildObservation,
+          onTaskEvent: handlers.onTaskEvent,
+          nativeMultiAgentObservation,
           onUsageLimit: handlers.onUsageLimit,
           onDisconnected: handlers.onDisconnected,
           clientName: "perch-owner"
@@ -241,6 +275,14 @@ export class CodexAppServerAdapter implements AgentAdapter {
   // runtime metadata (the rebind path re-checks it before adopting a daemon).
   runtimeFingerprint(): string | undefined {
     return this.daemons.currentRuntimeFingerprint();
+  }
+
+  taskReportingModeOf(sessionId: string): CodexTaskReportingMode | undefined {
+    return this.sessions.get(sessionId)?.taskReportingMode;
+  }
+
+  migrationOf(sessionId: string): CodexThreadMigration | undefined {
+    return this.sessions.get(sessionId)?.migration;
   }
 
   // The launcher assigns the worktree lease only after the session exists;
@@ -329,18 +371,42 @@ export class CodexAppServerAdapter implements AgentAdapter {
     }
     const cwd = request.cwd ?? process.cwd();
     const env = this.sessionEnv?.(sessionId, { ...request, sessionId });
+    if (
+      opts.resume &&
+      opts.resume.rootTaskReportingTool !== true &&
+      opts.resume.legacyChildDisabled !== true &&
+      !opts.resume.migration
+    ) {
+      throw new Error("codex resume requires proven root-only reporting authority");
+    }
+    const taskReportingMode: CodexTaskReportingMode =
+      opts.resume?.legacyChildDisabled === true
+        ? "legacy_hook_compat"
+        : "root_dynamic_tool";
+    const nativeMultiAgentMode = taskReportingMode === "legacy_hook_compat"
+      ? "legacy_compatibility" as const
+      : this.nativeMultiAgentObservation === "auto"
+        ? "enabled" as const
+        : "disabled" as const;
     const configOverrides = request.effort ? [`model_reasoning_effort="${request.effort}"`] : [];
 
     // Prefer the recorded socket of a surviving daemon (rebind without
     // killing it); otherwise acquire a fresh per-worktree daemon.
     let socketPath: string | undefined;
-    if (opts.resume?.socketPath) {
+    let adoptedSocket = false;
+    if (opts.resume?.migration && opts.resume.socketPath) {
+      await this.daemons.retireExisting(opts.resume.socketPath);
+    }
+    if (opts.resume?.socketPath && !opts.resume.migration) {
       const adopted = await this.daemons.adoptExisting(opts.resume.socketPath, cwd, {
         ...(opts.resume.runtimeFingerprint
           ? { expectedRuntimeFingerprint: opts.resume.runtimeFingerprint }
           : {})
       });
-      if (adopted) socketPath = adopted.socketPath;
+      if (adopted) {
+        socketPath = adopted.socketPath;
+        adoptedSocket = true;
+      }
     }
     if (!socketPath) {
       const handle = await this.daemons.acquire(cwd, { configOverrides, env });
@@ -366,17 +432,29 @@ export class CodexAppServerAdapter implements AgentAdapter {
       reconnecting: false,
       historyReplayEpoch: 0,
       historyGapHasAnchor: false,
-      attachCommandReady: opts.deferAttachCommand !== true
+      attachCommandReady: opts.deferAttachCommand !== true,
+      taskReportingMode,
+      nativeMultiAgentMode,
+      ...(opts.resume?.migration
+        ? {
+            migration: {
+              fromThreadId: opts.resume.threadId,
+              ...opts.resume.migration
+            }
+          }
+        : {})
     };
     session.client = this.createClient({
       sessionId,
       socketPath,
+      nativeMultiAgentObservation:
+        taskReportingMode === "legacy_hook_compat" ? "disabled" : this.nativeMultiAgentObservation,
       handlers: this.handlersFor(session)
     });
 
     try {
       await session.client.connect();
-      if (opts.resume) {
+      if (opts.resume && !opts.resume.migration) {
         const resumed = await session.client.resumeThread({
           threadId: opts.resume.threadId,
           cwd,
@@ -394,7 +472,7 @@ export class CodexAppServerAdapter implements AgentAdapter {
       // A daemon acquired for a launch that never produced a session dies
       // with the failure; an adopted resume daemon holds the only live copy
       // of the thread state and is left alone for the next attempt.
-      if (!opts.resume?.socketPath || socketPath !== opts.resume.socketPath) {
+      if (!adoptedSocket) {
         await this.daemons.release(socketPath);
       }
       throw error;
@@ -940,6 +1018,16 @@ export class CodexAppServerAdapter implements AgentAdapter {
         this.touch(session);
         this.events.onTurnComplete?.(session.id, ev);
       },
+      onNativeChildObservation: (observation) => {
+        this.events.onNativeChildObservation?.(session.id, observation);
+        // The only fleet surface is the existing root session summary.
+        // No child is ever added to the adapter's session map or topology.
+        this.emitFleetEvent("activity", "codex.native-child-observed", session.id);
+      },
+      onTaskEvent: (event) => this.events.onTaskEvent?.(session.id, event) ?? Promise.resolve({
+        success: false,
+        text: "Task reporting is unavailable."
+      }),
       onUsageLimit: (limit) => this.events.onUsageLimit?.(session.id, limit),
       onDisconnected: () => this.handleDisconnect(session)
     };
@@ -961,6 +1049,7 @@ export class CodexAppServerAdapter implements AgentAdapter {
   }
 
   private toAgentSession(session: OwnedSession): AgentSession {
+    const nativeChildren = this.nativeChildSummary?.(session.id);
     return {
       id: session.id,
       title: session.title,
@@ -973,12 +1062,17 @@ export class CodexAppServerAdapter implements AgentAdapter {
       ...(session.model ? { model: session.model } : {}),
       ...(session.effort ? { effort: session.effort } : {}),
       lastActivityAt: session.lastActivityAt,
+      nativeMultiAgentMode: session.nativeMultiAgentMode,
+      ...(session.migration ? { codexThreadMigration: { ...session.migration } } : {}),
       ...(session.threadId && session.attachCommandReady
         ? {
             attachCommand: `codex resume ${session.threadId} --remote unix://${session.socketPath}`,
             attachThreadId: session.threadId,
             attachSocketPath: session.socketPath
           }
+        : {}),
+      ...(nativeChildren && nativeChildren.length > 0
+        ? { nativeChildren }
         : {})
     };
   }

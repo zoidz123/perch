@@ -39,6 +39,19 @@ export type NewConversationParams = {
   sandbox: SandboxMode | null;
   config: Record<string, unknown> | null;
   persistExtendedHistory: boolean;
+  dynamicTools?: DynamicToolSpec[];
+};
+
+export type DynamicToolSpec = {
+  type: "namespace";
+  name: string;
+  description: string;
+  tools: Array<{
+    type: "function";
+    name: string;
+    description: string;
+    inputSchema: Record<string, unknown>;
+  }>;
 };
 
 export type ThreadResult = {

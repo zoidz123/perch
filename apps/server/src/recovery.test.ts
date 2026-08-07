@@ -8,6 +8,7 @@ import type { AddressInfo } from "node:net";
 import type { AgentSession, RecentEventsResult, StartAgentRequest } from "@perch/shared";
 import type { AgentAdapter } from "./adapters/types.js";
 import type { CodexAppServerAdapter } from "./adapters/codexAppServerAdapter.js";
+import { CodexRpcError } from "./adapters/codexAppServer.js";
 import { FakeCodexOwnedAdapter } from "./adapters/fakeCodexAppServer.js";
 import type { PtyAgentAdapter } from "./adapters/pty.js";
 import { RoutingAgentAdapter } from "./adapters/routingAdapter.js";
@@ -24,6 +25,7 @@ import type { OperationRecord } from "./stateDb.js";
 import { TaskStore } from "./tasks.js";
 import { TaskScheduler } from "./taskScheduler.js";
 import { CodexHistorySyncCoordinator } from "./codexHistorySync.js";
+import { nativeChildRunSummary, recordNativeChildRunObservation } from "./nativeChildRuns.js";
 import { TimelineStore } from "./timeline.js";
 import { WorktreePool } from "./worktrees.js";
 
@@ -219,6 +221,33 @@ test("Codex recovery resumes the exact thread and atomically binds g+1 without c
   h.cleanup();
 });
 
+test("Codex legacy compatibility requires persisted and model capability proof", async () => {
+  const h = harness();
+  const runtime = h.tasks.stateDb.runtimes.latestForTask(h.task.id)!;
+  const prepare = (capability: Record<string, string>) => codexRecoveryDriver.prepare(
+    {
+      ...runtime,
+      state: "recovering",
+      metadata: { codexNativeMultiAgentCapability: capability }
+    },
+    h.task
+  );
+
+  const persistedV2 = await prepare({ effective: "v2", persisted: "v2", model: "disabled" });
+  assert.equal(persistedV2.allowReplacementProviderSessionId, true);
+  assert.equal(persistedV2.launchInput?.codexOwnedResume?.migration?.reason, "unverified_native_multi_agent_capability");
+
+  const modelForcedV2 = await prepare({ effective: "v2", persisted: "disabled", model: "v2" });
+  assert.equal(modelForcedV2.allowReplacementProviderSessionId, true);
+  assert.equal(modelForcedV2.launchInput?.codexOwnedResume?.migration?.reason, "unverified_native_multi_agent_capability");
+
+  const disabled = await prepare({ effective: "disabled", persisted: "disabled", model: "disabled" });
+  assert.equal(disabled.allowReplacementProviderSessionId, undefined);
+  assert.equal(disabled.launchInput?.codexOwnedResume?.legacyChildDisabled, true);
+  assert.equal(disabled.launchInput?.codexOwnedResume?.migration, undefined);
+  h.cleanup();
+});
+
 test("missing or mismatched identity and stale process ownership never launch", async () => {
   const missing = harness("");
   await assert.rejects(missing.coordinator.execute(operation(missing.task.id), context()), /missing or untrusted/);
@@ -388,12 +417,10 @@ test("POST /tasks/:id/recover drives one duplicate-safe durable operation", asyn
   }
 });
 
-test("a daemon rebind re-records the socket every cycle and aliases the stale env identity to the live runtime", async () => {
+test("unproven legacy Codex recovery migrates once and preserves root-only reporting", async () => {
   const h = harness();
   const daemonSocket = "/fake/daemons/surviving.sock";
-  // Boot-time state: the durable hook credential the daemon env still carries,
-  // and the launch-recorded driver facts on the interrupted g0 runtime.
-  const stale = h.options.hooks.ensure("pty:old");
+  h.options.hooks.ensure("pty:old");
   h.tasks.stateDb.runtimes.compareAndSwap(h.task.id, 0, "recoverable", "recoverable", {
     metadata: {
       source: "managed-launch",
@@ -404,6 +431,43 @@ test("a daemon rebind re-records the socket every cycle and aliases the stale en
   const options = { ...h.options, providers: [codexRecoveryDriver] };
   const coordinator = new RecoveryCoordinator(options);
   (options as { recoveryCoordinator?: RecoveryCoordinator }).recoveryCoordinator = coordinator;
+  h.tasks.recordEvent(h.task.id, {
+    kind: "note",
+    source: "system",
+    message: "codex kickoff submitted over the app-server protocol; acceptance pending",
+    data: { reason: "kickoff_submitted", clientUserMessageId: `perch:kickoff:${h.task.id}` }
+  });
+  h.codexOwned.wireEvents({
+    onNativeChildObservation: (sessionId, observation) =>
+      recordNativeChildRunObservation(h.tasks.stateDb, sessionId, observation),
+    onTaskEvent: async (sessionId, event) => {
+      const runtime = h.tasks.stateDb.runtimes.findBySession(sessionId);
+      if (!runtime) return { success: false, text: "root runtime is not bound" };
+      h.tasks.recordEvent(runtime.taskId, { ...event, source: "worker" });
+      return { success: true, text: "recorded" };
+    }
+  });
+  h.codexOwned.onSubmitAcknowledgedTurn = async (sessionId) => {
+    const bound = h.tasks.stateDb.runtimes.findBySession(sessionId);
+    assert.equal(bound?.state, "live", "migration handoff starts only after the new root is bound");
+    assert.equal(
+      (bound?.metadata?.codexMigrationHandoff as { state?: string } | undefined)?.state,
+      "submitted",
+      "migration handoff intent is durable before submission"
+    );
+    h.codexOwned.events.onNativeChildObservation?.(sessionId, {
+      childThreadId: "child-during-handoff",
+      parentThreadId: bound!.providerSessionId!,
+      state: "running",
+      observedAt: new Date().toISOString(),
+      protocol: { itemType: "subAgentActivity", event: "started" }
+    });
+    const report = await h.codexOwned.events.onTaskEvent?.(sessionId, {
+      kind: "note",
+      message: "root report during migration handoff"
+    });
+    assert.equal(report?.success, true);
+  };
 
   await coordinator.execute(operation(h.task.id), context());
 
@@ -411,16 +475,36 @@ test("a daemon rebind re-records the socket every cycle and aliases the stale en
   assert.equal(g1.generation, 1);
   assert.equal(g1.state, "live");
   assert.equal(h.codexOwned.launches[0]?.resume?.socketPath, daemonSocket, "the recorded socket rode codexOwnedResume");
-  // The bind re-recorded the driver facts, so the NEXT restart's keep-sweep
-  // and rebind still find the daemon - not just the first cycle.
+  assert.equal(h.codexOwned.launches[0]?.resume?.migration?.reason, "unverified_native_multi_agent_capability");
+  assert.equal(h.codexOwned.launches[0]?.resume?.rootTaskReportingTool, undefined);
+  assert.notEqual(g1.providerSessionId, CODEX_THREAD_ID);
   assert.equal(g1.metadata?.codexDriver, "app-server-owned");
-  assert.equal(g1.metadata?.appServerSocketPath, daemonSocket);
-  assert.equal(g1.metadata?.appServerDaemonSessionId, "pty:old");
-  assert.equal(g1.metadata?.appServerDaemonGeneration, 0);
-  assert.equal(h.options.hooks.resolveAlias("pty:old"), g1.ptySessionId);
+  assert.notEqual(g1.metadata?.appServerSocketPath, daemonSocket);
+  assert.equal(g1.metadata?.codexTaskReportingMode, "root_dynamic_tool");
+  assert.equal(
+    (g1.metadata?.codexThreadMigration as { fromThreadId?: string } | undefined)?.fromThreadId,
+    CODEX_THREAD_ID
+  );
+  assert.equal(g1.metadata?.appServerDaemonSessionId, undefined);
+  assert.equal(h.options.hooks.resolveAlias("pty:old"), "pty:old");
+  assert.equal(h.codexOwned.launches[0]?.request.initialPrompt, undefined);
+  assert.match(h.codexOwned.submitted[0]?.text ?? "", /migrated this task to a fresh Codex thread/);
+  // The fresh thread never saw the original kickoff, so the handoff is the only
+  // place it learns the reporting contract, its branch, and its worktree.
+  const handoffText = h.codexOwned.submitted[0]?.text ?? "";
+  assert.match(handoffText, /Report status only with the root thread's perch\.report_task_event tool/);
+  assert.match(handoffText, new RegExp(`Create and work on branch perch/${h.task.id}`));
+  assert.match(handoffText, /Native children must not report Perch task lifecycle events\./);
+  assert.equal(h.codexOwned.submitted.length, 1);
+  assert.equal(h.codexOwned.historyReads, 0);
+  assert.ok(h.tasks.events(h.task.id).some((event) => event.data?.reason === "kickoff_superseded_by_migration"));
+  assert.ok(h.tasks.events(h.task.id).some((event) => event.message === "root report during migration handoff"));
+  assert.deepEqual(
+    nativeChildRunSummary(h.tasks.stateDb, g1.ptySessionId!).map((child) => child.childThreadId),
+    ["child-during-handoff"]
+  );
+  assert.ok(h.tasks.events(h.task.id).some((event) => event.data?.reason === "codex_thread_migrated"));
 
-  // A task-event POST with the stale env credentials (the surviving daemon's
-  // tool shells can never see fresh ones) resolves to the live session.
   const scheduler = new TaskScheduler({ stateDb: h.tasks.stateDb, operationKinds: ["dispatch", "recovery"] });
   const server = createControlServer({
     ...options,
@@ -434,35 +518,41 @@ test("a daemon rebind re-records the socket every cycle and aliases the stale en
   await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
   const port = (server.address() as AddressInfo).port;
   try {
-    const postEvent = () => fetch(`http://127.0.0.1:${port}/tasks/${encodeURIComponent(h.task.id)}/events`, {
+    const postHookEvent = (sessionId: string, token: string) => fetch(`http://127.0.0.1:${port}/tasks/${encodeURIComponent(h.task.id)}/events`, {
       method: "POST",
       headers: {
         "content-type": "application/json",
-        "x-perch-session": "pty:old",
-        "x-perch-token": stale.token
+        "x-perch-session": sessionId,
+        "x-perch-token": token
       },
-      body: JSON.stringify({ kind: "note", message: "still reporting after the rebind" })
+      body: JSON.stringify({ kind: "note", message: "inherited hook claim" })
     });
-    const first = await postEvent();
-    assert.equal(first.status, 200);
+    const g1Hook = h.options.hooks.ensure(g1.ptySessionId!);
+    const inherited = await postHookEvent(g1.ptySessionId!, g1Hook.token);
+    assert.equal(inherited.status, 401);
+    const root = await fetch(`http://127.0.0.1:${port}/tasks/${encodeURIComponent(h.task.id)}/events`, {
+      method: "POST",
+      headers: {
+        authorization: "Bearer rebind-token",
+        "content-type": "application/json",
+        "x-perch-root-session": g1.ptySessionId!
+      },
+      body: JSON.stringify({ kind: "note", message: "root dynamic-tool report" })
+    });
+    assert.equal(root.status, 200);
     assert.equal(h.tasks.events(h.task.id).at(-1)?.source, "worker");
 
-    // Second restart cycle: the daemon (and its unchanged env) outlives g1
-    // too. The re-recorded socket must rebind again and re-point the alias.
     h.codexOwned.killSession(g1.ptySessionId!);
     h.tasks.stateDb.runtimes.compareAndSwap(h.task.id, 1, "live", "recoverable", { metadata: g1.metadata });
     await coordinator.execute(operation(h.task.id, 1), context());
     const g2 = h.tasks.stateDb.runtimes.latestForTask(h.task.id)!;
     assert.equal(g2.generation, 2);
-    assert.equal(h.codexOwned.launches[1]?.resume?.socketPath, daemonSocket);
-    assert.equal(g2.metadata?.appServerSocketPath, daemonSocket);
-    assert.equal(g2.metadata?.appServerDaemonSessionId, "pty:old");
-    assert.equal(g2.metadata?.appServerDaemonGeneration, 0);
-    assert.equal(h.options.hooks.resolveAlias("pty:old"), g2.ptySessionId);
-
-    const second = await postEvent();
-    assert.equal(second.status, 200);
-    assert.equal(h.tasks.events(h.task.id).at(-1)?.source, "worker");
+    assert.equal(h.codexOwned.launches[1]?.resume?.socketPath, g1.metadata?.appServerSocketPath);
+    assert.equal(h.codexOwned.launches[1]?.resume?.rootTaskReportingTool, true);
+    assert.equal(h.codexOwned.launches[1]?.resume?.migration, undefined);
+    assert.equal(g2.providerSessionId, g1.providerSessionId);
+    assert.equal(g2.metadata?.appServerSocketPath, g1.metadata?.appServerSocketPath);
+    assert.equal(g2.metadata?.codexTaskReportingMode, "root_dynamic_tool");
     assert.equal(h.tasks.find(h.task.id)?.sessionId, g2.ptySessionId);
   } finally {
     server.closeAllConnections?.();
@@ -470,6 +560,143 @@ test("a daemon rebind re-records the socket every cycle and aliases the stale en
     await scheduler.stop();
     h.cleanup();
   }
+});
+
+test("Codex migration handoffs reconcile crash windows without blind replay", async () => {
+  const crashedBeforeSubmit = harness();
+  const crashedOptions = { ...crashedBeforeSubmit.options, providers: [codexRecoveryDriver] };
+  const crashedCoordinator = new RecoveryCoordinator(crashedOptions);
+  (crashedOptions as { recoveryCoordinator?: RecoveryCoordinator }).recoveryCoordinator = crashedCoordinator;
+  await crashedCoordinator.execute(operation(crashedBeforeSubmit.task.id), context());
+  let live = crashedBeforeSubmit.tasks.stateDb.runtimes.latestForTask(crashedBeforeSubmit.task.id)!;
+  const stableId = `perch:migration:${crashedBeforeSubmit.task.id}:g1`;
+  crashedBeforeSubmit.tasks.stateDb.runtimes.compareAndSwap(
+    live.taskId,
+    live.generation,
+    "live",
+    "live",
+    {
+      metadata: {
+        ...live.metadata,
+        codexMigrationHandoff: {
+          state: "pending",
+          clientUserMessageId: stableId,
+          handoff: "task_brief"
+        }
+      }
+    }
+  );
+  crashedBeforeSubmit.codexOwned.submitted.length = 0;
+  await crashedCoordinator.execute(operation(crashedBeforeSubmit.task.id), context());
+  live = crashedBeforeSubmit.tasks.stateDb.runtimes.latestForTask(crashedBeforeSubmit.task.id)!;
+  assert.equal((live.metadata?.codexMigrationHandoff as { state?: string })?.state, "accepted");
+  assert.deepEqual(crashedBeforeSubmit.codexOwned.submitted.map((entry) => entry.clientUserMessageId), [stableId]);
+  crashedBeforeSubmit.cleanup();
+
+  const acceptedAfterCrash = harness();
+  const acceptedOptions = { ...acceptedAfterCrash.options, providers: [codexRecoveryDriver] };
+  const acceptedCoordinator = new RecoveryCoordinator(acceptedOptions);
+  (acceptedOptions as { recoveryCoordinator?: RecoveryCoordinator }).recoveryCoordinator = acceptedCoordinator;
+  await acceptedCoordinator.execute(operation(acceptedAfterCrash.task.id), context());
+  live = acceptedAfterCrash.tasks.stateDb.runtimes.latestForTask(acceptedAfterCrash.task.id)!;
+  const acceptedId = `perch:migration:${acceptedAfterCrash.task.id}:g1`;
+  acceptedAfterCrash.tasks.stateDb.runtimes.compareAndSwap(live.taskId, live.generation, "live", "live", {
+    metadata: {
+      ...live.metadata,
+      codexMigrationHandoff: {
+        state: "submitted",
+        clientUserMessageId: acceptedId,
+        handoff: "task_brief"
+      }
+    }
+  });
+  acceptedAfterCrash.codexOwned.submitted.length = 0;
+  acceptedAfterCrash.codexOwned.history.set(acceptedId, { id: "turn-from-history" });
+  await acceptedCoordinator.execute(operation(acceptedAfterCrash.task.id), context());
+  live = acceptedAfterCrash.tasks.stateDb.runtimes.latestForTask(acceptedAfterCrash.task.id)!;
+  assert.deepEqual(live.metadata?.codexMigrationHandoff, {
+    state: "accepted",
+    clientUserMessageId: acceptedId,
+    handoff: "task_brief",
+    turnId: "turn-from-history"
+  });
+  assert.equal(acceptedAfterCrash.codexOwned.submitted.length, 0);
+  acceptedAfterCrash.cleanup();
+});
+
+test("Codex migration handoff rejection and unknown delivery park durably", async () => {
+  const rejected = harness();
+  const rejectedOptions = { ...rejected.options, providers: [codexRecoveryDriver] };
+  const rejectedCoordinator = new RecoveryCoordinator(rejectedOptions);
+  (rejectedOptions as { recoveryCoordinator?: RecoveryCoordinator }).recoveryCoordinator = rejectedCoordinator;
+  rejected.codexOwned.nextSubmitError = new CodexRpcError("turn/start", "handoff denied", -32600);
+  await assert.rejects(
+    rejectedCoordinator.execute(operation(rejected.task.id), context()),
+    /migration handoff was rejected/
+  );
+  let live = rejected.tasks.stateDb.runtimes.latestForTask(rejected.task.id)!;
+  assert.equal(live.state, "live");
+  assert.equal((live.metadata?.codexMigrationHandoff as { state?: string })?.state, "rejected");
+  assert.equal(rejected.tasks.find(rejected.task.id)?.state, "blocked");
+  rejected.cleanup();
+
+  const unknown = harness();
+  const unknownOptions = { ...unknown.options, providers: [codexRecoveryDriver] };
+  const unknownCoordinator = new RecoveryCoordinator(unknownOptions);
+  (unknownOptions as { recoveryCoordinator?: RecoveryCoordinator }).recoveryCoordinator = unknownCoordinator;
+  await unknownCoordinator.execute(operation(unknown.task.id), context());
+  live = unknown.tasks.stateDb.runtimes.latestForTask(unknown.task.id)!;
+  unknown.tasks.stateDb.runtimes.compareAndSwap(live.taskId, live.generation, "live", "live", {
+    metadata: {
+      ...live.metadata,
+      codexMigrationHandoff: {
+        state: "submitted",
+        clientUserMessageId: `perch:migration:${unknown.task.id}:g1`,
+        handoff: "task_brief"
+      }
+    }
+  });
+  unknown.codexOwned.historyReadError = new Error("history unavailable");
+  await assert.rejects(
+    unknownCoordinator.execute(operation(unknown.task.id), context()),
+    /acceptance is unknown/
+  );
+  live = unknown.tasks.stateDb.runtimes.latestForTask(unknown.task.id)!;
+  assert.equal((live.metadata?.codexMigrationHandoff as { state?: string })?.state, "delivery_unknown");
+  assert.equal(unknown.tasks.find(unknown.task.id)?.state, "blocked");
+  const submittedBeforeReconcile = unknown.codexOwned.submitted.length;
+  const unknownId = `perch:migration:${unknown.task.id}:g1`;
+  unknown.codexOwned.historyReadError = null;
+  unknown.codexOwned.history.set(unknownId, { id: "turn-confirmed-after-outage" });
+  await unknownCoordinator.execute(operation(unknown.task.id), context());
+  live = unknown.tasks.stateDb.runtimes.latestForTask(unknown.task.id)!;
+  assert.deepEqual(live.metadata?.codexMigrationHandoff, {
+    state: "accepted",
+    clientUserMessageId: unknownId,
+    handoff: "task_brief",
+    turnId: "turn-confirmed-after-outage"
+  });
+  assert.equal(unknown.codexOwned.submitted.length, submittedBeforeReconcile);
+  assert.equal(unknown.tasks.find(unknown.task.id)?.state, "working");
+  assert.ok(unknown.tasks.events(unknown.task.id).some(
+    (event) => event.data?.reason === "codex_migration_handoff_reconciled"
+  ));
+  const absentId = `${unknownId}:authoritatively-absent`;
+  unknown.tasks.stateDb.runtimes.compareAndSwap(live.taskId, live.generation, "live", "live", {
+    metadata: {
+      ...live.metadata,
+      codexMigrationHandoff: {
+        state: "delivery_unknown",
+        clientUserMessageId: absentId,
+        handoff: "task_brief",
+        failureReason: "prior transport outage"
+      }
+    }
+  });
+  await unknownCoordinator.execute(operation(unknown.task.id), context());
+  assert.equal(unknown.codexOwned.submitted.at(-1)?.clientUserMessageId, absentId);
+  assert.equal(unknown.codexOwned.submitted.length, submittedBeforeReconcile + 1);
+  unknown.cleanup();
 });
 
 test("the production provider-neutral coordinator drives Claude through its verified SessionStart", async () => {

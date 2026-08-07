@@ -34,10 +34,12 @@ import type { Readable, Writable } from "node:stream";
 import type {
   AgentSessionStatus,
   PendingServerRequest,
+  TaskEventRequest,
   TimelineItem,
   TimelineItemKind
 } from "@perch/shared";
 import { assertLocalRuntimeModelId } from "../modelSwitch.js";
+import { parseNativeChildRunObservations, type NativeChildRunObservation } from "../nativeChildRuns.js";
 import type {
   ApprovalPolicy,
   InputItem,
@@ -148,6 +150,13 @@ export type CodexAppServerOptions = {
   // which also transition to `running` mid-turn. This is the only signal the
   // launcher accepts to recover a blocked task back to working.
   onTurnStarted?: () => void;
+  // Provider-native multi-agent remains inside the root provider thread.
+  // Perch only observes the safe, content-free child projection.
+  onNativeChildObservation?: (observation: NativeChildRunObservation) => void;
+  onTaskEvent?: (event: TaskEventRequest) => Promise<{ success: boolean; text: string }>;
+  // "auto" starts disabled until a known native item is observed.
+  // "disabled" preserves the exact pre-v2 root-only path.
+  nativeMultiAgentObservation?: "auto" | "disabled";
   onUsageLimit?: (limit: UsageLimit) => void;
   // Fired when the CURRENT transport drops out from under a connected client
   // (daemon exit, socket churn) - never for a deliberate disconnect(). The
@@ -257,6 +266,9 @@ export class CodexAppServerClient {
   private readonly onAssistantStream?: (ev: { itemId: string; text: string; done: boolean }) => void;
   private readonly onTurnComplete?: (ev: { message: string }) => void;
   private readonly onTurnStarted?: () => void;
+  private readonly onNativeChildObservation?: (observation: NativeChildRunObservation) => void;
+  private readonly onTaskEvent?: (event: TaskEventRequest) => Promise<{ success: boolean; text: string }>;
+  private readonly nativeMultiAgentObservation: "auto" | "disabled";
   private readonly onUsageLimit?: (limit: UsageLimit) => void;
   private readonly onDisconnected?: () => void;
   private readonly clientName: string;
@@ -325,6 +337,9 @@ export class CodexAppServerClient {
     this.onAssistantStream = options.onAssistantStream;
     this.onTurnComplete = options.onTurnComplete;
     this.onTurnStarted = options.onTurnStarted;
+    this.onNativeChildObservation = options.onNativeChildObservation;
+    this.onTaskEvent = options.onTaskEvent;
+    this.nativeMultiAgentObservation = options.nativeMultiAgentObservation ?? "auto";
     this.onUsageLimit = options.onUsageLimit;
     this.onDisconnected = options.onDisconnected;
     this.clientName = options.clientName ?? "perch";
@@ -454,7 +469,8 @@ export class CodexAppServerClient {
       approvalPolicy: opts?.approvalPolicy ?? null,
       sandbox: opts?.sandbox ?? null,
       config: null,
-      persistExtendedHistory: true
+      persistExtendedHistory: true,
+      ...(this.onTaskEvent ? { dynamicTools: this.taskEventTools() } : {})
     };
     const result = (await this.request("thread/start", params)) as ThreadResult;
     this._threadId = result.thread.id;
@@ -809,6 +825,12 @@ export class CodexAppServerClient {
     this.transport.stdin.write(JSON.stringify(msg) + "\n");
   }
 
+  private respondError(id: string | number, code: number, message: string): void {
+    if (!this.transport?.stdin.writable) return;
+    const msg: JsonRpcMessage = { jsonrpc: "2.0", id, error: { code, message } };
+    this.transport.stdin.write(JSON.stringify(msg) + "\n");
+  }
+
   private handleLine(line: string, sourceEpoch: number): void {
     if (sourceEpoch !== this.processEpoch || !line.trim()) return;
 
@@ -867,6 +889,29 @@ export class CodexAppServerClient {
   }
 
   private async handleServerRequest(id: string | number, method: string, params: Record<string, unknown>): Promise<void> {
+    const requestThreadId = this.extractThreadId(params);
+    if (requestThreadId && requestThreadId !== this._threadId) {
+      this.declineServerRequest(id, method);
+      return;
+    }
+
+    if (method === "item/tool/call" && params.namespace === "perch" && params.tool === "report_task_event") {
+      const args = isRecord(params.arguments) ? params.arguments : {};
+      try {
+        const result = await this.onTaskEvent?.(args as TaskEventRequest);
+        this.respond(id, {
+          contentItems: [{ type: "inputText", text: result?.text ?? "Task reporting is unavailable." }],
+          success: result?.success === true
+        });
+      } catch (error) {
+        this.respond(id, {
+          contentItems: [{ type: "inputText", text: error instanceof Error ? error.message : String(error) }],
+          success: false
+        });
+      }
+      return;
+    }
+
     const structured = this.normalizeServerRequest(id, method, params);
     if (structured && this.onServerRequest) {
       const key = requestKey(id);
@@ -919,8 +964,59 @@ export class CodexAppServerClient {
       return;
     }
 
-    // Unknown server request - respond so codex does not hang.
+    // Unknown root request - respond so codex does not hang.
     this.respond(id, {});
+  }
+
+  private taskEventTools() {
+    return [{
+      type: "namespace" as const,
+      name: "perch",
+      description: "Perch task lifecycle reporting. Only the owned root thread is authorized.",
+      tools: [{
+        type: "function" as const,
+        name: "report_task_event",
+        description: "Report this task's current lifecycle event to Perch.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            kind: {
+              type: "string",
+              enum: ["working", "pr_linked", "needs_decision", "blocked", "done", "failed", "note"]
+            },
+            message: { type: "string" },
+            pr: { type: "string" },
+            data: { type: "object" }
+          },
+          required: ["kind"],
+          additionalProperties: false
+        }
+      }]
+    }];
+  }
+
+  private declineServerRequest(id: string | number, method: string): void {
+    if (method === "item/commandExecution/requestApproval" || method === "item/fileChange/requestApproval") {
+      this.respond(id, { decision: "decline" });
+      return;
+    }
+    if (method === "execCommandApproval" || method === "applyPatchApproval") {
+      this.respond(id, { decision: "denied" });
+      return;
+    }
+    if (method === "item/permissions/requestApproval") {
+      this.respond(id, { permissions: {}, scope: "turn" });
+      return;
+    }
+    if (method === "mcpServer/elicitation/request") {
+      this.respond(id, { action: "decline", content: null, _meta: null });
+      return;
+    }
+    if (method === "item/tool/requestUserInput") {
+      this.respond(id, { answers: {} });
+      return;
+    }
+    this.respondError(id, -32601, `Server request ${method} is not available to child threads`);
   }
 
   respondToServerRequest(
@@ -1150,6 +1246,15 @@ export class CodexAppServerClient {
     if (this.notificationProtocol === "legacy") return false;
     if (this.notificationProtocol === "unknown") this.notificationProtocol = "raw";
 
+    // App-server multi-agent events can be multiplexed onto the root client's
+    // transport. Existing root lifecycle callbacks are only allowed to see
+    // the owned root thread. A child notification is still consumed here so
+    // it cannot become a timeline item, status change, delivery receipt, or
+    // task-completion boundary by accident.
+    const notificationThreadId = this.extractThreadId(params);
+    const isRootThread = !this._threadId || !notificationThreadId || notificationThreadId === this._threadId;
+    if (!isRootThread) return true;
+
     // Any turn or item traffic is observed turn progress; it arms the
     // thread/status/changed idle handler below to report a completion even
     // when the daemon never sends turn/completed for a TUI-driven turn.
@@ -1230,6 +1335,16 @@ export class CodexAppServerClient {
     const itemType = typeof item.type === "string" ? item.type : "";
     const protocolItemId = typeof item.id === "string" && item.id.length > 0 ? item.id : undefined;
     const stagedId = (stage: string) => (protocolItemId ? `${protocolItemId}:${stage}` : undefined);
+
+    if (itemType === "subAgentActivity" || itemType === "collabAgentToolCall") {
+      if (this.nativeMultiAgentObservation === "auto" && this._threadId) {
+        for (const observation of parseNativeChildRunObservations({ item, rootThreadId: this._threadId })) {
+          this.onNativeChildObservation?.(observation);
+        }
+      }
+      // Native child activity is never part of the root chat timeline.
+      return true;
+    }
 
     if ((method === "item/started" || method === "item/completed") && itemType === "userMessage") {
       const text = rawUserMessageText(item);

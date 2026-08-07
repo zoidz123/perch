@@ -3,13 +3,14 @@ import assert from "node:assert/strict";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import type { AgentSessionStatus, FleetEvent, PendingServerRequest, TimelineItem } from "@perch/shared";
+import type { AgentSessionStatus, FleetEvent, NativeChildRunSummary, PendingServerRequest, TimelineItem } from "@perch/shared";
 import { TimelineStore } from "../timeline.js";
 import { CodexAppServerAdapter, CodexDeliveryUnknownError } from "./codexAppServerAdapter.js";
 import { CodexAppServerClient, isCodexRpcError } from "./codexAppServer.js";
 import type { CodexDaemonManager } from "./codexDaemon.js";
 import { FakeCodexAppServer, type FakeTurn } from "./fakeCodexAppServer.js";
 import { websocketUnixTransport } from "./wsUnixTransport.js";
+import type { NativeChildRunObservation } from "../nativeChildRuns.js";
 
 // The adapter suite runs against the fake daemon over the REAL ws-unix
 // transport and protocol engine, so what passes here is the wire behavior
@@ -36,6 +37,9 @@ type Fixture = {
     acquires: number;
     releases: string[];
     adopts: string[];
+    retires: string[];
+    configOverrides: string[][];
+    operations: string[];
   };
   events: {
     timeline: Array<{ item: TimelineItem; live: boolean }>;
@@ -44,6 +48,7 @@ type Fixture = {
     serverRequestsResolved: PendingServerRequest[];
     turnStarts: string[];
     turnCompletes: Array<{ sessionId: string; message: string }>;
+    nativeChildren: Array<{ sessionId: string; observation: NativeChildRunObservation }>;
     threads: Array<{ sessionId: string; threadId: string; socketPath: string }>;
     exits: Array<{ sessionId: string; status: string }>;
     fleet: FleetEvent[];
@@ -62,21 +67,35 @@ async function fixture(
     reconnectDelaysMs?: number[];
     historyReplayRetryDelaysMs?: number[];
     historyPageTimeoutMs?: number;
+    nativeChildSummary?: (sessionId: string) => NativeChildRunSummary[];
   } = {}
 ): Promise<Fixture> {
   const dir = mkdtempSync(join(tmpdir(), prefix));
   const socketPath = join(dir, "s");
   const fake = new FakeCodexAppServer();
   await fake.start(socketPath);
-  const daemons = { acquires: 0, releases: [] as string[], adopts: [] as string[] };
+  const daemons = {
+    acquires: 0,
+    releases: [] as string[],
+    adopts: [] as string[],
+    retires: [] as string[],
+    configOverrides: [] as string[][],
+    operations: [] as string[]
+  };
   const fakeManager = {
     currentRuntimeFingerprint: () => "fp-live",
-    acquire: async () => {
+    acquire: async (_cwd: string, options: { configOverrides?: string[] } = {}) => {
       daemons.acquires += 1;
+      daemons.operations.push("acquire");
+      daemons.configOverrides.push(options.configOverrides ?? []);
       return { socketPath, cwd: dir };
     },
     release: (path: string) => {
       daemons.releases.push(path);
+    },
+    retireExisting: async (path: string) => {
+      daemons.retires.push(path);
+      daemons.operations.push("retire");
     },
     adoptExisting: async (
       path: string,
@@ -109,6 +128,7 @@ async function fixture(
     serverRequestsResolved: [],
     turnStarts: [],
     turnCompletes: [],
+    nativeChildren: [],
     threads: [],
     exits: [],
     fleet: []
@@ -121,6 +141,7 @@ async function fixture(
       ? { historyReplayRetryDelaysMs: opts.historyReplayRetryDelaysMs }
       : {}),
     ...(opts.historyPageTimeoutMs ? { historyPageTimeoutMs: opts.historyPageTimeoutMs } : {}),
+    ...(opts.nativeChildSummary ? { nativeChildSummary: opts.nativeChildSummary } : {}),
     sessionEnv: () => ({ PERCH_SESSION_ID: "wired" })
   });
   adapter.wireEvents({
@@ -142,6 +163,7 @@ async function fixture(
     onServerRequestResolved: (_sessionId, request) => events.serverRequestsResolved.push(request),
     onTurnStarted: (sessionId) => events.turnStarts.push(sessionId),
     onTurnComplete: (sessionId, ev) => events.turnCompletes.push({ sessionId, message: ev.message }),
+    onNativeChildObservation: (sessionId, observation) => events.nativeChildren.push({ sessionId, observation }),
     onThreadStarted: (sessionId, threadId, socket) => events.threads.push({ sessionId, threadId, socketPath: socket }),
     onSessionExit: (sessionId, context) => events.exits.push({ sessionId, status: context.status })
   });
@@ -209,9 +231,63 @@ test("startOwned captures the thread id from the thread/start response and surfa
     assert.equal(f.adapter.threadIdOf("pty:s1"), "thr_1");
     assert.equal(session.attachCommand, `codex resume thr_1 --remote unix://${f.socketPath}`);
     assert.equal(session.model, "gpt-5.5-codex");
+    assert.equal(session.nativeMultiAgentMode, "enabled");
+    assert.equal(f.adapter.taskReportingModeOf("pty:s1"), "root_dynamic_tool");
     assert.deepEqual(f.events.threads, [{ sessionId: "pty:s1", threadId: "thr_1", socketPath: f.socketPath }]);
     // The daemon env carried the per-session hook wiring request.
     assert.equal(f.daemons.acquires, 1);
+  } finally {
+    await f.close();
+  }
+});
+
+test("native children stay inside the owned root session and never become fleet or attach targets", async () => {
+  const f = await fixture("pxa-native-child-");
+  try {
+    await f.adapter.startOwned({ command: "codex", agent: "codex", cwd: f.dir, sessionId: "pty:root" });
+    f.fake.emitNotification("thr_1", "item/completed", {
+      threadId: "thr_1",
+      item: {
+        type: "collabAgentToolCall",
+        id: "collab-1",
+        senderThreadId: "thr_1",
+        receiverThreadIds: ["child-1"],
+        status: "inProgress",
+        tool: "spawnAgent",
+        prompt: "must not become a Perch task"
+      }
+    });
+    f.fake.emitNotification("thr_1", "turn/started", { threadId: "child-1", turn: { id: "child-turn" } });
+    await tick();
+
+    assert.deepEqual(f.events.nativeChildren.map((event) => event.observation.childThreadId), ["child-1"]);
+    const sessions = await f.adapter.listSessions();
+    assert.deepEqual(sessions.map((session) => session.id), ["pty:root"]);
+    assert.equal(f.adapter.has("child-1"), false);
+    assert.equal(f.adapter.threadIdOf("child-1"), null);
+    assert.equal(sessions[0]?.attachThreadId, "thr_1");
+    assert.notEqual(sessions[0]?.attachThreadId, "child-1");
+    assert.equal(f.events.turnStarts.includes("pty:root"), false, "child turn did not call root lifecycle");
+    await assert.rejects(() => f.adapter.interrupt("child-1"), /unknown codex app-server session: child-1/);
+  } finally {
+    await f.close();
+  }
+});
+
+test("native child summaries are optional and remain nested on the root session", async () => {
+  const summary: NativeChildRunSummary = {
+    childThreadId: "child-1",
+    parentThreadId: "thr_1",
+    state: "completed",
+    observedAt: "2026-08-06T12:00:00.000Z",
+    protocol: { itemType: "collabAgentToolCall", itemId: "collab-1", event: "completed" }
+  };
+  const f = await fixture("pxa-native-summary-", { nativeChildSummary: () => [summary] });
+  try {
+    const root = await f.adapter.startOwned({ command: "codex", agent: "codex", cwd: f.dir, sessionId: "pty:root" });
+    assert.deepEqual(root.nativeChildren, [summary]);
+    assert.deepEqual((await f.adapter.listSessions())[0]?.nativeChildren, [summary]);
+    assert.equal(f.adapter.has("child-1"), false);
   } finally {
     await f.close();
   }
@@ -603,7 +679,7 @@ test("startOwned resume rebinds to a surviving daemon socket without a respawn a
 
     const session = await f.adapter.startOwned(
       { command: "codex", agent: "codex", cwd: f.dir, sessionId: "pty:new", args: ["resume", "thr_1"] },
-      { resume: { threadId: "thr_1", socketPath: f.socketPath } }
+      { resume: { threadId: "thr_1", socketPath: f.socketPath, rootTaskReportingTool: true } }
     );
     assert.equal(session.id, "pty:new");
     assert.equal(f.adapter.threadIdOf("pty:new"), "thr_1");
@@ -627,6 +703,90 @@ test("startOwned resume rebinds to a surviving daemon socket without a respawn a
   }
 });
 
+test("proven child-disabled legacy resumes retain compatibility reporting", async () => {
+  const f = await fixture("pxa-legacy-resume-");
+  try {
+    f.fake.seedThread("thr_legacy", []);
+    const session = await f.adapter.startOwned(
+      {
+        command: "codex",
+        agent: "codex",
+        cwd: f.dir,
+        sessionId: "pty:legacy",
+        args: ["resume", "thr_legacy"]
+      },
+      {
+        resume: {
+          threadId: "thr_legacy",
+          socketPath: f.socketPath,
+          legacyChildDisabled: true
+        }
+      }
+    );
+
+    assert.equal(session.nativeMultiAgentMode, "legacy_compatibility");
+    assert.equal(f.adapter.taskReportingModeOf("pty:legacy"), "legacy_hook_compat");
+    assert.deepEqual(f.daemons.adopts, [f.socketPath]);
+    assert.deepEqual(f.daemons.retires, []);
+    assert.deepEqual(f.daemons.configOverrides, []);
+    const resume = f.fake.requestLog.findLast((entry) => entry.method === "thread/resume");
+    assert.equal("dynamicTools" in (resume?.params ?? {}), false);
+    f.fake.emitNotification("thr_legacy", "item/completed", {
+      threadId: "thr_legacy",
+      item: {
+        type: "collabAgentToolCall",
+        id: "legacy-child",
+        senderThreadId: "thr_legacy",
+        receiverThreadIds: ["child-legacy"],
+        status: "inProgress",
+        tool: "spawnAgent"
+      }
+    });
+    await tick();
+    assert.deepEqual(f.events.nativeChildren, []);
+  } finally {
+    await f.close();
+  }
+});
+
+test("unproven legacy recovery retires the survivor before migrating to a fresh root", async () => {
+  const f = await fixture("pxa-legacy-migrate-");
+  try {
+    f.fake.seedThread("thr_legacy", []);
+    const session = await f.adapter.startOwned(
+      {
+        command: "codex",
+        agent: "codex",
+        cwd: f.dir,
+        sessionId: "pty:migrated"
+      },
+      {
+        resume: {
+          threadId: "thr_legacy",
+          socketPath: f.socketPath,
+          migration: {
+            reason: "unverified_native_multi_agent_capability",
+            handoff: "task_brief"
+          }
+        }
+      }
+    );
+
+    assert.deepEqual(f.daemons.operations, ["retire", "acquire"]);
+    assert.deepEqual(f.daemons.retires, [f.socketPath]);
+    assert.deepEqual(f.daemons.adopts, []);
+    assert.equal(f.adapter.threadIdOf("pty:migrated"), "thr_1");
+    assert.equal(session.nativeMultiAgentMode, "enabled");
+    assert.equal(session.codexThreadMigration?.fromThreadId, "thr_legacy");
+    assert.equal(f.fake.requestLog.some((entry) => entry.method === "thread/resume"), false);
+    const start = f.fake.requestLog.find((entry) => entry.method === "thread/start");
+    const dynamicTools = start?.params.dynamicTools as Array<{ tools?: Array<{ name?: string }> }> | undefined;
+    assert.equal(dynamicTools?.[0]?.tools?.[0]?.name, "report_task_event");
+  } finally {
+    await f.close();
+  }
+});
+
 test("startOwned recovery does not wait for full thread history before claiming ownership", async () => {
   const f = await fixture("pxa-metadata-resume-", {
     historyReplayRetryDelaysMs: [1, 1],
@@ -644,7 +804,7 @@ test("startOwned recovery does not wait for full thread history before claiming 
     const session = await Promise.race([
       f.adapter.startOwned(
         { command: "codex", agent: "codex", cwd: f.dir, sessionId: "pty:new", args: ["resume", "thr_1"] },
-        { resume: { threadId: "thr_1", socketPath: f.socketPath } }
+        { resume: { threadId: "thr_1", socketPath: f.socketPath, rootTaskReportingTool: true } }
       ),
       tick(500).then(() => {
         throw new Error("recovery waited for full thread history");
@@ -710,7 +870,7 @@ test("background history keeps provider order and cannot evict live recovery out
         sessionId: "pty:recovered",
         args: ["resume", "thr_big"]
       },
-      { resume: { threadId: "thr_big", socketPath: f.socketPath } }
+      { resume: { threadId: "thr_big", socketPath: f.socketPath, rootTaskReportingTool: true } }
     );
     assert.equal(f.startHistoryCatchUp("pty:recovered"), true);
     await f.adapter.submitAcknowledgedTurn("pty:recovered", "live recovery", {
@@ -756,7 +916,7 @@ test("terminal history catch-up failure is observable without rolling back the l
         sessionId: "pty:failed-history",
         args: ["resume", "thr_failed"]
       },
-      { resume: { threadId: "thr_failed", socketPath: f.socketPath } }
+      { resume: { threadId: "thr_failed", socketPath: f.socketPath, rootTaskReportingTool: true } }
     );
     assert.equal(f.startHistoryCatchUp("pty:failed-history"), true);
 
@@ -789,7 +949,7 @@ test("a control drop records the active history receipt as failed", async () => 
         sessionId: "pty:history-disconnect",
         args: ["resume", "thr_disconnect"]
       },
-      { resume: { threadId: "thr_disconnect", socketPath: f.socketPath } }
+      { resume: { threadId: "thr_disconnect", socketPath: f.socketPath, rootTaskReportingTool: true } }
     );
     const terminal: Array<{ state: string; error?: string }> = [];
     assert.equal(
@@ -829,7 +989,14 @@ test("startOwned resume adopts the recorded daemon when its runtime fingerprint 
 
     const session = await f.adapter.startOwned(
       { command: "codex", agent: "codex", cwd: f.dir, sessionId: "pty:new", args: ["resume", "thr_1"] },
-      { resume: { threadId: "thr_1", socketPath: f.socketPath, runtimeFingerprint: "fp-live" } }
+      {
+        resume: {
+          threadId: "thr_1",
+          socketPath: f.socketPath,
+          runtimeFingerprint: "fp-live",
+          rootTaskReportingTool: true
+        }
+      }
     );
     assert.equal(session.id, "pty:new");
     assert.equal(f.adapter.threadIdOf("pty:new"), "thr_1");
@@ -850,7 +1017,14 @@ test("startOwned resume refuses a daemon recorded by a different codex runtime a
 
     const session = await f.adapter.startOwned(
       { command: "codex", agent: "codex", cwd: f.dir, sessionId: "pty:new", args: ["resume", "thr_1"] },
-      { resume: { threadId: "thr_1", socketPath: f.socketPath, runtimeFingerprint: "fp-old" } }
+      {
+        resume: {
+          threadId: "thr_1",
+          socketPath: f.socketPath,
+          runtimeFingerprint: "fp-old",
+          rootTaskReportingTool: true
+        }
+      }
     );
     assert.equal(session.id, "pty:new");
     assert.equal(f.adapter.threadIdOf("pty:new"), "thr_1");

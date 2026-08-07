@@ -209,6 +209,7 @@ export class OwnerManager {
       sessionId: string;
       provider: string;
       providerSessionId: string;
+      allowProviderSessionReplacement?: boolean;
       model?: string;
       ownership?: RuntimeProcessOwnership;
       metadata?: Record<string, unknown>;
@@ -217,7 +218,10 @@ export class OwnerManager {
     if (
       recovering.state !== "recovering" ||
       recovering.provider !== input.provider ||
-      recovering.providerSessionId !== input.providerSessionId ||
+      (
+        recovering.providerSessionId !== input.providerSessionId &&
+        !(input.allowProviderSessionReplacement === true && input.provider === "codex")
+      ) ||
       !isTrustedProviderIdentity(input.provider, input.providerSessionId)
     ) {
       throw new Error(`mate provider identity mismatch at g${recovering.generation}`);
@@ -236,7 +240,7 @@ export class OwnerManager {
         state: "live",
         agent: recovering.agent,
         provider: recovering.provider,
-        providerSessionId: recovering.providerSessionId,
+        providerSessionId: input.providerSessionId,
         ptySessionId: input.sessionId,
         ...(input.ownership ?? {}),
         cwd: recovering.cwd,

@@ -8,7 +8,9 @@ import { CodexAppServerClient, type CodexTransport } from "./codexAppServer.js";
 import { TaskCompletionReconciler } from "../taskCompletion.js";
 import { TaskStore } from "../tasks.js";
 import { reportUsageLimitToTask } from "../taskWatchdog.js";
+import { PromptDeliveryTracker } from "../promptDeliveries.js";
 import type { TimelineItem, AgentSessionStatus, PendingServerRequest } from "@perch/shared";
+import type { NativeChildRunObservation } from "../nativeChildRuns.js";
 
 // A scripted codex app-server over PassThrough streams: parses the client's
 // NDJSON requests, auto-replies to lifecycle methods, and can push arbitrary
@@ -16,7 +18,7 @@ import type { TimelineItem, AgentSessionStatus, PendingServerRequest } from "@pe
 class MockCodexServer {
   toClient = new PassThrough(); // the client's stdout
   fromClient = new PassThrough(); // the client's stdin
-  requests: Array<{ id?: string | number; method?: string; params?: any; result?: any }> = [];
+  requests: Array<{ id?: string | number; method?: string; params?: any; result?: any; error?: any }> = [];
   private buf = "";
   private responders = new Map<string, (params: any) => unknown>();
 
@@ -49,6 +51,9 @@ class MockCodexServer {
   }
   reply(id: string | number, result: unknown): void {
     this.toClient.write(JSON.stringify({ jsonrpc: "2.0", id, result }) + "\n");
+  }
+  replyError(id: string | number, error: { code: number; message: string }): void {
+    this.toClient.write(JSON.stringify({ jsonrpc: "2.0", id, error }) + "\n");
   }
   push(method: string, params: unknown): void {
     this.toClient.write(JSON.stringify({ jsonrpc: "2.0", method, params }) + "\n");
@@ -84,6 +89,7 @@ async function connectedClient(overrides: Partial<{
   onAssistantStream: (ev: { itemId: string; text: string; done: boolean }) => void;
   onTurnComplete: (ev: { message: string }) => void;
   onTurnStarted: () => void;
+  onTaskEvent: (event: any) => Promise<{ success: boolean; text: string }>;
   onUsageLimit: (ev: { provider: string; retryAt?: string; source?: string }) => void;
 }> = {}): Promise<{ client: CodexAppServerClient; server: MockCodexServer }> {
   const server = new MockCodexServer();
@@ -333,6 +339,140 @@ test("raw v2 userMessage from a native TUI enters the mobile timeline", async ()
   assert.ok(items.some((i) => i.kind === "user" && i.id === "cx-item-native_1" && i.text === "from the TUI"));
 });
 
+test("native collaboration items become safe child observations, never root timeline rows", async () => {
+  const items: TimelineItem[] = [];
+  const observations: NativeChildRunObservation[] = [];
+  const { client, server } = await connectedClient({
+    onTimelineItem: (item) => items.push(item),
+    onNativeChildObservation: (observation) => observations.push(observation)
+  });
+  await client.startThread();
+  server.push("item/completed", {
+    threadId: "thr_1",
+    item: {
+      type: "collabAgentToolCall",
+      id: "collab-1",
+      senderThreadId: "thr_1",
+      receiverThreadIds: ["child-1"],
+      status: "completed",
+      tool: "spawnAgent",
+      prompt: "private child prompt",
+      agentsStates: { "child-1": { status: "running", message: "private child output" } }
+    }
+  });
+  server.push("item/completed", {
+    threadId: "thr_1",
+    item: {
+      type: "subAgentActivity",
+      id: "activity-1",
+      agentThreadId: "child-1",
+      agentPath: "0",
+      kind: "interrupted"
+    }
+  });
+  await tick();
+
+  assert.deepEqual(items, []);
+  assert.equal(observations.length, 2);
+  assert.equal(observations[0]?.childThreadId, "child-1");
+  assert.equal(observations[0]?.state, "running");
+  assert.equal(observations[1]?.state, "interrupted");
+  assert.equal(JSON.stringify(observations).includes("private child"), false);
+  assert.equal(JSON.stringify(observations).includes("spawnAgent"), false);
+  assert.deepEqual(
+    server.requests.filter((request) => ["spawnAgent", "sendInput", "wait", "closeAgent"].includes(request.method ?? "")),
+    [],
+    "Perch never issues native collaboration RPCs"
+  );
+});
+
+test("child-thread lifecycle traffic cannot mutate root turn, prompt delivery, timeline, or task completion", async () => {
+  const home = mkdtempSync(join(tmpdir(), "perch-codex-child-root-scope-"));
+  const tasks = new TaskStore({ PERCH_HOME: home } as NodeJS.ProcessEnv);
+  const task = tasks.create({ title: "root-owned completion", project: "/tmp/repo" });
+  tasks.update(task.id, { sessionId: "sess_1" });
+  tasks.recordEvent(task.id, { kind: "working", source: "system", message: "root is active" });
+  const completion = new TaskCompletionReconciler({ tasks });
+  const deliveries = new PromptDeliveryTracker(tasks.stateDb);
+  const delivery = deliveries.create("sess_1", "root delivery must remain pending", "human");
+  deliveries.markSubmitted(delivery.id, null);
+  const taskEventCount = tasks.events(task.id).length;
+  const items: TimelineItem[] = [];
+  const streams: Array<{ itemId: string; text: string; done: boolean }> = [];
+  let rootTurnStarts = 0;
+  let rootTurnCompletions = 0;
+  try {
+    const { client, server } = await connectedClient({
+      onTimelineItem: (item) => {
+        items.push(item);
+        deliveries.acknowledgeTimeline(item);
+      },
+      onAssistantStream: (stream) => streams.push(stream),
+      onTurnStarted: () => {
+        rootTurnStarts += 1;
+        completion.onTurnStarted("sess_1", "codex");
+      },
+      onTurnComplete: () => {
+        rootTurnCompletions += 1;
+        completion.onTurnCompleted("sess_1", "codex");
+      }
+    });
+    await client.startThread();
+    server.push("turn/started", { threadId: "child-1", turn: { id: "child-turn" } });
+    server.push("item/agentMessage/delta", { threadId: "child-1", itemId: "child-message", delta: "hidden" });
+    server.push("item/completed", {
+      threadId: "child-1",
+      item: { type: "agentMessage", id: "child-message", text: "hidden child answer", phase: "final_answer" }
+    });
+    server.push("item/completed", {
+      threadId: "child-1",
+      item: {
+        type: "userMessage",
+        id: "child-user-message",
+        content: [{ type: "text", text: "root delivery must remain pending" }]
+      }
+    });
+    server.push("turn/completed", { threadId: "child-1", turn: { id: "child-turn", status: "completed" } });
+    server.push("thread/status/changed", { threadId: "child-1", status: { type: "idle" } });
+    await tick();
+
+    assert.equal(client.turnId, null);
+    assert.equal(rootTurnStarts, 0);
+    assert.equal(rootTurnCompletions, 0);
+    assert.deepEqual(items, []);
+    assert.deepEqual(streams, []);
+    assert.equal(tasks.stateDb.promptDeliveries.find(delivery.id)?.state, "submitted");
+    assert.equal(tasks.events(task.id).length, taskEventCount);
+  } finally {
+    deliveries.stop();
+    tasks.close();
+    rmSync(home, { recursive: true, force: true });
+  }
+});
+
+test("disabled or unsupported native collaboration leaves the existing root-only path unchanged", async () => {
+  const items: TimelineItem[] = [];
+  const observations: unknown[] = [];
+  const { client, server } = await connectedClient({
+    onTimelineItem: (item) => items.push(item),
+    onNativeChildObservation: (observation) => observations.push(observation),
+    nativeMultiAgentObservation: "disabled"
+  });
+  await client.startThread();
+  server.push("item/completed", {
+    threadId: "thr_1",
+    item: { type: "subAgentActivity", id: "activity-1", agentThreadId: "child-1", agentPath: "0", kind: "started" }
+  });
+  // A -32601 response belongs to an unsupported optional method. Perch does
+  // not issue collaboration RPCs, so it cannot affect the root turn.
+  server.replyError(900, { code: -32601, message: "method not found" });
+  await tick();
+
+  assert.deepEqual(observations, []);
+  assert.deepEqual(items, []);
+  assert.equal(client.threadId, "thr_1");
+});
+
 test("submitTurn echoes the user turn with provenance", async () => {
   const items: TimelineItem[] = [];
   const { client } = await connectedClient({ onTimelineItem: (i) => items.push(i) });
@@ -467,6 +607,86 @@ test("structured requests preserve identity, cover every 0.144.1 family, and cle
   assert.equal(opened[3]?.persistence?.metadata?.codex_approval_kind, "mcp_tool_call");
   assert.equal(opened[3]?.persistence?.session, true);
   assert.equal(opened[3]?.persistence?.always, true);
+});
+
+test("child-thread server requests cannot enter root approval or input state", async () => {
+  const opened: PendingServerRequest[] = [];
+  const statuses: AgentSessionStatus[] = [];
+  let directApprovals = 0;
+  const { client, server } = await connectedClient({
+    onServerRequest: (request) => opened.push(request),
+    onStatus: (status) => statuses.push(status),
+    approvalHandler: async () => {
+      directApprovals += 1;
+      return "approved";
+    }
+  });
+  await client.startThread();
+  server.push("turn/started", { threadId: "thr_1", turn: { id: "root-turn" } });
+  await tick();
+
+  const cases = [
+    [81, "item/commandExecution/requestApproval", { decision: "decline" }],
+    [82, "item/fileChange/requestApproval", { decision: "decline" }],
+    [83, "item/permissions/requestApproval", { permissions: {}, scope: "turn" }],
+    [84, "mcpServer/elicitation/request", { action: "decline", content: null, _meta: null }],
+    [85, "item/tool/requestUserInput", { answers: {} }]
+  ] as const;
+  for (const [id, method] of cases) {
+    server.requestToClient(id, method, {
+      threadId: "child-1",
+      turnId: "child-turn",
+      itemId: `child-${id}`,
+      command: "private child command",
+      message: "private child message",
+      questions: [{ id: "private", question: "private child question" }]
+    });
+  }
+  server.requestToClient(86, "future/unknown/request", { threadId: "child-1" });
+  await tick();
+
+  assert.deepEqual(opened, []);
+  assert.equal(directApprovals, 0);
+  assert.deepEqual(statuses, ["running"]);
+  for (const [id, , expected] of cases) {
+    assert.deepEqual(server.requests.find((request) => request.id === id)?.result, expected);
+    assert.equal(client.respondToServerRequest(id, "accept", { answers: {} }), false);
+  }
+  assert.deepEqual(server.requests.find((request) => request.id === 86)?.error, {
+    code: -32601,
+    message: "Server request future/unknown/request is not available to child threads"
+  });
+});
+
+test("only the root thread can report task lifecycle events", async () => {
+  const reported: unknown[] = [];
+  const { client, server } = await connectedClient({
+    onTaskEvent: async (event) => {
+      reported.push(event);
+      return { success: true, text: '{"task":{"state":"working"}}' };
+    }
+  });
+  await client.startThread();
+  const dynamicTools = server.find("thread/start")?.params?.dynamicTools;
+  assert.equal(dynamicTools?.[0]?.tools?.[0]?.name, "report_task_event");
+
+  server.requestToClient(90, "item/tool/call", {
+    threadId: "thr_1",
+    namespace: "perch",
+    tool: "report_task_event",
+    arguments: { kind: "working", message: "root progress" }
+  });
+  server.requestToClient(91, "item/tool/call", {
+    threadId: "child-1",
+    namespace: "perch",
+    tool: "report_task_event",
+    arguments: { kind: "done", message: "child claim" }
+  });
+  await tick();
+
+  assert.deepEqual(reported, [{ kind: "working", message: "root progress" }]);
+  assert.equal(server.requests.find((request) => request.id === 90)?.result?.success, true);
+  assert.equal(server.requests.find((request) => request.id === 91)?.error?.code, -32601);
 });
 
 test("turn completion cannot clear a structured request; disconnect cleanup can", async () => {

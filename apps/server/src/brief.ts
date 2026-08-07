@@ -1,6 +1,14 @@
 import type { AgentKind, Task } from "@perch/shared";
 import { CHART_CAPABILITY_NOTE } from "./hooks.js";
 
+export const CODEX_NATIVE_CHILD_GUIDANCE = [
+  "Native Codex multi-agent guidance:",
+  "- If native children are available, they report back only through their native parent result path.",
+  "- Native children must not report Perch task lifecycle events.",
+  "- Perch accepts lifecycle reports only through the root thread's perch.report_task_event tool.",
+  "- Native children share the root worktree by default. Prefer read-only or decomposed work and never perform concurrent writes in that worktree."
+].join("\n");
+
 // The dispatch brief: Perch task reporting and delivery instructions.
 // Appended to the user's kickoff prompt when a task is dispatched, it tells
 // the worker where it is, how to name its branch, and how to report - the
@@ -21,23 +29,28 @@ export function dispatchBrief(
   plan: PlanBrief = {},
   agent?: AgentKind
 ): string {
+  const codex = agent === "codex";
   const verb = (kind: string, example: string) =>
-    `curl --silent --show-error --fail-with-body -X POST "\${PERCH_HOOK_URL%/hooks}/tasks/${task.id}/events" \\\n` +
-    `  -H "x-perch-session: $PERCH_SESSION_ID" -H "x-perch-token: $PERCH_HOOK_TOKEN" \\\n` +
-    `  -H "content-type: application/json" -d '{"kind":"${kind}","message":"${example}"}'`;
+    codex
+      ? `Call perch.report_task_event with {"kind":"${kind}","message":"${example}"}`
+      : `curl --silent --show-error --fail-with-body -X POST "\${PERCH_HOOK_URL%/hooks}/tasks/${task.id}/events" \\\n` +
+        `  -H "x-perch-session: $PERCH_SESSION_ID" -H "x-perch-token: $PERCH_HOOK_TOKEN" \\\n` +
+        `  -H "content-type: application/json" -d '{"kind":"${kind}","message":"${example}"}'`;
   const doneExample =
     task.kind === "scout"
       ? "what you found; no PR is required"
       : task.mode === "local-only"
         ? "what you did; no PR was opened"
         : "what you did; include the explicit PR URL";
-  const doneVerb =
-    `${verb("done", doneExample)} \\\n` +
-    `  | node -e 'let body=""; process.stdin.setEncoding("utf8"); process.stdin.on("data", chunk => body += chunk); process.stdin.on("end", () => { console.log(body); const response = JSON.parse(body); if (response.task?.state !== "completion_requested") { console.error("done report was not accepted: expected task.state == completion_requested"); process.exitCode = 1; } });'`;
-  const prLinkedVerb =
-    `curl --silent --show-error --fail-with-body -X POST "\${PERCH_HOOK_URL%/hooks}/tasks/${task.id}/events" \\\n` +
-    `  -H "x-perch-session: $PERCH_SESSION_ID" -H "x-perch-token: $PERCH_HOOK_TOKEN" \\\n` +
-    `  -H "content-type: application/json" -d '{"kind":"pr_linked","pr":"<canonical GitHub PR URL>"}'`;
+  const doneVerb = codex
+    ? `${verb("done", doneExample)} and require success=true with task.state=completion_requested in the returned JSON.`
+    : `${verb("done", doneExample)} \\\n` +
+      `  | node -e 'let body=""; process.stdin.setEncoding("utf8"); process.stdin.on("data", chunk => body += chunk); process.stdin.on("end", () => { console.log(body); const response = JSON.parse(body); if (response.task?.state !== "completion_requested") { console.error("done report was not accepted: expected task.state == completion_requested"); process.exitCode = 1; } });'`;
+  const prLinkedVerb = codex
+    ? `Call perch.report_task_event with {"kind":"pr_linked","pr":"<canonical GitHub PR URL>"}`
+    : `curl --silent --show-error --fail-with-body -X POST "\${PERCH_HOOK_URL%/hooks}/tasks/${task.id}/events" \\\n` +
+      `  -H "x-perch-session: $PERCH_SESSION_ID" -H "x-perch-token: $PERCH_HOOK_TOKEN" \\\n` +
+      `  -H "content-type: application/json" -d '{"kind":"pr_linked","pr":"<canonical GitHub PR URL>"}'`;
 
   const location = worktreePath
     ? `You are working in an isolated worktree at ${worktreePath}. Verify with pwd before changing anything; never cd outside it.`
@@ -80,11 +93,12 @@ export function dispatchBrief(
   // How to drive the gate, and the ask-user contract: findings travel to the
   // boss as structured data on the needs_decision verb, copied verbatim from
   // the gate's table - perch never parses pipeline output itself.
-  const askUserExample =
-    `curl --silent --show-error --fail-with-body -X POST "\${PERCH_HOOK_URL%/hooks}/tasks/${task.id}/events" \\\n` +
-    `  -H "x-perch-session: $PERCH_SESSION_ID" -H "x-perch-token: $PERCH_HOOK_TOKEN" \\\n` +
-    `  -H "content-type: application/json" \\\n` +
-    `  -d '{"kind":"needs_decision","message":"review gate: 2 findings need you","data":{"noMistakes":{"step":"review","findings":[{"id":"r1","severity":"error","file":"src/app.ts","line":42,"action":"ask-user","description":"the finding text, copied in full"}]}}}'`;
+  const askUserExample = codex
+    ? `Call perch.report_task_event with {"kind":"needs_decision","message":"review gate: 2 findings need you","data":{"noMistakes":{"step":"review","findings":[{"id":"r1","severity":"error","file":"src/app.ts","line":42,"action":"ask-user","description":"the finding text, copied in full"}]}}}`
+    : `curl --silent --show-error --fail-with-body -X POST "\${PERCH_HOOK_URL%/hooks}/tasks/${task.id}/events" \\\n` +
+      `  -H "x-perch-session: $PERCH_SESSION_ID" -H "x-perch-token: $PERCH_HOOK_TOKEN" \\\n` +
+      `  -H "content-type: application/json" \\\n` +
+      `  -d '{"kind":"needs_decision","message":"review gate: 2 findings need you","data":{"noMistakes":{"step":"review","findings":[{"id":"r1","severity":"error","file":"src/app.ts","line":42,"action":"ask-user","description":"the finding text, copied in full"}]}}}'`;
   const noMistakesDriving =
     task.kind !== "scout" && task.mode === "no-mistakes"
       ? [
@@ -131,7 +145,9 @@ export function dispatchBrief(
     ...noMistakesProhibition,
     ...planSection,
     "",
-    "Report status by POSTing task events (run these exact curl commands from your shell):",
+    codex
+      ? "Report status only with the root thread's perch.report_task_event tool:"
+      : "Report status by POSTing task events (run these exact curl commands from your shell):",
     `- started working:\n${verb("working", "short note on your approach")}`,
     ...(task.kind !== "scout" && task.mode !== "local-only"
       ? [
@@ -152,9 +168,11 @@ export function dispatchBrief(
     "Charts are working documents: on registration the server keeps the canonical copy under ~/.perch/charts/, so the chart outlives your worktree. When the boss approves a chart as a plan, approval is the promotion: the worker implementing it converts the approved chart's content into a markdown plan doc committed to the target project's repo (docs/plans/<date>-<name>.md, or that project's docs convention) as the first commit of the implementation branch, then builds against it. Scratchpad centrally, canon per-repo.",
     "",
     "Report sparsely: one working: when you start, then only on real state changes.",
-    "Never end a turn without reporting your current state via one of these curls; if you are about to wait on something long (CI, a review), report working: naming what you are waiting on first.",
+    codex
+      ? "Never end a turn without reporting your current state through perch.report_task_event; if you are about to wait on something long (CI, a review), report working: naming what you are waiting on first."
+      : "Never end a turn without reporting your current state via one of these curls; if you are about to wait on something long (CI, a review), report working: naming what you are waiting on first.",
     "The done: reporting verb requests mate verification; it does not mark the task done by itself.",
     "Never request completion until the definition of done above is actually met."
   ].join("\n");
-  return agent === "codex" ? `${brief}\n\n${CHART_CAPABILITY_NOTE}` : brief;
+  return agent === "codex" ? `${brief}\n\n${CODEX_NATIVE_CHILD_GUIDANCE}\n\n${CHART_CAPABILITY_NOTE}` : brief;
 }

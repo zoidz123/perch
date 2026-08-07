@@ -361,6 +361,7 @@ test("relay-style RPC /agents/pty and /mate/start use the same managed launcher"
 
 test("task dispatch keeps task worktree behavior while launching through the shared service", async () => {
   const fx = fixture();
+  fx.options.runtimeManager = new RuntimeManager(fx.options.tasks);
   const repo = makeRepo();
   const baseUrl = await listen(fx.server, fx.options);
 
@@ -396,6 +397,10 @@ test("task dispatch keeps task worktree behavior while launching through the sha
     assert.equal(fx.codexOwned.submitted[0]?.text, launch.initialPrompt);
     assert.equal(fx.codexOwned.submitted[0]?.clientUserMessageId, `perch-kickoff:${body.task.id}`);
     assert.equal(fx.codexOwned.submitted[0]?.source, "agent");
+    assert.equal(
+      fx.options.tasks.stateDb.runtimes.latestForTask(body.task.id)?.metadata?.codexTaskReportingMode,
+      "root_dynamic_tool"
+    );
 
     const sessionsResponse = await fetch(`${baseUrl}/sessions`, authed);
     assert.equal(sessionsResponse.status, 200);

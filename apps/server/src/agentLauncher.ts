@@ -99,7 +99,17 @@ export type StartManagedAgentInput = {
   // respawn (the daemon holds the live thread state). `runtimeFingerprint` is
   // the codex runtime recorded at launch: a mismatch with the current runtime
   // refuses the rebind and falls through to a fresh respawn+rollout-resume.
-  codexOwnedResume?: { threadId: string; socketPath?: string; runtimeFingerprint?: string };
+  codexOwnedResume?: {
+    threadId: string;
+    socketPath?: string;
+    runtimeFingerprint?: string;
+    rootTaskReportingTool?: boolean;
+    legacyChildDisabled?: boolean;
+    migration?: {
+      reason: "unverified_native_multi_agent_capability";
+      handoff: "task_brief" | "mate_state";
+    };
+  };
 };
 
 export type StartManagedAgentResult = {
@@ -321,6 +331,12 @@ export async function startManagedAgent(
     const codexThreadId = isCodexLaunch ? options.codexOwned?.threadIdOf(session.id) : null;
     const codexSocketPath = isCodexLaunch ? options.codexOwned?.socketPathOf(session.id) : undefined;
     const codexRuntimeFingerprint = isCodexLaunch ? options.codexOwned?.runtimeFingerprint() : undefined;
+    const codexTaskReportingMode = isCodexLaunch
+      ? options.codexOwned?.taskReportingModeOf(session.id)
+      : undefined;
+    const codexThreadMigration = isCodexLaunch
+      ? options.codexOwned?.migrationOf(session.id)
+      : undefined;
     const effectiveModel = isCodexLaunch ? session.model ?? request.model : request.model;
 
     if (runtime) {
@@ -335,7 +351,9 @@ export async function startManagedAgent(
                 ...(codexSocketPath ? { appServerSocketPath: codexSocketPath } : {}),
                 ...(codexRuntimeFingerprint
                   ? { appServerRuntimeFingerprint: codexRuntimeFingerprint }
-                  : {})
+                  : {}),
+                ...(codexTaskReportingMode ? { codexTaskReportingMode } : {}),
+                ...(codexThreadMigration ? { codexThreadMigration } : {})
               }
             }
           : {})
@@ -355,7 +373,9 @@ export async function startManagedAgent(
                 ...(codexSocketPath ? { appServerSocketPath: codexSocketPath } : {}),
                 ...(codexRuntimeFingerprint
                   ? { appServerRuntimeFingerprint: codexRuntimeFingerprint }
-                  : {})
+                  : {}),
+                ...(codexTaskReportingMode ? { codexTaskReportingMode } : {}),
+                ...(codexThreadMigration ? { codexThreadMigration } : {})
               }
             }
           : {}
@@ -466,7 +486,7 @@ export async function startManagedAgent(
     // but never acknowledged (the previous life died in the window between
     // send and response, or between acceptance and persistence). Reconcile it
     // against authoritative thread history - never a blind resend.
-    if (isCodexLaunch && codexOwnedResume && input.taskId) {
+    if (isCodexLaunch && codexOwnedResume && !codexOwnedResume.migration && input.taskId) {
       void reconcileCodexKickoff(options, session.id, input.taskId);
     }
 

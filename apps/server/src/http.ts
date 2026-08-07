@@ -151,7 +151,11 @@ import {
 import type { OperationRecord } from "./stateDb.js";
 import type { OperationExecutionContext, TaskScheduler } from "./taskScheduler.js";
 import type { RuntimeManager } from "./runtimeManager.js";
-import { isCodexMissingRolloutResumeError, RecoveryCoordinator } from "./recovery.js";
+import {
+  isCodexMissingRolloutResumeError,
+  isProvenLegacyChildDisabled,
+  RecoveryCoordinator
+} from "./recovery.js";
 import { RecoveryContinuationCoordinator } from "./recoveryContinuation.js";
 import type { OwnerManager } from "./ownerManager.js";
 import { MateRecoveryCoordinator } from "./mateRecovery.js";
@@ -3898,19 +3902,30 @@ async function handleTaskEvent(
 
   const bearer = authenticate(request, options);
   let source: "worker" | "system" = "system";
-  if (!bearer) {
+  if (bearer?.kind === "server" && request.headers["x-perch-root-session"] !== undefined) {
+    const rootSessionId = String(request.headers["x-perch-root-session"] ?? "");
+    const runtime = options.tasks.stateDb.runtimes.findBySession(rootSessionId);
+    if (!rootSessionId || task.sessionId !== rootSessionId || runtime?.agent !== "codex") {
+      writeJson(response, 401, { error: "Unauthorized" });
+      return;
+    }
+    source = "worker";
+  } else if (!bearer) {
     const presentedSessionId = String(request.headers["x-perch-session"] ?? "");
     const token = String(request.headers["x-perch-token"] ?? "");
     // Verification is against the presented (possibly spawn-time) identity;
     // the alias maps a rebound daemon's stale env credentials to the live
     // session the task now runs under.
     const sessionId = options.hooks.resolveAlias(presentedSessionId);
+    const runtime = options.tasks.stateDb.runtimes.findBySession(sessionId);
     const reason = !presentedSessionId || !token
       ? "missing_credentials"
       : !options.hooks.verify(presentedSessionId, token)
         ? "invalid_credentials"
         : task.sessionId !== sessionId
           ? "task_session_mismatch"
+          : runtime?.agent === "codex" && !allowsLegacyCodexHookReporting(runtime.metadata)
+            ? "root_thread_required"
           : undefined;
     if (reason) {
       // curl -f intentionally hides the response body from workers. Keep the
@@ -4077,6 +4092,10 @@ async function handleTaskEvent(
   }
 
   writeJson(response, 200, { task: updated });
+}
+
+function allowsLegacyCodexHookReporting(metadata: Record<string, unknown> | undefined): boolean {
+  return metadata?.codexTaskReportingMode === "legacy_hook_compat" && isProvenLegacyChildDisabled(metadata);
 }
 
 async function handleNoMistakesAuthorization(

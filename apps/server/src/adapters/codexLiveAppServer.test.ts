@@ -7,6 +7,7 @@ import { test } from "node:test";
 import { CodexAppServerClient } from "./codexAppServer.js";
 import { codexOnPath } from "./codexDaemon.js";
 import { isCodexMissingRolloutResumeError } from "../recovery.js";
+import type { NativeChildRunObservation } from "../nativeChildRuns.js";
 import { websocketUnixTransport } from "./wsUnixTransport.js";
 
 // Live verification against the INSTALLED codex (0.144.6 at authoring time):
@@ -19,6 +20,32 @@ import { websocketUnixTransport } from "./wsUnixTransport.js";
 // cleanly where codex is not installed (CI).
 
 const HAVE_CODEX = codexOnPath();
+// This test performs real model work and can create rollout records under the
+// explicitly supplied, dedicated Codex home. It never runs in ordinary local
+// or CI suites, and it never copies the user's config or credentials.
+const NATIVE_MULTI_AGENT_E2E_HOME = process.env.PERCH_CODEX_NATIVE_MULTI_AGENT_E2E_HOME;
+const RUN_NATIVE_MULTI_AGENT_E2E =
+  HAVE_CODEX &&
+  process.env.PERCH_CODEX_NATIVE_MULTI_AGENT_E2E === "1" &&
+  typeof NATIVE_MULTI_AGENT_E2E_HOME === "string" &&
+  NATIVE_MULTI_AGENT_E2E_HOME.length > 0;
+
+async function waitForDaemonClient(client: CodexAppServerClient, socketPath: string): Promise<void> {
+  const deadline = Date.now() + 30_000;
+  let lastError: unknown;
+  while (Date.now() < deadline) {
+    if (existsSync(socketPath)) {
+      try {
+        await client.connect();
+        return;
+      } catch (error) {
+        lastError = error;
+      }
+    }
+    await new Promise((resolve) => setTimeout(resolve, 200));
+  }
+  throw new Error(`app-server did not become healthy: ${String(lastError)}`);
+}
 
 test("installed codex schemas carry clientUserMessageId, expectedTurnId, and thread/read includeTurns", {
   skip: !HAVE_CODEX,
@@ -125,5 +152,85 @@ test("live daemon: owner handshake, thread/start, thread/read, and the fresh-thr
     await new Promise((resolve) => setTimeout(resolve, 200));
     rmSync(dir, { recursive: true, force: true });
     rmSync(codexHome, { recursive: true, force: true });
+  }
+});
+
+test("opt-in live native multi-agent root observes children, then reopens the completed graph after daemon restart", {
+  skip: !RUN_NATIVE_MULTI_AGENT_E2E,
+  timeout: 420_000
+}, async () => {
+  const dir = mkdtempSync(join(tmpdir(), "pxlive-native-multi-agent-"));
+  const socketPath = join(dir, "s");
+  const observations: NativeChildRunObservation[] = [];
+  let daemon: ChildProcess | undefined;
+  const root = new CodexAppServerClient({
+    sessionId: "live-native-root",
+    spawn: websocketUnixTransport({ socketPath }),
+    clientName: "perch-live-native-root",
+    onNativeChildObservation: (observation) => observations.push(observation)
+  });
+  const reopenRoot = new CodexAppServerClient({
+    sessionId: "live-native-reopen-root",
+    spawn: websocketUnixTransport({ socketPath }),
+    clientName: "perch-live-native-reopen-root"
+  });
+  const reopenChildren: CodexAppServerClient[] = [];
+  const startDaemon = () => spawn("codex", ["app-server", "--listen", `unix://${socketPath}`], {
+    cwd: dir,
+    env: { ...process.env, CODEX_HOME: NATIVE_MULTI_AGENT_E2E_HOME! },
+    stdio: ["ignore", "ignore", "ignore"]
+  });
+  const stopDaemon = async () => {
+    if (!daemon || daemon.exitCode !== null) return;
+    const exited = new Promise<void>((resolve) => {
+      daemon!.once("exit", () => resolve());
+      daemon!.once("error", () => resolve());
+    });
+    daemon.kill("SIGTERM");
+    await Promise.race([
+      exited,
+      new Promise<void>((_resolve, reject) => setTimeout(() => reject(new Error("native test daemon did not exit")), 10_000))
+    ]);
+  };
+  try {
+    daemon = startDaemon();
+    await waitForDaemonClient(root, socketPath);
+    const started = await root.startThread({ cwd: dir, sandbox: "read-only" });
+    const settled = await root.submitTurnAndWait(
+      "Use native multi-agent collaboration now. Spawn exactly two read-only children with distinct small research tasks about this empty temporary directory. Follow up with one child for a concise status, wait for both children to finish, then return a concise combined result. Do not write files and do not call any Perch hook or task endpoint.",
+      { turnTimeoutMs: 360_000 }
+    );
+    assert.equal(settled.aborted, false, "the root native collaboration turn completed");
+    const childThreadIds = [...new Set(observations.map((observation) => observation.childThreadId))];
+    assert.ok(childThreadIds.length >= 2, "root emitted observations for at least two native children");
+    assert.ok(
+      observations.some((observation) => observation.protocol.itemType === "subAgentActivity"),
+      "root exposed native child activity"
+    );
+
+    await root.disconnect();
+    await stopDaemon();
+    daemon = startDaemon();
+    await waitForDaemonClient(reopenRoot, socketPath);
+    const resumedRoot = await reopenRoot.resumeThread({ threadId: started.threadId, cwd: dir, excludeTurns: true });
+    assert.equal(resumedRoot.threadId, started.threadId, "completed root reopens after daemon restart");
+    for (const childThreadId of childThreadIds.slice(0, 2)) {
+      const child = new CodexAppServerClient({
+        sessionId: `live-native-reopen-${childThreadId}`,
+        spawn: websocketUnixTransport({ socketPath }),
+        clientName: "perch-live-native-reopen-child"
+      });
+      reopenChildren.push(child);
+      await child.connect();
+      const resumedChild = await child.resumeThread({ threadId: childThreadId, cwd: dir, excludeTurns: true });
+      assert.equal(resumedChild.threadId, childThreadId, "completed native child reopens after daemon restart");
+    }
+  } finally {
+    await Promise.all(reopenChildren.map((client) => client.disconnect().catch(() => {})));
+    await reopenRoot.disconnect().catch(() => {});
+    await root.disconnect().catch(() => {});
+    await stopDaemon().catch(() => {});
+    await new Promise((resolve) => setTimeout(resolve, 200));
+    rmSync(dir, { recursive: true, force: true });
   }
 });

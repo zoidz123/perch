@@ -82,6 +82,32 @@ test("acquire does not reuse a daemon across distinct session-scoped hook identi
   await manager.stopAll();
 });
 
+test("retireExisting stops the recorded daemon before a replacement can spawn", async () => {
+  const events: string[] = [];
+  let processNumber = 0;
+  const manager = new CodexDaemonManager({
+    env: { PERCH_HOME: "/tmp/perch-daemon-retire-test" },
+    spawn: () => {
+      const id = ++processNumber;
+      events.push(`spawn:${id}`);
+      const process = fakeProcess();
+      process.kill = () => {
+        process.killed = true;
+        events.push(`kill:${id}`);
+      };
+      return process;
+    },
+    waitHealthy: async () => {}
+  });
+
+  const first = await manager.acquire("/repo/one", { env: { PERCH_SESSION_ID: "old" } });
+  await manager.retireExisting(first.socketPath);
+  await manager.acquire("/repo/one", { env: { PERCH_SESSION_ID: "new" } });
+
+  assert.deepEqual(events, ["spawn:1", "kill:1", "spawn:2"]);
+  await manager.stopAll();
+});
+
 test("acquire threads config overrides to the spawn and keys distinct daemons per override", async () => {
   const spawns: Array<{ socketPath: string; cwd: string; configOverrides?: string[] }> = [];
   const manager = new CodexDaemonManager({
