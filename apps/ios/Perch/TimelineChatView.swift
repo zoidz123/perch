@@ -324,7 +324,7 @@ struct TimelineChatView: View {
 
 }
 
-// Three pulsing dots while the agent works, matching the muted canvas style.
+// Three status dots while the agent works. They pulse unless Reduce Motion is on.
 private struct ThinkingIndicator: View {
     let reduceMotion: Bool
     @State private var pulsing = false
