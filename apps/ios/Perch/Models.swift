@@ -1014,6 +1014,8 @@ struct StreamingMarkdownPresentationBuffer: Equatable {
     }
 
     private mutating func commit(_ text: String, at now: TimeInterval) -> Update {
+        pendingText = nil
+        scheduledCommitAt = nil
         let changed = displayedText != text
         displayedText = text
         lastCommitAt = now

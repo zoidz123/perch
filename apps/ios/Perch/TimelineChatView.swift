@@ -168,6 +168,7 @@ struct TimelineChatView: View {
                 }
             }
             .onAppear {
+                updateStreamingPresentation(store.streamingBySession[sessionId])
                 proxy.scrollTo(bottomID, anchor: .bottom)
             }
             .onChange(of: items.count) {
@@ -203,6 +204,7 @@ struct TimelineChatView: View {
                 }
             }
             .task {
+                updateStreamingPresentation(store.streamingBySession[sessionId])
                 await store.loadTimeline(sessionId)
                 await store.fetchCharts()
                 initialTimelineSeq = items.last(where: { $0.seq > 0 })?.seq ?? 0
