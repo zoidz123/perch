@@ -22,6 +22,10 @@ export type PreparedProviderRecovery = {
   request: StartAgentRequest;
   expectedProviderSessionId: string;
   allowReplacementProviderSessionId?: boolean;
+  postBindTurn?: {
+    text: string;
+    clientUserMessageId: string;
+  };
   // Extra launcher input the driver needs carried into startManagedAgent
   // (the codex driver passes the resume thread + recorded daemon socket).
   launchInput?: Pick<StartManagedAgentInput, "codexOwnedResume">;
@@ -216,6 +220,9 @@ export class RecoveryCoordinator {
     let launchedSessionId = sessionId;
     let launched = false;
     try {
+      if (prepared.postBindTurn) {
+        this.supersedePendingKickoff(task.id, sessionId);
+      }
       if (driver.verifyBeforeLaunch) {
         await this.verifyIdentity(driver, sessionId, providerSessionId, request.cwd ?? task.project);
       }
@@ -317,6 +324,9 @@ export class RecoveryCoordinator {
             }`
           );
         }
+        if (prepared.postBindTurn) {
+          await this.submitPostBindTurn(task.id, bound.ptySessionId, prepared.postBindTurn);
+        }
       }
     } catch (error) {
       let cleanupError: unknown;
@@ -345,6 +355,46 @@ export class RecoveryCoordinator {
     } finally {
       this.expectations.delete(sessionId);
       this.expectations.delete(launchedSessionId);
+    }
+  }
+
+  private supersedePendingKickoff(taskId: string, replacementSessionId: string): void {
+    const events = this.options.tasks.events(taskId);
+    const pending = events.some((event) => event.data?.reason === "kickoff_submitted") &&
+      !events.some((event) => event.data?.reason === "kickoff_accepted");
+    if (!pending || events.some((event) => event.data?.reason === "kickoff_superseded_by_migration")) return;
+    this.options.tasks.recordEvent(taskId, {
+      kind: "note",
+      source: "system",
+      message: "codex kickoff reconciliation was superseded before root thread migration",
+      data: { reason: "kickoff_superseded_by_migration", replacementSessionId }
+    });
+  }
+
+  private async submitPostBindTurn(
+    taskId: string,
+    sessionId: string,
+    turn: NonNullable<PreparedProviderRecovery["postBindTurn"]>
+  ): Promise<void> {
+    try {
+      if (!this.options.codexOwned) throw new Error("Codex ownership adapter is unavailable");
+      await this.options.codexOwned.submitAcknowledgedTurn(sessionId, turn.text, {
+        clientUserMessageId: turn.clientUserMessageId,
+        source: "agent"
+      });
+      this.options.tasks.recordEvent(taskId, {
+        kind: "note",
+        source: "system",
+        message: "codex accepted the post-migration handoff turn",
+        data: { reason: "codex_migration_handoff_accepted", sessionId }
+      });
+    } catch (error) {
+      this.options.tasks.recordEvent(taskId, {
+        kind: "blocked",
+        source: "system",
+        message: `codex post-migration handoff failed: ${error instanceof Error ? error.message : String(error)}`,
+        data: { reason: "codex_migration_handoff_failed", sessionId }
+      });
     }
   }
 
@@ -479,7 +529,6 @@ export const codexRecoveryDriver: RecoveryProviderDriver = {
         command: "codex",
         agent: "codex" as AgentKind,
         args: ["resume", threadId],
-        ...(migrateToFreshThread ? { initialPrompt: codexMigrationHandoff(task, handoff) } : {}),
         sessionId,
         cwd: canonicalPath(runtime.worktreePath ?? task.project),
         title: `codex - ${task.title}`,
@@ -490,6 +539,14 @@ export const codexRecoveryDriver: RecoveryProviderDriver = {
           ...(runtime.parentSessionId ? { parent: runtime.parentSessionId } : {})
         }
       },
+      ...(migrateToFreshThread
+        ? {
+            postBindTurn: {
+              text: codexMigrationHandoff(task, handoff),
+              clientUserMessageId: `perch:migration:${task.id}:g${runtime.generation + 1}`
+            }
+          }
+        : {}),
       launchInput: {
         codexOwnedResume: {
           threadId,

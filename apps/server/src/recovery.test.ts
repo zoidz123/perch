@@ -24,6 +24,7 @@ import type { OperationRecord } from "./stateDb.js";
 import { TaskStore } from "./tasks.js";
 import { TaskScheduler } from "./taskScheduler.js";
 import { CodexHistorySyncCoordinator } from "./codexHistorySync.js";
+import { nativeChildRunSummary, recordNativeChildRunObservation } from "./nativeChildRuns.js";
 import { TimelineStore } from "./timeline.js";
 import { WorktreePool } from "./worktrees.js";
 
@@ -429,6 +430,38 @@ test("unproven legacy Codex recovery migrates once and preserves root-only repor
   const options = { ...h.options, providers: [codexRecoveryDriver] };
   const coordinator = new RecoveryCoordinator(options);
   (options as { recoveryCoordinator?: RecoveryCoordinator }).recoveryCoordinator = coordinator;
+  h.tasks.recordEvent(h.task.id, {
+    kind: "note",
+    source: "system",
+    message: "codex kickoff submitted over the app-server protocol; acceptance pending",
+    data: { reason: "kickoff_submitted", clientUserMessageId: `perch:kickoff:${h.task.id}` }
+  });
+  h.codexOwned.wireEvents({
+    onNativeChildObservation: (sessionId, observation) =>
+      recordNativeChildRunObservation(h.tasks.stateDb, sessionId, observation),
+    onTaskEvent: async (sessionId, event) => {
+      const runtime = h.tasks.stateDb.runtimes.findBySession(sessionId);
+      if (!runtime) return { success: false, text: "root runtime is not bound" };
+      h.tasks.recordEvent(runtime.taskId, { ...event, source: "worker" });
+      return { success: true, text: "recorded" };
+    }
+  });
+  h.codexOwned.onSubmitAcknowledgedTurn = async (sessionId) => {
+    const bound = h.tasks.stateDb.runtimes.findBySession(sessionId);
+    assert.equal(bound?.state, "live", "migration handoff starts only after the new root is bound");
+    h.codexOwned.events.onNativeChildObservation?.(sessionId, {
+      childThreadId: "child-during-handoff",
+      parentThreadId: bound!.providerSessionId!,
+      state: "running",
+      observedAt: new Date().toISOString(),
+      protocol: { itemType: "subAgentActivity", event: "started" }
+    });
+    const report = await h.codexOwned.events.onTaskEvent?.(sessionId, {
+      kind: "note",
+      message: "root report during migration handoff"
+    });
+    assert.equal(report?.success, true);
+  };
 
   await coordinator.execute(operation(h.task.id), context());
 
@@ -448,7 +481,16 @@ test("unproven legacy Codex recovery migrates once and preserves root-only repor
   );
   assert.equal(g1.metadata?.appServerDaemonSessionId, undefined);
   assert.equal(h.options.hooks.resolveAlias("pty:old"), "pty:old");
+  assert.equal(h.codexOwned.launches[0]?.request.initialPrompt, undefined);
   assert.match(h.codexOwned.submitted[0]?.text ?? "", /migrated this task to a fresh Codex thread/);
+  assert.equal(h.codexOwned.submitted.length, 1);
+  assert.equal(h.codexOwned.historyReads, 0);
+  assert.ok(h.tasks.events(h.task.id).some((event) => event.data?.reason === "kickoff_superseded_by_migration"));
+  assert.ok(h.tasks.events(h.task.id).some((event) => event.message === "root report during migration handoff"));
+  assert.deepEqual(
+    nativeChildRunSummary(h.tasks.stateDb, g1.ptySessionId!).map((child) => child.childThreadId),
+    ["child-during-handoff"]
+  );
   assert.ok(h.tasks.events(h.task.id).some((event) => event.data?.reason === "codex_thread_migrated"));
 
   const scheduler = new TaskScheduler({ stateDb: h.tasks.stateDb, operationKinds: ["dispatch", "recovery"] });

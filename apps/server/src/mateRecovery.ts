@@ -225,6 +225,21 @@ export class MateRecoveryCoordinator {
           }`
         );
       }
+      if (prepared.postBindTurn) {
+        try {
+          if (!this.options.codexOwned) throw new Error("Codex ownership adapter is unavailable");
+          await this.options.codexOwned.submitAcknowledgedTurn(bound.ptySessionId, prepared.postBindTurn.text, {
+            clientUserMessageId: prepared.postBindTurn.clientUserMessageId,
+            source: "agent"
+          });
+        } catch (error) {
+          console.warn(
+            `codex mate migration handoff failed for ${bound.ptySessionId}: ${
+              error instanceof Error ? error.message : String(error)
+            }`
+          );
+        }
+      }
       return bound;
     } catch (error) {
       const recent = launched

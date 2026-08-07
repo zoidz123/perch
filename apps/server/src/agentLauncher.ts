@@ -486,7 +486,7 @@ export async function startManagedAgent(
     // but never acknowledged (the previous life died in the window between
     // send and response, or between acceptance and persistence). Reconcile it
     // against authoritative thread history - never a blind resend.
-    if (isCodexLaunch && codexOwnedResume && input.taskId) {
+    if (isCodexLaunch && codexOwnedResume && !codexOwnedResume.migration && input.taskId) {
       void reconcileCodexKickoff(options, session.id, input.taskId);
     }
 

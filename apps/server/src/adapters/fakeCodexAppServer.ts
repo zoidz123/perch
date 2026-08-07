@@ -467,10 +467,12 @@ export class FakeCodexOwnedAdapter {
   resumedThreadOverride: string | null = null;
   // Fired synchronously after a successful startOwned (candidate-death races).
   onStartOwned: ((sessionId: string) => void) | null = null;
+  onSubmitAcknowledgedTurn: ((sessionId: string) => void | Promise<void>) | null = null;
   // stopSession records the stop but the session refuses to die (cleanup-failure paths).
   refuseStop = false;
   // clientUserMessageId -> accepted turn (findAcceptedTurn reads this).
   readonly history = new Map<string, { id: string }>();
+  historyReads = 0;
   historyReadError: Error | null = null;
   // Reported by runtimeFingerprint() (rebind invariant tests set it).
   fakeRuntimeFingerprint: string | undefined;
@@ -626,6 +628,7 @@ export class FakeCodexOwnedAdapter {
       throw error;
     }
     this.submitted.push({ sessionId, text, clientUserMessageId: opts.clientUserMessageId, source: opts.source });
+    await this.onSubmitAcknowledgedTurn?.(sessionId);
     return { turnId: `turn-fake-${++this.turnCounter}` };
   }
 
@@ -652,6 +655,7 @@ export class FakeCodexOwnedAdapter {
   }
 
   async findAcceptedTurn(_sessionId: string, clientUserMessageId: string): Promise<{ id: string } | undefined> {
+    this.historyReads += 1;
     if (this.historyReadError) throw this.historyReadError;
     return this.history.get(clientUserMessageId);
   }
