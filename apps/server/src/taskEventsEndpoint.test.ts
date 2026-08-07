@@ -168,7 +168,8 @@ test("Codex inherited hook credentials cannot report root task lifecycle events"
       state: "live",
       agent: "codex",
       provider: "codex",
-      ptySessionId: sessionId
+      ptySessionId: sessionId,
+      metadata: { codexTaskReportingMode: "root_dynamic_tool" }
     });
 
     const inherited = await post(
@@ -187,6 +188,35 @@ test("Codex inherited hook credentials cannot report root task lifecycle events"
       { kind: "working", message: "root progress" }
     );
     assert.equal(root.status, 200);
+    assert.equal(tasks.find(task.id)?.state, "working");
+  });
+});
+
+test("legacy Codex runtimes retain hook lifecycle reporting", async () => {
+  await withServer(async ({ port, tasks, hooks }) => {
+    const task = tasks.create({ title: "legacy Codex lifecycle", project: "/tmp/repo", kind: "scout" });
+    const sessionId = "pty:legacy-codex";
+    const { token } = hooks.register(sessionId);
+    tasks.update(task.id, { sessionId });
+    tasks.stateDb.runtimes.create({
+      id: "legacy-codex-runtime",
+      taskId: task.id,
+      generation: 0,
+      state: "live",
+      agent: "codex",
+      provider: "codex",
+      ptySessionId: sessionId,
+      metadata: { codexTaskReportingMode: "legacy_hook_compat" }
+    });
+
+    const response = await post(
+      port,
+      task.id,
+      { "x-perch-session": sessionId, "x-perch-token": token },
+      { kind: "working", message: "legacy root progress" }
+    );
+
+    assert.equal(response.status, 200);
     assert.equal(tasks.find(task.id)?.state, "working");
   });
 });

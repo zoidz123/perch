@@ -429,11 +429,20 @@ type FakeOwnedSession = {
   labels?: Record<string, string>;
   worktreeId?: string;
   attachCommandReady: boolean;
+  taskReportingMode: "root_dynamic_tool" | "legacy_hook_compat";
 };
 
 export class FakeCodexOwnedAdapter {
   readonly name = "fake-codex-owned";
-  launches: Array<{ request: Record<string, unknown>; resume?: { threadId: string; socketPath?: string } }> = [];
+  launches: Array<{
+    request: Record<string, unknown>;
+    resume?: {
+      threadId: string;
+      socketPath?: string;
+      runtimeFingerprint?: string;
+      rootTaskReportingTool?: boolean;
+    };
+  }> = [];
   submitted: Array<{ sessionId: string; text: string; clientUserMessageId?: string; source?: string }> = [];
   modelSwitches: Array<{ sessionId: string; model: string; effort?: string }> = [];
   serverResponses: Array<{ sessionId: string; response: Record<string, unknown> }> = [];
@@ -500,6 +509,10 @@ export class FakeCodexOwnedAdapter {
     return this.fakeRuntimeFingerprint;
   }
 
+  taskReportingModeOf(sessionId: string): "root_dynamic_tool" | "legacy_hook_compat" | undefined {
+    return this.sessions.get(sessionId)?.taskReportingMode;
+  }
+
   setWorktreeId(sessionId: string, worktreeId: string): void {
     const session = this.sessions.get(sessionId);
     if (session) session.worktreeId = worktreeId;
@@ -511,13 +524,23 @@ export class FakeCodexOwnedAdapter {
 
   async startOwned(
     request: { sessionId?: string; title?: string; cwd?: string; labels?: Record<string, string> },
-    opts: { deferAttachCommand?: boolean; resume?: { threadId: string; socketPath?: string } } = {}
+    opts: {
+      deferAttachCommand?: boolean;
+      resume?: {
+        threadId: string;
+        socketPath?: string;
+        runtimeFingerprint?: string;
+        rootTaskReportingTool?: boolean;
+      };
+    } = {}
   ) {
     if (this.failStart) throw this.failStart;
     const id = request.sessionId ?? `pty:${Math.random().toString(36).slice(2)}`;
     const threadId =
       this.resumedThreadOverride ?? opts.resume?.threadId ?? `thr-fake-${++this.threadCounter}`;
-    const socketPath = opts.resume?.socketPath ?? `/fake/daemons/${id.slice(4, 12)}.sock`;
+    const socketPath = opts.resume?.rootTaskReportingTool === true && opts.resume.socketPath
+      ? opts.resume.socketPath
+      : `/fake/daemons/${id.slice(4, 12)}.sock`;
     this.launches.push({ request: { ...request }, ...(opts.resume ? { resume: opts.resume } : {}) });
     this.sessions.set(id, {
       id,
@@ -526,7 +549,11 @@ export class FakeCodexOwnedAdapter {
       title: request.title ?? "codex",
       cwd: request.cwd,
       labels: request.labels,
-      attachCommandReady: opts.deferAttachCommand !== true
+      attachCommandReady: opts.deferAttachCommand !== true,
+      taskReportingMode:
+        opts.resume && opts.resume.rootTaskReportingTool !== true
+          ? "legacy_hook_compat"
+          : "root_dynamic_tool"
     });
     this.onStartOwned?.(id);
     return {
@@ -540,6 +567,10 @@ export class FakeCodexOwnedAdapter {
       status: "idle" as const,
       ...(this.effectiveModel ? { model: this.effectiveModel } : {}),
       lastActivityAt: new Date().toISOString(),
+      nativeMultiAgentMode:
+        opts.resume && opts.resume.rootTaskReportingTool !== true
+          ? "legacy_compatibility" as const
+          : "enabled" as const,
       ...(opts.deferAttachCommand !== true
         ? {
             attachCommand: `codex resume ${threadId} --remote unix://${socketPath}`,

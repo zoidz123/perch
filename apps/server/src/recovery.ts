@@ -422,11 +422,6 @@ export class RecoveryCoordinator {
 // thread state intact); otherwise a fresh daemon resumes the rollout-backed
 // thread and codex represents the stale in-flight turn as interrupted.
 //
-// Legacy runtimes recorded before app-server ownership carry no driver
-// metadata but the same authoritative thread id, so they migrate through the
-// identical thread/resume path when the rollout exists. When it never will
-// (the -32600 missing-rollout condition), the resume fails with the exact
-// classifiable message and the runtime ends truthfully - never a PTY resume.
 export const codexRecoveryDriver: RecoveryProviderDriver = {
   provider: "codex",
   prepare(runtime, task) {
@@ -453,6 +448,7 @@ export const codexRecoveryDriver: RecoveryProviderDriver = {
       typeof runtime.metadata?.appServerRuntimeFingerprint === "string"
         ? (runtime.metadata.appServerRuntimeFingerprint as string)
         : undefined;
+    const rootTaskReportingTool = runtime.metadata?.codexTaskReportingMode === "root_dynamic_tool";
     return {
       expectedProviderSessionId: threadId,
       request: {
@@ -473,7 +469,8 @@ export const codexRecoveryDriver: RecoveryProviderDriver = {
         codexOwnedResume: {
           threadId,
           ...(socketPath ? { socketPath } : {}),
-          ...(runtimeFingerprint ? { runtimeFingerprint } : {})
+          ...(runtimeFingerprint ? { runtimeFingerprint } : {}),
+          ...(rootTaskReportingTool ? { rootTaskReportingTool: true } : {})
         }
       }
     };
@@ -490,7 +487,7 @@ export const codexRecoveryDriver: RecoveryProviderDriver = {
 // resolve to the live runtime. Returns undefined for non-owned (Claude)
 // sessions.
 export function codexOwnedBindFacts(
-  codexOwned: Pick<CodexAppServerAdapter, "socketPathOf" | "runtimeFingerprint"> | undefined,
+  codexOwned: Pick<CodexAppServerAdapter, "socketPathOf" | "runtimeFingerprint" | "taskReportingModeOf"> | undefined,
   liveSessionId: string,
   recovering: Pick<RuntimeRecord, "generation" | "ptySessionId" | "metadata">,
   resume: { threadId: string; socketPath?: string } | undefined
@@ -498,10 +495,12 @@ export function codexOwnedBindFacts(
   const socketPath = codexOwned?.socketPathOf(liveSessionId);
   if (!socketPath) return undefined;
   const runtimeFingerprint = codexOwned?.runtimeFingerprint();
+  const taskReportingMode = codexOwned?.taskReportingModeOf(liveSessionId);
   const metadata: Record<string, unknown> = {
     codexDriver: "app-server-owned",
     appServerSocketPath: socketPath,
-    ...(runtimeFingerprint ? { appServerRuntimeFingerprint: runtimeFingerprint } : {})
+    ...(runtimeFingerprint ? { appServerRuntimeFingerprint: runtimeFingerprint } : {}),
+    ...(taskReportingMode ? { codexTaskReportingMode: taskReportingMode } : {})
   };
   const rebound = Boolean(resume?.socketPath && resume.socketPath === socketPath);
   if (!rebound) return { metadata };

@@ -502,7 +502,6 @@ export class CodexAppServerClient {
       approvalPolicy: opts.approvalPolicy ?? defaults.approvalPolicy ?? null,
       sandbox: opts.sandbox ?? defaults.sandbox ?? null,
       persistExtendedHistory: true,
-      ...(this.onTaskEvent ? { dynamicTools: this.taskEventTools() } : {}),
       ...(opts.excludeTurns === undefined ? {} : { excludeTurns: opts.excludeTurns })
     };
     const result = (await this.request("thread/resume", params)) as ThreadResult;

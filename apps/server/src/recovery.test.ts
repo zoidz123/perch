@@ -388,12 +388,10 @@ test("POST /tasks/:id/recover drives one duplicate-safe durable operation", asyn
   }
 });
 
-test("a daemon rebind re-records the socket every cycle and aliases the stale env identity to the live runtime", async () => {
+test("legacy Codex recovery keeps hook reporting without adopting the inherited-authority daemon", async () => {
   const h = harness();
   const daemonSocket = "/fake/daemons/surviving.sock";
-  // Boot-time state: the durable hook credential the daemon env still carries,
-  // and the launch-recorded driver facts on the interrupted g0 runtime.
-  const stale = h.options.hooks.ensure("pty:old");
+  h.options.hooks.ensure("pty:old");
   h.tasks.stateDb.runtimes.compareAndSwap(h.task.id, 0, "recoverable", "recoverable", {
     metadata: {
       source: "managed-launch",
@@ -411,16 +409,13 @@ test("a daemon rebind re-records the socket every cycle and aliases the stale en
   assert.equal(g1.generation, 1);
   assert.equal(g1.state, "live");
   assert.equal(h.codexOwned.launches[0]?.resume?.socketPath, daemonSocket, "the recorded socket rode codexOwnedResume");
-  // The bind re-recorded the driver facts, so the NEXT restart's keep-sweep
-  // and rebind still find the daemon - not just the first cycle.
+  assert.equal(h.codexOwned.launches[0]?.resume?.rootTaskReportingTool, undefined);
   assert.equal(g1.metadata?.codexDriver, "app-server-owned");
-  assert.equal(g1.metadata?.appServerSocketPath, daemonSocket);
-  assert.equal(g1.metadata?.appServerDaemonSessionId, "pty:old");
-  assert.equal(g1.metadata?.appServerDaemonGeneration, 0);
-  assert.equal(h.options.hooks.resolveAlias("pty:old"), g1.ptySessionId);
+  assert.notEqual(g1.metadata?.appServerSocketPath, daemonSocket);
+  assert.equal(g1.metadata?.codexTaskReportingMode, "legacy_hook_compat");
+  assert.equal(g1.metadata?.appServerDaemonSessionId, undefined);
+  assert.equal(h.options.hooks.resolveAlias("pty:old"), "pty:old");
 
-  // A task-event POST with the stale env credentials (the surviving daemon's
-  // tool shells can never see fresh ones) resolves to the live session.
   const scheduler = new TaskScheduler({ stateDb: h.tasks.stateDb, operationKinds: ["dispatch", "recovery"] });
   const server = createControlServer({
     ...options,
@@ -434,33 +429,33 @@ test("a daemon rebind re-records the socket every cycle and aliases the stale en
   await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
   const port = (server.address() as AddressInfo).port;
   try {
-    const postEvent = () => fetch(`http://127.0.0.1:${port}/tasks/${encodeURIComponent(h.task.id)}/events`, {
+    const postEvent = (sessionId: string, token: string) => fetch(`http://127.0.0.1:${port}/tasks/${encodeURIComponent(h.task.id)}/events`, {
       method: "POST",
       headers: {
         "content-type": "application/json",
-        "x-perch-session": "pty:old",
-        "x-perch-token": stale.token
+        "x-perch-session": sessionId,
+        "x-perch-token": token
       },
       body: JSON.stringify({ kind: "note", message: "still reporting after the rebind" })
     });
-    const first = await postEvent();
+    const g1Hook = h.options.hooks.ensure(g1.ptySessionId!);
+    const first = await postEvent(g1.ptySessionId!, g1Hook.token);
     assert.equal(first.status, 200);
     assert.equal(h.tasks.events(h.task.id).at(-1)?.source, "worker");
 
-    // Second restart cycle: the daemon (and its unchanged env) outlives g1
-    // too. The re-recorded socket must rebind again and re-point the alias.
     h.codexOwned.killSession(g1.ptySessionId!);
     h.tasks.stateDb.runtimes.compareAndSwap(h.task.id, 1, "live", "recoverable", { metadata: g1.metadata });
     await coordinator.execute(operation(h.task.id, 1), context());
     const g2 = h.tasks.stateDb.runtimes.latestForTask(h.task.id)!;
     assert.equal(g2.generation, 2);
-    assert.equal(h.codexOwned.launches[1]?.resume?.socketPath, daemonSocket);
-    assert.equal(g2.metadata?.appServerSocketPath, daemonSocket);
-    assert.equal(g2.metadata?.appServerDaemonSessionId, "pty:old");
-    assert.equal(g2.metadata?.appServerDaemonGeneration, 0);
-    assert.equal(h.options.hooks.resolveAlias("pty:old"), g2.ptySessionId);
+    assert.equal(h.codexOwned.launches[1]?.resume?.socketPath, g1.metadata?.appServerSocketPath);
+    assert.equal(h.codexOwned.launches[1]?.resume?.rootTaskReportingTool, undefined);
+    assert.notEqual(g2.metadata?.appServerSocketPath, g1.metadata?.appServerSocketPath);
+    assert.equal(g2.metadata?.codexTaskReportingMode, "legacy_hook_compat");
+    assert.equal(g2.metadata?.appServerDaemonSessionId, undefined);
 
-    const second = await postEvent();
+    const g2Hook = h.options.hooks.ensure(g2.ptySessionId!);
+    const second = await postEvent(g2.ptySessionId!, g2Hook.token);
     assert.equal(second.status, 200);
     assert.equal(h.tasks.events(h.task.id).at(-1)?.source, "worker");
     assert.equal(h.tasks.find(h.task.id)?.sessionId, g2.ptySessionId);

@@ -3920,7 +3920,7 @@ async function handleTaskEvent(
         ? "invalid_credentials"
         : task.sessionId !== sessionId
           ? "task_session_mismatch"
-          : runtime?.agent === "codex"
+          : runtime?.agent === "codex" && runtime.metadata?.codexTaskReportingMode === "root_dynamic_tool"
             ? "root_thread_required"
           : undefined;
     if (reason) {

@@ -837,7 +837,8 @@ test("Codex mate recovery rebinds to the launch-recorded daemon socket and alias
       metadata: {
         source: "mate-launch",
         codexDriver: "app-server-owned",
-        appServerSocketPath: mateSocket
+        appServerSocketPath: mateSocket,
+        codexTaskReportingMode: "root_dynamic_tool"
       }
     });
     ownerManager.recordProviderSession("pty:old-codex-mate", "codex", MATE_CONVERSATION);
@@ -846,13 +847,18 @@ test("Codex mate recovery rebinds to the launch-recorded daemon socket and alias
 
     const result = await recovery.recover(recoverable);
     assert.equal(result.recoveredMate, true);
-    assert.deepEqual(codexOwned.launches[0]?.resume, { threadId: MATE_CONVERSATION, socketPath: mateSocket });
+    assert.deepEqual(codexOwned.launches[0]?.resume, {
+      threadId: MATE_CONVERSATION,
+      socketPath: mateSocket,
+      rootTaskReportingTool: true
+    });
 
     const bound = ownerManager.latestMate()!;
     assert.equal(bound.generation, 1);
     assert.equal(bound.state, "live");
     assert.equal(bound.metadata?.codexDriver, "app-server-owned");
     assert.equal(bound.metadata?.appServerSocketPath, mateSocket);
+    assert.equal(bound.metadata?.codexTaskReportingMode, "root_dynamic_tool");
     assert.equal(bound.metadata?.appServerDaemonSessionId, "pty:old-codex-mate");
     assert.equal(bound.metadata?.appServerDaemonGeneration, 0);
     assert.equal(recoveryOptions.hooks.resolveAlias("pty:old-codex-mate"), bound.ptySessionId);

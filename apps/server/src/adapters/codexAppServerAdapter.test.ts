@@ -37,6 +37,7 @@ type Fixture = {
     acquires: number;
     releases: string[];
     adopts: string[];
+    configOverrides: string[][];
   };
   events: {
     timeline: Array<{ item: TimelineItem; live: boolean }>;
@@ -71,11 +72,17 @@ async function fixture(
   const socketPath = join(dir, "s");
   const fake = new FakeCodexAppServer();
   await fake.start(socketPath);
-  const daemons = { acquires: 0, releases: [] as string[], adopts: [] as string[] };
+  const daemons = {
+    acquires: 0,
+    releases: [] as string[],
+    adopts: [] as string[],
+    configOverrides: [] as string[][]
+  };
   const fakeManager = {
     currentRuntimeFingerprint: () => "fp-live",
-    acquire: async () => {
+    acquire: async (_cwd: string, options: { configOverrides?: string[] } = {}) => {
       daemons.acquires += 1;
+      daemons.configOverrides.push(options.configOverrides ?? []);
       return { socketPath, cwd: dir };
     },
     release: (path: string) => {
@@ -215,6 +222,8 @@ test("startOwned captures the thread id from the thread/start response and surfa
     assert.equal(f.adapter.threadIdOf("pty:s1"), "thr_1");
     assert.equal(session.attachCommand, `codex resume thr_1 --remote unix://${f.socketPath}`);
     assert.equal(session.model, "gpt-5.5-codex");
+    assert.equal(session.nativeMultiAgentMode, "enabled");
+    assert.equal(f.adapter.taskReportingModeOf("pty:s1"), "root_dynamic_tool");
     assert.deepEqual(f.events.threads, [{ sessionId: "pty:s1", threadId: "thr_1", socketPath: f.socketPath }]);
     // The daemon env carried the per-session hook wiring request.
     assert.equal(f.daemons.acquires, 1);
@@ -661,7 +670,7 @@ test("startOwned resume rebinds to a surviving daemon socket without a respawn a
 
     const session = await f.adapter.startOwned(
       { command: "codex", agent: "codex", cwd: f.dir, sessionId: "pty:new", args: ["resume", "thr_1"] },
-      { resume: { threadId: "thr_1", socketPath: f.socketPath } }
+      { resume: { threadId: "thr_1", socketPath: f.socketPath, rootTaskReportingTool: true } }
     );
     assert.equal(session.id, "pty:new");
     assert.equal(f.adapter.threadIdOf("pty:new"), "thr_1");
@@ -685,6 +694,48 @@ test("startOwned resume rebinds to a surviving daemon socket without a respawn a
   }
 });
 
+test("legacy resumes use compatibility reporting with native multi-agent disabled", async () => {
+  const f = await fixture("pxa-legacy-resume-");
+  try {
+    f.fake.seedThread("thr_legacy", []);
+    const session = await f.adapter.startOwned(
+      {
+        command: "codex",
+        agent: "codex",
+        cwd: f.dir,
+        sessionId: "pty:legacy",
+        args: ["resume", "thr_legacy"]
+      },
+      { resume: { threadId: "thr_legacy", socketPath: f.socketPath } }
+    );
+
+    assert.equal(session.nativeMultiAgentMode, "legacy_compatibility");
+    assert.equal(f.adapter.taskReportingModeOf("pty:legacy"), "legacy_hook_compat");
+    assert.deepEqual(f.daemons.adopts, []);
+    assert.deepEqual(f.daemons.configOverrides, [[
+      "features.multi_agent=false",
+      "features.multi_agent_v2.enabled=false"
+    ]]);
+    const resume = f.fake.requestLog.findLast((entry) => entry.method === "thread/resume");
+    assert.equal("dynamicTools" in (resume?.params ?? {}), false);
+    f.fake.emitNotification("thr_legacy", "item/completed", {
+      threadId: "thr_legacy",
+      item: {
+        type: "collabAgentToolCall",
+        id: "legacy-child",
+        senderThreadId: "thr_legacy",
+        receiverThreadIds: ["child-legacy"],
+        status: "inProgress",
+        tool: "spawnAgent"
+      }
+    });
+    await tick();
+    assert.deepEqual(f.events.nativeChildren, []);
+  } finally {
+    await f.close();
+  }
+});
+
 test("startOwned recovery does not wait for full thread history before claiming ownership", async () => {
   const f = await fixture("pxa-metadata-resume-", {
     historyReplayRetryDelaysMs: [1, 1],
@@ -702,7 +753,7 @@ test("startOwned recovery does not wait for full thread history before claiming 
     const session = await Promise.race([
       f.adapter.startOwned(
         { command: "codex", agent: "codex", cwd: f.dir, sessionId: "pty:new", args: ["resume", "thr_1"] },
-        { resume: { threadId: "thr_1", socketPath: f.socketPath } }
+        { resume: { threadId: "thr_1", socketPath: f.socketPath, rootTaskReportingTool: true } }
       ),
       tick(500).then(() => {
         throw new Error("recovery waited for full thread history");
@@ -768,7 +819,7 @@ test("background history keeps provider order and cannot evict live recovery out
         sessionId: "pty:recovered",
         args: ["resume", "thr_big"]
       },
-      { resume: { threadId: "thr_big", socketPath: f.socketPath } }
+      { resume: { threadId: "thr_big", socketPath: f.socketPath, rootTaskReportingTool: true } }
     );
     assert.equal(f.startHistoryCatchUp("pty:recovered"), true);
     await f.adapter.submitAcknowledgedTurn("pty:recovered", "live recovery", {
@@ -814,7 +865,7 @@ test("terminal history catch-up failure is observable without rolling back the l
         sessionId: "pty:failed-history",
         args: ["resume", "thr_failed"]
       },
-      { resume: { threadId: "thr_failed", socketPath: f.socketPath } }
+      { resume: { threadId: "thr_failed", socketPath: f.socketPath, rootTaskReportingTool: true } }
     );
     assert.equal(f.startHistoryCatchUp("pty:failed-history"), true);
 
@@ -847,7 +898,7 @@ test("a control drop records the active history receipt as failed", async () => 
         sessionId: "pty:history-disconnect",
         args: ["resume", "thr_disconnect"]
       },
-      { resume: { threadId: "thr_disconnect", socketPath: f.socketPath } }
+      { resume: { threadId: "thr_disconnect", socketPath: f.socketPath, rootTaskReportingTool: true } }
     );
     const terminal: Array<{ state: string; error?: string }> = [];
     assert.equal(
@@ -887,7 +938,14 @@ test("startOwned resume adopts the recorded daemon when its runtime fingerprint 
 
     const session = await f.adapter.startOwned(
       { command: "codex", agent: "codex", cwd: f.dir, sessionId: "pty:new", args: ["resume", "thr_1"] },
-      { resume: { threadId: "thr_1", socketPath: f.socketPath, runtimeFingerprint: "fp-live" } }
+      {
+        resume: {
+          threadId: "thr_1",
+          socketPath: f.socketPath,
+          runtimeFingerprint: "fp-live",
+          rootTaskReportingTool: true
+        }
+      }
     );
     assert.equal(session.id, "pty:new");
     assert.equal(f.adapter.threadIdOf("pty:new"), "thr_1");
@@ -908,7 +966,14 @@ test("startOwned resume refuses a daemon recorded by a different codex runtime a
 
     const session = await f.adapter.startOwned(
       { command: "codex", agent: "codex", cwd: f.dir, sessionId: "pty:new", args: ["resume", "thr_1"] },
-      { resume: { threadId: "thr_1", socketPath: f.socketPath, runtimeFingerprint: "fp-old" } }
+      {
+        resume: {
+          threadId: "thr_1",
+          socketPath: f.socketPath,
+          runtimeFingerprint: "fp-old",
+          rootTaskReportingTool: true
+        }
+      }
     );
     assert.equal(session.id, "pty:new");
     assert.equal(f.adapter.threadIdOf("pty:new"), "thr_1");

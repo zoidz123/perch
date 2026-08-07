@@ -99,7 +99,12 @@ export type StartManagedAgentInput = {
   // respawn (the daemon holds the live thread state). `runtimeFingerprint` is
   // the codex runtime recorded at launch: a mismatch with the current runtime
   // refuses the rebind and falls through to a fresh respawn+rollout-resume.
-  codexOwnedResume?: { threadId: string; socketPath?: string; runtimeFingerprint?: string };
+  codexOwnedResume?: {
+    threadId: string;
+    socketPath?: string;
+    runtimeFingerprint?: string;
+    rootTaskReportingTool?: boolean;
+  };
 };
 
 export type StartManagedAgentResult = {
@@ -321,6 +326,9 @@ export async function startManagedAgent(
     const codexThreadId = isCodexLaunch ? options.codexOwned?.threadIdOf(session.id) : null;
     const codexSocketPath = isCodexLaunch ? options.codexOwned?.socketPathOf(session.id) : undefined;
     const codexRuntimeFingerprint = isCodexLaunch ? options.codexOwned?.runtimeFingerprint() : undefined;
+    const codexTaskReportingMode = isCodexLaunch
+      ? options.codexOwned?.taskReportingModeOf(session.id)
+      : undefined;
     const effectiveModel = isCodexLaunch ? session.model ?? request.model : request.model;
 
     if (runtime) {
@@ -335,7 +343,8 @@ export async function startManagedAgent(
                 ...(codexSocketPath ? { appServerSocketPath: codexSocketPath } : {}),
                 ...(codexRuntimeFingerprint
                   ? { appServerRuntimeFingerprint: codexRuntimeFingerprint }
-                  : {})
+                  : {}),
+                ...(codexTaskReportingMode ? { codexTaskReportingMode } : {})
               }
             }
           : {})
@@ -355,7 +364,8 @@ export async function startManagedAgent(
                 ...(codexSocketPath ? { appServerSocketPath: codexSocketPath } : {}),
                 ...(codexRuntimeFingerprint
                   ? { appServerRuntimeFingerprint: codexRuntimeFingerprint }
-                  : {})
+                  : {}),
+                ...(codexTaskReportingMode ? { codexTaskReportingMode } : {})
               }
             }
           : {}

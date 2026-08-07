@@ -98,6 +98,7 @@ export type CodexHistoryCatchUpRequest = {
 export type CreateOwnedClient = (args: {
   sessionId: string;
   socketPath: string;
+  nativeMultiAgentObservation: "auto" | "disabled";
   handlers: {
     onTimelineItem: (item: TimelineItem) => void;
     onStatus: (status: AgentSessionStatus) => void;
@@ -143,8 +144,11 @@ export type StartOwnedOptions = {
     // matches; a mismatch (codex upgraded between lives) falls through to a
     // fresh daemon resuming the rollout-backed thread.
     runtimeFingerprint?: string;
+    rootTaskReportingTool?: boolean;
   };
 };
+
+export type CodexTaskReportingMode = "root_dynamic_tool" | "legacy_hook_compat";
 
 type OwnedSession = {
   id: string;
@@ -174,6 +178,8 @@ type OwnedSession = {
   historyGapHasAnchor: boolean;
   historyCatchUp?: { epoch: number; request: CodexHistoryCatchUpRequest };
   attachCommandReady: boolean;
+  taskReportingMode: CodexTaskReportingMode;
+  nativeMultiAgentMode: "enabled" | "disabled" | "legacy_compatibility";
 };
 
 const DEFAULT_RECONNECT_DELAYS_MS = [500, 2_000];
@@ -207,7 +213,7 @@ export class CodexAppServerAdapter implements AgentAdapter {
     this.nativeMultiAgentObservation = options.nativeMultiAgentObservation ?? "auto";
     this.createClient =
       options.createClient ??
-      (({ sessionId, socketPath, handlers }) =>
+      (({ sessionId, socketPath, nativeMultiAgentObservation, handlers }) =>
         new CodexAppServerClient({
           sessionId,
           spawn: websocketUnixTransport({ socketPath }),
@@ -220,7 +226,7 @@ export class CodexAppServerAdapter implements AgentAdapter {
           onTurnComplete: handlers.onTurnComplete,
           onNativeChildObservation: handlers.onNativeChildObservation,
           onTaskEvent: handlers.onTaskEvent,
-          nativeMultiAgentObservation: this.nativeMultiAgentObservation,
+          nativeMultiAgentObservation,
           onUsageLimit: handlers.onUsageLimit,
           onDisconnected: handlers.onDisconnected,
           clientName: "perch-owner"
@@ -258,6 +264,10 @@ export class CodexAppServerAdapter implements AgentAdapter {
   // runtime metadata (the rebind path re-checks it before adopting a daemon).
   runtimeFingerprint(): string | undefined {
     return this.daemons.currentRuntimeFingerprint();
+  }
+
+  taskReportingModeOf(sessionId: string): CodexTaskReportingMode | undefined {
+    return this.sessions.get(sessionId)?.taskReportingMode;
   }
 
   // The launcher assigns the worktree lease only after the session exists;
@@ -346,18 +356,36 @@ export class CodexAppServerAdapter implements AgentAdapter {
     }
     const cwd = request.cwd ?? process.cwd();
     const env = this.sessionEnv?.(sessionId, { ...request, sessionId });
-    const configOverrides = request.effort ? [`model_reasoning_effort="${request.effort}"`] : [];
+    const taskReportingMode: CodexTaskReportingMode =
+      opts.resume && opts.resume.rootTaskReportingTool !== true
+        ? "legacy_hook_compat"
+        : "root_dynamic_tool";
+    const nativeMultiAgentMode = taskReportingMode === "legacy_hook_compat"
+      ? "legacy_compatibility" as const
+      : this.nativeMultiAgentObservation === "auto"
+        ? "enabled" as const
+        : "disabled" as const;
+    const configOverrides = [
+      ...(request.effort ? [`model_reasoning_effort="${request.effort}"`] : []),
+      ...(taskReportingMode === "legacy_hook_compat"
+        ? ["features.multi_agent=false", "features.multi_agent_v2.enabled=false"]
+        : [])
+    ];
 
     // Prefer the recorded socket of a surviving daemon (rebind without
     // killing it); otherwise acquire a fresh per-worktree daemon.
     let socketPath: string | undefined;
-    if (opts.resume?.socketPath) {
+    let adoptedSocket = false;
+    if (opts.resume?.socketPath && taskReportingMode === "root_dynamic_tool") {
       const adopted = await this.daemons.adoptExisting(opts.resume.socketPath, cwd, {
         ...(opts.resume.runtimeFingerprint
           ? { expectedRuntimeFingerprint: opts.resume.runtimeFingerprint }
           : {})
       });
-      if (adopted) socketPath = adopted.socketPath;
+      if (adopted) {
+        socketPath = adopted.socketPath;
+        adoptedSocket = true;
+      }
     }
     if (!socketPath) {
       const handle = await this.daemons.acquire(cwd, { configOverrides, env });
@@ -383,11 +411,15 @@ export class CodexAppServerAdapter implements AgentAdapter {
       reconnecting: false,
       historyReplayEpoch: 0,
       historyGapHasAnchor: false,
-      attachCommandReady: opts.deferAttachCommand !== true
+      attachCommandReady: opts.deferAttachCommand !== true,
+      taskReportingMode,
+      nativeMultiAgentMode
     };
     session.client = this.createClient({
       sessionId,
       socketPath,
+      nativeMultiAgentObservation:
+        taskReportingMode === "legacy_hook_compat" ? "disabled" : this.nativeMultiAgentObservation,
       handlers: this.handlersFor(session)
     });
 
@@ -411,7 +443,7 @@ export class CodexAppServerAdapter implements AgentAdapter {
       // A daemon acquired for a launch that never produced a session dies
       // with the failure; an adopted resume daemon holds the only live copy
       // of the thread state and is left alone for the next attempt.
-      if (!opts.resume?.socketPath || socketPath !== opts.resume.socketPath) {
+      if (!adoptedSocket) {
         await this.daemons.release(socketPath);
       }
       throw error;
@@ -1001,6 +1033,7 @@ export class CodexAppServerAdapter implements AgentAdapter {
       ...(session.model ? { model: session.model } : {}),
       ...(session.effort ? { effort: session.effort } : {}),
       lastActivityAt: session.lastActivityAt,
+      nativeMultiAgentMode: session.nativeMultiAgentMode,
       ...(session.threadId && session.attachCommandReady
         ? {
             attachCommand: `codex resume ${session.threadId} --remote unix://${session.socketPath}`,

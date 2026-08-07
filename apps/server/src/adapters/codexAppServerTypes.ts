@@ -70,7 +70,6 @@ export type ResumeConversationParams = {
   // Codex 0.145.0: establish the live subscription without rebuilding the
   // entire rollout into thread.turns.
   excludeTurns?: boolean;
-  dynamicTools?: DynamicToolSpec[];
 };
 
 // turn/start params. Only `threadId` + `input` are required; every override is
