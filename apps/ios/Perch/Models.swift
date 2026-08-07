@@ -977,7 +977,11 @@ struct StreamingMarkdownPresentationBuffer: Equatable {
             return commit(text, at: now)
         }
 
-        guard text != displayedText else { return .none }
+        if text == displayedText {
+            pendingText = nil
+            scheduledCommitAt = nil
+            return .none
+        }
 
         if let lastCommitAt, now - lastCommitAt >= Self.maximumCommitInterval {
             return commit(text, at: now)
