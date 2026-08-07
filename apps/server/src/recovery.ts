@@ -428,6 +428,19 @@ export class RecoveryCoordinator {
           data: { reason: "codex_migration_handoff_accepted", sessionId: runtime.ptySessionId }
         });
       }
+      const latestBlock = this.options.tasks.events(task.id).filter((event) => event.kind === "blocked").at(-1);
+      if (
+        acceptedNow &&
+        this.options.tasks.find(task.id)?.state === "blocked" &&
+        latestBlock?.data?.reason === "codex_migration_handoff_failed"
+      ) {
+        this.options.tasks.recordEvent(task.id, {
+          kind: "working",
+          source: "system",
+          message: "codex migration handoff was confirmed after recovery",
+          data: { reason: "codex_migration_handoff_reconciled", sessionId: runtime.ptySessionId }
+        });
+      }
     } catch (error) {
       if (!this.options.tasks.events(task.id).some(
         (event) => event.data?.reason === "codex_migration_handoff_failed"

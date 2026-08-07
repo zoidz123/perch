@@ -671,6 +671,10 @@ test("Codex migration handoff rejection and unknown delivery park durably", asyn
     turnId: "turn-confirmed-after-outage"
   });
   assert.equal(unknown.codexOwned.submitted.length, submittedBeforeReconcile);
+  assert.equal(unknown.tasks.find(unknown.task.id)?.state, "working");
+  assert.ok(unknown.tasks.events(unknown.task.id).some(
+    (event) => event.data?.reason === "codex_migration_handoff_reconciled"
+  ));
   const absentId = `${unknownId}:authoritatively-absent`;
   unknown.tasks.stateDb.runtimes.compareAndSwap(live.taskId, live.generation, "live", "live", {
     metadata: {
