@@ -3,11 +3,12 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
-import { MAILBOX_CONTROL_PREFIX, type AgentSession, type RecentEventsResult, type Task } from "@perch/shared";
+import type { AgentSession, RecentEventsResult, Task } from "@perch/shared";
 import type { AgentAdapter } from "./adapters/types.js";
 import { FleetMonitor } from "./fleetMonitor.js";
 import { deliverMateAttention, isMailboxRouted, MateMailboxNudger, wakeLine } from "./mateWake.js";
 import { TaskStore } from "./tasks.js";
+import { MAILBOX_CONTROL_PREFIX } from "./timeline.js";
 
 function task(overrides: Partial<Task> = {}): Task {
   const now = new Date().toISOString();

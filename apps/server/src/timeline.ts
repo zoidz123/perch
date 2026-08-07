@@ -12,12 +12,11 @@ import {
 } from "node:fs";
 import { dirname, join } from "node:path";
 import { StringDecoder } from "node:string_decoder";
-import {
-  MAILBOX_CONTROL_PREFIX,
-  type CodexReasoningEffort,
-  type TimelineItem,
-  type TimelineItemKind,
-  type TimelineItemSource
+import type {
+  CodexReasoningEffort,
+  TimelineItem,
+  TimelineItemKind,
+  TimelineItemSource
 } from "@perch/shared";
 
 // Structured timeline recovered by tailing the agent's own session file
@@ -40,7 +39,11 @@ const SOURCE_TTL_MS = 60_000;
 // but every boss-facing projection - the fetch endpoint and the live
 // timeline_item fan-out - drops them so a control prompt can never render as
 // a message the boss supposedly sent. Internal observers (prompt-delivery
-// receipts) still see the raw row.
+// receipts) still see the raw row. The constant lives here rather than
+// @perch/shared because the server imports shared types only (the packed
+// tarball has no @perch/shared runtime package; see e2ee/crypto.ts).
+export const MAILBOX_CONTROL_PREFIX = "[perch mailbox]";
+
 export function isMailboxControlItem(item: Pick<TimelineItem, "kind" | "text">): boolean {
   return item.kind === "user" && (item.text?.startsWith(MAILBOX_CONTROL_PREFIX) ?? false);
 }

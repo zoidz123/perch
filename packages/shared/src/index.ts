@@ -1194,11 +1194,12 @@ export type TimelineResponse = {
   revision: number;
 };
 
-// Server-injected mate mailbox attention nudges start with this exact prefix.
-// They are disposable attention transport, never content: the server filters
-// user rows carrying it out of every boss-facing timeline projection, while
-// the provider's own transcript (attach views) keeps them.
-export const MAILBOX_CONTROL_PREFIX = "[perch mailbox]";
+// Server-injected mate mailbox attention nudges start with the exact prefix
+// "[perch mailbox]" (MAILBOX_CONTROL_PREFIX in apps/server/src/timeline.ts;
+// @perch/shared stays type-only at server runtime). They are disposable
+// attention transport, never content: the server filters user rows carrying
+// it out of every boss-facing timeline projection, while the provider's own
+// transcript (attach views) keeps them.
 
 // One worker-to-mate mailbox message projection: a stable pointer plus safe
 // routing metadata and a bounded summary. Full report/event content is read

@@ -1,10 +1,11 @@
-import { MAILBOX_CONTROL_PREFIX, type Task, type TaskEventKind, type TaskEventSource } from "@perch/shared";
+import type { Task, TaskEventKind, TaskEventSource } from "@perch/shared";
 import type { AgentAdapter } from "./adapters/types.js";
 import type { ChartRegistry } from "./charts.js";
 import { findingsWakeSummary, parseNoMistakesGate } from "./findings.js";
 import type { FleetMonitor, SessionStatusChange } from "./fleetMonitor.js";
 import type { MateMailboxRepository } from "./stateDb.js";
 import type { TaskStore } from "./tasks.js";
+import { MAILBOX_CONTROL_PREFIX } from "./timeline.js";
 
 // Boss-relevant task events (the absorb policy): decision-shaped moments
 // reach the mate and the phone; working-heartbeats and bookkeeping notes stay
