@@ -489,6 +489,12 @@ test("unproven legacy Codex recovery migrates once and preserves root-only repor
   assert.equal(h.options.hooks.resolveAlias("pty:old"), "pty:old");
   assert.equal(h.codexOwned.launches[0]?.request.initialPrompt, undefined);
   assert.match(h.codexOwned.submitted[0]?.text ?? "", /migrated this task to a fresh Codex thread/);
+  // The fresh thread never saw the original kickoff, so the handoff is the only
+  // place it learns the reporting contract, its branch, and its worktree.
+  const handoffText = h.codexOwned.submitted[0]?.text ?? "";
+  assert.match(handoffText, /Report status only with the root thread's perch\.report_task_event tool/);
+  assert.match(handoffText, new RegExp(`Create and work on branch perch/${h.task.id}`));
+  assert.match(handoffText, /Native children must not report Perch task lifecycle events\./);
   assert.equal(h.codexOwned.submitted.length, 1);
   assert.equal(h.codexOwned.historyReads, 0);
   assert.ok(h.tasks.events(h.task.id).some((event) => event.data?.reason === "kickoff_superseded_by_migration"));

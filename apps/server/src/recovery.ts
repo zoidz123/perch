@@ -8,6 +8,7 @@ import {
   type StartManagedAgentInput
 } from "./agentLauncher.js";
 import type { AuditRecord } from "./audit.js";
+import { dispatchBrief } from "./brief.js";
 import type { HookEventPayload } from "./hooks.js";
 import { claudeRecoveryDriver } from "./providerRecovery.js";
 import { isTrustedProviderIdentity } from "./runtimeManager.js";
@@ -404,7 +405,7 @@ export class RecoveryCoordinator {
       const acceptedNow = await deliverCodexMigrationHandoff({
         codexOwned: this.options.codexOwned,
         sessionId: runtime.ptySessionId,
-        text: codexMigrationHandoff(task, handoff.handoff),
+        text: codexMigrationHandoff(task, handoff.handoff, runtime.worktreePath),
         handoff,
         persist: (next) => {
           const updated = this.options.tasks.stateDb.runtimes.compareAndSwap(
@@ -600,7 +601,7 @@ export const codexRecoveryDriver: RecoveryProviderDriver = {
       ...(migrateToFreshThread
         ? {
             postBindTurn: {
-              text: codexMigrationHandoff(task, handoff),
+              text: codexMigrationHandoff(task, handoff, runtime.worktreePath),
               clientUserMessageId: `perch:migration:${task.id}:g${runtime.generation + 1}`,
               handoff
             }
@@ -634,16 +635,23 @@ export function isProvenLegacyChildDisabled(metadata: Record<string, unknown> | 
   return proof.effective === "disabled" && proof.persisted === "disabled" && proof.model === "disabled";
 }
 
-function codexMigrationHandoff(task: Task, handoff: "task_brief" | "mate_state"): string {
+function codexMigrationHandoff(
+  task: Task,
+  handoff: "task_brief" | "mate_state",
+  worktreePath: string | undefined
+): string {
   if (handoff === "mate_state") {
     return "Perch migrated this owner to a fresh Codex thread to preserve root-only task authority. Inspect the current Perch task ledger and worktree state, then continue orchestration from durable state.";
   }
-  const brief = task.prompt?.trim().slice(0, 12_000);
+  const prompt = task.prompt?.trim().slice(0, 12_000);
+  // The fresh thread carries none of the original kickoff, so the handoff must
+  // re-state the dispatch brief - it is the only place the migrated worker
+  // learns to report through the root thread's report_task_event tool.
   return [
     "Perch migrated this task to a fresh Codex thread to preserve root-only task authority.",
     "Continue from the current worktree and verify existing changes before editing.",
-    brief ? `Original task brief:\n${brief}` : `Task: ${task.title}`
-  ].join("\n\n");
+    prompt ? `Original task brief:\n${prompt}` : `Task: ${task.title}`
+  ].join("\n\n") + dispatchBrief(task, worktreePath, {}, "codex");
 }
 
 function pendingMigrationHandoff(

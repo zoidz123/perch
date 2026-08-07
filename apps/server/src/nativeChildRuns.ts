@@ -31,6 +31,11 @@ function childState(value: unknown): NativeChildRunState {
       return "completed";
     case "errored":
       return "failed";
+    // Both are terminal but prove neither completion nor error. Mapping them
+    // to "unknown" would keep a torn-down child durably stored as running.
+    case "shutdown":
+    case "notFound":
+      return "interrupted";
     default:
       return "unknown";
   }

@@ -41,6 +41,28 @@ test("native child parser retains only safe collaboration observation fields", (
   assert.equal(JSON.stringify(observations).includes("spawnAgent"), false);
 });
 
+test("torn-down children observe as terminal, never staying durably live", () => {
+  // "unknown" is held back by the durable store, so a shutdown child that mapped
+  // to it would stay stored as running until the next server restart.
+  const states = parseNativeChildRunObservations({
+    rootThreadId: "root",
+    observedAt: "2026-08-06T12:00:00.000Z",
+    item: {
+      type: "collabAgentToolCall",
+      id: "collab-2",
+      senderThreadId: "root",
+      receiverThreadIds: ["child-shutdown", "child-missing"],
+      status: "completed",
+      agentsStates: {
+        "child-shutdown": { status: "shutdown" },
+        "child-missing": { status: "notFound" }
+      }
+    }
+  }).map((child) => child.state);
+
+  assert.deepEqual(states, ["interrupted", "interrupted"]);
+});
+
 test("native child parser is tolerant and defaults unknown shapes to no observation", () => {
   assert.deepEqual(
     parseNativeChildRunObservations({ rootThreadId: "root", item: { type: "subAgentActivity", agentPath: "0" } }),
