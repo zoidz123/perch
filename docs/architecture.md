@@ -34,9 +34,10 @@ When a managed Codex root turn exposes native multi-agent V2, Codex itself invok
 Perch never sends `spawnAgent`, `sendInput`, `wait`, `resumeAgent`, or `closeAgent` as a collaboration RPC.
 Perch feature-detects known root-thread `subAgentActivity` and `collabAgentToolCall` item shapes instead of guessing from a Codex version string.
 Unsupported, disabled, unknown, and optional-method-error cases preserve the prior root-only behavior.
+Set `PERCH_CODEX_NATIVE_MULTI_AGENT=disabled` before server start to disable observation without changing the user's Codex configuration.
 Perch stores only a durable content-free child observation keyed to the outer runtime generation, with child and parent thread IDs, path or depth, role when supplied, observed state, timestamps, and protocol metadata.
 Child observations are not Tasks, Runtimes, AgentSessions, fleet rows, worktrees, attach targets, chat timelines, or task-completion authorities.
-Root lifecycle and completion callbacks reject child-thread notifications before they can alter root state, prompt delivery, or task lifecycle.
+Root lifecycle and completion callbacks reject child-thread notifications before they can alter root state, prompt delivery, or task lifecycle, and child-thread server requests are answered with a safe denial instead of being surfaced as root requests.
 Perch intentionally offers no direct child interruption because the verified Codex 0.146.0 probe interrupted the root workflow too.
 Native children share the root worktree, so work is decomposed read-only where possible and concurrent writes are unsafe.
 The real native-collaboration contract test remains opt-in (`PERCH_CODEX_NATIVE_MULTI_AGENT_E2E=1` plus an explicitly dedicated `PERCH_CODEX_NATIVE_MULTI_AGENT_E2E_HOME`) because it performs model work and writes only to that supplied test home.
@@ -72,7 +73,7 @@ Composer messages queue while a permission prompt is open so ordinary text canno
 
 ## Durable task state
 
-SQLite stores the current task projection, immutable task events, separately persisted PR, completion-verification, and review facts, runtime generations, Mate ownership, leased operations, Codex history-sync receipts, and notification outbox.
+SQLite stores the current task projection, immutable task events, separately persisted PR, completion-verification, and review facts, runtime generations, Mate ownership, leased operations, Codex history-sync receipts, content-free native Codex child observations, and notification outbox.
 The task lifecycle describes work meaning, while runtime state describes the replaceable process executing it.
 
 ```text
@@ -101,12 +102,13 @@ Before recovery launches a replacement process, Perch proves the previous one is
 It only reaps a crash orphan when the executable, PID birth time, and expected provider match the persisted runtime record.
 
 Claude recovery resumes the exact conversation and requires a matching authenticated session-start event.
-Codex recovery `thread/resume`s the exact recorded thread through the owning adapter with turn history excluded from that response.
-A daemon that survived the restart is rebound over its recorded socket without a respawn, while a dead daemon is respawned to resume the rollout-backed thread with the stale in-flight turn represented as interrupted.
-The resumed thread id from the protocol response is the identity proof, so Perch can publish the live session and commit the next runtime generation without waiting for the rollout history.
+Codex recovery resumes the exact recorded thread when durable metadata proves its root-only task-reporting authority.
+A runtime without either the current root dynamic-tool marker or durable proof that native children were disabled migrates to a fresh root thread, records the replacement identity, and submits an idempotent handoff from the task brief or durable Mate state before recovery completes.
+For an authorized same-thread recovery, a daemon that survived the restart is rebound over its recorded socket without a respawn, while a dead daemon is respawned to resume the rollout-backed thread with the stale in-flight turn represented as interrupted.
+The resumed or replacement thread id from the protocol response is the identity proof, so Perch can publish the live session and commit the next runtime generation without waiting for rollout history.
 After the live bind, a separate durable receipt drives newest-first `thread/turns/list` catch-up through bounded pages.
 Catch-up inserts older rows before live recovery output, records cursor progress, retries bounded failures independently, and notifies timeline clients to refetch when a backfill changes their view.
-Legacy Codex runtimes recorded before app-server ownership migrate through the same thread/resume path when their rollout exists; a thread whose rollout was never written fails with the permanent missing-rollout condition and ends truthfully.
+Older Codex runtimes without a verified provider identity remain unrecoverable; an authorized same-thread resume whose rollout was never written fails with the permanent missing-rollout condition and ends truthfully.
 The replacement session must still be alive before Perch commits the next runtime generation.
 
 ## iPhone control surface

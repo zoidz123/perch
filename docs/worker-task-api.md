@@ -22,6 +22,10 @@ Native Codex children can inherit the root daemon's hook credential, so that cre
 The standard worker brief therefore tells native children to report only through their native parent result path and never call Perch task outcome hooks.
 This is defense in depth, not the task-completion security boundary: Mate verification remains authoritative.
 
+Fresh managed Codex threads receive `perch.report_task_event` as a root-thread dynamic tool.
+The owning app-server adapter binds that call to the root session and relays it through the authenticated event endpoint; child-thread tool requests are denied.
+Direct hook-token task reports remain accepted only for Claude workers and proven legacy Codex runtimes whose native children were disabled.
+
 Workers derive the server base URL with `${PERCH_HOOK_URL%/hooks}`.
 They never receive the server bearer token.
 
@@ -35,13 +39,15 @@ curl -s -H "Authorization: Bearer $TOKEN" "$BASE/tasks"
 
 | Credential | Intended caller | Accepted by |
 | --- | --- | --- |
-| Session headers `x-perch-session` and `x-perch-token` | Provider hooks and the worker | `POST /hooks`, the worker form of `POST /tasks/:id/events`, and adjacent worker capabilities such as chart registration |
+| Session headers `x-perch-session` and `x-perch-token` | Provider hooks, Claude workers, and proven legacy Codex workers | `POST /hooks`, the compatible worker form of `POST /tasks/:id/events`, and adjacent worker capabilities such as chart registration |
+| Owned Codex root-thread identity | Fresh managed Codex worker root | The `perch.report_task_event` dynamic tool, which the app-server adapter relays to `POST /tasks/:id/events` |
 | `Authorization: Bearer <server-token>` | Mate and local CLI tools | Authenticated task and session routes |
 | Paired device bearer token | iPhone | Most authenticated read and control routes, but not completion verification |
 
 For `POST /tasks/:id/events`, the session in `x-perch-session` must be the session currently linked to that task.
 Hook-token events are persisted with `source: "worker"`.
-Bearer-authenticated events are persisted with `source: "system"` and do not satisfy the worker's per-turn outcome requirement.
+Ordinary bearer-authenticated events are persisted with `source: "system"` and do not satisfy the worker's per-turn outcome requirement.
+The internal Codex root-tool relay also presents the server bearer, but its separately verified root session makes the event `source: "worker"`.
 
 ## Endpoint map
 
@@ -50,13 +56,13 @@ Bearer-authenticated events are persisted with `source: "system"` and do not sat
 | `POST /tasks` | Mate | Create a task and, with `dispatch: true`, acquire a worktree, start a worker, and link the runtime. |
 | `GET /tasks` | Mate, CLI, phone | List durable task projections. |
 | `GET /tasks/:id` | Mate, CLI, phone | Read one task and its immutable ordered event log. |
-| `POST /tasks/:id/events` | Worker | Report `working`, `pr_linked`, `needs_decision`, `blocked`, `done`, `failed`, or `note`. |
+| `POST /tasks/:id/events` | Worker or owned Codex root-tool relay | Report `working`, `pr_linked`, `needs_decision`, `blocked`, `done`, `failed`, or `note`. |
 | `POST /hooks` | Installed provider hook | Report provider lifecycle signals such as turn start and turn completion. |
 | `POST /tasks/:id/completion` | Mate with the server token | Accept or reject the latest worker completion request. |
 | `POST /tasks/:id/decision` | Mate or phone | Answer a structured no-mistakes review gate reported through `needs_decision`. |
 | `GET /sessions` | Mate, CLI, phone | Read live fleet and provider-session status. |
 | `POST /sessions/:sessionId/input` | Mate, CLI, phone | Send or queue follow-up text to the worker session. |
-| `POST /tasks/:id/recover` | Mate, CLI, phone | Resume the same verified provider conversation in a new runtime generation. |
+| `POST /tasks/:id/recover` | Mate, CLI, phone | Recover managed provider work in a new runtime generation. |
 | `POST /tasks/:id/teardown` | Mate, CLI, phone | Stop the worker, release its worktree, and close the task when the landed gate permits it. |
 
 The authenticated routes use JSON request and response bodies.
@@ -127,7 +133,7 @@ The event `seq` is the stable identifier used for completion decisions and turn-
 
 ### `POST /tasks/:id/events`
 
-A worker reports an outcome with its session credentials:
+A Claude worker or compatible legacy Codex worker reports an outcome with its session credentials:
 
 ```sh
 curl -sf -X POST "${PERCH_HOOK_URL%/hooks}/tasks/<task-id>/events" \
@@ -151,6 +157,7 @@ The request body is:
 `message` and serialized `data` are each limited to 32 KiB.
 `data` must be a JSON object.
 The successful response is `{ "task": <updated-task> }`.
+Fresh managed Codex workers call `perch.report_task_event` with the same request body fields and must require `success: true` from the tool result.
 
 | Worker wire verb | Durable event | Resulting task state | Meaning |
 | --- | --- | --- | --- |

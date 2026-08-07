@@ -685,7 +685,7 @@ export async function deliverCodexMigrationHandoff(input: {
     );
   }
   if (handoff.state === "submitted" || handoff.state === "delivery_unknown") {
-    let accepted: { id: string } | undefined;
+    let accepted: { id?: string } | undefined;
     try {
       accepted = await input.codexOwned.findAcceptedTurn(input.sessionId, handoff.clientUserMessageId);
     } catch (error) {

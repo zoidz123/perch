@@ -111,7 +111,7 @@ export type AgentSession = {
   // task's semantic state.
   runtime?: RuntimeSnapshot;
   // Native Codex multi-agent observations for this root session.
-  // Append-only and optional so older clients keep decoding the session shape.
+  // Optional so older clients keep decoding the session shape.
   nativeChildren?: NativeChildRunSummary[];
   nativeMultiAgentMode?: "enabled" | "disabled" | "legacy_compatibility";
   codexThreadMigration?: {

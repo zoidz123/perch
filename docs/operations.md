@@ -161,9 +161,11 @@ Use `PERCH_SERVER_URL` to select another loopback port for development or isolat
 Never expose the server port directly to the public internet.
 
 Stopping the server interrupts its owned PTYs and stops its app-server-owned Codex daemons.
-The next start respawns those daemons and resumes their exact recorded threads, while recovery after an ungraceful server exit can instead rebind a daemon that survived.
+The next start respawns those daemons and recovers their managed roots, while recovery after an ungraceful server exit can instead rebind a daemon that survived.
 Managed workers and Mate are recoverable only when Perch has persisted a verified provider conversation identity and can either rebind a surviving Codex daemon or prove the old process is gone.
-Codex recovery makes the exact recorded thread live before it catches up older timeline rows in bounded background pages, so a large rollout does not delay Mate or worker availability.
+Codex recovery normally resumes the recorded thread, but older metadata that cannot prove root-only task-reporting authority triggers a fresh root thread with a durable handoff instead.
+The recovered root becomes live before Perch catches up older timeline rows in bounded background pages, so a large rollout does not delay Mate or worker availability.
+See [Perch architecture](architecture.md#recovery) for the recovery identity contract.
 The iPhone refetches the timeline when background catch-up changes it.
 Solo sessions and arbitrary `perch run` commands do not have managed task recovery.
 
