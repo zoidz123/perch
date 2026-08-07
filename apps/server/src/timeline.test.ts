@@ -6,6 +6,7 @@ import { test } from "node:test";
 import {
   claudeRowModel,
   codexRowThreadSettings,
+  isMailboxControlItem,
   normalizeClaudeRow,
   normalizeCodexRow,
   TimelineStore
@@ -835,4 +836,40 @@ test("model listener fires on tailed claude assistant rows, backfill included", 
 
   store.stop();
   rmSync(dir, { recursive: true, force: true });
+});
+
+test("mailbox control prompts never reach the boss-facing timeline projection", () => {
+  const store = new TimelineStore();
+  const item = (id: string, kind: "user" | "assistant", text: string) => ({
+    seq: 0,
+    id,
+    sessionId: "pty:mate",
+    kind,
+    text,
+    at: "2026-08-07T00:00:00.000Z"
+  });
+  const observed: string[] = [];
+  store.observe((entry) => observed.push(entry.id));
+
+  store.ingest(item("boss-turn", "user", "please merge it"), { live: true });
+  store.ingest(item("nudge", "user", "[perch mailbox] 2 unread worker messages - drain your mailbox"), {
+    live: true
+  });
+  store.ingest(item("reply", "assistant", "On it, boss."), { live: true });
+
+  const fetched = store.fetch("pty:mate", 0, 10);
+  assert.deepEqual(
+    fetched.items.map((entry) => entry.id),
+    ["boss-turn", "reply"],
+    "the control prompt is filtered from the projection"
+  );
+  // Internal observers (prompt-delivery receipts) still see the raw row.
+  assert.deepEqual(observed, ["boss-turn", "nudge", "reply"]);
+
+  // The predicate is user-rows-only: an assistant quoting the prefix renders.
+  assert.equal(isMailboxControlItem({ kind: "assistant", text: "[perch mailbox] quoted" }), false);
+  assert.equal(isMailboxControlItem({ kind: "user", text: "[perch mailbox] 1 unread" }), true);
+  assert.equal(isMailboxControlItem({ kind: "user", text: "ordinary boss text" }), false);
+
+  store.stop();
 });

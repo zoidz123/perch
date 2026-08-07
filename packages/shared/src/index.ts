@@ -685,6 +685,31 @@ export type TaskEventRequest = {
   data?: Record<string, unknown>;
 };
 
+// A worker's lossless deliverable submission (POST /tasks/:id/reports and the
+// perch.send_report Codex root tool). Success means the full report was
+// durably committed with a pending mate delivery - not that the mate
+// processed it.
+export type WorkerReportRequest = {
+  // Concise routing summary carried by list/wait responses and the pointer
+  // task event. Bounded small; never a substitute for the report.
+  summary: string;
+  // The complete worker-authored report, stored byte-for-byte.
+  report: string;
+  // Complete structured evidence, stored verbatim as submitted.
+  evidence?: Record<string, unknown>;
+  format?: string;
+  // Sender-provided retry key, unique per (task, sender session). Tool layers
+  // may default it to a content hash; the endpoint requires it.
+  idempotencyKey?: string;
+};
+
+export type WorkerReportResponse = {
+  reportId: string;
+  duplicate: boolean;
+  reportBytes: number;
+  reportSha256: string;
+};
+
 export type CompletionDecisionRequest = {
   action: "accept" | "reject";
   // The immutable completion_requested event being decided. This prevents a
@@ -1167,6 +1192,55 @@ export type TimelineResponse = {
   items: TimelineItem[];
   lastSeq: number;
   revision: number;
+};
+
+// Server-injected mate mailbox attention nudges start with the exact prefix
+// "[perch mailbox]" (MAILBOX_CONTROL_PREFIX in apps/server/src/timeline.ts;
+// @perch/shared stays type-only at server runtime). They are disposable
+// attention transport, never content: the server filters user rows carrying
+// it out of every boss-facing timeline projection, while the provider's own
+// transcript (attach views) keeps them.
+
+// One worker-to-mate mailbox message projection: a stable pointer plus safe
+// routing metadata and a bounded summary. Full report/event content is read
+// through the read_message tool, never carried in list/wait responses.
+export type MateMailboxMessage = {
+  id: string;
+  taskId: string;
+  workerName?: string;
+  // The durable task-event kind that produced this message (worker_report
+  // pointer notes surface as "note" with reportId set).
+  kind: TaskEventKind;
+  taskEventSeq: number;
+  // Deterministic mailbox order: global commit order of the source event.
+  orderKey: number;
+  state: "pending" | "claimed" | "acknowledged";
+  summary?: string;
+  // Set when the summary was truncated for routing; the full text is available
+  // through read_message. Never applied to report bodies.
+  summaryTruncated?: boolean;
+  reportId?: string;
+  at: string;
+  claimToken?: string;
+  claimExpiresAt?: string;
+};
+
+// Immutable full worker report as returned by read_message: byte-for-byte the
+// content the worker submitted, plus provenance and integrity facts.
+export type WorkerReportContent = {
+  id: string;
+  taskId: string;
+  sessionId: string;
+  runtimeId?: string;
+  runtimeGeneration?: number;
+  workerName?: string;
+  format: string;
+  summary: string;
+  report: string;
+  evidence?: Record<string, unknown>;
+  reportBytes: number;
+  reportSha256: string;
+  acceptedAt: string;
 };
 
 

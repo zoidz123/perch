@@ -51,6 +51,8 @@ import type {
   TaskEventKind,
   TaskEventRequest,
   TaskPr,
+  MateMailboxMessage,
+  WorkerReportRequest,
   TasksResponse,
   UsageResponse,
   WebSocketRpcRequest,
@@ -148,7 +150,7 @@ import {
   markTaskWorkingFromActivity,
   startManagedAgent
 } from "./agentLauncher.js";
-import type { OperationRecord } from "./stateDb.js";
+import type { MateMailboxDeliveryRecord, OperationRecord } from "./stateDb.js";
 import type { OperationExecutionContext, TaskScheduler } from "./taskScheduler.js";
 import type { RuntimeManager } from "./runtimeManager.js";
 import {
@@ -1420,6 +1422,24 @@ async function route(
   const taskEventsMatch = pathname.match(/^\/tasks\/([^/]+)\/events$/);
   if (request.method === "POST" && taskEventsMatch) {
     await handleTaskEvent(request, response, options, decodeURIComponent(taskEventsMatch[1] ?? ""));
+    return;
+  }
+
+  // Lossless worker deliverables: the full report + evidence commit durably
+  // with a pending mate mailbox delivery. Worker-authored only - the same
+  // fail-closed identity ladder as the events route, with no system fallback.
+  const taskReportsMatch = pathname.match(/^\/tasks\/([^/]+)\/reports$/);
+  if (request.method === "POST" && taskReportsMatch) {
+    await handleWorkerReport(request, response, options, decodeURIComponent(taskReportsMatch[1] ?? ""));
+    return;
+  }
+
+  // The mate's mailbox tools (read_messages / read_message / ack_message /
+  // wait_for_messages). Claim and acknowledgment are fenced to the live mate
+  // generation's own hook credential, so they sit above the bearer gate like
+  // the other hook-token routes.
+  if (pathname === "/mate/mailbox" || pathname.startsWith("/mate/mailbox/")) {
+    await routeMateMailbox(request, response, options, pathname, url);
     return;
   }
 
@@ -4096,6 +4116,398 @@ async function handleTaskEvent(
 
 function allowsLegacyCodexHookReporting(metadata: Record<string, unknown> | undefined): boolean {
   return metadata?.codexTaskReportingMode === "legacy_hook_compat" && isProvenLegacyChildDisabled(metadata);
+}
+
+// Lossless report bounds. Density is preserved byte-for-byte within these
+// explicit limits; oversize submissions are rejected loudly (413), never
+// silently truncated. Larger artifacts belong in repo files or charts,
+// referenced from the report by path or content hash.
+export const MAX_WORKER_REPORT_SUMMARY_BYTES = 4 * 1024;
+export const MAX_WORKER_REPORT_BODY_BYTES = 256 * 1024;
+export const MAX_WORKER_REPORT_EVIDENCE_BYTES = 256 * 1024;
+// Routing summaries in mailbox list/wait responses are clipped to this many
+// characters (flagged summaryTruncated); read_message always returns the
+// untruncated original.
+const MAILBOX_SUMMARY_CHARS = 2_000;
+// A mailbox claim leases the message to the current mate generation for this
+// long; an expired lease returns the message to pending automatically.
+const MAILBOX_CLAIM_TTL_MS = 10 * 60_000;
+const MAILBOX_WAIT_MAX_SECONDS = 30;
+
+// Worker identity ladder for report submission, mirroring handleTaskEvent:
+// the Codex root-tool relay (server bearer + verified root session) or the
+// task session's own hook credential (with the root_thread_required gate).
+// There is no bearer/system fallback - reports are worker-authored only.
+function authenticateWorkerReport(
+  request: IncomingMessage,
+  options: HttpServerOptions,
+  task: Task
+): { sessionId: string } | { status: number; error: string } {
+  const bearer = authenticate(request, options);
+  if (bearer?.kind === "server" && request.headers["x-perch-root-session"] !== undefined) {
+    const rootSessionId = String(request.headers["x-perch-root-session"] ?? "");
+    const runtime = options.tasks.stateDb.runtimes.findBySession(rootSessionId);
+    if (!rootSessionId || task.sessionId !== rootSessionId || runtime?.agent !== "codex") {
+      return { status: 401, error: "Unauthorized" };
+    }
+    return { sessionId: rootSessionId };
+  }
+  if (bearer) return { status: 401, error: "worker reports require task-session credentials" };
+  const presentedSessionId = String(request.headers["x-perch-session"] ?? "");
+  const token = String(request.headers["x-perch-token"] ?? "");
+  const sessionId = options.hooks.resolveAlias(presentedSessionId);
+  const runtime = options.tasks.stateDb.runtimes.findBySession(sessionId);
+  const reason = !presentedSessionId || !token
+    ? "missing_credentials"
+    : !options.hooks.verify(presentedSessionId, token)
+      ? "invalid_credentials"
+      : task.sessionId !== sessionId
+        ? "task_session_mismatch"
+        : runtime?.agent === "codex" && !allowsLegacyCodexHookReporting(runtime.metadata)
+          ? "root_thread_required"
+        : undefined;
+  if (reason) {
+    console.warn(
+      `worker-report: rejected status=401 task=${task.id} session=${presentedSessionId ? presentedSessionId.slice(0, 16) : "missing"} reason=${reason}`
+    );
+    return { status: 401, error: "Unauthorized" };
+  }
+  return { sessionId };
+}
+
+async function handleWorkerReport(
+  request: IncomingMessage,
+  response: ServerResponse,
+  options: HttpServerOptions,
+  taskId: string
+): Promise<void> {
+  const task = options.tasks.find(taskId);
+  if (!task) {
+    writeJson(response, 404, { error: `Unknown task: ${taskId}` });
+    return;
+  }
+  const auth = authenticateWorkerReport(request, options, task);
+  if ("error" in auth) {
+    writeJson(response, auth.status, { error: auth.error });
+    return;
+  }
+
+  let body: WorkerReportRequest;
+  try {
+    body = await readJson<WorkerReportRequest>(request);
+  } catch {
+    writeJson(response, 400, { error: "request body must be JSON" });
+    return;
+  }
+  if (typeof body.summary !== "string" || !body.summary.trim()) {
+    writeJson(response, 400, { error: "summary is required" });
+    return;
+  }
+  if (typeof body.report !== "string" || !body.report.trim()) {
+    writeJson(response, 400, { error: "report is required" });
+    return;
+  }
+  const idempotencyKey = typeof body.idempotencyKey === "string" ? body.idempotencyKey.trim() : "";
+  if (!idempotencyKey || idempotencyKey.length > 200) {
+    writeJson(response, 400, { error: "idempotencyKey is required (at most 200 characters)" });
+    return;
+  }
+  const format = typeof body.format === "string" && body.format.trim() ? body.format.trim() : "markdown";
+  if (format.length > 64) {
+    writeJson(response, 400, { error: "format must be at most 64 characters" });
+    return;
+  }
+  const summaryBytes = Buffer.byteLength(body.summary, "utf8");
+  if (summaryBytes > MAX_WORKER_REPORT_SUMMARY_BYTES) {
+    writeJson(response, 413, {
+      error: `summary too large: ${summaryBytes} bytes (max ${MAX_WORKER_REPORT_SUMMARY_BYTES}); the summary routes, the report carries the content`
+    });
+    return;
+  }
+  const reportBytes = Buffer.byteLength(body.report, "utf8");
+  if (reportBytes > MAX_WORKER_REPORT_BODY_BYTES) {
+    writeJson(response, 413, {
+      error: `report too large: ${reportBytes} bytes (max ${MAX_WORKER_REPORT_BODY_BYTES}); commit large artifacts to the branch (or a chart) and reference them by path or content hash - nothing is truncated server-side`
+    });
+    return;
+  }
+  let evidence: Record<string, unknown> | undefined;
+  if (body.evidence !== undefined) {
+    if (body.evidence === null || typeof body.evidence !== "object" || Array.isArray(body.evidence)) {
+      writeJson(response, 400, { error: "evidence must be a JSON object" });
+      return;
+    }
+    const evidenceBytes = Buffer.byteLength(JSON.stringify(body.evidence), "utf8");
+    if (evidenceBytes > MAX_WORKER_REPORT_EVIDENCE_BYTES) {
+      writeJson(response, 413, {
+        error: `evidence too large: ${evidenceBytes} bytes (max ${MAX_WORKER_REPORT_EVIDENCE_BYTES}); reference larger artifacts by path or content hash - nothing is truncated server-side`
+      });
+      return;
+    }
+    evidence = body.evidence;
+  }
+
+  try {
+    const result = options.tasks.recordWorkerReport(taskId, {
+      sessionId: auth.sessionId,
+      idempotencyKey,
+      format,
+      summary: body.summary,
+      report: body.report,
+      ...(evidence ? { evidence } : {})
+    });
+    writeJson(response, 200, {
+      reportId: result.report.id,
+      duplicate: result.duplicate,
+      reportBytes: result.report.reportBytes,
+      reportSha256: result.report.reportSha256
+    });
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    writeJson(response, message.includes("idempotency key") ? 409 : 500, { error: message });
+  }
+}
+
+// Claim/acknowledge identity: the live mate generation's own hook credential.
+// Mechanical refusals: workers and native children (session mismatch), paired
+// devices and bearer callers (no hook credential), superseded mate sessions
+// (alias/session mismatch), and stale generations (compare-and-swap at ack).
+function authenticateMateMailbox(
+  request: IncomingMessage,
+  options: HttpServerOptions
+): { sessionId: string; generation: number } | { status: number; error: string } {
+  const presentedSessionId = String(request.headers["x-perch-session"] ?? "");
+  const token = String(request.headers["x-perch-token"] ?? "");
+  if (!presentedSessionId || !token) {
+    return { status: 401, error: "mate mailbox access requires the mate session's hook credentials" };
+  }
+  if (!options.hooks.verify(presentedSessionId, token)) {
+    return { status: 401, error: "Unauthorized" };
+  }
+  const sessionId = options.hooks.resolveAlias(presentedSessionId);
+  const mate = options.ownerManager?.latestMate();
+  if (!mate || mate.state !== "live") {
+    return { status: 409, error: "no live mate generation is registered" };
+  }
+  if (!mate.ptySessionId || mate.ptySessionId !== sessionId) {
+    return { status: 403, error: "mailbox claims are restricted to the live mate session" };
+  }
+  return { sessionId, generation: mate.generation };
+}
+
+// Routing projection: a stable pointer plus safe metadata. Never the report
+// body; the summary is clipped (and flagged) when long.
+function mailboxMessageProjection(
+  options: HttpServerOptions,
+  record: MateMailboxDeliveryRecord,
+  withClaim: boolean
+): MateMailboxMessage {
+  const event = options.tasks.stateDb.tasks.eventById(record.taskEventId);
+  const report = record.reportId ? options.tasks.stateDb.workerReports.find(record.reportId) : undefined;
+  const fullSummary = report?.summary ?? event?.message ?? "";
+  const truncated = fullSummary.length > MAILBOX_SUMMARY_CHARS;
+  const task = options.tasks.find(record.taskId);
+  return {
+    id: record.id,
+    taskId: record.taskId,
+    ...(task?.workerName ? { workerName: task.workerName } : {}),
+    kind: event?.kind ?? "note",
+    taskEventSeq: event?.seq ?? 0,
+    orderKey: record.taskEventId,
+    state: record.state,
+    ...(fullSummary
+      ? { summary: truncated ? fullSummary.slice(0, MAILBOX_SUMMARY_CHARS) : fullSummary }
+      : {}),
+    ...(truncated ? { summaryTruncated: true } : {}),
+    ...(record.reportId ? { reportId: record.reportId } : {}),
+    at: event?.at ?? record.createdAt,
+    ...(withClaim && record.claimToken ? { claimToken: record.claimToken } : {}),
+    ...(withClaim && record.claimExpiresAt ? { claimExpiresAt: record.claimExpiresAt } : {})
+  };
+}
+
+async function routeMateMailbox(
+  request: IncomingMessage,
+  response: ServerResponse,
+  options: HttpServerOptions,
+  pathname: string,
+  url: URL
+): Promise<void> {
+  const mailbox = options.tasks.stateDb.mateMailbox;
+
+  // Non-mutating observability: the boss (server/device bearer) or the mate
+  // may list. Listing never claims and never acknowledges.
+  if (request.method === "GET" && pathname === "/mate/mailbox") {
+    const bearer = authenticate(request, options);
+    const mateAuth = bearer ? undefined : authenticateMateMailbox(request, options);
+    if (!bearer && mateAuth && "error" in mateAuth) {
+      writeJson(response, mateAuth.status, { error: mateAuth.error });
+      return;
+    }
+    const includeAcknowledged = url.searchParams.get("includeAcknowledged") === "1";
+    const limit = Number(url.searchParams.get("limit") ?? 100);
+    const messages = mailbox
+      .list({ includeAcknowledged, limit: Number.isFinite(limit) ? limit : 100 })
+      .map((record) => mailboxMessageProjection(options, record, false));
+    writeJson(response, 200, { messages, pending: mailbox.pendingCount(new Date().toISOString()) });
+    return;
+  }
+
+  // read_messages: claim the oldest unacknowledged messages for the live mate
+  // generation. Tokens are (re)minted per call; stale tokens can never ack.
+  if (request.method === "POST" && pathname === "/mate/mailbox/read") {
+    const auth = authenticateMateMailbox(request, options);
+    if ("error" in auth) {
+      writeJson(response, auth.status, { error: auth.error });
+      return;
+    }
+    const body = await readJsonOrEmpty<{ limit?: number }>(request);
+    const limit = Number.isInteger(body.limit) && (body.limit as number) > 0 ? (body.limit as number) : 10;
+    const now = new Date().toISOString();
+    const claimed = mailbox.claim({ generation: auth.generation, limit, ttlMs: MAILBOX_CLAIM_TTL_MS, now });
+    writeJson(response, 200, {
+      messages: claimed.map((record) => mailboxMessageProjection(options, record, true)),
+      pending: mailbox.pendingCount(new Date().toISOString())
+    });
+    return;
+  }
+
+  // wait_for_messages: a bounded latency optimization over the same durable
+  // mailbox - never the correctness layer. Returns immediately when anything
+  // is pending, empty on timeout; a lost wait loses nothing.
+  if (request.method === "GET" && pathname === "/mate/mailbox/wait") {
+    const auth = authenticateMateMailbox(request, options);
+    if ("error" in auth) {
+      writeJson(response, auth.status, { error: auth.error });
+      return;
+    }
+    const requested = Number(url.searchParams.get("timeoutSeconds") ?? 25);
+    const timeoutSeconds = Math.max(0, Math.min(Number.isFinite(requested) ? requested : 25, MAILBOX_WAIT_MAX_SECONDS));
+    const deadline = Date.now() + timeoutSeconds * 1000;
+    // The socket can disappear mid-wait (client gone, server shutdown). A
+    // vanished waiter must cost nothing: stop polling and never write to a
+    // dead response - the durable mailbox still holds every message.
+    try {
+      for (;;) {
+        const now = new Date().toISOString();
+        if (mailbox.pendingCount(now) > 0) {
+          if (response.writableEnded || request.destroyed) return;
+          const messages = mailbox.list({ limit: 50 }).map((record) => mailboxMessageProjection(options, record, false));
+          writeJson(response, 200, { messages, timedOut: false });
+          return;
+        }
+        if (Date.now() >= deadline || response.writableEnded || request.destroyed) break;
+        await new Promise((resolve) => setTimeout(resolve, Math.min(250, Math.max(1, deadline - Date.now()))));
+      }
+      if (!response.writableEnded && !request.destroyed) writeJson(response, 200, { messages: [], timedOut: true });
+    } catch {
+      // A torn-down socket while replying is a disconnect, not a server fault.
+    }
+    return;
+  }
+
+  // read_message: the original full report and evidence, byte-for-byte, plus
+  // the full source event. The mate (or the boss over bearer auth) reads here
+  // before semantic acknowledgment.
+  const messageMatch = pathname.match(/^\/mate\/mailbox\/message\/([^/]+)$/);
+  if (request.method === "GET" && messageMatch) {
+    const bearer = authenticate(request, options);
+    const mateAuth = bearer ? undefined : authenticateMateMailbox(request, options);
+    if (!bearer && mateAuth && "error" in mateAuth) {
+      writeJson(response, mateAuth.status, { error: mateAuth.error });
+      return;
+    }
+    const record = mailbox.find(decodeURIComponent(messageMatch[1] ?? ""));
+    if (!record) {
+      writeJson(response, 404, { error: "Unknown mailbox message" });
+      return;
+    }
+    const event = options.tasks.stateDb.tasks.eventById(record.taskEventId);
+    const report = record.reportId ? options.tasks.stateDb.workerReports.find(record.reportId) : undefined;
+    writeJson(response, 200, {
+      message: mailboxMessageProjection(options, record, false),
+      ...(event ? { event } : {}),
+      ...(report
+        ? {
+            report: {
+              id: report.id,
+              taskId: report.taskId,
+              sessionId: report.sessionId,
+              ...(report.runtimeId ? { runtimeId: report.runtimeId } : {}),
+              ...(report.runtimeGeneration !== undefined ? { runtimeGeneration: report.runtimeGeneration } : {}),
+              ...(report.workerName ? { workerName: report.workerName } : {}),
+              format: report.format,
+              summary: report.summary,
+              report: report.report,
+              ...(report.evidence ? { evidence: report.evidence } : {}),
+              reportBytes: report.reportBytes,
+              reportSha256: report.reportSha256,
+              acceptedAt: report.acceptedAt
+            }
+          }
+        : {})
+    });
+    return;
+  }
+
+  // ack_message / ack_messages: idempotent semantic acknowledgment, fenced by
+  // claim token + live generation. Acknowledgment marks mailbox processing
+  // only - trusted task completion still requires POST /tasks/:id/completion.
+  if (request.method === "POST" && pathname === "/mate/mailbox/ack") {
+    const auth = authenticateMateMailbox(request, options);
+    if ("error" in auth) {
+      writeJson(response, auth.status, { error: auth.error });
+      return;
+    }
+    type AckEntry = { id?: string; claimToken?: string; idempotencyKey?: string; disposition?: string };
+    const body = await readJsonOrEmpty<{ acks?: AckEntry[] } & AckEntry>(request);
+    const entries: AckEntry[] = Array.isArray(body.acks) ? body.acks : [body];
+    if (entries.length === 0 || entries.length > 50) {
+      writeJson(response, 400, { error: "acks must contain between 1 and 50 entries" });
+      return;
+    }
+    const results = entries.map((entry) => {
+      if (!entry.id || typeof entry.id !== "string") return { id: entry.id ?? "", outcome: "invalid", error: "id is required" };
+      if (!entry.claimToken || typeof entry.claimToken !== "string") {
+        return { id: entry.id, outcome: "invalid", error: "claimToken is required" };
+      }
+      const key = typeof entry.idempotencyKey === "string" ? entry.idempotencyKey.trim() : "";
+      if (!key || key.length > 200) {
+        return { id: entry.id, outcome: "invalid", error: "idempotencyKey is required (at most 200 characters)" };
+      }
+      const disposition =
+        typeof entry.disposition === "string" && entry.disposition.trim()
+          ? entry.disposition.trim().slice(0, 200)
+          : undefined;
+      const result = options.tasks.stateDb.mateMailbox.ack({
+        id: entry.id,
+        claimToken: entry.claimToken,
+        generation: auth.generation,
+        idempotencyKey: key,
+        ...(disposition ? { disposition } : {}),
+        sessionId: auth.sessionId,
+        now: new Date().toISOString()
+      });
+      switch (result.outcome) {
+        case "acknowledged":
+          return { id: entry.id, outcome: "acknowledged", duplicate: result.duplicate };
+        case "not_found":
+          return { id: entry.id, outcome: "error", error: "unknown mailbox message" };
+        case "ack_conflict":
+          return { id: entry.id, outcome: "error", error: "already acknowledged with a different idempotency key" };
+        case "not_claimed":
+          return { id: entry.id, outcome: "error", error: "message is not claimed; read_messages first" };
+        case "stale_token":
+          return { id: entry.id, outcome: "error", error: "claim token is stale or expired; read_messages again" };
+        case "stale_generation":
+          return { id: entry.id, outcome: "error", error: "claim belongs to a different mate generation; read_messages again" };
+      }
+    });
+    writeJson(response, 200, { results });
+    return;
+  }
+
+  writeJson(response, 404, { error: "Not found" });
 }
 
 async function handleNoMistakesAuthorization(

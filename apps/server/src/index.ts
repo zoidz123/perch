@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import { statSync } from "node:fs";
 import { basename } from "node:path";
 import { PtyAgentAdapter } from "./adapters/pty.js";
@@ -29,7 +30,7 @@ import { DeviceRegistry, serverIdentity, tokensEqual } from "./pairing.js";
 import { readOrCreateBoxKeyPair } from "./e2ee/keys.js";
 import { RelayClient } from "./relayClient.js";
 import type { ClientAuth } from "./fleetMonitor.js";
-import { deliverMateWake, wireChartWake } from "./mateWake.js";
+import { deliverMateAttention, MateMailboxNudger, wireChartWake } from "./mateWake.js";
 import { PrPoller } from "./prPoller.js";
 import { ProjectRegistry } from "./projects.js";
 import { StatusReconciler } from "./reconciler.js";
@@ -43,7 +44,7 @@ import { executeTeardown, landedGate, ownLeaseFor } from "./teardown.js";
 import { WorktreePool } from "./worktrees.js";
 import { ApnsPushSender, apnsConfigFromEnv, NoopPushSender } from "./push.js";
 import { PushRouter } from "./pushRouter.js";
-import { TimelineStore } from "./timeline.js";
+import { isMailboxControlItem, TimelineStore } from "./timeline.js";
 import { nativeChildRunSummary, recordNativeChildRunObservation } from "./nativeChildRuns.js";
 import { TaskScheduler } from "./taskScheduler.js";
 import { OutboxWorker } from "./outboxWorker.js";
@@ -204,6 +205,9 @@ const apnsConfig = apnsConfigFromEnv();
 const apnsPush = apnsConfig ? new ApnsPushSender(apnsConfig, () => devices.pushTokens()) : undefined;
 const push = apnsPush ?? new NoopPushSender();
 console.log(apnsConfig ? `push: APNs enabled (${apnsConfig.host})` : "push: APNs not configured (noop sender)");
+// Constructed right after the monitor below; declared here so the monitor's
+// status tap can reference it.
+let mailboxNudger: MateMailboxNudger | undefined;
 const monitor = new FleetMonitor(adapter, {
   reconcileMs: config.reconcileMs,
   auditLog,
@@ -213,8 +217,12 @@ const monitor = new FleetMonitor(adapter, {
   // socket even if it is not a current FleetMonitor client. LAN-only servers
   // have no relay client, so this is a no-op there.
   onDisconnectDevice: (deviceId) => relayClient?.disconnectDevice(deviceId),
-  onStatusChange: ({ sessionId, from, to, source }) =>
-    metrics.recordSessionStatus(sessionId, from, to, source),
+  onStatusChange: (change) => {
+    metrics.recordSessionStatus(change.sessionId, change.from, change.to, change.source);
+    // Safe-checkpoint attention: a mate turn ending is the moment to surface
+    // mailbox work that arrived while it was reasoning.
+    mailboxNudger?.onStatusChange(change);
+  },
   // A structured provider signal, hook, or terminal fallback reported quota
   // exhaustion. Block the owning task through the normal mate wake channel.
   onUsageLimit: (sessionId, _agent, limit) => reportUsageLimitToTask(tasks, sessionId, limit, metrics),
@@ -239,6 +247,7 @@ const monitor = new FleetMonitor(adapter, {
   }
 });
 monitor.setRuntimeSnapshot((sessionId) => runtimeManager.snapshotForSession(sessionId));
+mailboxNudger = new MateMailboxNudger({ mailbox: tasks.stateDb.mateMailbox, adapter, monitor });
 void adapter
   .listSessions()
   .then((sessions) => {
@@ -350,6 +359,35 @@ codexOwned.wireEvents({
     );
     return { success: response.ok, text: await response.text() };
   },
+  // The perch.send_report root tool: relayed like report_task_event so the
+  // worker's full deliverable reaches the durable mailbox without curl and
+  // without granting native children any authority (the endpoint pins the
+  // verified root session). A retry with no explicit key stays idempotent
+  // because the default key derives from the content itself.
+  onWorkerReport: async (sessionId, report) => {
+    const runtime = tasks.stateDb.runtimes.findBySession(sessionId);
+    if (!runtime) return { success: false, text: "No task runtime is bound to this root thread." };
+    const idempotencyKey =
+      typeof report.idempotencyKey === "string" && report.idempotencyKey.trim()
+        ? report.idempotencyKey
+        : `report-${createHash("sha256")
+            .update(JSON.stringify([report.summary, report.report, report.evidence ?? null, report.format ?? null]))
+            .digest("hex")
+            .slice(0, 32)}`;
+    const response = await fetch(
+      `http://127.0.0.1:${config.port}/tasks/${encodeURIComponent(runtime.taskId)}/reports`,
+      {
+        method: "POST",
+        headers: {
+          authorization: `Bearer ${config.authToken}`,
+          "content-type": "application/json",
+          "x-perch-root-session": sessionId
+        },
+        body: JSON.stringify({ ...report, idempotencyKey })
+      }
+    );
+    return { success: response.ok, text: await response.text() };
+  },
   onThreadStarted: (sessionId, threadId) => {
     runtimeManager.recordProviderSession(sessionId, "codex", threadId);
     ownerManager.recordProviderSession(sessionId, "codex", threadId);
@@ -388,7 +426,11 @@ codexOwned.wireEvents({
 const outboxWorker = new OutboxWorker({
   stateDb: tasks.stateDb,
   deliver: {
-    mate: ({ task, event }) => deliverMateWake(task, event, adapter, monitor),
+    // Worker-authored events already committed their durable mailbox delivery
+    // with the event; the mate channel then carries only a disposable
+    // attention nudge for them. System notifications keep the legacy content
+    // wake line.
+    mate: ({ task, event }) => deliverMateAttention(task, event, adapter, monitor, mailboxNudger),
     push: ({ task, event }) => pushRouter.deliverTaskEvent(task, event)
   }
 });
@@ -463,7 +505,10 @@ tasks.subscribe((task, event) => {
 });
 
 // Structured timeline items stream to subscribed clients as they land.
+// Mailbox control prompts stay out of every boss-facing projection (the
+// fetch endpoint filters them too); the provider transcript keeps them.
 timeline.subscribe((item) => {
+  if (isMailboxControlItem(item)) return;
   monitor.publish({
     type: "timeline_item",
     sessionId: item.sessionId,

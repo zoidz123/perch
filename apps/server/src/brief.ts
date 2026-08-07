@@ -159,6 +159,12 @@ export function dispatchBrief(
     `- request completion verification (the command fails unless Perch acknowledges task.state == completion_requested):\n${doneVerb}`,
     `- cannot complete:\n${verb("failed", "why")}`,
     "",
+    "Full report: before requesting completion on substantial work (always for scout findings), deliver your complete worker-authored report and structured evidence to the mate mailbox - the done: message stays a concise claim:",
+    codex
+      ? `Call perch.send_report with {"summary":"<one-paragraph routing summary>","report":"<the complete report>","evidence":{...optional structured evidence...}} and require success=true. Success means the report was durably committed.`
+      : `perch report send --task ${task.id} --summary "<one-paragraph routing summary>" --report-file <path-to-full-report.md> [--evidence-file <path.json>]`,
+    "Perch stores the report byte-for-byte (limits: 4 KiB summary, 256 KiB report, 256 KiB evidence JSON; oversize is rejected explicitly, never truncated). Reference larger artifacts by committed file path or content hash inside the report.",
+    "",
     "Drawing charts: when something you hand the boss is easier reviewed visually than as prose - a plan, a comparison, findings - draw a chart: one HTML file the boss annotates from desktop or phone.",
     "Fetch the authoring guide first (curl -sf \"${PERCH_HOOK_URL%/hooks}/charts/authoring\") and follow it: every chart renders in the one fixed perch look via chart.css and its documented classes - no <style> blocks, no style= attributes, no external design systems.",
     "Write the file to .charts/<slug>.html in your workspace (keep it out of commits) and register it once:",

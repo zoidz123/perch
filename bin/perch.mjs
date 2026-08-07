@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 
 import { spawn, spawnSync } from "node:child_process";
-import { randomBytes } from "node:crypto";
+import { createHash, randomBytes } from "node:crypto";
 import { chmodSync, existsSync, linkSync, mkdirSync, openSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { basename, dirname, join, resolve } from "node:path";
@@ -99,6 +99,16 @@ async function main() {
 
   if (parsed.command === "tasks") {
     await runTasksCommand(parsed.args, parsed.options);
+    return;
+  }
+
+  if (parsed.command === "report") {
+    await runReportCommand(parsed.args, parsed.options);
+    return;
+  }
+
+  if (parsed.command === "mailbox") {
+    await runMailboxCommand(parsed.args, parsed.options);
     return;
   }
 
@@ -1173,6 +1183,201 @@ function formatConfigValue(value) {
 // Durable task status
 // ---------------------------------------------------------------------------
 
+// ---------------------------------------------------------------------------
+// Worker reports and the mate mailbox: the typed tool layer over the
+// hook-token HTTP plumbing, so agents never need curl for the lossless
+// report path. Authenticates with the session's own hook credentials
+// (PERCH_SESSION_ID / PERCH_HOOK_TOKEN, already in managed session envs).
+// ---------------------------------------------------------------------------
+
+function hookCredentialHeaders() {
+  const sessionId = process.env.PERCH_SESSION_ID;
+  const token = process.env.PERCH_HOOK_TOKEN;
+  if (!sessionId || !token) {
+    throw new Error(
+      "PERCH_SESSION_ID / PERCH_HOOK_TOKEN are not set; report and mailbox commands run inside a Perch-managed session"
+    );
+  }
+  return { "x-perch-session": sessionId, "x-perch-token": token, "content-type": "application/json" };
+}
+
+function hookBaseUrl(options) {
+  const hookUrl = process.env.PERCH_HOOK_URL;
+  if (hookUrl) {
+    return hookUrl.replace(/\/hooks\/?$/, "");
+  }
+  return normalizeServerUrl(options.server).toString().replace(/\/$/, "");
+}
+
+function parseSubcommandFlags(args) {
+  const flags = {};
+  const positionals = [];
+  for (let index = 0; index < args.length; index += 1) {
+    const arg = args[index];
+    if (!arg.startsWith("--")) {
+      positionals.push(arg);
+      continue;
+    }
+    const eq = arg.indexOf("=");
+    if (eq >= 0) {
+      flags[arg.slice(2, eq)] = arg.slice(eq + 1);
+      continue;
+    }
+    const name = arg.slice(2);
+    const next = args[index + 1];
+    if (next !== undefined && !next.startsWith("--")) {
+      flags[name] = next;
+      index += 1;
+    } else {
+      flags[name] = true;
+    }
+  }
+  return { flags, positionals };
+}
+
+async function mailboxFetch(url, init) {
+  const response = await fetch(url, init);
+  const text = await response.text();
+  if (!response.ok) {
+    let detail = text;
+    try {
+      detail = JSON.parse(text).error ?? text;
+    } catch {
+      // keep raw body
+    }
+    throw new Error(`${init?.method ?? "GET"} ${new URL(url).pathname} failed (${response.status}): ${detail}`);
+  }
+  try {
+    return JSON.parse(text);
+  } catch {
+    return text;
+  }
+}
+
+async function runReportCommand(args, options) {
+  const { flags, positionals } = parseSubcommandFlags(args);
+  const action = positionals[0];
+  if (action !== "send") {
+    throw new Error("usage: perch report send --task <task-id> --summary <text> (--report <text> | --report-file <path>) [--evidence-file <path>] [--format <format>] [--key <idempotency-key>]");
+  }
+  const taskId = flags.task;
+  if (!taskId || typeof taskId !== "string") {
+    throw new Error("--task <task-id> is required");
+  }
+  const summary =
+    typeof flags.summary === "string"
+      ? flags.summary
+      : typeof flags["summary-file"] === "string"
+        ? readFileSync(flags["summary-file"], "utf8")
+        : undefined;
+  if (!summary || !summary.trim()) {
+    throw new Error("--summary <text> (or --summary-file) is required");
+  }
+  const report =
+    typeof flags.report === "string"
+      ? flags.report
+      : typeof flags["report-file"] === "string"
+        ? readFileSync(flags["report-file"], "utf8")
+        : undefined;
+  if (!report || !report.trim()) {
+    throw new Error("--report <text> or --report-file <path> is required");
+  }
+  let evidence;
+  if (typeof flags["evidence-file"] === "string") {
+    evidence = JSON.parse(readFileSync(flags["evidence-file"], "utf8"));
+  } else if (typeof flags.evidence === "string") {
+    evidence = JSON.parse(flags.evidence);
+  }
+  const format = typeof flags.format === "string" ? flags.format : undefined;
+  // A stable default key derives from the content itself, so an unchanged
+  // retry is idempotent without the caller inventing a key.
+  const idempotencyKey =
+    typeof flags.key === "string" && flags.key.trim()
+      ? flags.key.trim()
+      : `report-${createHash("sha256")
+          .update(JSON.stringify([summary, report, evidence ?? null, format ?? null]))
+          .digest("hex")
+          .slice(0, 32)}`;
+  const result = await mailboxFetch(`${hookBaseUrl(options)}/tasks/${encodeURIComponent(taskId)}/reports`, {
+    method: "POST",
+    headers: hookCredentialHeaders(),
+    body: JSON.stringify({
+      summary,
+      report,
+      ...(evidence !== undefined ? { evidence } : {}),
+      ...(format ? { format } : {}),
+      idempotencyKey
+    })
+  });
+  console.log(JSON.stringify(result, null, 2));
+  if (!result.duplicate) {
+    console.error(`report ${result.reportId} durably committed (${result.reportBytes} bytes)`);
+  } else {
+    console.error(`report ${result.reportId} was already committed for this idempotency key (retry acknowledged)`);
+  }
+}
+
+async function runMailboxCommand(args, options) {
+  const { flags, positionals } = parseSubcommandFlags(args);
+  const action = positionals[0] ?? "read";
+  const base = hookBaseUrl(options);
+  if (action === "read") {
+    const limit = Number(flags.limit ?? 10);
+    const result = await mailboxFetch(`${base}/mate/mailbox/read`, {
+      method: "POST",
+      headers: hookCredentialHeaders(),
+      body: JSON.stringify({ limit: Number.isFinite(limit) ? limit : 10 })
+    });
+    console.log(JSON.stringify(result, null, 2));
+    return;
+  }
+  if (action === "list") {
+    const result = await mailboxFetch(`${base}/mate/mailbox`, { headers: hookCredentialHeaders() });
+    console.log(JSON.stringify(result, null, 2));
+    return;
+  }
+  if (action === "message") {
+    const id = positionals[1];
+    if (!id) throw new Error("usage: perch mailbox message <message-id>");
+    const result = await mailboxFetch(`${base}/mate/mailbox/message/${encodeURIComponent(id)}`, {
+      headers: hookCredentialHeaders()
+    });
+    console.log(JSON.stringify(result, null, 2));
+    return;
+  }
+  if (action === "ack") {
+    const id = positionals[1];
+    const claimToken = typeof flags.token === "string" ? flags.token : undefined;
+    if (!id || !claimToken) throw new Error("usage: perch mailbox ack <message-id> --token <claim-token> [--key <idempotency-key>] [--disposition <text>]");
+    const result = await mailboxFetch(`${base}/mate/mailbox/ack`, {
+      method: "POST",
+      headers: hookCredentialHeaders(),
+      body: JSON.stringify({
+        id,
+        claimToken,
+        idempotencyKey: typeof flags.key === "string" && flags.key.trim() ? flags.key.trim() : `ack-${id}`,
+        ...(typeof flags.disposition === "string" ? { disposition: flags.disposition } : {})
+      })
+    });
+    console.log(JSON.stringify(result, null, 2));
+    const failed = (result.results ?? []).find((entry) => entry.outcome !== "acknowledged");
+    if (failed) {
+      throw new Error(`acknowledgment failed for ${failed.id}: ${failed.error ?? failed.outcome}`);
+    }
+    return;
+  }
+  if (action === "wait") {
+    const requested = Number(flags.timeout ?? 25);
+    const timeout = Math.max(0, Math.min(Number.isFinite(requested) ? requested : 25, 30));
+    const result = await mailboxFetch(`${base}/mate/mailbox/wait?timeoutSeconds=${timeout}`, {
+      headers: hookCredentialHeaders()
+    });
+    console.log(JSON.stringify(result, null, 2));
+    return;
+  }
+  throw new Error("usage: perch mailbox [read|list|message <id>|ack <id> --token <t>|wait [--timeout <sec<=30>]]");
+}
+
 async function runTasksCommand(args, options) {
   let json = false;
   for (const arg of args) {
@@ -1913,7 +2118,7 @@ function parseArgs(argv) {
     }
     // `project`, `config`, `runtime`, `models`, `tasks`, `worktrees`, and `doctor` keep their own flags as positionals; the shared flags above
     // (--server, --token, ...) are already consumed.
-    if (arg.startsWith("-") && command !== "project" && command !== "config" && command !== "runtime" && command !== "models" && command !== "tasks" && command !== "worktrees" && command !== "doctor") {
+    if (arg.startsWith("-") && command !== "project" && command !== "config" && command !== "runtime" && command !== "models" && command !== "tasks" && command !== "worktrees" && command !== "doctor" && command !== "report" && command !== "mailbox") {
       throw new Error(`unknown option for ${command}: ${arg} (see \`perch --help\`)`);
     }
     args.push(arg);
@@ -2469,6 +2674,8 @@ function printHelp(command) {
   perch stop <session-id>
   perch ls
   perch tasks [--json]
+  perch report send --task <task-id> --summary <text> --report-file <path>
+  perch mailbox [read|list|message <id>|ack <id> --token <t>|wait]
   perch pair
   perch devices [ls|revoke <id>]
   perch project [list]
@@ -2536,6 +2743,8 @@ function commandHelp(command) {
   if (command === "stop") return "Usage: perch stop <session-id>\n\nStops a live Perch session. Session ids may be shortened when unambiguous.";
   if (command === "ls") return "Usage: perch ls\n\nLists Perch sessions.";
   if (command === "tasks") return "Usage: perch tasks [--json]\n\nLists active durable tasks using the same task state, runtime, and PR facts shown in the mobile app.";
+  if (command === "report") return "Usage: perch report send --task <task-id> --summary <text> (--report <text> | --report-file <path>) [--evidence-file <path>] [--format <format>] [--key <idempotency-key>]\n\nDurably submits a worker's full report + evidence to the mate mailbox (byte-for-byte, no truncation). Success means the report was committed, not that the mate processed it. Uses the session's hook credentials from the environment.";
+  if (command === "mailbox") return "Usage:\n  perch mailbox read [--limit <n>]\n  perch mailbox list\n  perch mailbox message <message-id>\n  perch mailbox ack <message-id> --token <claim-token> [--key <idempotency-key>] [--disposition <text>]\n  perch mailbox wait [--timeout <seconds, max 30>]\n\nThe mate's durable worker-to-mate mailbox: read claims the oldest unacknowledged messages (returning pointers + summaries + claim tokens), message returns the original full report/event content, ack records the semantic acknowledgment, and wait is a bounded (<= 30s) latency optimization that returns immediately when messages are pending. Restricted to the live mate session's hook credentials.";
   if (command === "pair") return "Usage: perch pair [--title <device-name>]\n\nCreates a device pairing offer. Treat the printed URL and QR code as credentials.";
   if (command === "devices") return "Usage:\n  perch devices [ls]\n  perch devices revoke <id>\n\nLists paired devices or revokes one device token.";
   if (command === "project") return `Usage:\n  perch project [list|ls]\n  perch project add <path> [--mode direct-PR|no-mistakes|local-only] [--yes]\n  perch project show <path>\n  perch project set <path> --mode direct-PR|no-mistakes|local-only [--yes]\n  perch project remove|rm <path>\n\nThe project registry is live server state. Use \`perch project list\` to inspect it.\n\`--mode no-mistakes\` initializes and verifies the bundled gate before persisting the mode; it asks once unless --yes is present.`;

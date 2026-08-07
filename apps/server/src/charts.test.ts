@@ -30,7 +30,7 @@ import {
   type ChartEventKind
 } from "./charts.js";
 import { FleetMonitor } from "./fleetMonitor.js";
-import { wireChartWake, wireMateWake } from "./mateWake.js";
+import { MateMailboxNudger, wireChartWake, wireMateWake } from "./mateWake.js";
 import { HookRegistry } from "./hooks.js";
 import { createControlServer, handleWebSocketRpcRequest } from "./http.js";
 import { OwnerManager } from "./ownerManager.js";
@@ -1138,7 +1138,7 @@ test("closing the owning task archives its charts; re-registering same path crea
 
 test("a crew chart wakes the supervising session with the review link", async () => {
   await withServer(async ({ port, adapter, hooks, tasks, ownerManager, charts, monitor, chartFile }) => {
-    wireMateWake(tasks, adapter, monitor);
+    wireMateWake(tasks, adapter, monitor, new MateMailboxNudger({ mailbox: tasks.stateDb.mateMailbox, adapter, monitor }));
     wireChartWake(charts, tasks, (chartId) => `http://mac:4711/charts/${chartId}/review`);
     const sessionId = "pty:worker";
     adapter.sessions = [
@@ -1194,7 +1194,7 @@ test("a solo chart (no task, no parent) wakes nobody", async () => {
 
 test("a scout chart is persisted and wakes the current live mate", async () => {
   await withServer(async ({ port, adapter, hooks, tasks, charts, monitor, chartFile }) => {
-    wireMateWake(tasks, adapter, monitor);
+    wireMateWake(tasks, adapter, monitor, new MateMailboxNudger({ mailbox: tasks.stateDb.mateMailbox, adapter, monitor }));
     wireChartWake(charts, tasks, (chartId) => `http://mac:4711/charts/${chartId}/review`);
     const sessionId = "pty:scout";
     adapter.sessions = [

@@ -55,7 +55,7 @@ Mate is one durable fleet owner, not another task row.
 Before exposing a fresh Codex Mate's native attach command, Perch submits and awaits one visible readiness turn so the new thread has rollout-backed history and can be resumed immediately.
 
 Mate dispatches tasks into registered projects and isolated worktrees.
-Worker events wake Mate through a queued server path, so it does not poll and the user can steer the fleet from one conversation.
+Worker outcomes fan in through a durable server-side mailbox that Mate drains at safe checkpoints; a content-free nudge raises attention when Mate is idle, so it neither polls nor gets interrupted, and the user can steer the fleet from one conversation.
 
 One shared fleet monitor derives lightweight state for every session and fans it out to connected clients.
 Opening one session adds detailed events without narrowing fleet coverage.
@@ -73,7 +73,8 @@ Composer messages queue while a permission prompt is open so ordinary text canno
 
 ## Durable task state
 
-SQLite stores the current task projection, immutable task events, separately persisted PR, completion-verification, and review facts, runtime generations, Mate ownership, leased operations, Codex history-sync receipts, content-free native Codex child observations, and notification outbox.
+SQLite stores the current task projection, immutable task events, separately persisted PR, completion-verification, and review facts, runtime generations, Mate ownership, leased operations, Codex history-sync receipts, content-free native Codex child observations, notification outbox, immutable lossless worker reports, and the mutable Mate mailbox delivery projection.
+Worker-authored boss-relevant events and full worker reports fan in to Mate through that durable mailbox (claimed and acknowledged by the live Mate generation at safe checkpoints), while wakes are disposable content-free attention nudges; see [Worker task API and turn lifecycle](worker-task-api.md#worker-reports-and-the-mate-mailbox).
 The task lifecycle describes work meaning, while runtime state describes the replaceable process executing it.
 
 ```text

@@ -26,6 +26,7 @@ import type {
   ServerRequestResponse,
   StartAgentRequest,
   TaskEventRequest,
+  WorkerReportRequest,
   TimelineItem,
   TopologyResponse
 } from "@perch/shared";
@@ -75,6 +76,7 @@ export type CodexOwnedEventSink = {
   onTurnComplete?: (sessionId: string, ev: { message: string }) => void;
   onNativeChildObservation?: (sessionId: string, observation: NativeChildRunObservation) => void;
   onTaskEvent?: (sessionId: string, event: TaskEventRequest) => Promise<{ success: boolean; text: string }>;
+  onWorkerReport?: (sessionId: string, report: WorkerReportRequest) => Promise<{ success: boolean; text: string }>;
   onThreadStarted?: (sessionId: string, threadId: string, socketPath: string) => void;
   onModelResolved?: (sessionId: string, model: string) => void;
   onUsageLimit?: (sessionId: string, limit: UsageLimit) => void;
@@ -109,6 +111,7 @@ export type CreateOwnedClient = (args: {
     onTurnComplete: (ev: { message: string }) => void;
     onNativeChildObservation: (observation: NativeChildRunObservation) => void;
     onTaskEvent: (event: TaskEventRequest) => Promise<{ success: boolean; text: string }>;
+    onWorkerReport: (report: WorkerReportRequest) => Promise<{ success: boolean; text: string }>;
     onUsageLimit: (limit: UsageLimit) => void;
     onDisconnected: () => void;
   };
@@ -237,6 +240,7 @@ export class CodexAppServerAdapter implements AgentAdapter {
           onTurnComplete: handlers.onTurnComplete,
           onNativeChildObservation: handlers.onNativeChildObservation,
           onTaskEvent: handlers.onTaskEvent,
+          onWorkerReport: handlers.onWorkerReport,
           nativeMultiAgentObservation,
           onUsageLimit: handlers.onUsageLimit,
           onDisconnected: handlers.onDisconnected,
@@ -1027,6 +1031,10 @@ export class CodexAppServerAdapter implements AgentAdapter {
       onTaskEvent: (event) => this.events.onTaskEvent?.(session.id, event) ?? Promise.resolve({
         success: false,
         text: "Task reporting is unavailable."
+      }),
+      onWorkerReport: (report) => this.events.onWorkerReport?.(session.id, report) ?? Promise.resolve({
+        success: false,
+        text: "Worker report submission is unavailable."
       }),
       onUsageLimit: (limit) => this.events.onUsageLimit?.(session.id, limit),
       onDisconnected: () => this.handleDisconnect(session)

@@ -1,11 +1,16 @@
 import { mkdirSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { basename, join } from "node:path";
-import { randomBytes } from "node:crypto";
+import { createHash, randomBytes, randomUUID } from "node:crypto";
 import type { Task, TaskEvent, TaskEventKind, TaskEventSource, TaskPr, TaskState } from "@perch/shared";
-import { BOSS_EVENT_KINDS } from "./mateWake.js";
+import { BOSS_EVENT_KINDS, MATE_MAILBOX_EVENT_KINDS } from "./mateWake.js";
 import { PUSH_EVENT_KINDS } from "./pushRouter.js";
-import { StateDb, type NotificationIntentInput } from "./stateDb.js";
+import {
+  StateDb,
+  type MailboxAppendInput,
+  type NotificationIntentInput,
+  type WorkerReportRecord
+} from "./stateDb.js";
 import { runtimeSnapshot } from "./runtimeManager.js";
 import { deriveTaskPresentation, type TaskPresentationFacts } from "./taskPresentation.js";
 
@@ -279,7 +284,7 @@ export class TaskStore {
     task.updatedAt = nextTimestamp(task.updatedAt);
     const linkedEvent = { kind: "pr_linked" as const, ...event };
     const notificationIntents = taskEventNotificationIntents(task, linkedEvent);
-    this.stateDb.tasks.record(withoutDerived(task), linkedEvent, notificationIntents);
+    this.stateDb.tasks.record(withoutDerived(task), linkedEvent, notificationIntents, mailboxAppendFor(linkedEvent));
     const updated = this.withPresentation({ ...task });
     for (const listener of this.listeners) {
       try {
@@ -313,7 +318,7 @@ export class TaskStore {
     }
     task.updatedAt = nextTimestamp(task.updatedAt);
     const notificationIntents = options.notificationIntents ?? taskEventNotificationIntents(task, event);
-    this.stateDb.tasks.record(withoutDerived(task), event, notificationIntents);
+    this.stateDb.tasks.record(withoutDerived(task), event, notificationIntents, mailboxAppendFor(event));
     // Derive after the append so listeners observe the presentation this event
     // produced, never the one it replaced.
     const updated = this.withPresentation({ ...task });
@@ -356,7 +361,8 @@ export class TaskStore {
       notifications.push({ task: { ...task }, event, previousState });
       return {
         event,
-        intents: notificationIntents ?? taskEventNotificationIntents(task, event)
+        intents: notificationIntents ?? taskEventNotificationIntents(task, event),
+        mailbox: mailboxAppendFor(event)
       };
     });
     this.stateDb.tasks.recordMany(withoutDerived(task), persisted);
@@ -381,6 +387,105 @@ export class TaskStore {
       }
     }
     return this.withPresentation({ ...task }, facts);
+  }
+
+  // Accept a worker's lossless deliverable: the immutable report row, its
+  // pointer task event (safe summary + stable report id, never the body), and
+  // the pending mate mailbox delivery commit in ONE SQLite transaction - tool
+  // success means all three are durable. Content is stored byte-for-byte;
+  // size limits are enforced by the caller before this point. A retry with
+  // the same idempotency key and identical content returns the original
+  // committed report; the same key with different content is a conflict.
+  recordWorkerReport(
+    id: string,
+    input: {
+      sessionId: string;
+      idempotencyKey: string;
+      format?: string;
+      summary: string;
+      report: string;
+      evidence?: Record<string, unknown>;
+    }
+  ): { task: Task; report: WorkerReportRecord; duplicate: boolean } {
+    const task = this.mustFind(id);
+    const format = input.format ?? "markdown";
+    const evidenceJson = input.evidence ? JSON.stringify(input.evidence) : undefined;
+    const reportSha256 = createHash("sha256").update(input.report, "utf8").digest("hex");
+    const matches = (existing: WorkerReportRecord) =>
+      existing.summary === input.summary &&
+      existing.report === input.report &&
+      existing.format === format &&
+      existing.reportSha256 === reportSha256 &&
+      JSON.stringify(existing.evidence ?? null) === JSON.stringify(input.evidence ?? null);
+    const conflict = () =>
+      new Error(
+        `idempotency key ${input.idempotencyKey} was already used for a different report; pick a new key`
+      );
+    const existing = this.stateDb.workerReports.findByIdempotencyKey(id, input.sessionId, input.idempotencyKey);
+    if (existing) {
+      if (!matches(existing)) throw conflict();
+      return { task: this.withPresentation({ ...task }), report: existing, duplicate: true };
+    }
+
+    const runtime = this.stateDb.runtimes.latestForTask(id);
+    const previousState = task.state;
+    task.updatedAt = nextTimestamp(task.updatedAt);
+    const report = {
+      id: randomUUID(),
+      taskId: id,
+      sessionId: input.sessionId,
+      ...(runtime ? { runtimeId: runtime.id, runtimeGeneration: runtime.generation } : {}),
+      ...(task.workerName ? { workerName: task.workerName } : {}),
+      idempotencyKey: input.idempotencyKey,
+      format,
+      summary: input.summary,
+      report: input.report,
+      ...(evidenceJson ? { evidenceJson } : {}),
+      reportBytes: Buffer.byteLength(input.report, "utf8"),
+      reportSha256
+    };
+    const event = {
+      kind: "note" as const,
+      source: "worker" as const,
+      message: input.summary,
+      data: {
+        reason: "worker_report",
+        reportId: report.id,
+        reportBytes: report.reportBytes,
+        reportSha256,
+        format
+      }
+    };
+    try {
+      this.stateDb.tasks.record(
+        withoutDerived(task),
+        event,
+        [{ channel: "mate", payload: { task: { ...withoutDerived(task) }, event: { ...event } } }],
+        { recipient: "mate", report }
+      );
+    } catch (error) {
+      // A concurrent retry with the same key won the race: the transaction
+      // rolled back whole, so re-read the winner and answer idempotently.
+      if (isUniqueConstraint(error)) {
+        const winner = this.stateDb.workerReports.findByIdempotencyKey(id, input.sessionId, input.idempotencyKey);
+        if (winner) {
+          if (!matches(winner)) throw conflict();
+          return { task: this.withPresentation({ ...task }), report: winner, duplicate: true };
+        }
+      }
+      throw error;
+    }
+    const stored = this.stateDb.workerReports.find(report.id);
+    if (!stored) throw new Error("worker report vanished after commit");
+    const updated = this.withPresentation({ ...task });
+    for (const listener of this.listeners) {
+      try {
+        listener({ ...updated }, { ...event, previousState });
+      } catch {
+        // Observers never disturb the ledger.
+      }
+    }
+    return { task: updated, report: stored, duplicate: false };
   }
 
   private withRuntime(task: Task): Task {
@@ -461,6 +566,23 @@ function taskEventNotificationIntents(
     intents.push({ channel: "push", payload });
   }
   return intents;
+}
+
+// Worker-authored boss-relevant events are mailbox fan-in: the delivery row
+// commits with the event, and the mate drains it at a safe checkpoint instead
+// of receiving injected chat text. System/hook/poller-sourced notifications
+// keep the legacy wake path (see mateWake.ts).
+function mailboxAppendFor(event: {
+  kind: TaskEventKind;
+  source: TaskEventSource;
+}): MailboxAppendInput | undefined {
+  return event.source === "worker" && MATE_MAILBOX_EVENT_KINDS.has(event.kind)
+    ? { recipient: "mate" }
+    : undefined;
+}
+
+function isUniqueConstraint(error: unknown): boolean {
+  return error instanceof Error && (error as { code?: string }).code === "SQLITE_CONSTRAINT_UNIQUE";
 }
 
 function samePrIdentity(existing: TaskPr, incoming: TaskPr): boolean {
