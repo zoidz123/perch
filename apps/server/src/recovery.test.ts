@@ -219,6 +219,33 @@ test("Codex recovery resumes the exact thread and atomically binds g+1 without c
   h.cleanup();
 });
 
+test("Codex legacy compatibility requires persisted and model capability proof", async () => {
+  const h = harness();
+  const runtime = h.tasks.stateDb.runtimes.latestForTask(h.task.id)!;
+  const prepare = (capability: Record<string, string>) => codexRecoveryDriver.prepare(
+    {
+      ...runtime,
+      state: "recovering",
+      metadata: { codexNativeMultiAgentCapability: capability }
+    },
+    h.task
+  );
+
+  const persistedV2 = await prepare({ effective: "v2", persisted: "v2", model: "disabled" });
+  assert.equal(persistedV2.allowReplacementProviderSessionId, true);
+  assert.equal(persistedV2.launchInput?.codexOwnedResume?.migration?.reason, "unverified_native_multi_agent_capability");
+
+  const modelForcedV2 = await prepare({ effective: "v2", persisted: "disabled", model: "v2" });
+  assert.equal(modelForcedV2.allowReplacementProviderSessionId, true);
+  assert.equal(modelForcedV2.launchInput?.codexOwnedResume?.migration?.reason, "unverified_native_multi_agent_capability");
+
+  const disabled = await prepare({ effective: "disabled", persisted: "disabled", model: "disabled" });
+  assert.equal(disabled.allowReplacementProviderSessionId, undefined);
+  assert.equal(disabled.launchInput?.codexOwnedResume?.legacyChildDisabled, true);
+  assert.equal(disabled.launchInput?.codexOwnedResume?.migration, undefined);
+  h.cleanup();
+});
+
 test("missing or mismatched identity and stale process ownership never launch", async () => {
   const missing = harness("");
   await assert.rejects(missing.coordinator.execute(operation(missing.task.id), context()), /missing or untrusted/);
@@ -388,7 +415,7 @@ test("POST /tasks/:id/recover drives one duplicate-safe durable operation", asyn
   }
 });
 
-test("legacy Codex recovery keeps hook reporting without adopting the inherited-authority daemon", async () => {
+test("unproven legacy Codex recovery migrates once and preserves root-only reporting", async () => {
   const h = harness();
   const daemonSocket = "/fake/daemons/surviving.sock";
   h.options.hooks.ensure("pty:old");
@@ -409,12 +436,20 @@ test("legacy Codex recovery keeps hook reporting without adopting the inherited-
   assert.equal(g1.generation, 1);
   assert.equal(g1.state, "live");
   assert.equal(h.codexOwned.launches[0]?.resume?.socketPath, daemonSocket, "the recorded socket rode codexOwnedResume");
+  assert.equal(h.codexOwned.launches[0]?.resume?.migration?.reason, "unverified_native_multi_agent_capability");
   assert.equal(h.codexOwned.launches[0]?.resume?.rootTaskReportingTool, undefined);
+  assert.notEqual(g1.providerSessionId, CODEX_THREAD_ID);
   assert.equal(g1.metadata?.codexDriver, "app-server-owned");
   assert.notEqual(g1.metadata?.appServerSocketPath, daemonSocket);
-  assert.equal(g1.metadata?.codexTaskReportingMode, "legacy_hook_compat");
+  assert.equal(g1.metadata?.codexTaskReportingMode, "root_dynamic_tool");
+  assert.equal(
+    (g1.metadata?.codexThreadMigration as { fromThreadId?: string } | undefined)?.fromThreadId,
+    CODEX_THREAD_ID
+  );
   assert.equal(g1.metadata?.appServerDaemonSessionId, undefined);
   assert.equal(h.options.hooks.resolveAlias("pty:old"), "pty:old");
+  assert.match(h.codexOwned.submitted[0]?.text ?? "", /migrated this task to a fresh Codex thread/);
+  assert.ok(h.tasks.events(h.task.id).some((event) => event.data?.reason === "codex_thread_migrated"));
 
   const scheduler = new TaskScheduler({ stateDb: h.tasks.stateDb, operationKinds: ["dispatch", "recovery"] });
   const server = createControlServer({
@@ -429,18 +464,28 @@ test("legacy Codex recovery keeps hook reporting without adopting the inherited-
   await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
   const port = (server.address() as AddressInfo).port;
   try {
-    const postEvent = (sessionId: string, token: string) => fetch(`http://127.0.0.1:${port}/tasks/${encodeURIComponent(h.task.id)}/events`, {
+    const postHookEvent = (sessionId: string, token: string) => fetch(`http://127.0.0.1:${port}/tasks/${encodeURIComponent(h.task.id)}/events`, {
       method: "POST",
       headers: {
         "content-type": "application/json",
         "x-perch-session": sessionId,
         "x-perch-token": token
       },
-      body: JSON.stringify({ kind: "note", message: "still reporting after the rebind" })
+      body: JSON.stringify({ kind: "note", message: "inherited hook claim" })
     });
     const g1Hook = h.options.hooks.ensure(g1.ptySessionId!);
-    const first = await postEvent(g1.ptySessionId!, g1Hook.token);
-    assert.equal(first.status, 200);
+    const inherited = await postHookEvent(g1.ptySessionId!, g1Hook.token);
+    assert.equal(inherited.status, 401);
+    const root = await fetch(`http://127.0.0.1:${port}/tasks/${encodeURIComponent(h.task.id)}/events`, {
+      method: "POST",
+      headers: {
+        authorization: "Bearer rebind-token",
+        "content-type": "application/json",
+        "x-perch-root-session": g1.ptySessionId!
+      },
+      body: JSON.stringify({ kind: "note", message: "root dynamic-tool report" })
+    });
+    assert.equal(root.status, 200);
     assert.equal(h.tasks.events(h.task.id).at(-1)?.source, "worker");
 
     h.codexOwned.killSession(g1.ptySessionId!);
@@ -449,15 +494,11 @@ test("legacy Codex recovery keeps hook reporting without adopting the inherited-
     const g2 = h.tasks.stateDb.runtimes.latestForTask(h.task.id)!;
     assert.equal(g2.generation, 2);
     assert.equal(h.codexOwned.launches[1]?.resume?.socketPath, g1.metadata?.appServerSocketPath);
-    assert.equal(h.codexOwned.launches[1]?.resume?.rootTaskReportingTool, undefined);
-    assert.notEqual(g2.metadata?.appServerSocketPath, g1.metadata?.appServerSocketPath);
-    assert.equal(g2.metadata?.codexTaskReportingMode, "legacy_hook_compat");
-    assert.equal(g2.metadata?.appServerDaemonSessionId, undefined);
-
-    const g2Hook = h.options.hooks.ensure(g2.ptySessionId!);
-    const second = await postEvent(g2.ptySessionId!, g2Hook.token);
-    assert.equal(second.status, 200);
-    assert.equal(h.tasks.events(h.task.id).at(-1)?.source, "worker");
+    assert.equal(h.codexOwned.launches[1]?.resume?.rootTaskReportingTool, true);
+    assert.equal(h.codexOwned.launches[1]?.resume?.migration, undefined);
+    assert.equal(g2.providerSessionId, g1.providerSessionId);
+    assert.equal(g2.metadata?.appServerSocketPath, g1.metadata?.appServerSocketPath);
+    assert.equal(g2.metadata?.codexTaskReportingMode, "root_dynamic_tool");
     assert.equal(h.tasks.find(h.task.id)?.sessionId, g2.ptySessionId);
   } finally {
     server.closeAllConnections?.();

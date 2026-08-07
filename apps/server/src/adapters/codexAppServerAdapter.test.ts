@@ -37,7 +37,9 @@ type Fixture = {
     acquires: number;
     releases: string[];
     adopts: string[];
+    retires: string[];
     configOverrides: string[][];
+    operations: string[];
   };
   events: {
     timeline: Array<{ item: TimelineItem; live: boolean }>;
@@ -76,17 +78,24 @@ async function fixture(
     acquires: 0,
     releases: [] as string[],
     adopts: [] as string[],
-    configOverrides: [] as string[][]
+    retires: [] as string[],
+    configOverrides: [] as string[][],
+    operations: [] as string[]
   };
   const fakeManager = {
     currentRuntimeFingerprint: () => "fp-live",
     acquire: async (_cwd: string, options: { configOverrides?: string[] } = {}) => {
       daemons.acquires += 1;
+      daemons.operations.push("acquire");
       daemons.configOverrides.push(options.configOverrides ?? []);
       return { socketPath, cwd: dir };
     },
     release: (path: string) => {
       daemons.releases.push(path);
+    },
+    retireExisting: async (path: string) => {
+      daemons.retires.push(path);
+      daemons.operations.push("retire");
     },
     adoptExisting: async (
       path: string,
@@ -694,7 +703,7 @@ test("startOwned resume rebinds to a surviving daemon socket without a respawn a
   }
 });
 
-test("legacy resumes use compatibility reporting with native multi-agent disabled", async () => {
+test("proven child-disabled legacy resumes retain compatibility reporting", async () => {
   const f = await fixture("pxa-legacy-resume-");
   try {
     f.fake.seedThread("thr_legacy", []);
@@ -706,16 +715,20 @@ test("legacy resumes use compatibility reporting with native multi-agent disable
         sessionId: "pty:legacy",
         args: ["resume", "thr_legacy"]
       },
-      { resume: { threadId: "thr_legacy", socketPath: f.socketPath } }
+      {
+        resume: {
+          threadId: "thr_legacy",
+          socketPath: f.socketPath,
+          legacyChildDisabled: true
+        }
+      }
     );
 
     assert.equal(session.nativeMultiAgentMode, "legacy_compatibility");
     assert.equal(f.adapter.taskReportingModeOf("pty:legacy"), "legacy_hook_compat");
-    assert.deepEqual(f.daemons.adopts, []);
-    assert.deepEqual(f.daemons.configOverrides, [[
-      "features.multi_agent=false",
-      "features.multi_agent_v2.enabled=false"
-    ]]);
+    assert.deepEqual(f.daemons.adopts, [f.socketPath]);
+    assert.deepEqual(f.daemons.retires, []);
+    assert.deepEqual(f.daemons.configOverrides, []);
     const resume = f.fake.requestLog.findLast((entry) => entry.method === "thread/resume");
     assert.equal("dynamicTools" in (resume?.params ?? {}), false);
     f.fake.emitNotification("thr_legacy", "item/completed", {
@@ -731,6 +744,44 @@ test("legacy resumes use compatibility reporting with native multi-agent disable
     });
     await tick();
     assert.deepEqual(f.events.nativeChildren, []);
+  } finally {
+    await f.close();
+  }
+});
+
+test("unproven legacy recovery retires the survivor before migrating to a fresh root", async () => {
+  const f = await fixture("pxa-legacy-migrate-");
+  try {
+    f.fake.seedThread("thr_legacy", []);
+    const session = await f.adapter.startOwned(
+      {
+        command: "codex",
+        agent: "codex",
+        cwd: f.dir,
+        sessionId: "pty:migrated"
+      },
+      {
+        resume: {
+          threadId: "thr_legacy",
+          socketPath: f.socketPath,
+          migration: {
+            reason: "unverified_native_multi_agent_capability",
+            handoff: "task_brief"
+          }
+        }
+      }
+    );
+
+    assert.deepEqual(f.daemons.operations, ["retire", "acquire"]);
+    assert.deepEqual(f.daemons.retires, [f.socketPath]);
+    assert.deepEqual(f.daemons.adopts, []);
+    assert.equal(f.adapter.threadIdOf("pty:migrated"), "thr_1");
+    assert.equal(session.nativeMultiAgentMode, "enabled");
+    assert.equal(session.codexThreadMigration?.fromThreadId, "thr_legacy");
+    assert.equal(f.fake.requestLog.some((entry) => entry.method === "thread/resume"), false);
+    const start = f.fake.requestLog.find((entry) => entry.method === "thread/start");
+    const dynamicTools = start?.params.dynamicTools as Array<{ tools?: Array<{ name?: string }> }> | undefined;
+    assert.equal(dynamicTools?.[0]?.tools?.[0]?.name, "report_task_event");
   } finally {
     await f.close();
   }

@@ -20,6 +20,7 @@
 // failureInjection.ts for test-only hooks in prod source).
 
 import { createServer, type Server } from "node:http";
+import { randomUUID } from "node:crypto";
 import { WebSocketServer, type WebSocket } from "ws";
 import type {
   CodexHistoryCatchUpRequest,
@@ -430,6 +431,11 @@ type FakeOwnedSession = {
   worktreeId?: string;
   attachCommandReady: boolean;
   taskReportingMode: "root_dynamic_tool" | "legacy_hook_compat";
+  migration?: {
+    fromThreadId: string;
+    reason: "unverified_native_multi_agent_capability";
+    handoff: "task_brief" | "mate_state";
+  };
 };
 
 export class FakeCodexOwnedAdapter {
@@ -441,6 +447,11 @@ export class FakeCodexOwnedAdapter {
       socketPath?: string;
       runtimeFingerprint?: string;
       rootTaskReportingTool?: boolean;
+      legacyChildDisabled?: boolean;
+      migration?: {
+        reason: "unverified_native_multi_agent_capability";
+        handoff: "task_brief" | "mate_state";
+      };
     };
   }> = [];
   submitted: Array<{ sessionId: string; text: string; clientUserMessageId?: string; source?: string }> = [];
@@ -513,6 +524,10 @@ export class FakeCodexOwnedAdapter {
     return this.sessions.get(sessionId)?.taskReportingMode;
   }
 
+  migrationOf(sessionId: string): FakeOwnedSession["migration"] {
+    return this.sessions.get(sessionId)?.migration;
+  }
+
   setWorktreeId(sessionId: string, worktreeId: string): void {
     const session = this.sessions.get(sessionId);
     if (session) session.worktreeId = worktreeId;
@@ -531,14 +546,20 @@ export class FakeCodexOwnedAdapter {
         socketPath?: string;
         runtimeFingerprint?: string;
         rootTaskReportingTool?: boolean;
+        legacyChildDisabled?: boolean;
+        migration?: {
+          reason: "unverified_native_multi_agent_capability";
+          handoff: "task_brief" | "mate_state";
+        };
       };
     } = {}
   ) {
     if (this.failStart) throw this.failStart;
     const id = request.sessionId ?? `pty:${Math.random().toString(36).slice(2)}`;
-    const threadId =
-      this.resumedThreadOverride ?? opts.resume?.threadId ?? `thr-fake-${++this.threadCounter}`;
-    const socketPath = opts.resume?.rootTaskReportingTool === true && opts.resume.socketPath
+    const threadId = opts.resume?.migration
+      ? randomUUID()
+      : this.resumedThreadOverride ?? opts.resume?.threadId ?? `thr-fake-${++this.threadCounter}`;
+    const socketPath = !opts.resume?.migration && opts.resume?.socketPath
       ? opts.resume.socketPath
       : `/fake/daemons/${id.slice(4, 12)}.sock`;
     this.launches.push({ request: { ...request }, ...(opts.resume ? { resume: opts.resume } : {}) });
@@ -551,9 +572,12 @@ export class FakeCodexOwnedAdapter {
       labels: request.labels,
       attachCommandReady: opts.deferAttachCommand !== true,
       taskReportingMode:
-        opts.resume && opts.resume.rootTaskReportingTool !== true
+        opts.resume?.legacyChildDisabled === true
           ? "legacy_hook_compat"
-          : "root_dynamic_tool"
+          : "root_dynamic_tool",
+      ...(opts.resume?.migration
+        ? { migration: { fromThreadId: opts.resume.threadId, ...opts.resume.migration } }
+        : {})
     });
     this.onStartOwned?.(id);
     return {
@@ -568,9 +592,12 @@ export class FakeCodexOwnedAdapter {
       ...(this.effectiveModel ? { model: this.effectiveModel } : {}),
       lastActivityAt: new Date().toISOString(),
       nativeMultiAgentMode:
-        opts.resume && opts.resume.rootTaskReportingTool !== true
+        opts.resume?.legacyChildDisabled === true
           ? "legacy_compatibility" as const
           : "enabled" as const,
+      ...(opts.resume?.migration
+        ? { codexThreadMigration: { fromThreadId: opts.resume.threadId, ...opts.resume.migration } }
+        : {}),
       ...(opts.deferAttachCommand !== true
         ? {
             attachCommand: `codex resume ${threadId} --remote unix://${socketPath}`,

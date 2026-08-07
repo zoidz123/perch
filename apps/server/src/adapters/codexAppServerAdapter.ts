@@ -145,10 +145,20 @@ export type StartOwnedOptions = {
     // fresh daemon resuming the rollout-backed thread.
     runtimeFingerprint?: string;
     rootTaskReportingTool?: boolean;
+    legacyChildDisabled?: boolean;
+    migration?: {
+      reason: "unverified_native_multi_agent_capability";
+      handoff: "task_brief" | "mate_state";
+    };
   };
 };
 
 export type CodexTaskReportingMode = "root_dynamic_tool" | "legacy_hook_compat";
+export type CodexThreadMigration = {
+  fromThreadId: string;
+  reason: "unverified_native_multi_agent_capability";
+  handoff: "task_brief" | "mate_state";
+};
 
 type OwnedSession = {
   id: string;
@@ -180,6 +190,7 @@ type OwnedSession = {
   attachCommandReady: boolean;
   taskReportingMode: CodexTaskReportingMode;
   nativeMultiAgentMode: "enabled" | "disabled" | "legacy_compatibility";
+  migration?: CodexThreadMigration;
 };
 
 const DEFAULT_RECONNECT_DELAYS_MS = [500, 2_000];
@@ -270,6 +281,10 @@ export class CodexAppServerAdapter implements AgentAdapter {
     return this.sessions.get(sessionId)?.taskReportingMode;
   }
 
+  migrationOf(sessionId: string): CodexThreadMigration | undefined {
+    return this.sessions.get(sessionId)?.migration;
+  }
+
   // The launcher assigns the worktree lease only after the session exists;
   // record it on the adapter's own session so later listSessions snapshots
   // keep the association (toAgentSession returns copies, not live objects).
@@ -356,8 +371,16 @@ export class CodexAppServerAdapter implements AgentAdapter {
     }
     const cwd = request.cwd ?? process.cwd();
     const env = this.sessionEnv?.(sessionId, { ...request, sessionId });
+    if (
+      opts.resume &&
+      opts.resume.rootTaskReportingTool !== true &&
+      opts.resume.legacyChildDisabled !== true &&
+      !opts.resume.migration
+    ) {
+      throw new Error("codex resume requires proven root-only reporting authority");
+    }
     const taskReportingMode: CodexTaskReportingMode =
-      opts.resume && opts.resume.rootTaskReportingTool !== true
+      opts.resume?.legacyChildDisabled === true
         ? "legacy_hook_compat"
         : "root_dynamic_tool";
     const nativeMultiAgentMode = taskReportingMode === "legacy_hook_compat"
@@ -365,18 +388,16 @@ export class CodexAppServerAdapter implements AgentAdapter {
       : this.nativeMultiAgentObservation === "auto"
         ? "enabled" as const
         : "disabled" as const;
-    const configOverrides = [
-      ...(request.effort ? [`model_reasoning_effort="${request.effort}"`] : []),
-      ...(taskReportingMode === "legacy_hook_compat"
-        ? ["features.multi_agent=false", "features.multi_agent_v2.enabled=false"]
-        : [])
-    ];
+    const configOverrides = request.effort ? [`model_reasoning_effort="${request.effort}"`] : [];
 
     // Prefer the recorded socket of a surviving daemon (rebind without
     // killing it); otherwise acquire a fresh per-worktree daemon.
     let socketPath: string | undefined;
     let adoptedSocket = false;
-    if (opts.resume?.socketPath && taskReportingMode === "root_dynamic_tool") {
+    if (opts.resume?.migration && opts.resume.socketPath) {
+      await this.daemons.retireExisting(opts.resume.socketPath);
+    }
+    if (opts.resume?.socketPath && !opts.resume.migration) {
       const adopted = await this.daemons.adoptExisting(opts.resume.socketPath, cwd, {
         ...(opts.resume.runtimeFingerprint
           ? { expectedRuntimeFingerprint: opts.resume.runtimeFingerprint }
@@ -413,7 +434,15 @@ export class CodexAppServerAdapter implements AgentAdapter {
       historyGapHasAnchor: false,
       attachCommandReady: opts.deferAttachCommand !== true,
       taskReportingMode,
-      nativeMultiAgentMode
+      nativeMultiAgentMode,
+      ...(opts.resume?.migration
+        ? {
+            migration: {
+              fromThreadId: opts.resume.threadId,
+              ...opts.resume.migration
+            }
+          }
+        : {})
     };
     session.client = this.createClient({
       sessionId,
@@ -425,7 +454,7 @@ export class CodexAppServerAdapter implements AgentAdapter {
 
     try {
       await session.client.connect();
-      if (opts.resume) {
+      if (opts.resume && !opts.resume.migration) {
         const resumed = await session.client.resumeThread({
           threadId: opts.resume.threadId,
           cwd,
@@ -1034,6 +1063,7 @@ export class CodexAppServerAdapter implements AgentAdapter {
       ...(session.effort ? { effort: session.effort } : {}),
       lastActivityAt: session.lastActivityAt,
       nativeMultiAgentMode: session.nativeMultiAgentMode,
+      ...(session.migration ? { codexThreadMigration: { ...session.migration } } : {}),
       ...(session.threadId && session.attachCommandReady
         ? {
             attachCommand: `codex resume ${session.threadId} --remote unix://${session.socketPath}`,

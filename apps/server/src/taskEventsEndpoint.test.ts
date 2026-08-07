@@ -206,7 +206,14 @@ test("legacy Codex runtimes retain hook lifecycle reporting", async () => {
       agent: "codex",
       provider: "codex",
       ptySessionId: sessionId,
-      metadata: { codexTaskReportingMode: "legacy_hook_compat" }
+      metadata: {
+        codexTaskReportingMode: "legacy_hook_compat",
+        codexNativeMultiAgentCapability: {
+          effective: "disabled",
+          persisted: "disabled",
+          model: "disabled"
+        }
+      }
     });
 
     const response = await post(
@@ -218,6 +225,42 @@ test("legacy Codex runtimes retain hook lifecycle reporting", async () => {
 
     assert.equal(response.status, 200);
     assert.equal(tasks.find(task.id)?.state, "working");
+  });
+});
+
+test("legacy Codex hook reporting rejects unproven child capability", async () => {
+  await withServer(async ({ port, tasks, hooks }) => {
+    const task = tasks.create({ title: "unsafe legacy Codex", project: "/tmp/repo", kind: "scout" });
+    const sessionId = "pty:unsafe-legacy";
+    const { token } = hooks.register(sessionId);
+    tasks.update(task.id, { sessionId });
+    tasks.stateDb.runtimes.create({
+      id: "unsafe-legacy-runtime",
+      taskId: task.id,
+      generation: 0,
+      state: "live",
+      agent: "codex",
+      provider: "codex",
+      ptySessionId: sessionId,
+      metadata: {
+        codexTaskReportingMode: "legacy_hook_compat",
+        codexNativeMultiAgentCapability: {
+          effective: "v2",
+          persisted: "v2",
+          model: "disabled"
+        }
+      }
+    });
+
+    const response = await post(
+      port,
+      task.id,
+      { "x-perch-session": sessionId, "x-perch-token": token },
+      { kind: "failed", message: "child claim" }
+    );
+
+    assert.equal(response.status, 401);
+    assert.equal(tasks.find(task.id)?.state, "queued");
   });
 });
 

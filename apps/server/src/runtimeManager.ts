@@ -187,6 +187,7 @@ export class RuntimeManager {
       sessionId: string;
       provider: string;
       providerSessionId: string;
+      allowProviderSessionReplacement?: boolean;
       ownership?: RuntimeProcessOwnership;
       // Driver facts re-recorded at bind (codexDriver, appServerSocketPath):
       // the recovered generation must keep protecting its live daemon across
@@ -198,7 +199,10 @@ export class RuntimeManager {
       recovering.state !== "recovering" ||
       !isTrustedProviderIdentity(input.provider, input.providerSessionId) ||
       recovering.provider !== input.provider ||
-      recovering.providerSessionId !== input.providerSessionId
+      (
+        recovering.providerSessionId !== input.providerSessionId &&
+        !(input.allowProviderSessionReplacement === true && input.provider === "codex")
+      )
     ) {
       throw new Error(`provider identity mismatch for ${recovering.taskId} g${recovering.generation}`);
     }
@@ -207,7 +211,7 @@ export class RuntimeManager {
         state: "live",
         agent: recovering.agent,
         provider: recovering.provider,
-        providerSessionId: recovering.providerSessionId,
+        providerSessionId: input.providerSessionId,
         ptySessionId: input.sessionId,
         ...(input.ownership ?? {}),
         ...(recovering.worktreeId ? { worktreeId: recovering.worktreeId } : {}),

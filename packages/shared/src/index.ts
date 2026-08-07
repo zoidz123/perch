@@ -114,6 +114,11 @@ export type AgentSession = {
   // Append-only and optional so older clients keep decoding the session shape.
   nativeChildren?: NativeChildRunSummary[];
   nativeMultiAgentMode?: "enabled" | "disabled" | "legacy_compatibility";
+  codexThreadMigration?: {
+    fromThreadId: string;
+    reason: "unverified_native_multi_agent_capability";
+    handoff: "task_brief" | "mate_state";
+  };
 };
 
 export type PendingApproval = {

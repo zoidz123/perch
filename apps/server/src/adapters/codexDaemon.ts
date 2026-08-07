@@ -336,6 +336,41 @@ export class CodexDaemonManager {
     return handle;
   }
 
+  async retireExisting(socketPath: string): Promise<void> {
+    for (const [key, entry] of this.daemons) {
+      if (entry.handle.socketPath !== socketPath) continue;
+      this.daemons.delete(key);
+      await stopOwnedProcess(entry.process, this.shutdownGraceMs, socketPath, this.onLog);
+      removeDaemonFiles(socketPath);
+      return;
+    }
+    if (!existsSync(socketPath)) {
+      const pid = readPidFile(socketPath);
+      if (pid === undefined) return;
+      await stopOwnedProcess(this.adoptProcess(socketPath), this.shutdownGraceMs, socketPath, this.onLog);
+      removeDaemonFiles(socketPath);
+      return;
+    }
+    try {
+      await this.waitHealthy(socketPath, 2_000);
+    } catch {
+      const pid = readPidFile(socketPath);
+      if (pid === undefined) {
+        throw new Error(`cannot prove codex app-server retired without an owned pid: ${socketPath}`);
+      }
+      const process = this.adoptProcess(socketPath);
+      await stopOwnedProcess(process, this.shutdownGraceMs, socketPath, this.onLog);
+      removeDaemonFiles(socketPath);
+      return;
+    }
+    const pid = readPidFile(socketPath);
+    if (pid === undefined) {
+      throw new Error(`cannot retire live codex app-server without an owned pid: ${socketPath}`);
+    }
+    await stopOwnedProcess(this.adoptProcess(socketPath), this.shutdownGraceMs, socketPath, this.onLog);
+    removeDaemonFiles(socketPath);
+  }
+
   // A session-scoped daemon belongs to the control session that acquired it.
   // Stop it when that session detaches so sequential tasks do not accumulate
   // one live process per historical hook identity.

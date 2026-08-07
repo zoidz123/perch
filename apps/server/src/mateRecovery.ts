@@ -34,8 +34,9 @@ type MateRecoveryOptions = ManagedAgentLauncherOptions & {
 type IdentityExpectation = {
   provider: string;
   providerSessionId: string;
+  allowReplacementProviderSessionId: boolean;
   payload?: HookEventPayload;
-  recordSession: (sessionId: string) => void;
+  recordSession: (sessionId: string, providerSessionId: string) => void;
   resolve: () => void;
   reject: (error: Error) => void;
 };
@@ -60,7 +61,12 @@ export class MateRecoveryCoordinator {
     const expected = this.expectations.get(sessionId);
     if (!expected) return;
     const driver = this.providers.get(expected.provider);
-    const valid = provider === expected.provider && providerSessionId === expected.providerSessionId && (
+    const identityMatches = providerSessionId === expected.providerSessionId || (
+      expected.allowReplacementProviderSessionId &&
+      providerSessionId !== expected.providerSessionId &&
+      isTrustedProviderIdentity(provider, providerSessionId)
+    );
+    const valid = provider === expected.provider && identityMatches && (
       !driver?.verifySessionStart || Boolean(payload && driver.verifySessionStart(providerSessionId, payload))
     );
     if (!valid) {
@@ -70,7 +76,7 @@ export class MateRecoveryCoordinator {
       return;
     }
     try {
-      expected.recordSession(sessionId);
+      expected.recordSession(sessionId, providerSessionId);
       expected.resolve();
     } catch (error) {
       expected.reject(error instanceof Error ? error : new Error(String(error)));
@@ -141,14 +147,22 @@ export class MateRecoveryCoordinator {
     let unsubscribe: (() => void) | undefined;
     try {
       const providerSessionId = claimed.providerSessionId!;
+      let recoveredProviderSessionId = providerSessionId;
       const prepared = await this.prepare(claimed);
       prepared.request.title = "mate";
       prepared.request.labels = { ...prepared.request.labels, role: "mate" };
       sessionId = prepared.request.sessionId!;
       launchedSessionId = sessionId;
-      const identity = this.expectIdentity(sessionId, claimed.provider, providerSessionId, (candidateSessionId) => {
-        claimed = this.options.ownerManager.recordRecoverySession(claimed, candidateSessionId);
-      });
+      const identity = this.expectIdentity(
+        sessionId,
+        claimed.provider,
+        providerSessionId,
+        prepared.allowReplacementProviderSessionId === true,
+        (candidateSessionId, observedProviderSessionId) => {
+          recoveredProviderSessionId = observedProviderSessionId;
+          claimed = this.options.ownerManager.recordRecoverySession(claimed, candidateSessionId);
+        }
+      );
       unsubscribe = this.options.adapter.subscribeAgentEvents?.((event) => {
         if (event.sessionId === launchedSessionId && event.type === "terminal_output") {
           const text = event.text ?? event.raw;
@@ -193,7 +207,8 @@ export class MateRecoveryCoordinator {
       const bound = this.options.ownerManager.bindRecoveredMate(claimed, {
         sessionId: launchedSessionId,
         provider: claimed.provider,
-        providerSessionId,
+        providerSessionId: recoveredProviderSessionId,
+        allowProviderSessionReplacement: prepared.allowReplacementProviderSessionId === true,
         ...(result.session.model ? { model: result.session.model } : {}),
         ownership: this.options.adapter.runtimeProcess?.(launchedSessionId),
         ...(bindFacts ? { metadata: bindFacts.metadata } : {})
@@ -323,7 +338,8 @@ export class MateRecoveryCoordinator {
     sessionId: string,
     provider: string,
     providerSessionId: string,
-    recordSession: (sessionId: string) => void
+    allowReplacementProviderSessionId: boolean,
+    recordSession: (sessionId: string, providerSessionId: string) => void
   ): Promise<void> {
     const identity = new Promise<void>((resolve, reject) => {
       const timer = setTimeout(
@@ -334,6 +350,7 @@ export class MateRecoveryCoordinator {
       this.expectations.set(sessionId, {
         provider,
         providerSessionId,
+        allowReplacementProviderSessionId,
         recordSession,
         resolve: () => { clearTimeout(timer); resolve(); },
         reject: (error) => { clearTimeout(timer); reject(error); }

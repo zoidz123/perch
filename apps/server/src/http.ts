@@ -151,7 +151,11 @@ import {
 import type { OperationRecord } from "./stateDb.js";
 import type { OperationExecutionContext, TaskScheduler } from "./taskScheduler.js";
 import type { RuntimeManager } from "./runtimeManager.js";
-import { isCodexMissingRolloutResumeError, RecoveryCoordinator } from "./recovery.js";
+import {
+  isCodexMissingRolloutResumeError,
+  isProvenLegacyChildDisabled,
+  RecoveryCoordinator
+} from "./recovery.js";
 import { RecoveryContinuationCoordinator } from "./recoveryContinuation.js";
 import type { OwnerManager } from "./ownerManager.js";
 import { MateRecoveryCoordinator } from "./mateRecovery.js";
@@ -3920,7 +3924,7 @@ async function handleTaskEvent(
         ? "invalid_credentials"
         : task.sessionId !== sessionId
           ? "task_session_mismatch"
-          : runtime?.agent === "codex" && runtime.metadata?.codexTaskReportingMode === "root_dynamic_tool"
+          : runtime?.agent === "codex" && !allowsLegacyCodexHookReporting(runtime.metadata)
             ? "root_thread_required"
           : undefined;
     if (reason) {
@@ -4088,6 +4092,10 @@ async function handleTaskEvent(
   }
 
   writeJson(response, 200, { task: updated });
+}
+
+function allowsLegacyCodexHookReporting(metadata: Record<string, unknown> | undefined): boolean {
+  return metadata?.codexTaskReportingMode === "legacy_hook_compat" && isProvenLegacyChildDisabled(metadata);
 }
 
 async function handleNoMistakesAuthorization(

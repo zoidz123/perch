@@ -21,6 +21,7 @@ const DEFAULT_IDENTITY_TIMEOUT_MS = 30_000;
 export type PreparedProviderRecovery = {
   request: StartAgentRequest;
   expectedProviderSessionId: string;
+  allowReplacementProviderSessionId?: boolean;
   // Extra launcher input the driver needs carried into startManagedAgent
   // (the codex driver passes the resume thread + recorded daemon socket).
   launchInput?: Pick<StartManagedAgentInput, "codexOwnedResume">;
@@ -56,7 +57,8 @@ type RecoveryPayload = {
 type IdentityExpectation = {
   provider: string;
   providerSessionId: string;
-  recordSession: (sessionId: string) => void;
+  allowReplacementProviderSessionId: boolean;
+  recordSession: (sessionId: string, providerSessionId: string) => void;
   resolve: () => void;
   reject: (error: Error) => void;
 };
@@ -80,10 +82,14 @@ export class RecoveryCoordinator {
     const expected = this.expectations.get(sessionId);
     if (!expected) return;
     const driver = this.providers.get(expected.provider);
+    const identityMatches = providerSessionId === expected.providerSessionId || (
+      expected.allowReplacementProviderSessionId &&
+      providerSessionId !== expected.providerSessionId &&
+      isTrustedProviderIdentity(provider, providerSessionId)
+    );
     const verified = Boolean(
-      provider === expected.provider &&
-      providerSessionId === expected.providerSessionId &&
-      (!driver?.verifySessionStart || (payload && driver.verifySessionStart(expected.providerSessionId, payload)))
+      provider === expected.provider && identityMatches &&
+      (!driver?.verifySessionStart || (payload && driver.verifySessionStart(providerSessionId, payload)))
     );
     if (!verified) {
       expected.reject(
@@ -94,7 +100,7 @@ export class RecoveryCoordinator {
       return;
     }
     try {
-      expected.recordSession(sessionId);
+      expected.recordSession(sessionId, providerSessionId);
       expected.resolve();
     } catch (error) {
       expected.reject(error instanceof Error ? error : new Error(String(error)));
@@ -122,7 +128,8 @@ export class RecoveryCoordinator {
     ) {
       throw new Error("provider session identity is missing or untrusted");
     }
-    const providerSessionId = runtime.providerSessionId;
+    const providerSessionId = runtime.providerSessionId!;
+    let recoveredProviderSessionId: string = providerSessionId;
     const driver = this.providers.get(runtime.provider ?? runtime.agent);
     if (!driver) throw new Error(`recovery provider is not supported: ${runtime.provider ?? runtime.agent}`);
 
@@ -194,11 +201,18 @@ export class RecoveryCoordinator {
       throw new Error(`recovery worktree lease disappeared: ${leaseId}`);
     }
 
-    const identity = this.expectIdentity(sessionId, driver.provider, providerSessionId, (candidateSessionId) => {
-      const linked = this.options.runtimeManager?.recordRecoverySession(runtime, candidateSessionId);
-      if (!linked) throw new Error("runtime manager is unavailable during recovery");
-      runtime = linked;
-    });
+    const identity = this.expectIdentity(
+      sessionId,
+      driver.provider,
+      providerSessionId,
+      prepared.allowReplacementProviderSessionId === true,
+      (candidateSessionId, observedProviderSessionId) => {
+        recoveredProviderSessionId = observedProviderSessionId;
+        const linked = this.options.runtimeManager?.recordRecoverySession(runtime, candidateSessionId);
+        if (!linked) throw new Error("runtime manager is unavailable during recovery");
+        runtime = linked;
+      }
+    );
     let launchedSessionId = sessionId;
     let launched = false;
     try {
@@ -273,7 +287,8 @@ export class RecoveryCoordinator {
       const bound = this.options.runtimeManager?.bindRecoveredRuntime(runtime, {
         sessionId: result.session.id,
         provider: driver.provider,
-        providerSessionId,
+        providerSessionId: recoveredProviderSessionId,
+        allowProviderSessionReplacement: prepared.allowReplacementProviderSessionId === true,
         ownership: this.options.adapter.runtimeProcess?.(result.session.id),
         ...(bindFacts ? { metadata: bindFacts.metadata } : {})
       });
@@ -281,6 +296,18 @@ export class RecoveryCoordinator {
         this.options.hooks.aliasSession(bindFacts.aliasSessionId, result.session.id);
       }
       if (bound) {
+        if (prepared.allowReplacementProviderSessionId) {
+          this.options.tasks.recordEvent(task.id, {
+            kind: "note",
+            source: "system",
+            message: "codex recovery migrated to a fresh root thread",
+            data: {
+              reason: "codex_thread_migrated",
+              fromThreadId: providerSessionId,
+              toThreadId: recoveredProviderSessionId
+            }
+          });
+        }
         try {
           this.options.codexHistorySync?.startForTaskRuntime(bound);
         } catch (error) {
@@ -325,7 +352,8 @@ export class RecoveryCoordinator {
     sessionId: string,
     provider: string,
     providerSessionId: string,
-    recordSession: (sessionId: string) => void
+    allowReplacementProviderSessionId: boolean,
+    recordSession: (sessionId: string, providerSessionId: string) => void
   ): Promise<void> {
     const identity = new Promise<void>((resolve, reject) => {
       const timer = setTimeout(
@@ -336,6 +364,7 @@ export class RecoveryCoordinator {
       this.expectations.set(sessionId, {
         provider,
         providerSessionId,
+        allowReplacementProviderSessionId,
         recordSession,
         resolve: () => {
           clearTimeout(timer);
@@ -413,15 +442,6 @@ export class RecoveryCoordinator {
   }
 }
 
-// App-server-owned Codex recovery: the launch itself is the identity proof.
-// The owning adapter thread/resumes the recorded thread and returns only when
-// the protocol response carries the resumed thread id; the launcher feeds
-// that id straight into the coordinator's identity expectation. A runtime
-// whose metadata recorded the daemon socket rebinds to that daemon when it
-// still answers (Perch restart with a healthy daemon - no respawn, live
-// thread state intact); otherwise a fresh daemon resumes the rollout-backed
-// thread and codex represents the stale in-flight turn as interrupted.
-//
 export const codexRecoveryDriver: RecoveryProviderDriver = {
   provider: "codex",
   prepare(runtime, task) {
@@ -449,12 +469,17 @@ export const codexRecoveryDriver: RecoveryProviderDriver = {
         ? (runtime.metadata.appServerRuntimeFingerprint as string)
         : undefined;
     const rootTaskReportingTool = runtime.metadata?.codexTaskReportingMode === "root_dynamic_tool";
+    const legacyChildDisabled = isProvenLegacyChildDisabled(runtime.metadata);
+    const migrateToFreshThread = !rootTaskReportingTool && !legacyChildDisabled;
+    const handoff = task.id === "owner:mate" ? "mate_state" as const : "task_brief" as const;
     return {
       expectedProviderSessionId: threadId,
+      ...(migrateToFreshThread ? { allowReplacementProviderSessionId: true } : {}),
       request: {
         command: "codex",
         agent: "codex" as AgentKind,
         args: ["resume", threadId],
+        ...(migrateToFreshThread ? { initialPrompt: codexMigrationHandoff(task, handoff) } : {}),
         sessionId,
         cwd: canonicalPath(runtime.worktreePath ?? task.project),
         title: `codex - ${task.title}`,
@@ -470,12 +495,40 @@ export const codexRecoveryDriver: RecoveryProviderDriver = {
           threadId,
           ...(socketPath ? { socketPath } : {}),
           ...(runtimeFingerprint ? { runtimeFingerprint } : {}),
-          ...(rootTaskReportingTool ? { rootTaskReportingTool: true } : {})
+          ...(rootTaskReportingTool ? { rootTaskReportingTool: true } : {}),
+          ...(legacyChildDisabled ? { legacyChildDisabled: true } : {}),
+          ...(migrateToFreshThread
+            ? {
+                migration: {
+                  reason: "unverified_native_multi_agent_capability" as const,
+                  handoff
+                }
+              }
+            : {})
         }
       }
     };
   }
 };
+
+export function isProvenLegacyChildDisabled(metadata: Record<string, unknown> | undefined): boolean {
+  const capability = metadata?.codexNativeMultiAgentCapability;
+  if (!capability || typeof capability !== "object" || Array.isArray(capability)) return false;
+  const proof = capability as Record<string, unknown>;
+  return proof.effective === "disabled" && proof.persisted === "disabled" && proof.model === "disabled";
+}
+
+function codexMigrationHandoff(task: Task, handoff: "task_brief" | "mate_state"): string {
+  if (handoff === "mate_state") {
+    return "Perch migrated this owner to a fresh Codex thread to preserve root-only task authority. Inspect the current Perch task ledger and worktree state, then continue orchestration from durable state.";
+  }
+  const brief = task.prompt?.trim().slice(0, 12_000);
+  return [
+    "Perch migrated this task to a fresh Codex thread to preserve root-only task authority.",
+    "Continue from the current worktree and verify existing changes before editing.",
+    brief ? `Original task brief:\n${brief}` : `Task: ${task.title}`
+  ].join("\n\n");
+}
 
 // Driver facts a codex recovery must re-record on the freshly bound
 // generation: the CURRENT daemon socket (so the rebind guarantee holds across
@@ -487,7 +540,7 @@ export const codexRecoveryDriver: RecoveryProviderDriver = {
 // resolve to the live runtime. Returns undefined for non-owned (Claude)
 // sessions.
 export function codexOwnedBindFacts(
-  codexOwned: Pick<CodexAppServerAdapter, "socketPathOf" | "runtimeFingerprint" | "taskReportingModeOf"> | undefined,
+  codexOwned: Pick<CodexAppServerAdapter, "socketPathOf" | "runtimeFingerprint" | "taskReportingModeOf" | "migrationOf"> | undefined,
   liveSessionId: string,
   recovering: Pick<RuntimeRecord, "generation" | "ptySessionId" | "metadata">,
   resume: { threadId: string; socketPath?: string } | undefined
@@ -496,11 +549,16 @@ export function codexOwnedBindFacts(
   if (!socketPath) return undefined;
   const runtimeFingerprint = codexOwned?.runtimeFingerprint();
   const taskReportingMode = codexOwned?.taskReportingModeOf(liveSessionId);
+  const migration = codexOwned?.migrationOf(liveSessionId);
   const metadata: Record<string, unknown> = {
     codexDriver: "app-server-owned",
     appServerSocketPath: socketPath,
     ...(runtimeFingerprint ? { appServerRuntimeFingerprint: runtimeFingerprint } : {}),
-    ...(taskReportingMode ? { codexTaskReportingMode: taskReportingMode } : {})
+    ...(taskReportingMode ? { codexTaskReportingMode: taskReportingMode } : {}),
+    ...(taskReportingMode === "legacy_hook_compat" && recovering.metadata?.codexNativeMultiAgentCapability
+      ? { codexNativeMultiAgentCapability: recovering.metadata.codexNativeMultiAgentCapability }
+      : {}),
+    ...(migration ? { codexThreadMigration: migration } : {})
   };
   const rebound = Boolean(resume?.socketPath && resume.socketPath === socketPath);
   if (!rebound) return { metadata };

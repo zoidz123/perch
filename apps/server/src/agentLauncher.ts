@@ -104,6 +104,11 @@ export type StartManagedAgentInput = {
     socketPath?: string;
     runtimeFingerprint?: string;
     rootTaskReportingTool?: boolean;
+    legacyChildDisabled?: boolean;
+    migration?: {
+      reason: "unverified_native_multi_agent_capability";
+      handoff: "task_brief" | "mate_state";
+    };
   };
 };
 
@@ -329,6 +334,9 @@ export async function startManagedAgent(
     const codexTaskReportingMode = isCodexLaunch
       ? options.codexOwned?.taskReportingModeOf(session.id)
       : undefined;
+    const codexThreadMigration = isCodexLaunch
+      ? options.codexOwned?.migrationOf(session.id)
+      : undefined;
     const effectiveModel = isCodexLaunch ? session.model ?? request.model : request.model;
 
     if (runtime) {
@@ -344,7 +352,8 @@ export async function startManagedAgent(
                 ...(codexRuntimeFingerprint
                   ? { appServerRuntimeFingerprint: codexRuntimeFingerprint }
                   : {}),
-                ...(codexTaskReportingMode ? { codexTaskReportingMode } : {})
+                ...(codexTaskReportingMode ? { codexTaskReportingMode } : {}),
+                ...(codexThreadMigration ? { codexThreadMigration } : {})
               }
             }
           : {})
@@ -365,7 +374,8 @@ export async function startManagedAgent(
                 ...(codexRuntimeFingerprint
                   ? { appServerRuntimeFingerprint: codexRuntimeFingerprint }
                   : {}),
-                ...(codexTaskReportingMode ? { codexTaskReportingMode } : {})
+                ...(codexTaskReportingMode ? { codexTaskReportingMode } : {}),
+                ...(codexThreadMigration ? { codexThreadMigration } : {})
               }
             }
           : {}
