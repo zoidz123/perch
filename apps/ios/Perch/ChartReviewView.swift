@@ -8,6 +8,7 @@ struct ChartReviewView: View {
     @EnvironmentObject private var store: PerchStore
     @Environment(\.dismiss) private var dismiss
     let chart: ChartModel
+    let permitsOutboundActions: Bool
 
     @StateObject private var bridge = ChartBridge()
     @State private var noteDraft = ""
@@ -69,9 +70,13 @@ struct ChartReviewView: View {
             bottomBar
         }
         .background(Style.canvas.ignoresSafeArea())
-        .task {
+        .task(id: permitsOutboundActions) {
             bridge.onLayoutWarnings = { warnings in
-                Task { await store.reportChartLayoutWarnings(chart.id, warnings: warnings) }
+                guard permitsOutboundActions, store.isServerLive else { return }
+                Task {
+                    guard permitsOutboundActions, store.isServerLive else { return }
+                    await store.reportChartLayoutWarnings(chart.id, warnings: warnings)
+                }
             }
             // Arm the gesture; the web view re-asserts this on load too, so the
             // review is always ready to annotate whichever order they settle.
@@ -106,6 +111,7 @@ struct ChartReviewView: View {
                     sessionGoneMessage = nil
                     routeToMate()
                 }
+                .disabled(!permitsOutboundActions)
             }
             Button("Cancel", role: .cancel) {
                 sessionGoneMessage = nil
@@ -349,18 +355,23 @@ struct ChartReviewView: View {
     }
 
     private var canSend: Bool {
-        !bridge.pendingNotes.isEmpty
-            || !message.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        permitsOutboundActions
+            && (!bridge.pendingNotes.isEmpty
+                || !message.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
     }
 
     private func send() {
-        guard canSend, !sending else {
+        guard permitsOutboundActions, store.isServerLive, canSend, !sending else {
             return
         }
         sending = true
         sendError = nil
         let notes = bridge.pendingNotes
         Task {
+            guard store.isServerLive else {
+                sending = false
+                return
+            }
             do {
                 let queued = try await store.sendChartFeedback(chart.id, message: message, annotations: notes)
                 bridge.pendingNotes = []
@@ -386,6 +397,7 @@ struct ChartReviewView: View {
     // Dead owner fallback: hand the same feedback to the mate as plain text,
     // with the chart named so the mate can pick it up with full context.
     private func routeToMate() {
+        guard permitsOutboundActions, store.isServerLive else { return }
         var lines = ["About the chart \"\(chart.name)\" (\(chart.file)) - its agent is gone:"]
         for (index, note) in bridge.pendingNotes.enumerated() {
             let target = note.tag == "text" || note.tag == "mermaid-node"
@@ -400,7 +412,10 @@ struct ChartReviewView: View {
         bridge.pendingNotes = []
         message = ""
         dismiss()
-        Task { _ = await store.sendToMate(text) }
+        Task {
+            guard store.isServerLive else { return }
+            _ = await store.sendToMate(text)
+        }
     }
 
     private var loadFailedCard: some View {

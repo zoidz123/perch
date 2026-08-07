@@ -115,7 +115,10 @@ struct ContentView: View {
         // The chart room rides above whatever is open (home or a session):
         // card taps and future deep links both just set store.openChart.
         .fullScreenCover(item: $store.openChart) { chart in
-            ChartReviewView(chart: chart)
+            ChartReviewView(
+                chart: chart,
+                permitsOutboundActions: store.sessionContentPresentation(for: chart.sessionId).permitsOutboundActions
+            )
                 .environmentObject(store)
                 .preferredColorScheme(.dark)
         }
@@ -243,6 +246,10 @@ struct HomeView: View {
     @State private var showRemoveConfirm = false
     @State private var removeRefusedMessage: String?
 
+    private var workspacePresentation: ConnectionContentPresentation {
+        store.workspaceContentPresentation
+    }
+
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
             // Before pairing there is nothing to act on, so the header
@@ -265,17 +272,28 @@ struct HomeView: View {
 
             if !store.isPaired {
                 PairPrompt(showPairSheet: $showPairSheet)
-            } else if store.isConnectingToServer {
-                connectingState
-            } else if !store.isServerLive {
-                offlineState
-            } else if store.agentSessions.isEmpty && liveTasks.isEmpty {
-                emptyState
             } else {
-                sessionList
+                if workspacePresentation.usesBlockingPlaceholder {
+                    if store.isConnectingToServer {
+                        connectingState
+                    } else {
+                        offlineState
+                    }
+                } else {
+                    if workspacePresentation.showsConnectionIndicator {
+                        ConnectionStatusIndicator(availability: store.presentedServerAvailability)
+                            .padding(.horizontal, Style.pageInset)
+                            .padding(.bottom, 14)
+                    }
+                    if store.agentSessions.isEmpty && liveTasks.isEmpty {
+                        emptyState
+                    } else {
+                        sessionList
+                    }
+                }
             }
 
-            if !store.isConnectingToServer {
+            if !workspacePresentation.usesBlockingPlaceholder {
                 footer
             }
         }
@@ -297,12 +315,14 @@ struct HomeView: View {
             presenting: removeCandidate
         ) { candidate in
             Button("Remove", role: .destructive) {
+                guard workspacePresentation.permitsOutboundActions else { return }
                 Task {
                     if let message = await store.removeProject(candidate.path) {
                         removeRefusedMessage = message
                     }
                 }
             }
+            .disabled(!workspacePresentation.permitsOutboundActions)
             Button("Cancel", role: .cancel) {}
         } message: { _ in
             Text("This only takes the project off Perch's list. The repo on disk is untouched.")
@@ -504,10 +524,13 @@ struct HomeView: View {
                     // The mate manages its scope: long-press to register a new
                     // project under it (each project header removes itself).
                     .contextMenu {
-                        Button {
-                            showAddProject = true
-                        } label: {
-                            Label("Add project", systemImage: "folder.badge.plus")
+                        if workspacePresentation.permitsOutboundActions {
+                            Button {
+                                guard workspacePresentation.permitsOutboundActions else { return }
+                                showAddProject = true
+                            } label: {
+                                Label("Add project", systemImage: "folder.badge.plus")
+                            }
                         }
                     }
 
@@ -526,7 +549,11 @@ struct HomeView: View {
                 // solo agents it is the only way to start one.
                 soloSectionHeader
                 ForEach(orphanTasks) { task in
-                    TaskRow(task: task, session: session(for: task))
+                    TaskRow(
+                        task: task,
+                        session: session(for: task),
+                        permitsOutboundActions: workspacePresentation.permitsOutboundActions
+                    )
                         .environmentObject(store)
                 }
                 ForEach(otherSessions) { session in
@@ -570,8 +597,9 @@ struct HomeView: View {
         .padding(.bottom, 4)
         .contentShape(Rectangle())
         .contextMenu {
-            if project.hasPrefix("/") {
+            if project.hasPrefix("/"), workspacePresentation.permitsOutboundActions {
                 Button(role: .destructive) {
+                    guard workspacePresentation.permitsOutboundActions else { return }
                     removeCandidate = RemoveProjectCandidate(name: name, path: project)
                     showRemoveConfirm = true
                 } label: {
@@ -610,7 +638,12 @@ struct HomeView: View {
     // A crew row nested under its project header, tied back to it with a
     // thread line in the leading gutter.
     private func nestedTaskRow(_ task: AgentTask) -> some View {
-        TaskRow(task: task, session: session(for: task), showsProject: false)
+        TaskRow(
+            task: task,
+            session: session(for: task),
+            showsProject: false,
+            permitsOutboundActions: workspacePresentation.permitsOutboundActions
+        )
             .environmentObject(store)
             .padding(.leading, 22)
             .overlay(alignment: .leading) {
@@ -645,6 +678,7 @@ struct HomeView: View {
                     .foregroundStyle(Style.textPrimary)
                 Spacer()
                 Button {
+                    guard workspacePresentation.permitsOutboundActions else { return }
                     showNewAgent = true
                 } label: {
                     Image(systemName: "plus")
@@ -654,6 +688,8 @@ struct HomeView: View {
                         .background(Style.secondaryFill, in: Circle())
                 }
                 .accessibilityLabel("New agent")
+                .disabled(!workspacePresentation.permitsOutboundActions)
+                .opacity(workspacePresentation.permitsOutboundActions ? 1 : 0.45)
             }
             Text("Run an agent directly for one-off or exploratory tasks.")
                 .font(.system(size: 12.5))
@@ -794,9 +830,8 @@ struct HomeView: View {
     }
 }
 
-// Connecting never reuses cached rows or leaves a disabled control in place.
-// The navigation shell remains, then the full interface appears after fresh
-// readiness evidence arrives.
+// A cold connection without authenticated cached content blocks the body.
+// Reconnects with cached content use ConnectionStatusIndicator instead.
 struct ConnectionWaitingState: View {
     var body: some View {
         HStack(spacing: 8) {
@@ -809,6 +844,63 @@ struct ConnectionWaitingState: View {
         }
         .accessibilityElement(children: .combine)
         .accessibilityLabel("Connecting to Mac. Fresh data is still loading.")
+    }
+}
+
+struct ConnectionStatusIndicator: View {
+    let availability: PresentedServerAvailability
+
+    private var title: String {
+        switch availability {
+        case .connecting:
+            "Reconnecting to Mac"
+        case .offline:
+            "Mac offline"
+        case .online:
+            ""
+        }
+    }
+
+    private var icon: String {
+        switch availability {
+        case .connecting:
+            "arrow.triangle.2.circlepath"
+        case .offline:
+            "wifi.exclamationmark"
+        case .online:
+            ""
+        }
+    }
+
+    var body: some View {
+        HStack(spacing: 8) {
+            if availability == .connecting {
+                ProgressView()
+                    .controlSize(.small)
+                    .tint(Style.textSecondary)
+            } else {
+                Image(systemName: icon)
+                    .font(.system(size: 13, weight: .semibold))
+                    .foregroundStyle(Style.warningText)
+            }
+            Text(title)
+                .font(.system(size: 13, weight: .medium))
+                .foregroundStyle(availability == .offline ? Style.warningText : Style.textSecondary)
+            Spacer(minLength: 0)
+        }
+        .padding(.horizontal, 12)
+        .padding(.vertical, 9)
+        .background(Style.secondaryFill, in: RoundedRectangle(cornerRadius: 12, style: .continuous))
+        .overlay(
+            RoundedRectangle(cornerRadius: 12, style: .continuous)
+                .strokeBorder(Style.hairline, lineWidth: 1)
+        )
+        .accessibilityElement(children: .combine)
+        .accessibilityLabel(
+            availability == .connecting
+                ? "Reconnecting to Mac. Cached content is read-only until fresh data arrives."
+                : "Mac offline. Cached content is read-only until fresh data arrives."
+        )
     }
 }
 
@@ -1510,6 +1602,10 @@ struct SessionDetailView: View {
         )
     }
 
+    private var contentPresentation: ConnectionContentPresentation {
+        store.sessionContentPresentation(for: sessionId)
+    }
+
     // The mate's own chat: the Charts hub button lives on this composer, where
     // the boss actually chats with the mate.
     private var isMate: Bool {
@@ -1531,19 +1627,23 @@ struct SessionDetailView: View {
                 .padding(.bottom, 10)
                 .background(Style.canvas)
 
-            if store.isConnectingToServer {
-                ConnectionDetailPlaceholder()
-            } else if !store.isServerLive {
-                ConnectionOfflineDetail()
-            } else if detailPresentation == .launching {
-                LaunchingSessionShell(task: sessionTask)
-            } else if detailPresentation == .unavailable {
-                UnavailableSessionShell(task: sessionTask)
-            } else if hasChatSource {
-                TimelineChatView(sessionId: sessionId)
-                    .environmentObject(store)
+            if contentPresentation.usesBlockingPlaceholder {
+                if store.isConnectingToServer {
+                    ConnectionDetailPlaceholder()
+                } else if !store.isServerLive {
+                    ConnectionOfflineDetail()
+                } else {
+                    detailContent
+                }
             } else {
-                AgentChatPlaceholder(agent: session?.agent ?? .unknown)
+                VStack(spacing: 0) {
+                    if contentPresentation.showsConnectionIndicator {
+                        ConnectionStatusIndicator(availability: store.presentedServerAvailability)
+                            .padding(.horizontal, 12)
+                            .padding(.bottom, 8)
+                    }
+                    detailContent
+                }
             }
 
             bottomArea
@@ -1561,6 +1661,23 @@ struct SessionDetailView: View {
         }
         .onDisappear {
             store.closeDetail(sessionId, token: selectionToken)
+        }
+    }
+
+    @ViewBuilder
+    private var detailContent: some View {
+        if detailPresentation == .launching {
+            LaunchingSessionShell(task: sessionTask)
+        } else if detailPresentation == .unavailable {
+            UnavailableSessionShell(task: sessionTask)
+        } else if hasChatSource {
+            TimelineChatView(
+                sessionId: sessionId,
+                permitsOutboundActions: contentPresentation.permitsOutboundActions
+            )
+                .environmentObject(store)
+        } else {
+            AgentChatPlaceholder(agent: session?.agent ?? .unknown)
         }
     }
 
@@ -1597,7 +1714,7 @@ struct SessionDetailView: View {
             Spacer()
 
             VStack(spacing: 1) {
-                if !store.isConnectingToServer {
+                if !store.isConnectingToServer || !contentPresentation.usesBlockingPlaceholder {
                     Text(detailTitle)
                         .font(.system(size: 18, weight: .semibold))
                         .lineLimit(1)
@@ -1614,7 +1731,7 @@ struct SessionDetailView: View {
                         .foregroundStyle(Style.textFaint)
                         .lineLimit(1)
                         .truncationMode(.head)
-                } else if !store.isServerLive, !store.isConnectingToServer {
+                } else if !store.isServerLive, !contentPresentation.showsConnectionIndicator {
                     Text("Reconnect to continue")
                         .font(.system(size: 12))
                         .foregroundStyle(Style.textSecondary)
@@ -1664,7 +1781,7 @@ struct SessionDetailView: View {
     }
 
     private var detailTitle: String {
-        if !store.isServerLive {
+        if !store.isServerLive && !contentPresentation.showsConnectionIndicator {
             return "Mac offline"
         }
         return session.map { titleFor($0) } ?? sessionTask?.workerName ?? "Agent"
@@ -1684,9 +1801,7 @@ struct SessionDetailView: View {
 
     @ViewBuilder
     private var bottomArea: some View {
-        if store.isConnectingToServer {
-            EmptyView()
-        } else if detailPresentation.permitsActions && store.isServerLive {
+        if detailPresentation.permitsActions && contentPresentation.permitsOutboundActions {
             VStack(spacing: 8) {
                 if let request = session?.pendingServerRequest {
                     StructuredRequestCard(request: request) { decision, content in
@@ -1898,7 +2013,8 @@ struct SessionDetailView: View {
     }
 
     private var canSend: Bool {
-        hasDraft || !store.pendingAttachments.isEmpty
+        contentPresentation.permitsOutboundActions
+            && (hasDraft || !store.pendingAttachments.isEmpty)
     }
 
     private func sendDraft() {

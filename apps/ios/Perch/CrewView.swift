@@ -89,6 +89,7 @@ struct TaskRow: View {
     let session: AgentSession?
     // Nested under a project header, the project is already said once.
     var showsProject = true
+    let permitsOutboundActions: Bool
 
     @State private var tearingDown = false
     @State private var teardownError: String?
@@ -101,15 +102,18 @@ struct TaskRow: View {
         .accessibilityElement(children: .contain)
         .accessibilityAction(named: "Open \(workerIdentity)") { openLiveSession() }
         .contextMenu {
-            Button {
-                teardown(force: false)
-            } label: {
-                Label("Tear down", systemImage: "checkmark.seal")
-            }
-            Button(role: .destructive) {
-                confirmForce = true
-            } label: {
-                Label("Force tear down", systemImage: "exclamationmark.triangle")
+            if permitsOutboundActions {
+                Button {
+                    teardown(force: false)
+                } label: {
+                    Label("Tear down", systemImage: "checkmark.seal")
+                }
+                Button(role: .destructive) {
+                    guard permitsOutboundActions else { return }
+                    confirmForce = true
+                } label: {
+                    Label("Force tear down", systemImage: "exclamationmark.triangle")
+                }
             }
         }
         .confirmationDialog(
@@ -209,7 +213,7 @@ struct TaskRow: View {
             // status is only ever this dot (shared vocabulary, never text).
             if runtimePresentation.canRecover {
                 Button {
-                    Task { await store.recoverTask(task.id) }
+                    recover()
                 } label: {
                     Label("Recover", systemImage: "arrow.clockwise")
                         .font(.system(size: 12, weight: .semibold))
@@ -220,10 +224,10 @@ struct TaskRow: View {
                         .overlay(Capsule().strokeBorder(Style.hairline, lineWidth: 1))
                 }
                 .buttonStyle(.plain)
-                .disabled(!store.isServerLive)
-                .opacity(store.isServerLive ? 1 : 0.45)
+                .disabled(!permitsOutboundActions)
+                .opacity(permitsOutboundActions ? 1 : 0.45)
                 .accessibilityLabel("Recover \(workerIdentity)")
-                .accessibilityHint(store.isServerLive ? "Starts a new runtime for this task" : "Reconnect to the Mac to recover")
+                .accessibilityHint(permitsOutboundActions ? "Starts a new runtime for this task" : "Reconnect to the Mac to recover")
             } else if tearingDown || runtimePresentation.showsProgress {
                 ProgressView().controlSize(.small)
             } else if runtimePresentation.label == "Live" {
@@ -369,7 +373,7 @@ struct TaskRow: View {
     }
 
     private func teardown(force: Bool) {
-        guard !tearingDown else { return }
+        guard permitsOutboundActions, !tearingDown else { return }
         tearingDown = true
         Task {
             let error = await store.teardownTask(task.id, force: force)
@@ -378,6 +382,11 @@ struct TaskRow: View {
                 teardownError = error
             }
         }
+    }
+
+    private func recover() {
+        guard permitsOutboundActions else { return }
+        Task { await store.recoverTask(task.id) }
     }
 
     private func openLiveSession() {

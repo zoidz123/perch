@@ -9,6 +9,7 @@ import UIKit
 struct TimelineChatView: View {
     @EnvironmentObject private var store: PerchStore
     let sessionId: String
+    let permitsOutboundActions: Bool
     private let bottomID = "chat-bottom"
 
     // Sticky-bottom state machine: follow
@@ -88,9 +89,7 @@ struct TimelineChatView: View {
                                 item: item,
                                 reveal: item.kind == .assistant && item.seq > revealAfterSeq,
                                 undelivered: undelivered,
-                                onRetry: {
-                                    Task { await store.retryOptimistic(sessionId, item.id) }
-                                },
+                                onRetry: permitsOutboundActions ? { retry(item.id) } : nil,
                                 onGrow: {
                                     if sticky {
                                         proxy.scrollTo(bottomID, anchor: .bottom)
@@ -223,6 +222,11 @@ struct TimelineChatView: View {
                 }
             }
         }
+    }
+
+    private func retry(_ itemId: String) {
+        guard permitsOutboundActions else { return }
+        Task { await store.retryOptimistic(sessionId, itemId) }
     }
 
     private func presentLatestChartIfReady(_ proxy: ScrollViewProxy, requireFresh: Bool = false) {
