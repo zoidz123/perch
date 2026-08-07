@@ -8,6 +8,7 @@ import UIKit
 // quiet single-line summaries.
 struct TimelineChatView: View {
     @EnvironmentObject private var store: PerchStore
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
     let sessionId: String
     let permitsOutboundActions: Bool
     private let bottomID = "chat-bottom"
@@ -15,14 +16,24 @@ struct TimelineChatView: View {
     // Sticky-bottom state machine: follow
     // new messages only while the user is at the bottom; a deliberate scroll
     // up detaches; the pill re-attaches. Content growth never detaches.
-    @State private var sticky = true
-    @State private var unseenWhileDetached = false
-    // Seq high-water mark captured after the initial load: only items that
-    // arrive AFTER it get the typewriter reveal; history renders instantly.
-    @State private var revealAfterSeq = Int.max
+    @State private var scrollPresentation = TimelineScrollPresentation()
+    @State private var streamingPresentation = StreamingMarkdownPresentationBuffer()
+    @State private var streamingFlushTask: Task<Void, Never>?
+    @State private var initialTimelineSeq = Int.max
 
     private var items: [TimelineItem] {
-        store.chatItems(sessionId)
+        let source = store.chatItems(sessionId)
+        guard let reply = store.streamingBySession[sessionId] else { return source }
+        let previewID = reply.canonicalTimelineItemID
+        if source.contains(where: { $0.id == previewID && $0.seq > 0 }) {
+            return source.filter { $0.id != previewID || $0.seq > 0 }
+        }
+        guard let displayedText = streamingPresentation.displayedText(for: reply.itemId) else {
+            return source.filter { $0.id != previewID }
+        }
+        return source.map { item in
+            item.id == previewID ? reply.asTimelineItem(sessionId: sessionId, text: displayedText) : item
+        }
     }
 
     // Show the thinking indicator only while a reply is actually pending:
@@ -68,7 +79,7 @@ struct TimelineChatView: View {
 
     private var freshChartReadyItemId: String? {
         items.last { item in
-            item.seq > revealAfterSeq && (item.text?.contains("· chart_ready:") ?? false)
+            item.seq > initialTimelineSeq && (item.text?.contains("· chart_ready:") ?? false)
         }?.id
     }
 
@@ -87,14 +98,8 @@ struct TimelineChatView: View {
                             let undelivered = store.isOptimisticFailed(sessionId, item.id)
                             TimelineRow(
                                 item: item,
-                                reveal: item.kind == .assistant && item.seq > revealAfterSeq,
                                 undelivered: undelivered,
-                                onRetry: permitsOutboundActions ? { retry(item.id) } : nil,
-                                onGrow: {
-                                    if sticky {
-                                        proxy.scrollTo(bottomID, anchor: .bottom)
-                                    }
-                                }
+                                onRetry: permitsOutboundActions ? { retry(item.id) } : nil
                             )
                             .opacity(item.id.hasPrefix("optimistic-") && !undelivered ? 0.55 : 1)
                             .padding(.vertical, 8)
@@ -117,7 +122,7 @@ struct TimelineChatView: View {
                             .transition(.move(edge: .bottom).combined(with: .opacity))
                         }
                         if isWorking {
-                            ThinkingIndicator()
+                            ThinkingIndicator(reduceMotion: reduceMotion)
                                 .padding(.vertical, 8)
                         }
                         Color.clear
@@ -140,14 +145,13 @@ struct TimelineChatView: View {
                 // any deliberate drag detaches; sending or the pill re-sticks.
                 .onScrollPhaseChange { _, newPhase in
                     if newPhase == .interacting {
-                        sticky = false
+                        scrollPresentation.detachForManualScroll()
                     }
                 }
 
-                if !sticky, unseenWhileDetached {
+                if !scrollPresentation.isSticky, scrollPresentation.unseenWhileDetached {
                     Button {
-                        sticky = true
-                        unseenWhileDetached = false
+                        scrollPresentation.returnToLatest()
                         proxy.scrollTo(bottomID, anchor: .bottom)
                     } label: {
                         Image(systemName: "arrow.down")
@@ -160,33 +164,28 @@ struct TimelineChatView: View {
                     }
                     .padding(.trailing, 16)
                     .padding(.bottom, 10)
-                    .transition(.scale.combined(with: .opacity))
+                    .transition(reduceMotion ? .opacity : .scale.combined(with: .opacity))
                 }
             }
             .onAppear {
                 proxy.scrollTo(bottomID, anchor: .bottom)
             }
-            .onChange(of: isWorking) { _, working in
-                if working, sticky {
-                    withAnimation(.easeOut(duration: 0.15)) {
-                        proxy.scrollTo(bottomID, anchor: .bottom)
-                    }
+            .onChange(of: items.count) {
+                if scrollPresentation.didCommitDisplayedContent() {
+                    proxy.scrollTo(bottomID, anchor: .bottom)
                 }
             }
-            .onChange(of: items.count) {
-                if sticky {
-                    // No animation: streamed items arrive in bursts, and
-                    // overlapping animated scrolls fed the layout storm.
-                    proxy.scrollTo(bottomID, anchor: .bottom)
-                } else {
-                    unseenWhileDetached = true
-                }
+            .onChange(of: streamingPresentation.commitGeneration) { old, new in
+                guard new > old, scrollPresentation.didCommitDisplayedContent() else { return }
+                proxy.scrollTo(bottomID, anchor: .bottom)
+            }
+            .onChange(of: store.streamingBySession[sessionId]) { _, reply in
+                updateStreamingPresentation(reply)
             }
             // Sending always returns to the bottom.
             .onChange(of: store.optimisticBySession[sessionId]?.count ?? 0) { old, new in
                 if new > old {
-                    sticky = true
-                    unseenWhileDetached = false
+                    scrollPresentation.returnToLatest()
                     proxy.scrollTo(bottomID, anchor: .bottom)
                 }
             }
@@ -206,9 +205,11 @@ struct TimelineChatView: View {
             .task {
                 await store.loadTimeline(sessionId)
                 await store.fetchCharts()
-                revealAfterSeq = items.last(where: { $0.seq > 0 })?.seq ?? 0
+                initialTimelineSeq = items.last(where: { $0.seq > 0 })?.seq ?? 0
+                updateStreamingPresentation(store.streamingBySession[sessionId])
                 presentLatestChartIfReady(proxy, requireFresh: true)
             }
+            .onDisappear { cancelStreamingFlush() }
         }
         // Belt-and-suspenders: while the session
         // is running, reconcile against the authoritative timeline every few
@@ -229,6 +230,44 @@ struct TimelineChatView: View {
         Task { await store.retryOptimistic(sessionId, itemId) }
     }
 
+    private func updateStreamingPresentation(_ reply: StreamingReply?) {
+        guard let reply else {
+            cancelStreamingFlush()
+            streamingPresentation.reset()
+            return
+        }
+        let update = streamingPresentation.receive(
+            itemID: reply.itemId,
+            text: reply.text,
+            done: reply.done,
+            now: Date().timeIntervalSinceReferenceDate
+        )
+        if reply.done { cancelStreamingFlush() }
+        if case .scheduled(let deadline) = update {
+            scheduleStreamingFlush(for: reply.itemId, at: deadline)
+        }
+    }
+
+    private func scheduleStreamingFlush(for itemID: String, at deadline: TimeInterval) {
+        guard streamingFlushTask == nil else { return }
+        let delay = max(0, deadline - Date().timeIntervalSinceReferenceDate)
+        streamingFlushTask = Task { @MainActor in
+            try? await Task.sleep(for: .seconds(delay))
+            guard !Task.isCancelled else { return }
+            streamingFlushTask = nil
+            guard streamingPresentation.itemID == itemID else { return }
+            let update = streamingPresentation.commitPending(at: Date().timeIntervalSinceReferenceDate)
+            if case .scheduled(let nextDeadline) = update {
+                scheduleStreamingFlush(for: itemID, at: nextDeadline)
+            }
+        }
+    }
+
+    private func cancelStreamingFlush() {
+        streamingFlushTask?.cancel()
+        streamingFlushTask = nil
+    }
+
     private func presentLatestChartIfReady(_ proxy: ScrollViewProxy, requireFresh: Bool = false) {
         guard let chart = latestChart,
               visibleChartCardId != chart.id,
@@ -237,14 +276,14 @@ struct TimelineChatView: View {
             return
         }
 
-        let shouldFollow = sticky
+        let shouldFollow = scrollPresentation.isSticky
         withAnimation(.snappy(duration: 0.22)) {
             visibleChartCardId = chart.id
         }
         if shouldFollow {
             proxy.scrollTo(bottomID, anchor: .bottom)
         } else {
-            unseenWhileDetached = true
+            _ = scrollPresentation.didCommitDisplayedContent()
         }
     }
 
@@ -274,6 +313,7 @@ struct TimelineChatView: View {
 
 // Three pulsing dots while the agent works, matching the muted canvas style.
 private struct ThinkingIndicator: View {
+    let reduceMotion: Bool
     @State private var pulsing = false
 
     var body: some View {
@@ -284,7 +324,7 @@ private struct ThinkingIndicator: View {
                     .frame(width: 7, height: 7)
                     .opacity(pulsing ? 1 : 0.25)
                     .animation(
-                        .easeInOut(duration: 0.55)
+                        reduceMotion ? nil : .easeInOut(duration: 0.55)
                             .repeatForever(autoreverses: true)
                             .delay(Double(index) * 0.18),
                         value: pulsing
@@ -292,7 +332,8 @@ private struct ThinkingIndicator: View {
             }
         }
         .padding(.vertical, 4)
-        .onAppear { pulsing = true }
+        .onAppear { pulsing = !reduceMotion }
+        .onChange(of: reduceMotion) { _, reduced in pulsing = !reduced }
         .accessibilityLabel("Agent is working")
     }
 }
@@ -353,12 +394,10 @@ private func toolGlyph(_ name: String?) -> String {
 
 private struct TimelineRow: View {
     let item: TimelineItem
-    var reveal = false
     // An optimistic message whose canonical row never arrived. The bubble stays
     // (never eat the boss's words) but stops pretending to be in flight.
     var undelivered = false
     var onRetry: (() -> Void)?
-    var onGrow: (() -> Void)?
     @State private var expanded = false
 
     var body: some View {
@@ -386,12 +425,7 @@ private struct TimelineRow: View {
                 }
             }
         case .assistant:
-            RevealingMarkdown(
-                itemId: item.id,
-                text: item.text ?? "",
-                reveal: reveal,
-                onGrow: onGrow
-            )
+            StyledMarkdown(text: TimelineTextPresentation.completedAssistantText(for: item))
         case .toolCall:
             activityLine(
                 glyph: toolGlyph(item.tool?.name),
@@ -462,61 +496,6 @@ private struct TimelineRow: View {
                 )
             }
         }
-    }
-}
-
-// Typewriter reveal for freshly-arrived assistant text: the transcript only
-// carries whole messages (the no-SDK tradeoff), so intra-message streaming is
-// simulated client-side by revealing the text progressively. History and
-// re-encountered rows render instantly (the ledger survives List cell reuse).
-@MainActor
-private final class RevealLedger {
-    static let shared = RevealLedger()
-    // Progress survives List cell churn: rows are recreated ~50ms after
-    // appearing (next store publish reflows), which cancels the animating
-    // task - the successor resumes from here instead of bailing.
-    var progress = [String: Int]()
-    var completed = Set<String>()
-}
-
-private struct RevealingMarkdown: View {
-    let itemId: String
-    let text: String
-    let reveal: Bool
-    var onGrow: (() -> Void)?
-
-    @State private var visibleCount: Int?
-
-    private var shouldAnimate: Bool {
-        reveal && !RevealLedger.shared.completed.contains(itemId) && text.count <= 6000
-    }
-
-    var body: some View {
-        StyledMarkdown(text: visibleCount.map { String(text.prefix($0)) } ?? text)
-            .task(id: itemId) {
-                guard shouldAnimate else { return }
-                let ledger = RevealLedger.shared
-                let total = text.count
-                // ~1.6s total regardless of length; chunked, not per-char.
-                let step = max(2, total / 50)
-                var shown = ledger.progress[itemId] ?? 0
-                visibleCount = shown
-                while shown < total, !Task.isCancelled {
-                    shown = min(total, shown + step)
-                    visibleCount = shown
-                    ledger.progress[itemId] = shown
-                    if shown % (step * 5) < step {
-                        onGrow?()
-                    }
-                    try? await Task.sleep(for: .milliseconds(32))
-                }
-                if shown >= total {
-                    ledger.completed.insert(itemId)
-                    ledger.progress[itemId] = nil
-                    visibleCount = nil
-                    onGrow?()
-                }
-            }
     }
 }
 
