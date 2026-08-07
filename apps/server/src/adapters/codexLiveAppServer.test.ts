@@ -204,8 +204,8 @@ test("opt-in live native multi-agent root observes children, then reopens the co
     const childThreadIds = [...new Set(observations.map((observation) => observation.childThreadId))];
     assert.ok(childThreadIds.length >= 2, "root emitted observations for at least two native children");
     assert.ok(
-      observations.some((observation) => observation.protocol.itemType === "collabAgentToolCall"),
-      "root exposed a native collaboration tool-call item"
+      observations.some((observation) => observation.protocol.itemType === "subAgentActivity"),
+      "root exposed native child activity"
     );
 
     await root.disconnect();
