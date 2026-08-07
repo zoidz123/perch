@@ -176,6 +176,17 @@ final class PerchStore: ObservableObject {
         hasUsableFleetSnapshot = true
     }
 
+    // A successful direct /sessions response is authenticated, authoritative
+    // Mac data. Settle the product presentation at that boundary rather than
+    // making it wait for optional task, project, usage, model, or timeline
+    // enrichment.
+    func acceptDirectFleetSnapshot(_ snapshot: [AgentSession]) {
+        applyUsableFleetSnapshot(snapshot)
+        connectionState = "Direct fleet snapshot complete"
+        _ = completeConnectionReadiness(.directBootstrap, reason: "fresh direct fleet snapshot")
+        errorMessage = nil
+    }
+
     private func beginConnectionReadiness() {
         let now = ProcessInfo.processInfo.systemUptime
         if connectionStatusHysteresis.beginConnecting(at: now) {
@@ -749,7 +760,14 @@ final class PerchStore: ObservableObject {
 
         do {
             let response: SessionsResponse = try await request(path: "/sessions")
-            applyUsableFleetSnapshot(response.sessions)
+            acceptDirectFleetSnapshot(response.sessions)
+            // Never tear down a healthy socket (foreground/pull-to-refresh
+            // call this constantly); reconnect only when it is gone or dead.
+            // Starting a missing socket is independent of optional enrichment
+            // and preserves selected-session subscriptions on foreground.
+            if webSocketTask == nil {
+                connectWebSocket()
+            }
             // The crew ledger rides the same refresh; its absence (older
             // server) must never break the fleet.
             await refreshTaskSnapshot()
@@ -769,14 +787,6 @@ final class PerchStore: ObservableObject {
             }
             if let selectedSessionId {
                 await loadTimeline(selectedSessionId)
-            }
-            connectionState = "Direct bootstrap complete"
-            _ = completeConnectionReadiness(.directBootstrap, reason: "fresh direct bootstrap")
-            errorMessage = nil
-            // Never tear down a healthy socket (foreground/pull-to-refresh
-            // call this constantly); reconnect only when it is gone or dead.
-            if webSocketTask == nil {
-                connectWebSocket()
             }
         } catch {
             if isCancellation(error) {
