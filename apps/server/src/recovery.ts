@@ -666,12 +666,12 @@ export async function deliverCodexMigrationHandoff(input: {
 }): Promise<boolean> {
   let handoff = input.handoff;
   if (handoff.state === "accepted") return false;
-  if (handoff.state === "rejected" || handoff.state === "delivery_unknown") {
+  if (handoff.state === "rejected") {
     throw new CodexMigrationHandoffError(
-      handoff.failureReason ?? `migration handoff is ${handoff.state.replace("_", " ")}`
+      handoff.failureReason ?? "migration handoff is rejected"
     );
   }
-  if (handoff.state === "submitted") {
+  if (handoff.state === "submitted" || handoff.state === "delivery_unknown") {
     let accepted: { id: string } | undefined;
     try {
       accepted = await input.codexOwned.findAcceptedTurn(input.sessionId, handoff.clientUserMessageId);
@@ -684,6 +684,10 @@ export async function deliverCodexMigrationHandoff(input: {
     if (accepted) {
       input.persist({ ...handoff, state: "accepted", turnId: accepted.id, failureReason: undefined });
       return true;
+    }
+    if (handoff.state === "delivery_unknown") {
+      handoff = { ...handoff, state: "submitted", failureReason: undefined };
+      input.persist(handoff);
     }
   } else {
     handoff = { ...handoff, state: "submitted", failureReason: undefined };

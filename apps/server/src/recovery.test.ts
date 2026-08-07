@@ -658,6 +658,34 @@ test("Codex migration handoff rejection and unknown delivery park durably", asyn
   live = unknown.tasks.stateDb.runtimes.latestForTask(unknown.task.id)!;
   assert.equal((live.metadata?.codexMigrationHandoff as { state?: string })?.state, "delivery_unknown");
   assert.equal(unknown.tasks.find(unknown.task.id)?.state, "blocked");
+  const submittedBeforeReconcile = unknown.codexOwned.submitted.length;
+  const unknownId = `perch:migration:${unknown.task.id}:g1`;
+  unknown.codexOwned.historyReadError = null;
+  unknown.codexOwned.history.set(unknownId, { id: "turn-confirmed-after-outage" });
+  await unknownCoordinator.execute(operation(unknown.task.id), context());
+  live = unknown.tasks.stateDb.runtimes.latestForTask(unknown.task.id)!;
+  assert.deepEqual(live.metadata?.codexMigrationHandoff, {
+    state: "accepted",
+    clientUserMessageId: unknownId,
+    handoff: "task_brief",
+    turnId: "turn-confirmed-after-outage"
+  });
+  assert.equal(unknown.codexOwned.submitted.length, submittedBeforeReconcile);
+  const absentId = `${unknownId}:authoritatively-absent`;
+  unknown.tasks.stateDb.runtimes.compareAndSwap(live.taskId, live.generation, "live", "live", {
+    metadata: {
+      ...live.metadata,
+      codexMigrationHandoff: {
+        state: "delivery_unknown",
+        clientUserMessageId: absentId,
+        handoff: "task_brief",
+        failureReason: "prior transport outage"
+      }
+    }
+  });
+  await unknownCoordinator.execute(operation(unknown.task.id), context());
+  assert.equal(unknown.codexOwned.submitted.at(-1)?.clientUserMessageId, absentId);
+  assert.equal(unknown.codexOwned.submitted.length, submittedBeforeReconcile + 1);
   unknown.cleanup();
 });
 

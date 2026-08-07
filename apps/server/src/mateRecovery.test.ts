@@ -873,6 +873,18 @@ test("Codex Mate migration parks rejected handoffs with durable recovery evidenc
       tasks.stateDb.ownerOperations.findByKey(`mate-fleet:${live.ownerId}:g1`)?.state,
       "failed"
     );
+    codexOwned.historyReadError = null;
+    codexOwned.history.set("perch:migration:owner:mate:g1", { id: "mate-turn-confirmed-after-outage" });
+    const reconciled = await recovery.recover(ownerManager.latestMate()!);
+    assert.equal(reconciled.recoveredMate, false);
+    assert.equal(
+      (ownerManager.latestMate()?.metadata?.codexMigrationHandoff as { state?: string } | undefined)?.state,
+      "accepted"
+    );
+    assert.equal(
+      tasks.stateDb.ownerOperations.findByKey(`mate-fleet:${live.ownerId}:g1`)?.state,
+      "succeeded"
+    );
   } finally {
     await scheduler.stop();
     monitor.stop();
