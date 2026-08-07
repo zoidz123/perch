@@ -16,6 +16,7 @@
 
 /* Begin PBXFileReference section */
 		9A1111111111111111111205 /* Perch.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = Perch.app; sourceTree = BUILT_PRODUCTS_DIR; };
+		9B1111111111111111111206 /* PerchTests.xctest */ = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; includeInIndex = 0; path = PerchTests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
 /* End PBXFileReference section */
 
 /* Begin PBXFileSystemSynchronizedBuildFileExceptionSet section */
@@ -41,6 +42,17 @@
 			path = Perch;
 			sourceTree = "<group>";
 		};
+		9B3333333333333333333001 /* PerchTests */ = {
+			isa = PBXFileSystemSynchronizedRootGroup;
+			exceptions = (
+			);
+			explicitFileTypes = {
+			};
+			explicitFolders = (
+			);
+			path = PerchTests;
+			sourceTree = "<group>";
+		};
 /* End PBXFileSystemSynchronizedRootGroup section */
 
 /* Begin PBXFrameworksBuildPhase section */
@@ -56,6 +68,13 @@
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
+		9B1111111111111111111302 /* Frameworks */ = {
+			isa = PBXFrameworksBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
 /* End PBXFrameworksBuildPhase section */
 
 /* Begin PBXGroup section */
@@ -63,6 +82,7 @@
 			isa = PBXGroup;
 			children = (
 				9A3333333333333333333001 /* Perch */,
+				9B3333333333333333333001 /* PerchTests */,
 				9A1111111111111111111403 /* Products */,
 			);
 			sourceTree = "<group>";
@@ -71,6 +91,7 @@
 			isa = PBXGroup;
 			children = (
 				9A1111111111111111111205 /* Perch.app */,
+				9B1111111111111111111206 /* PerchTests.xctest */,
 			);
 			name = Products;
 			sourceTree = "<group>";
@@ -105,7 +126,40 @@
 			productReference = 9A1111111111111111111205 /* Perch.app */;
 			productType = "com.apple.product-type.application";
 		};
+		9B1111111111111111111502 /* PerchTests */ = {
+			isa = PBXNativeTarget;
+			buildConfigurationList = 9B1111111111111111111803 /* Build configuration list for PBXNativeTarget "PerchTests" */;
+			buildPhases = (
+				9B1111111111111111111603 /* Sources */,
+				9B1111111111111111111302 /* Frameworks */,
+				9B1111111111111111111604 /* Resources */,
+			);
+			buildRules = (
+			);
+			dependencies = (
+				9B1111111111111111111202 /* PBXTargetDependency */,
+			);
+			fileSystemSynchronizedGroups = (
+				9B3333333333333333333001 /* PerchTests */,
+			);
+			name = PerchTests;
+			packageProductDependencies = (
+			);
+			productName = PerchTests;
+			productReference = 9B1111111111111111111206 /* PerchTests.xctest */;
+			productType = "com.apple.product-type.bundle.unit-test";
+		};
 /* End PBXNativeTarget section */
+
+/* Begin PBXContainerItemProxy section */
+		9B1111111111111111111201 /* PBXContainerItemProxy */ = {
+			isa = PBXContainerItemProxy;
+			containerPortal = 9A1111111111111111111701 /* Project object */;
+			proxyType = 1;
+			remoteGlobalIDString = 9A1111111111111111111501;
+			remoteInfo = Perch;
+		};
+/* End PBXContainerItemProxy section */
 
 /* Begin PBXProject section */
 		9A1111111111111111111701 /* Project object */ = {
@@ -117,6 +171,10 @@
 				TargetAttributes = {
 					9A1111111111111111111501 = {
 						CreatedOnToolsVersion = 26.6;
+					};
+					9B1111111111111111111502 = {
+						CreatedOnToolsVersion = 26.6;
+						TestTargetID = 9A1111111111111111111501;
 					};
 				};
 			};
@@ -142,12 +200,28 @@
 			projectRoot = "";
 			targets = (
 				9A1111111111111111111501 /* Perch */,
+				9B1111111111111111111502 /* PerchTests */,
 			);
 		};
 /* End PBXProject section */
 
+/* Begin PBXTargetDependency section */
+		9B1111111111111111111202 /* PBXTargetDependency */ = {
+			isa = PBXTargetDependency;
+			target = 9A1111111111111111111501 /* Perch */;
+			targetProxy = 9B1111111111111111111201 /* PBXContainerItemProxy */;
+		};
+/* End PBXTargetDependency section */
+
 /* Begin PBXResourcesBuildPhase section */
 		9A1111111111111111111602 /* Resources */ = {
+			isa = PBXResourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+		9B1111111111111111111604 /* Resources */ = {
 			isa = PBXResourcesBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
@@ -158,6 +232,13 @@
 
 /* Begin PBXSourcesBuildPhase section */
 		9A1111111111111111111601 /* Sources */ = {
+			isa = PBXSourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+		9B1111111111111111111603 /* Sources */ = {
 			isa = PBXSourcesBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
@@ -402,6 +483,48 @@
 			};
 			name = Release;
 		};
+		9B1111111111111111111905 /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				BUNDLE_LOADER = "$(TEST_HOST)";
+				CODE_SIGN_STYLE = Automatic;
+				GENERATE_INFOPLIST_FILE = YES;
+				IPHONEOS_DEPLOYMENT_TARGET = 26.0;
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/Frameworks",
+					"@loader_path/Frameworks",
+				);
+				PRODUCT_BUNDLE_IDENTIFIER = com.ellipsoid.perch.tests;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SWIFT_EMIT_LOC_STRINGS = NO;
+				SWIFT_VERSION = 6.0;
+				TARGETED_DEVICE_FAMILY = 1;
+				TEST_HOST = "$(BUILT_PRODUCTS_DIR)/Perch.app/$(BUNDLE_EXECUTABLE_FOLDER_PATH)/Perch";
+			};
+			name = Debug;
+		};
+		9B1111111111111111111906 /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				BUNDLE_LOADER = "$(TEST_HOST)";
+				CODE_SIGN_STYLE = Automatic;
+				GENERATE_INFOPLIST_FILE = YES;
+				IPHONEOS_DEPLOYMENT_TARGET = 26.0;
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/Frameworks",
+					"@loader_path/Frameworks",
+				);
+				PRODUCT_BUNDLE_IDENTIFIER = com.ellipsoid.perch.tests;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SWIFT_EMIT_LOC_STRINGS = NO;
+				SWIFT_VERSION = 6.0;
+				TARGETED_DEVICE_FAMILY = 1;
+				TEST_HOST = "$(BUILT_PRODUCTS_DIR)/Perch.app/$(BUNDLE_EXECUTABLE_FOLDER_PATH)/Perch";
+			};
+			name = Release;
+		};
 /* End XCBuildConfiguration section */
 
 /* Begin XCConfigurationList section */
@@ -419,6 +542,15 @@
 			buildConfigurations = (
 				9A1111111111111111111903 /* Debug */,
 				9A1111111111111111111904 /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Release;
+		};
+		9B1111111111111111111803 /* Build configuration list for PBXNativeTarget "PerchTests" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				9B1111111111111111111905 /* Debug */,
+				9B1111111111111111111906 /* Release */,
 			);
 			defaultConfigurationIsVisible = 0;
 			defaultConfigurationName = Release;

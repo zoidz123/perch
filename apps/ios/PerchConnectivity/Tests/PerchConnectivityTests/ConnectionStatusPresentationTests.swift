@@ -148,7 +148,7 @@ final class ConnectionStatusPresentationTests: XCTestCase {
         XCTAssertTrue(presentation.permitsOutboundActions)
     }
 
-    func testCachedChartReviewStaysVisibleButBlocksWritesUntilFreshReadiness() {
+    func testCachedContentStaysVisibleButBlocksWritesUntilFreshReadiness() {
         var status = ConnectionStatusHysteresis(initialAvailability: .online, readinessTimeout: 8)
 
         status.beginConnecting(at: 20)

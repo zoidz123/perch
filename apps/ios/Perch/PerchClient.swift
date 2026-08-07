@@ -92,20 +92,8 @@ final class PerchStore: ObservableObject {
     // to serve /config - the settings popup then shows what it can and its
     // writes fail loudly rather than silently doing nothing.
     @Published var config: ConfigResponse?
-    // Registered charts (GET /charts). Older servers 404 and leave this empty,
-    // which must never break anything else.
-    @Published var charts: [ChartModel] = []
-    // Dismissed timeline chart-card identities. Kept in the shared store so a
-    // dismissed Mate chat heads-up survives navigation, chart fetch refreshes,
-    // and app restarts without hiding a later chart version.
-    @Published private var dismissedChartCardKeys: Set<String> = []
-    // Bumped per chart when its file changes on disk (WS "chart" message);
-    // an open review screen reloads on the bump.
-    @Published var chartVersions: [String: Int] = [:]
-    // The chart whose review screen is open (card taps set this; nil closes).
-    @Published var openChart: ChartModel?
     // The committed plan whose read-only render is open (hub taps set this).
-    @Published var openPlan: ChartPlanDoc?
+    @Published var openPlan: PlanDocument?
     // In-flight timeline hole fetches (gap detection), per session.
     private var timelineCatchUps = Set<String>()
     private var timelineRevisionsBySession: [String: Int] = [:]
@@ -145,10 +133,7 @@ final class PerchStore: ObservableObject {
     }
     private var pendingRPC: [String: PendingRPC] = [:]
 
-    private static let dismissedChartCardKeysKey = "Perch.dismissedChartCardKeys.v1"
-
     init() {
-        dismissedChartCardKeys = Set(UserDefaults.standard.stringArray(forKey: Self.dismissedChartCardKeysKey) ?? [])
         if let host = HostStore.load() {
             savedHost = host
             serverURL = host.activeEndpoint.url
@@ -367,9 +352,6 @@ final class PerchStore: ObservableObject {
         pendingEffortBySession = [:]
         models = nil
         config = nil
-        charts = []
-        chartVersions = [:]
-        openChart = nil
         openPlan = nil
         timelineCatchUps = []
         errorMessage = nil
@@ -784,10 +766,6 @@ final class PerchStore: ObservableObject {
             // leaves this nil and the picker falls back to its static catalog.
             if let modelsResult: ModelsResponse = try? await request(path: "/models") {
                 models = modelsResult
-            }
-            // Charts ride the same refresh; absent on older servers.
-            if let chartsResult: ChartsResult = try? await request(path: "/charts") {
-                charts = chartsResult.charts
             }
             if let selectedSessionId {
                 await loadTimeline(selectedSessionId)
@@ -2146,9 +2124,6 @@ final class PerchStore: ObservableObject {
                 if let result: ProjectsResult = try? await self.request(path: "/projects") {
                     self.projects = result.projects
                 }
-                if let result: ChartsResult = try? await self.request(path: "/charts") {
-                    self.charts = result.charts
-                }
                 return true
             }
         }
@@ -2185,82 +2160,29 @@ final class PerchStore: ObservableObject {
             if let updated = WorkspaceGrouping.applyingStatus(status, to: sessionId, in: sessions) {
                 sessions = updated
             }
-        case let .chart(_, chartId, _, _, _):
-            // Registered or file changed: bump so an open review reloads, and
-            // refetch the registry so cards appear/update without a pull.
-            chartVersions[chartId, default: 0] += 1
-            Task { await self.fetchCharts() }
+        case .chart:
+            // Keep decoding the append-only wire event so an old or newer
+            // server cannot drop the socket. Charts no longer have a mobile
+            // presentation or fetch path.
+            break
         default:
             break
         }
     }
 
-    // MARK: - Charts
-
-    // Charts in one session's chat, oldest first (their place in the story):
-    // the ones it drew, plus its crew's (the mate sees every chart the tasks
-    // it dispatched produced).
-    func chartsFor(_ sessionId: String) -> [ChartModel] {
-        charts
-            .filter { $0.sessionId == sessionId || $0.parentSessionId == sessionId }
-            .sorted { $0.registeredAt < $1.registeredAt }
-    }
-
-    func isChartCardDismissed(_ chart: ChartModel) -> Bool {
-        dismissedChartCardKeys.contains(chart.cardDismissalIdentity.key)
-    }
-
-    func dismissChartCard(_ chart: ChartModel) {
-        dismissedChartCardKeys.insert(chart.cardDismissalIdentity.key)
-        UserDefaults.standard.set(
-            Array(dismissedChartCardKeys).sorted(),
-            forKey: Self.dismissedChartCardKeysKey
-        )
-    }
-
-    func fetchCharts() async {
-        if let result: ChartsResult = try? await request(path: "/charts") {
-            charts = result.charts
-        }
-    }
-
-    // The unified hub listing (GET /charts/hub): charts and committed plans
-    // grouped by project, plus ungrouped charts. Read on demand by the Charts
-    // hub sheet; throws so the sheet can show an honest error state.
-    func fetchChartsHub() async throws -> ChartsHubResponse {
+    // The server's established plans route also contains deprecated chart
+    // fields. PlansHubResponse decodes only the committed plans needed here.
+    func fetchPlansHub() async throws -> PlansHubResponse {
         try await request(path: "/charts/hub")
     }
 
-    // The chart document with the annotation SDK injected server-side. LAN
-    // fetches the raw HTML route; the relay carries it as JSON over RPC.
-    func chartHtml(_ chartId: String) async throws -> String {
-        if isRelayActive {
-            let result: ChartHtmlResult = try await rpcDecoding(
-                method: "GET",
-                path: "/charts/\(escapePath(chartId))/html"
-            )
-            return result.html
-        }
-        var request = try makeRequest(path: "/charts/\(escapePath(chartId))")
-        request.httpMethod = "GET"
-        let (data, response) = try await URLSession.shared.data(for: request)
-        try validate(response, data: data)
-        guard let html = String(data: data, encoding: .utf8) else {
-            throw PerchClientError.invalidResponse
-        }
-        return html
-    }
-
-    // A committed plan rendered as chart-styled HTML (GET /charts/plan?path=),
-    // server-side path-confined to tracked projects' docs/plans. The document is
-    // self-contained (chart.css inlined) so the phone loads one string, no
-    // sibling-asset round-trips. Mirrors chartHtml: raw HTML on LAN, JSON over
-    // the relay. Server endpoint lands in a parallel task; a 404 here means it
-    // is not deployed yet.
+    // A committed plan rendered server-side. The route remains the server's
+    // compatibility endpoint; the phone loads one self-contained document on
+    // LAN or through relay RPC.
     func planHtml(_ relativePath: String) async throws -> String {
         let query = relativePath.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) ?? relativePath
         if isRelayActive {
-            let result: ChartPlanHtmlResult = try await rpcDecoding(
+            let result: PlanHtmlResult = try await rpcDecoding(
                 method: "GET",
                 path: "/charts/plan?path=\(query)"
             )
@@ -2274,62 +2196,6 @@ final class PerchStore: ObservableObject {
             throw PerchClientError.invalidResponse
         }
         return html
-    }
-
-    // A chart-relative asset (chart.css, images), directory-confined
-    // server-side. Base64 JSON on the relay; raw bytes on LAN.
-    func chartAsset(_ chartId: String, path: String) async throws -> (data: Data, contentType: String) {
-        if isRelayActive {
-            let query = path.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) ?? path
-            let result: ChartAssetResult = try await rpcDecoding(
-                method: "GET",
-                path: "/charts/\(escapePath(chartId))/asset64?path=\(query)"
-            )
-            guard let data = Data(base64Encoded: result.base64) else {
-                throw PerchClientError.invalidResponse
-            }
-            return (data, result.contentType)
-        }
-        var request = try makeRequest(path: "/charts/\(escapePath(chartId))/\(escapePath(path))")
-        request.httpMethod = "GET"
-        let (data, response) = try await URLSession.shared.data(for: request)
-        try validate(response, data: data)
-        let contentType = (response as? HTTPURLResponse)?
-            .value(forHTTPHeaderField: "Content-Type") ?? "application/octet-stream"
-        return (data, contentType)
-    }
-
-    // Send-only boss feedback: annotations + message become one composer block
-    // in the owning session's PTY. The agent's reply is the chart changing.
-    // Returns whether the server queued it behind an open permission prompt.
-    func sendChartFeedback(
-        _ chartId: String,
-        message: String,
-        annotations: [ChartAnnotationDraft]
-    ) async throws -> Bool {
-        var body: [String: Any] = [:]
-        let trimmed = message.trimmingCharacters(in: .whitespacesAndNewlines)
-        if !trimmed.isEmpty {
-            body["message"] = trimmed
-        }
-        if !annotations.isEmpty {
-            body["annotations"] = annotations.map { $0.payload.mapValues(\.jsonObject) }
-        }
-        let result: ChartFeedbackResult = try await postDecodingAny(
-            path: "/charts/\(escapePath(chartId))/feedback",
-            body: body
-        )
-        return result.queued ?? false
-    }
-
-    // The SDK's automated layout audit, relayed to the authoring agent as
-    // machine feedback (deduped server-side). Best-effort by design.
-    func reportChartLayoutWarnings(_ chartId: String, warnings: [Any]) async {
-        guard JSONSerialization.isValidJSONObject(["w": warnings]) else { return }
-        try? await postAny(
-            path: "/charts/\(escapePath(chartId))/layout-warnings",
-            body: ["layout_warnings": warnings]
-        )
     }
 
     // Apply a live assistant-reply frame. Each frame carries the full text so

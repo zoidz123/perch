@@ -527,9 +527,8 @@ enum AgentEvent: Identifiable, Equatable {
     case assistantStream(sessionId: String, itemId: String, text: String, done: Bool, at: String)
     case approvalRequest(sessionId: String, id: String, summary: String, command: String?, at: String)
     case status(sessionId: String, status: AgentSessionStatus, at: String)
-    // A registered chart appeared or its HTML changed on disk (append-only
-    // wire message; older servers never send it). Clients showing the chart
-    // refetch it.
+    // Deprecated append-only wire event retained for compatibility with
+    // servers that still emit it. Mobile intentionally decodes then ignores it.
     case chart(sessionId: String, chartId: String, name: String, reason: String, at: String)
 
     var id: String {

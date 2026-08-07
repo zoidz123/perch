@@ -112,18 +112,8 @@ struct ContentView: View {
             PairView()
                 .environmentObject(store)
         }
-        // The chart room rides above whatever is open (home or a session):
-        // card taps and future deep links both just set store.openChart.
-        .fullScreenCover(item: $store.openChart) { chart in
-            ChartReviewView(
-                chart: chart,
-                permitsOutboundActions: store.sessionContentPresentation(for: chart.sessionId).permitsOutboundActions
-            )
-                .environmentObject(store)
-                .preferredColorScheme(.dark)
-        }
-        // A committed plan opened from the Charts hub: the same chart styling,
-        // read-only (a plan has no owning session to send feedback to).
+        // A committed plan opened from the Plans hub is read-only because it
+        // has no owning agent session to route feedback to.
         .fullScreenCover(item: $store.openPlan) { plan in
             PlanReviewView(plan: plan)
                 .environmentObject(store)
@@ -209,13 +199,6 @@ struct ContentView: View {
             await store.refresh()
             if let sessionId = UserDefaults.standard.string(forKey: "PerchOpenSession") {
                 await store.openSession(sessionId)
-            }
-            // -PerchOpenChart <id> deep-opens the chart room (E2E/screenshots).
-            if let chartId = UserDefaults.standard.string(forKey: "PerchOpenChart") {
-                await store.fetchCharts()
-                if let chart = store.charts.first(where: { $0.id == chartId }) {
-                    store.openChart = chart
-                }
             }
             if openUsageOnLaunch {
                 showUsageSheet = true
@@ -1041,13 +1024,14 @@ struct HomeComposer: View {
     var focused: FocusState<Bool>.Binding
     @State private var text = ""
     @State private var sending = false
-    @State private var showChartsHub = false
+    @State private var showPlansHub = false
     @StateObject private var dictation = VoiceDictation()
 
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
-            // Controls row: the mate's model picker sits at the left (parity with
-            // the session composer), the Charts hub button is right-aligned.
+            // Controls row: the mate's model picker sits at the left, while
+            // committed implementation plans remain reachable from the home
+            // composer without exposing the retired chart surface.
             HStack(spacing: 10) {
                 if let mate = store.mateSession {
                     ModelChip(sessionId: mate.id, agent: mate.agent)
@@ -1057,12 +1041,12 @@ struct HomeComposer: View {
                 Spacer(minLength: 8)
 
                 Button {
-                    showChartsHub = true
+                    showPlansHub = true
                 } label: {
                     HStack(spacing: 5) {
-                        Image(systemName: "chart.bar.doc.horizontal")
+                        Image(systemName: "doc.plaintext")
                             .font(.system(size: 13, weight: .semibold))
-                        Text("Charts")
+                        Text("Plans")
                             .font(.system(size: 13, weight: .medium))
                     }
                     .foregroundStyle(Style.textSecondary)
@@ -1133,8 +1117,8 @@ struct HomeComposer: View {
             .animation(.easeOut(duration: 0.16), value: focused.wrappedValue)
             .dictationLifecycle(dictation)
         }
-        .sheet(isPresented: $showChartsHub) {
-            ChartsHubView()
+        .sheet(isPresented: $showPlansHub) {
+            PlansHubView()
                 .environmentObject(store)
                 .preferredColorScheme(.dark)
         }
@@ -1576,7 +1560,7 @@ struct SessionDetailView: View {
     @State private var selectionToken = UUID()
     @State private var pickedPhotos: [PhotosPickerItem] = []
     @State private var uploadingPhoto = false
-    @State private var showChartsHub = false
+    @State private var showPlansHub = false
     @FocusState private var composerFocused: Bool
     @StateObject private var dictation = VoiceDictation()
     // The no-mistakes gate this session's task is parked on, if any (resolved
@@ -1606,8 +1590,7 @@ struct SessionDetailView: View {
         store.sessionContentPresentation(for: sessionId)
     }
 
-    // The mate's own chat: the Charts hub button lives on this composer, where
-    // the boss actually chats with the mate.
+    // The mate's own chat exposes the committed Plans hub from its composer.
     private var isMate: Bool {
         session?.labels?["role"] == "mate"
     }
@@ -1924,9 +1907,8 @@ struct SessionDetailView: View {
         VStack(alignment: .leading, spacing: 8) {
             AttachmentBar(picked: $pickedPhotos, uploading: $uploadingPhoto)
 
-            // Controls row: the model picker at the left; for the mate's own
-            // chat the Charts hub button is right-aligned (parity with the home
-            // composer, where the boss also reaches the mate).
+            // Controls row: the model picker remains available for provider
+            // sessions. The mate also exposes the committed Plans hub here.
             if (session?.agent == .claude || session?.agent == .codex) || isMate {
                 HStack(spacing: 10) {
                     if let agent = session?.agent, agent == .claude || agent == .codex {
@@ -1936,12 +1918,12 @@ struct SessionDetailView: View {
                     if isMate {
                         Spacer(minLength: 8)
                         Button {
-                            showChartsHub = true
+                            showPlansHub = true
                         } label: {
                             HStack(spacing: 5) {
-                                Image(systemName: "chart.bar.doc.horizontal")
+                                Image(systemName: "doc.plaintext")
                                     .font(.system(size: 13, weight: .semibold))
-                                Text("Charts")
+                                Text("Plans")
                                     .font(.system(size: 13, weight: .medium))
                             }
                             .foregroundStyle(Style.textSecondary)
@@ -2001,8 +1983,8 @@ struct SessionDetailView: View {
             .animation(.easeOut(duration: 0.16), value: composerFocused)
             .dictationLifecycle(dictation)
         }
-        .sheet(isPresented: $showChartsHub) {
-            ChartsHubView()
+        .sheet(isPresented: $showPlansHub) {
+            PlansHubView()
                 .environmentObject(store)
                 .preferredColorScheme(.dark)
         }
