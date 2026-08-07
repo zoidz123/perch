@@ -36,6 +36,10 @@ struct TimelineChatView: View {
         }
     }
 
+    private var latestCanonicalAssistantItem: TimelineItem? {
+        store.chatItems(sessionId).last { $0.kind == .assistant && $0.seq > 0 }
+    }
+
     // Show the thinking indicator only while a reply is actually pending:
     // a message still in flight (optimistic and not yet timed out) or a running
     // turn whose last timeline item is not yet the assistant's text. A freshly
@@ -180,6 +184,10 @@ struct TimelineChatView: View {
                 guard new > old, scrollPresentation.didCommitDisplayedContent() else { return }
                 proxy.scrollTo(bottomID, anchor: .bottom)
             }
+            .onChange(of: latestCanonicalAssistantItem) {
+                guard scrollPresentation.didCommitDisplayedContent() else { return }
+                proxy.scrollTo(bottomID, anchor: .bottom)
+            }
             .onChange(of: store.streamingBySession[sessionId]) { _, reply in
                 updateStreamingPresentation(reply)
             }
@@ -237,6 +245,9 @@ struct TimelineChatView: View {
             cancelStreamingFlush()
             streamingPresentation.reset()
             return
+        }
+        if let currentItemID = streamingPresentation.itemID, currentItemID != reply.itemId {
+            cancelStreamingFlush()
         }
         let update = streamingPresentation.receive(
             itemID: reply.itemId,
