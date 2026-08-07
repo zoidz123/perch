@@ -19,7 +19,6 @@ struct TimelineChatView: View {
     @State private var scrollPresentation = TimelineScrollPresentation()
     @State private var streamingPresentation = StreamingMarkdownPresentationBuffer()
     @State private var streamingFlushTask: Task<Void, Never>?
-    @State private var initialTimelineSeq = Int.max
 
     private var items: [TimelineItem] {
         let source = store.chatItems(sessionId)
@@ -61,32 +60,6 @@ struct TimelineChatView: View {
         return last.kind != .assistant
     }
 
-    @State private var visibleChartCardId: String?
-    private let chartCardFreshness: TimeInterval = 60 * 60
-
-    private var latestChart: ChartModel? {
-        store.chartsFor(sessionId).last
-    }
-
-    private var chartCardIdentities: Set<String> {
-        Set(store.chartsFor(sessionId).map { $0.cardDismissalIdentity.key })
-    }
-
-    private var visibleChartCard: ChartModel? {
-        guard let chart = latestChart,
-              chart.id == visibleChartCardId,
-              !store.isChartCardDismissed(chart) else {
-            return nil
-        }
-        return chart
-    }
-
-    private var freshChartReadyItemId: String? {
-        items.last { item in
-            item.seq > initialTimelineSeq && (item.text?.contains("· chart_ready:") ?? false)
-        }?.id
-    }
-
     var body: some View {
         ScrollViewReader { proxy in
             ZStack(alignment: .bottomTrailing) {
@@ -107,23 +80,6 @@ struct TimelineChatView: View {
                             )
                             .opacity(item.id.hasPrefix("optimistic-") && !undelivered ? 0.55 : 1)
                             .padding(.vertical, 8)
-                        }
-                        // Chart cards are a heads-up only. The Charts hub is
-                        // the durable home, so this row expires after a short
-                        // hold or a manual dismiss.
-                        if let chart = visibleChartCard {
-                            ChartCardRow(
-                                chart: chart,
-                                crewTaskTitle: chart.sessionId == sessionId ? nil : chart.taskTitle,
-                                action: {
-                                    store.openChart = chart
-                                },
-                                onDismiss: {
-                                    dismissChartCard(chart)
-                                }
-                            )
-                            .padding(.vertical, 8)
-                            .transition(.move(edge: .bottom).combined(with: .opacity))
                         }
                         if isWorking {
                             ThinkingIndicator(reduceMotion: reduceMotion)
@@ -198,26 +154,10 @@ struct TimelineChatView: View {
                     proxy.scrollTo(bottomID, anchor: .bottom)
                 }
             }
-            .onChange(of: chartCardIdentities) { oldKeys, newKeys in
-                guard !newKeys.subtracting(oldKeys).isEmpty else { return }
-                presentLatestChartIfReady(proxy)
-            }
-            .onChange(of: freshChartReadyItemId) { _, itemId in
-                guard itemId != nil else { return }
-                Task {
-                    await store.fetchCharts()
-                    await MainActor.run {
-                        presentLatestChartIfReady(proxy)
-                    }
-                }
-            }
             .task {
                 updateStreamingPresentation(store.streamingBySession[sessionId])
                 await store.loadTimeline(sessionId)
-                await store.fetchCharts()
-                initialTimelineSeq = items.last(where: { $0.seq > 0 })?.seq ?? 0
                 updateStreamingPresentation(store.streamingBySession[sessionId])
-                presentLatestChartIfReady(proxy, requireFresh: true)
             }
             .onDisappear { cancelStreamingFlush() }
         }
@@ -279,47 +219,6 @@ struct TimelineChatView: View {
     private func cancelStreamingFlush() {
         streamingFlushTask?.cancel()
         streamingFlushTask = nil
-    }
-
-    private func presentLatestChartIfReady(_ proxy: ScrollViewProxy, requireFresh: Bool = false) {
-        guard let chart = latestChart,
-              visibleChartCardId != chart.id,
-              !store.isChartCardDismissed(chart),
-              !requireFresh || isFreshChart(chart) else {
-            return
-        }
-
-        let shouldFollow = scrollPresentation.isSticky
-        withAnimation(.snappy(duration: 0.22)) {
-            visibleChartCardId = chart.id
-        }
-        if shouldFollow {
-            proxy.scrollTo(bottomID, anchor: .bottom)
-        } else {
-            _ = scrollPresentation.didCommitDisplayedContent()
-        }
-    }
-
-    private func dismissChartCard(_ chart: ChartModel) {
-        store.dismissChartCard(chart)
-        guard visibleChartCardId == chart.id else { return }
-        withAnimation(.easeOut(duration: 0.16)) {
-            visibleChartCardId = nil
-        }
-    }
-
-    private func isFreshChart(_ chart: ChartModel) -> Bool {
-        guard let registeredAt = parseIsoDate(chart.registeredAt) else { return false }
-        return Date().timeIntervalSince(registeredAt) <= chartCardFreshness
-    }
-
-    private func parseIsoDate(_ value: String) -> Date? {
-        let fractional = ISO8601DateFormatter()
-        fractional.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
-        if let date = fractional.date(from: value) {
-            return date
-        }
-        return ISO8601DateFormatter().date(from: value)
     }
 
 }

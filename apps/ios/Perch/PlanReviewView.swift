@@ -1,16 +1,14 @@
 import SwiftUI
 import WebKit
 
-// The plan room: a read-only render of a committed implementation plan in the
-// same fixed Oro Nero chart styling as the chart room. The server renders the
-// plan's markdown to chart-styled HTML (GET /charts/plan?path=); the phone
-// loads that one self-contained document. Read-only by design: a committed plan has no
-// owning agent session to route feedback to, so there is no annotation chrome -
-// brainstorm-to-build, one continuous look, minus the send bar.
+// The plan room is a read-only render of a committed implementation plan. The
+// server returns one self-contained HTML document, so the phone does not need
+// any companion asset requests. A committed plan has no owning agent session
+// to route feedback to, so the surface has no annotation chrome.
 struct PlanReviewView: View {
     @EnvironmentObject private var store: PerchStore
     @Environment(\.dismiss) private var dismiss
-    let plan: ChartPlanDoc
+    let plan: PlanDocument
 
     @State private var html: String?
     @State private var loadFailed: String?
@@ -104,10 +102,8 @@ struct PlanReviewView: View {
     }
 }
 
-// The plan document surface: a WKWebView loading the server-rendered,
-// self-contained chart-styled HTML string directly (no scheme handler - the
-// document inlines its styling, so there are no sibling-asset fetches). External
-// links open in Safari; everything else is a static read.
+// The plan document surface loads the server-rendered, self-contained HTML
+// string directly. External links open in Safari; everything else is static.
 struct PlanWebView: UIViewRepresentable {
     let html: String
 
