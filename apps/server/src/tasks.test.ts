@@ -17,7 +17,7 @@ test("task lifecycle: create, verbs advance state, events append", () => {
   assert.match(task.id, /^fix-the-flaky-auth-[0-9a-f]{4}$/);
   assert.equal(task.state, "queued");
   assert.equal(task.kind, "ship");
-  assert.equal(task.mode, "direct-PR");
+  assert.equal(task.mode, undefined);
 
   tasks.recordEvent(task.id, { kind: "working", source: "worker", message: "reproducing" });
   tasks.recordEvent(task.id, { kind: "needs_decision", source: "worker", message: "two fixes possible" });
@@ -41,6 +41,21 @@ test("task lifecycle: create, verbs advance state, events append", () => {
     [1, 2, 3, 4, 5, 6, 7]
   );
 
+  rmSync(home, { recursive: true, force: true });
+});
+
+test("new tasks reject legacy delivery modes and accept the three task kinds", () => {
+  const { store: tasks, home } = store();
+  for (const mode of ["direct-PR", "no-mistakes", "local-only"] as const) {
+    assert.throws(
+      () => tasks.create({ title: `legacy ${mode}`, project: "/tmp/repo", mode }),
+      /legacy-only/
+    );
+  }
+  for (const kind of ["ship", "scout", "operate"] as const) {
+    assert.equal(tasks.create({ title: `${kind} task`, project: "/tmp/repo", kind }).kind, kind);
+  }
+  tasks.close();
   rmSync(home, { recursive: true, force: true });
 });
 
@@ -231,7 +246,7 @@ test("legacy active workers receive an atomic persisted name without rewriting h
 
 test("event data rides the ledger verbatim and reaches subscribers", () => {
   const { store: tasks, home } = store();
-  const task = tasks.create({ title: "gated ship", project: "/tmp/repo", mode: "no-mistakes" });
+  const task = tasks.create({ title: "gated ship", project: "/tmp/repo" });
   const noMistakes = {
     step: "review",
     findings: [{ id: "r1", severity: "error", file: "src/db.ts", line: 8, action: "ask-user", description: "index drop" }]
@@ -437,66 +452,19 @@ test("derived readiness follows verification and PR facts, and never persists", 
   rmSync(home, { recursive: true, force: true });
 });
 
-test("no-mistakes Reviewing follows durable review facts, not project mode", () => {
+test("legacy no-mistakes records remain readable but do not enter Reviewing from legacy authorization facts", () => {
   const { store: tasks, home } = store();
-  const task = tasks.create({ title: "gated work", project: "/tmp/repo", mode: "no-mistakes" });
-
-  // Scouting and implementation stay Working from launch.
-  const working = tasks.recordEvent(task.id, { kind: "working", source: "worker", message: "implementing" });
-  assert.equal(working.presentation?.state, "working");
-
-  // A denied authorization never marks review.
-  const denied = tasks.recordEvent(task.id, {
-    kind: "note",
-    source: "system",
-    data: { noMistakesAuthorization: { allowed: false, reason: "runtime_not_live" } }
-  });
-  assert.equal(denied.presentation?.state, "working");
-
-  // Only the system-recorded authorize decision counts; a worker-sourced note
-  // claiming allowed never creates the review fact.
-  const forged = tasks.recordEvent(task.id, {
-    kind: "note",
-    source: "worker",
-    data: { noMistakesAuthorization: { allowed: true, operation: "run", reason: "authorized" } }
-  });
-  assert.equal(forged.presentation?.state, "working");
-
-  // The allowed authorization is the durable proof the pipeline engaged.
-  const reviewing = tasks.recordEvent(task.id, {
-    kind: "note",
-    source: "system",
-    data: { noMistakesAuthorization: { allowed: true, operation: "run", reason: "authorized" } }
-  });
-  assert.equal(reviewing.presentation?.state, "reviewing");
-  assert.equal(tasks.list().find((candidate) => candidate.id === task.id)?.presentation?.state, "reviewing");
-
-  // A parked gate takes its primary state; resumed work surrenders review.
-  const parked = tasks.recordEvent(task.id, { kind: "needs_decision", source: "worker", message: "gate findings" });
-  assert.equal(parked.presentation?.state, "needs_you");
-  const resumed = tasks.recordEvent(task.id, { kind: "working", source: "worker", message: "addressing findings" });
-  assert.equal(resumed.presentation?.state, "working");
-
-  // Re-entering the pipeline restores Reviewing; a mate reject surrenders it.
+  const task = {
+    id: "legacy-gated-a1b2", title: "gated work", project: "/tmp/repo", kind: "ship" as const,
+    mode: "no-mistakes" as const, state: "working" as const,
+    createdAt: "2026-08-07T00:00:00.000Z", updatedAt: "2026-08-07T00:00:00.000Z"
+  };
+  tasks.stateDb.tasks.insertImported(task, [{ seq: 1, at: task.createdAt, kind: "created", source: "system" }]);
   tasks.recordEvent(task.id, {
-    kind: "note",
-    source: "system",
-    data: { noMistakesAuthorization: { allowed: true, operation: "gate-push", reason: "authorized" } }
+    kind: "note", source: "system", data: { noMistakesAuthorization: { allowed: true } }
   });
-  assert.equal(tasks.find(task.id)?.presentation?.state, "reviewing");
-  tasks.recordEvent(task.id, {
-    kind: "completion_requested",
-    source: "worker",
-    data: { deliverable: { kind: "pr", headOid: "head-a" } }
-  });
-  const requestSeq = tasks.events(task.id).at(-1)!.seq;
-  assert.equal(tasks.find(task.id)?.presentation?.state, "awaiting_verification");
-  const rejected = tasks.recordEvent(task.id, {
-    kind: "completion_rejected",
-    source: "system",
-    data: { completionDecision: { requestSeq } }
-  });
-  assert.equal(rejected.presentation?.state, "working");
+  assert.equal(tasks.find(task.id)?.mode, "no-mistakes");
+  assert.equal(tasks.find(task.id)?.presentation?.state, "working");
 
   tasks.close();
   rmSync(home, { recursive: true, force: true });

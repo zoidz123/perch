@@ -24,6 +24,7 @@
     "docs/security.md",
     "docs/no-mistakes-authorization.md",
     "docs/no-mistakes-upstream-sync.md",
+    "docs/autoreview-delivery.md",
     "docs/releasing.md",
     "scripts/check-public-seed.mjs",
     "scripts/npm-package-smoke.mjs",
@@ -40,6 +41,7 @@
     "docs/security.md",
     "docs/no-mistakes-authorization.md",
     "docs/no-mistakes-upstream-sync.md",
+    "docs/autoreview-delivery.md",
     "docs/releasing.md",
     "THIRD_PARTY_NOTICES.md",
     "packages/relay/README.md",
@@ -47,6 +49,9 @@
   ],
   "runtimeMarkdown": [
     "apps/server/assets/charts/AUTHORING.md",
-    "apps/server/assets/mate/AGENTS.md"
+    "apps/server/assets/mate/AGENTS.md",
+    "apps/server/assets/autoreview/skill/AGENTS.md",
+    "apps/server/assets/autoreview/skill/CLAUDE.md",
+    "apps/server/assets/autoreview/skill/SKILL.md"
   ]
 }

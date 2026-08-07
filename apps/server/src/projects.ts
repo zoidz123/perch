@@ -2,16 +2,13 @@ import { chmodSync, existsSync, readFileSync, renameSync, statSync, writeFileSyn
 import { homedir } from "node:os";
 import { basename, join, resolve } from "node:path";
 
-// Project registry: the places agents work. Seeded automatically from every
-// session start (so it fills itself from real usage, happy-style) and
-// editable explicitly; per-project delivery mode fields ride along for the
-// task layer (M1) and the mate (M2).
+// Project registry: the places agents work. It is seeded automatically from
+// every session start and deliberately has no delivery policy. Task kind owns
+// the product behavior for every new task.
 
 export type Project = {
   rootPath: string;
   name: string;
-  // Delivery mode for tasks in this project (M1+): how work ships.
-  mode?: "direct-PR" | "no-mistakes" | "local-only";
   addedAt: string;
   lastUsedAt: string;
 };
@@ -38,7 +35,7 @@ export class ProjectRegistry {
 
   // Record usage of a directory (called on every session start). Registers
   // unknown paths and bumps lastUsedAt on known ones.
-  touch(rootPath: string, fields: Partial<Pick<Project, "mode" | "name">> = {}): Project {
+  touch(rootPath: string, fields: Partial<Pick<Project, "name">> = {}): Project {
     const root = resolve(rootPath);
     const projects = this.load();
     const now = new Date().toISOString();
@@ -62,9 +59,6 @@ export class ProjectRegistry {
     if (fields.name) {
       project.name = fields.name;
     }
-    if (fields.mode) {
-      project.mode = fields.mode;
-    }
     this.persist(projects);
     return { ...project };
   }
@@ -73,23 +67,6 @@ export class ProjectRegistry {
     const root = resolve(rootPath);
     const project = this.load().find((candidate) => candidate.rootPath === root);
     return project ? { ...project } : undefined;
-  }
-
-  configure(
-    rootPath: string,
-    fields: { mode?: Project["mode"] | null }
-  ): Project {
-    const root = resolve(rootPath);
-    const existing = this.find(root);
-    const project = existing ?? this.touch(root);
-    const projects = this.load();
-    const target = projects.find((candidate) => candidate.rootPath === project.rootPath);
-    if (!target) throw new Error(`Unknown project: ${root}`);
-    if (fields.mode === null) delete target.mode;
-    else if (fields.mode !== undefined) target.mode = fields.mode;
-    target.lastUsedAt = new Date().toISOString();
-    this.persist(projects);
-    return { ...target };
   }
 
   // Unregister a project. Registry-only: the directory on disk is untouched.
@@ -117,7 +94,7 @@ export class ProjectRegistry {
             // Legacy registry rows can carry the removed field. Drop it from
             // the in-memory view without writing on startup; a later ordinary
             // registry mutation persists this normalized shape.
-            const { yolo: _legacyYolo, ...current } = project as Project & { yolo?: unknown };
+            const { yolo: _legacyYolo, mode: _legacyMode, ...current } = project as Project & { yolo?: unknown; mode?: unknown };
             return current as Project;
           })
         : [];

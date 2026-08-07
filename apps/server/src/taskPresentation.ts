@@ -1,6 +1,9 @@
 import type { Task, TaskPr, TaskPresentation } from "@perch/shared";
 
-export type TaskDeliverable = { kind: "pr"; headOid?: string } | { kind: "local"; revision?: string };
+export type TaskDeliverable =
+  | { kind: "pr"; headOid?: string }
+  | { kind: "local"; revision?: string }
+  | { kind: "report" };
 
 // The durable verification facts for a task's latest completion request:
 // which deliverable it named, whether the mate accepted it, and (local-only)
@@ -12,11 +15,12 @@ export type TaskVerificationFacts = {
   acceptedRevision?: string;
 };
 
-// The durable proof that a task's work entered the no-mistakes review
-// pipeline: the seq of the latest allowed runtime authorization (run,
-// gate-push, or agent-launch) not yet superseded by a return to working.
+// The durable review receipt state for the task's latest bundled AutoReview
+// attempt. A presentation never infers this state from task mode or prompt
+// wording.
 export type TaskReviewFacts = {
-  enteredSeq: number;
+  state: "running" | "findings" | "clean" | "failed" | "superseded" | "scope_paused";
+  attemptId: string;
 };
 
 export type TaskPresentationFacts = {
@@ -38,14 +42,15 @@ export function deriveTaskPresentation(task: Task, facts: TaskPresentationFacts 
   if (task.state === "needs_you") return { state: "needs_you" };
   if (task.state === "blocked") return { state: "blocked" };
   if (task.state === "completion_requested") return { state: "awaiting_verification" };
-  // A no-mistakes task is Reviewing only while the durable review facts prove
-  // the pipeline is actively engaged: an allowed runtime authorization not yet
-  // superseded by a return to working. Mode alone never promotes Working -
-  // scouting and implementation stay Working until the gate truly starts.
-  if (task.mode === "no-mistakes" && task.state === "working" && facts.review) return { state: "reviewing" };
+  // Review state belongs to the durable AutoReview receipt.  Legacy delivery
+  // modes cannot promote a task into Reviewing.
+  if (task.kind === "ship" && task.state === "working" && facts.review?.state === "running") return { state: "reviewing" };
   if (task.state !== "done") return { state: "working" };
   const verification = facts.verification;
   const deliverable = verification?.accepted ? verification.deliverable : undefined;
+  // Kept solely so persisted local-only records retain their historic
+  // recovery/presentation semantics during the migration window. New task
+  // creation cannot produce this mode.
   if (task.mode === "local-only") {
     if (
       deliverable?.kind === "local" &&
@@ -54,6 +59,10 @@ export function deriveTaskPresentation(task: Task, facts: TaskPresentationFacts 
     ) return { state: "ready_to_apply" };
     return { state: "working" };
   }
+  if ((task.kind === "operate" || task.kind === "scout") && verification?.accepted && deliverable?.kind === "report") {
+    return { state: "verified_done" };
+  }
+  if (task.kind === "operate" || task.kind === "scout") return { state: "working" };
   const pr = facts.pr ?? task.pr;
   if (
     deliverable?.kind === "pr" &&

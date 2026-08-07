@@ -14,7 +14,7 @@ Perch keeps this delegation durable with explicit task lifecycles, immutable evi
 npm install --global perchctl
 ```
 
-The `perchctl` package installs the `perch` command and its compatible signed no-mistakes runtime for Darwin arm64 and x64.
+The `perchctl` package installs the `perch` command and the pinned bundled AutoReview skill, helper, harness, attribution, license, and integrity manifest.
 Installation performs no lifecycle download and works with `npm --ignore-scripts`.
 
 ## Getting started
@@ -51,6 +51,8 @@ For one provider session without Mate orchestration, run `perch claude` or `perc
 A local background server launches Claude Code under server-owned PTYs and Codex through app-server daemons while preserving each provider's native desktop interface.
 SQLite records every task change and the state of each worker.
 The Task API carries structured updates between Mate and workers, and a worker's completion request becomes done only after Mate verifies and accepts it.
+New tasks are `ship`, `scout`, or `operate`.
+Ship work runs focused tests, receives a clean bundled AutoReview receipt for its exact final tree and diff, and uses a server-owned operation to create its PR.
 Every task has an explicit owner, which makes coordination more predictable even though agent execution is not deterministic.
 
 Perch was inspired by [Kun Chen's FirstMate](https://github.com/kunchenguid/firstmate) and its first-mate-and-crew model for coordinating isolated coding agents.
@@ -78,7 +80,7 @@ See the [complete CLI guide](docs/cli.md) for verified arguments, options, defau
 - [Architecture](docs/architecture.md)
 - [Worker task API and turn lifecycle](docs/worker-task-api.md)
 - [Security](docs/security.md)
-- [No-mistakes authorization](docs/no-mistakes-authorization.md)
+- [Bundled AutoReview delivery](docs/autoreview-delivery.md)
 - [Release and version synchronization](docs/releasing.md)
 
 Perch is available under the [MIT License](LICENSE).

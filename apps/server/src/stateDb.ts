@@ -12,9 +12,9 @@ import type {
   TaskPr
 } from "@perch/shared";
 import Database from "better-sqlite3";
-import type { TaskDeliverable, TaskReviewFacts, TaskVerificationFacts } from "./taskPresentation.js";
+import type { TaskDeliverable, TaskVerificationFacts } from "./taskPresentation.js";
 
-const LATEST_SCHEMA_VERSION = 16;
+const LATEST_SCHEMA_VERSION = 17;
 const LEGACY_TASK_IMPORT = "tasks-json-v1";
 
 const MIGRATIONS = [
@@ -638,6 +638,74 @@ const MIGRATIONS = [
       CREATE INDEX mate_mailbox_order_idx
         ON mate_mailbox_deliveries(recipient, state, task_event_id);
     `
+  },
+  {
+    version: 17,
+    name: "durable-autoreview-receipts",
+    sql: `
+      CREATE TABLE autoreview_attempts (
+        id TEXT PRIMARY KEY,
+        task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE RESTRICT,
+        runtime_id TEXT NOT NULL REFERENCES runtimes(id) ON DELETE RESTRICT,
+        runtime_generation INTEGER NOT NULL CHECK (runtime_generation >= 0),
+        session_id TEXT NOT NULL,
+        idempotency_key TEXT NOT NULL UNIQUE,
+        repository TEXT NOT NULL,
+        worktree_path TEXT NOT NULL,
+        branch TEXT NOT NULL,
+        base_ref TEXT NOT NULL,
+        base_oid TEXT NOT NULL,
+        head_oid TEXT NOT NULL,
+        tree_oid TEXT NOT NULL,
+        diff_manifest_json TEXT NOT NULL,
+        diff_sha256 TEXT NOT NULL,
+        status_porcelain_sha256 TEXT NOT NULL,
+        worktree_clean INTEGER NOT NULL CHECK (worktree_clean IN (0, 1)),
+        bundle_version TEXT NOT NULL,
+        upstream_commit TEXT NOT NULL,
+        helper_sha256 TEXT NOT NULL,
+        requested_engine TEXT NOT NULL,
+        requested_model TEXT NOT NULL,
+        requested_reasoning TEXT NOT NULL,
+        actual_engine TEXT,
+        actual_model TEXT,
+        actual_reasoning TEXT,
+        fallback_reason TEXT,
+        state TEXT NOT NULL CHECK (state IN ('running', 'clean', 'findings', 'failed', 'superseded', 'scope_paused')),
+        exit_code INTEGER,
+        findings_json TEXT NOT NULL DEFAULT '[]',
+        author_disposition_json TEXT NOT NULL DEFAULT '[]',
+        test_evidence_json TEXT NOT NULL DEFAULT '{}',
+        stdout_sha256 TEXT,
+        stderr_sha256 TEXT,
+        failure_code TEXT,
+        started_at TEXT NOT NULL,
+        completed_at TEXT,
+        supersedes_attempt_id TEXT REFERENCES autoreview_attempts(id) ON DELETE RESTRICT,
+        superseded_by_attempt_id TEXT REFERENCES autoreview_attempts(id) ON DELETE RESTRICT
+      ) STRICT;
+      CREATE INDEX autoreview_attempts_task_idx
+        ON autoreview_attempts(task_id, started_at DESC);
+      CREATE INDEX autoreview_attempts_exact_target_idx
+        ON autoreview_attempts(task_id, base_oid, head_oid, tree_oid, diff_sha256, state);
+
+      CREATE TABLE delivery_pr_attempts (
+        task_id TEXT PRIMARY KEY REFERENCES tasks(id) ON DELETE RESTRICT,
+        receipt_id TEXT NOT NULL REFERENCES autoreview_attempts(id) ON DELETE RESTRICT,
+        idempotency_key TEXT NOT NULL UNIQUE,
+        state TEXT NOT NULL CHECK (state IN ('creating', 'created', 'failed')),
+        base_oid TEXT NOT NULL,
+        head_oid TEXT NOT NULL,
+        tree_oid TEXT NOT NULL,
+        diff_sha256 TEXT NOT NULL,
+        pr_url TEXT,
+        pr_number INTEGER,
+        failure_code TEXT,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+      ) STRICT;
+      CREATE INDEX delivery_pr_attempts_receipt_idx ON delivery_pr_attempts(receipt_id);
+    `
   }
 ] as const;
 
@@ -805,6 +873,82 @@ export type OperationRecord = {
   attempts: number;
   lastError?: string;
   payload?: Record<string, unknown>;
+  createdAt: string;
+  updatedAt: string;
+};
+
+export type AutoReviewFindingRecord = {
+  id: string;
+  priority: string;
+  description: string;
+  location?: { file?: string; line?: number; column?: number };
+};
+
+export type AutoReviewTestEvidence = {
+  argv: string[];
+  argvSha256: string;
+  exitCode: number;
+  stdoutSha256: string;
+  stderrSha256: string;
+  headOid: string;
+  treeOid: string;
+  completedAt: string;
+};
+
+export type AutoReviewAttemptRecord = {
+  id: string;
+  taskId: string;
+  runtimeId: string;
+  runtimeGeneration: number;
+  sessionId: string;
+  idempotencyKey: string;
+  repository: string;
+  worktreePath: string;
+  branch: string;
+  baseRef: string;
+  baseOid: string;
+  headOid: string;
+  treeOid: string;
+  diffManifest: Record<string, unknown>;
+  diffSha256: string;
+  statusPorcelainSha256: string;
+  worktreeClean: boolean;
+  bundleVersion: string;
+  upstreamCommit: string;
+  helperSha256: string;
+  requestedEngine: string;
+  requestedModel: string;
+  requestedReasoning: string;
+  actualEngine?: string;
+  actualModel?: string;
+  actualReasoning?: string;
+  fallbackReason?: string;
+  state: "running" | "clean" | "findings" | "failed" | "superseded" | "scope_paused";
+  exitCode?: number;
+  findings: AutoReviewFindingRecord[];
+  authorDispositions: Array<Record<string, unknown>>;
+  testEvidence: AutoReviewTestEvidence | Record<string, never>;
+  stdoutSha256?: string;
+  stderrSha256?: string;
+  failureCode?: string;
+  startedAt: string;
+  completedAt?: string;
+  supersedesAttemptId?: string;
+  supersededByAttemptId?: string;
+};
+
+export type DeliveryPrAttemptRecord = {
+  taskId: string;
+  receiptId: string;
+  idempotencyKey: string;
+  state: "creating" | "created" | "failed";
+  baseOid: string;
+  headOid: string;
+  treeOid: string;
+  diffSha256: string;
+  prUrl?: string;
+  prNumber?: number;
+  failureCode?: string;
   createdAt: string;
   updatedAt: string;
 };
@@ -1071,6 +1215,8 @@ export class StateDb {
   readonly nativeChildRuns: NativeChildRunRepository;
   readonly workerReports: WorkerReportRepository;
   readonly mateMailbox: MateMailboxRepository;
+  readonly autoreview: AutoReviewRepository;
+  readonly delivery: DeliveryPrRepository;
   private readonly db: Database.Database;
 
   constructor(env: NodeJS.ProcessEnv = process.env) {
@@ -1084,6 +1230,8 @@ export class StateDb {
     this.db.prepare("UPDATE native_child_runs SET state = 'unknown' WHERE state IN ('waiting', 'running')").run();
     this.workerReports = new WorkerReportRepository(this.db);
     this.mateMailbox = new MateMailboxRepository(this.db);
+    this.autoreview = new AutoReviewRepository(this.db);
+    this.delivery = new DeliveryPrRepository(this.db);
     this.tasks = new TaskRepository(this.db, this.workerReports, this.mateMailbox);
     this.runtimes = new RuntimeRepository(this.db);
     this.operations = new OperationRepository(this.db);
@@ -1368,23 +1516,6 @@ export class TaskRepository {
     return new Map(rows.map((row) => [row.task_id, verificationFactsFromRow(row)]));
   }
 
-  // The durable proof of active no-mistakes review: the latest allowed runtime
-  // authorization not yet superseded by a return to working. Maintained per
-  // event append, so presentation never scans the full ledger on hot paths.
-  reviewFacts(taskId: string): TaskReviewFacts | undefined {
-    const row = this.db
-      .prepare("SELECT entered_seq FROM task_review_facts WHERE task_id = ?")
-      .get(taskId) as { entered_seq: number } | undefined;
-    return row ? { enteredSeq: row.entered_seq } : undefined;
-  }
-
-  reviewFactsByTask(): Map<string, TaskReviewFacts> {
-    const rows = this.db
-      .prepare("SELECT task_id, entered_seq FROM task_review_facts")
-      .all() as Array<{ task_id: string; entered_seq: number }>;
-    return new Map(rows.map((row) => [row.task_id, { enteredSeq: row.entered_seq }]));
-  }
-
   insertImported(task: Task, events: TaskEvent[]): { task: number; events: number } {
     const taskResult = this.db
       .prepare("INSERT OR IGNORE INTO tasks(id, state, updated_at, projection_json) VALUES (?, ?, ?, ?)")
@@ -1562,6 +1693,180 @@ type WorkerReportRow = {
   report_sha256: string;
   accepted_at: string;
 };
+
+export class AutoReviewRepository {
+  constructor(private readonly db: Database.Database) {}
+
+  find(id: string): AutoReviewAttemptRecord | undefined {
+    const row = this.db.prepare("SELECT * FROM autoreview_attempts WHERE id = ?").get(id) as Record<string, unknown> | undefined;
+    return row ? autoReviewAttemptFromRow(row) : undefined;
+  }
+
+  findByIdempotencyKey(key: string): AutoReviewAttemptRecord | undefined {
+    const row = this.db.prepare("SELECT * FROM autoreview_attempts WHERE idempotency_key = ?").get(key) as Record<string, unknown> | undefined;
+    return row ? autoReviewAttemptFromRow(row) : undefined;
+  }
+
+  latest(taskId: string): AutoReviewAttemptRecord | undefined {
+    const row = this.db
+      .prepare("SELECT * FROM autoreview_attempts WHERE task_id = ? ORDER BY started_at DESC, id DESC LIMIT 1")
+      .get(taskId) as Record<string, unknown> | undefined;
+    return row ? autoReviewAttemptFromRow(row) : undefined;
+  }
+
+  latestByTask(): Map<string, AutoReviewAttemptRecord> {
+    const rows = this.db.prepare(
+      `SELECT attempt.* FROM autoreview_attempts attempt
+       JOIN (SELECT task_id, max(started_at) AS started_at FROM autoreview_attempts GROUP BY task_id) latest
+         ON latest.task_id = attempt.task_id AND latest.started_at = attempt.started_at`
+    ).all() as Record<string, unknown>[];
+    return new Map(rows.map((row) => {
+      const attempt = autoReviewAttemptFromRow(row);
+      return [attempt.taskId, attempt];
+    }));
+  }
+
+  latestForTarget(input: Pick<AutoReviewAttemptRecord, "taskId" | "baseOid" | "headOid" | "treeOid" | "diffSha256">): AutoReviewAttemptRecord | undefined {
+    const row = this.db
+      .prepare(
+        `SELECT * FROM autoreview_attempts
+         WHERE task_id = ? AND base_oid = ? AND head_oid = ? AND tree_oid = ? AND diff_sha256 = ?
+         ORDER BY started_at DESC, id DESC LIMIT 1`
+      )
+      .get(input.taskId, input.baseOid, input.headOid, input.treeOid, input.diffSha256) as Record<string, unknown> | undefined;
+    return row ? autoReviewAttemptFromRow(row) : undefined;
+  }
+
+  create(attempt: AutoReviewAttemptRecord): void {
+    this.db
+      .prepare(
+        `INSERT INTO autoreview_attempts(
+          id, task_id, runtime_id, runtime_generation, session_id, idempotency_key,
+          repository, worktree_path, branch, base_ref, base_oid, head_oid, tree_oid,
+          diff_manifest_json, diff_sha256, status_porcelain_sha256, worktree_clean,
+          bundle_version, upstream_commit, helper_sha256,
+          requested_engine, requested_model, requested_reasoning,
+          actual_engine, actual_model, actual_reasoning, fallback_reason, state, exit_code,
+          findings_json, author_disposition_json, test_evidence_json, stdout_sha256, stderr_sha256,
+          failure_code, started_at, completed_at, supersedes_attempt_id, superseded_by_attempt_id
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+      )
+      .run(
+        attempt.id, attempt.taskId, attempt.runtimeId, attempt.runtimeGeneration, attempt.sessionId, attempt.idempotencyKey,
+        attempt.repository, attempt.worktreePath, attempt.branch, attempt.baseRef, attempt.baseOid, attempt.headOid, attempt.treeOid,
+        JSON.stringify(attempt.diffManifest), attempt.diffSha256, attempt.statusPorcelainSha256, attempt.worktreeClean ? 1 : 0,
+        attempt.bundleVersion, attempt.upstreamCommit, attempt.helperSha256,
+        attempt.requestedEngine, attempt.requestedModel, attempt.requestedReasoning,
+        attempt.actualEngine ?? null, attempt.actualModel ?? null, attempt.actualReasoning ?? null, attempt.fallbackReason ?? null,
+        attempt.state, attempt.exitCode ?? null,
+        JSON.stringify(attempt.findings), JSON.stringify(attempt.authorDispositions), JSON.stringify(attempt.testEvidence),
+        attempt.stdoutSha256 ?? null, attempt.stderrSha256 ?? null, attempt.failureCode ?? null,
+        attempt.startedAt, attempt.completedAt ?? null, attempt.supersedesAttemptId ?? null, attempt.supersededByAttemptId ?? null
+      );
+  }
+
+  complete(input: Pick<AutoReviewAttemptRecord, "id" | "state" | "exitCode" | "findings" | "authorDispositions" | "testEvidence" | "actualEngine" | "actualModel" | "actualReasoning" | "fallbackReason" | "stdoutSha256" | "stderrSha256" | "failureCode">): AutoReviewAttemptRecord {
+    this.db
+      .prepare(
+        `UPDATE autoreview_attempts
+         SET state = ?, exit_code = ?, findings_json = ?, author_disposition_json = ?, test_evidence_json = ?,
+             actual_engine = ?, actual_model = ?, actual_reasoning = ?, fallback_reason = ?,
+             stdout_sha256 = ?, stderr_sha256 = ?, failure_code = ?, completed_at = ?
+         WHERE id = ? AND state = 'running'`
+      )
+      .run(
+        input.state, input.exitCode ?? null, JSON.stringify(input.findings), JSON.stringify(input.authorDispositions), JSON.stringify(input.testEvidence),
+        input.actualEngine ?? null, input.actualModel ?? null, input.actualReasoning ?? null, input.fallbackReason ?? null,
+        input.stdoutSha256 ?? null, input.stderrSha256 ?? null, input.failureCode ?? null, new Date().toISOString(), input.id
+      );
+    const completed = this.find(input.id);
+    if (!completed) throw new Error(`Unknown AutoReview attempt: ${input.id}`);
+    return completed;
+  }
+
+  supersede(previousId: string, nextId: string): void {
+    this.db.prepare("UPDATE autoreview_attempts SET state = 'superseded', superseded_by_attempt_id = ?, completed_at = coalesce(completed_at, ?) WHERE id = ?")
+      .run(nextId, new Date().toISOString(), previousId);
+  }
+}
+
+export class DeliveryPrRepository {
+  constructor(private readonly db: Database.Database) {}
+
+  find(taskId: string): DeliveryPrAttemptRecord | undefined {
+    const row = this.db.prepare("SELECT * FROM delivery_pr_attempts WHERE task_id = ?").get(taskId) as Record<string, unknown> | undefined;
+    return row ? deliveryPrAttemptFromRow(row) : undefined;
+  }
+
+  create(attempt: DeliveryPrAttemptRecord): DeliveryPrAttemptRecord {
+    this.db
+      .prepare(
+        `INSERT INTO delivery_pr_attempts(
+          task_id, receipt_id, idempotency_key, state, base_oid, head_oid, tree_oid, diff_sha256,
+          pr_url, pr_number, failure_code, created_at, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+      )
+      .run(
+        attempt.taskId, attempt.receiptId, attempt.idempotencyKey, attempt.state, attempt.baseOid, attempt.headOid,
+        attempt.treeOid, attempt.diffSha256, attempt.prUrl ?? null, attempt.prNumber ?? null, attempt.failureCode ?? null,
+        attempt.createdAt, attempt.updatedAt
+      );
+    return this.find(attempt.taskId)!;
+  }
+
+  complete(taskId: string, prUrl: string, prNumber: number | undefined): DeliveryPrAttemptRecord {
+    this.db.prepare(
+      "UPDATE delivery_pr_attempts SET state = 'created', pr_url = ?, pr_number = ?, failure_code = NULL, updated_at = ? WHERE task_id = ?"
+    ).run(prUrl, prNumber ?? null, new Date().toISOString(), taskId);
+    return this.find(taskId)!;
+  }
+
+  fail(taskId: string, failureCode: string): DeliveryPrAttemptRecord {
+    this.db.prepare("UPDATE delivery_pr_attempts SET state = 'failed', failure_code = ?, updated_at = ? WHERE task_id = ?")
+      .run(failureCode, new Date().toISOString(), taskId);
+    return this.find(taskId)!;
+  }
+}
+
+function autoReviewAttemptFromRow(row: Record<string, unknown>): AutoReviewAttemptRecord {
+  const json = (key: string, fallback: unknown) => {
+    const value = row[key];
+    if (typeof value !== "string") return fallback;
+    try { return JSON.parse(value); } catch { return fallback; }
+  };
+  return {
+    id: String(row.id), taskId: String(row.task_id), runtimeId: String(row.runtime_id), runtimeGeneration: Number(row.runtime_generation),
+    sessionId: String(row.session_id), idempotencyKey: String(row.idempotency_key), repository: String(row.repository),
+    worktreePath: String(row.worktree_path), branch: String(row.branch), baseRef: String(row.base_ref), baseOid: String(row.base_oid),
+    headOid: String(row.head_oid), treeOid: String(row.tree_oid), diffManifest: json("diff_manifest_json", {}) as Record<string, unknown>,
+    diffSha256: String(row.diff_sha256), statusPorcelainSha256: String(row.status_porcelain_sha256), worktreeClean: Number(row.worktree_clean) === 1,
+    bundleVersion: String(row.bundle_version), upstreamCommit: String(row.upstream_commit), helperSha256: String(row.helper_sha256),
+    requestedEngine: String(row.requested_engine), requestedModel: String(row.requested_model), requestedReasoning: String(row.requested_reasoning),
+    ...(typeof row.actual_engine === "string" ? { actualEngine: row.actual_engine } : {}),
+    ...(typeof row.actual_model === "string" ? { actualModel: row.actual_model } : {}),
+    ...(typeof row.actual_reasoning === "string" ? { actualReasoning: row.actual_reasoning } : {}),
+    ...(typeof row.fallback_reason === "string" ? { fallbackReason: row.fallback_reason } : {}),
+    state: String(row.state) as AutoReviewAttemptRecord["state"], ...(typeof row.exit_code === "number" ? { exitCode: row.exit_code } : {}),
+    findings: json("findings_json", []) as AutoReviewFindingRecord[], authorDispositions: json("author_disposition_json", []) as Array<Record<string, unknown>>,
+    testEvidence: json("test_evidence_json", {}) as AutoReviewAttemptRecord["testEvidence"],
+    ...(typeof row.stdout_sha256 === "string" ? { stdoutSha256: row.stdout_sha256 } : {}),
+    ...(typeof row.stderr_sha256 === "string" ? { stderrSha256: row.stderr_sha256 } : {}),
+    ...(typeof row.failure_code === "string" ? { failureCode: row.failure_code } : {}),
+    startedAt: String(row.started_at), ...(typeof row.completed_at === "string" ? { completedAt: row.completed_at } : {}),
+    ...(typeof row.supersedes_attempt_id === "string" ? { supersedesAttemptId: row.supersedes_attempt_id } : {}),
+    ...(typeof row.superseded_by_attempt_id === "string" ? { supersededByAttemptId: row.superseded_by_attempt_id } : {})
+  };
+}
+
+function deliveryPrAttemptFromRow(row: Record<string, unknown>): DeliveryPrAttemptRecord {
+  return {
+    taskId: String(row.task_id), receiptId: String(row.receipt_id), idempotencyKey: String(row.idempotency_key),
+    state: String(row.state) as DeliveryPrAttemptRecord["state"], baseOid: String(row.base_oid), headOid: String(row.head_oid), treeOid: String(row.tree_oid),
+    diffSha256: String(row.diff_sha256), ...(typeof row.pr_url === "string" ? { prUrl: row.pr_url } : {}),
+    ...(typeof row.pr_number === "number" ? { prNumber: row.pr_number } : {}),
+    ...(typeof row.failure_code === "string" ? { failureCode: row.failure_code } : {}), createdAt: String(row.created_at), updatedAt: String(row.updated_at)
+  };
+}
 
 export class WorkerReportRepository {
   constructor(private readonly db: Database.Database) {}

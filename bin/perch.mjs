@@ -107,6 +107,21 @@ async function main() {
     return;
   }
 
+  if (parsed.command === "task") {
+    await runTaskEventCommand(parsed.args, parsed.options);
+    return;
+  }
+
+  if (parsed.command === "autoreview") {
+    await runAutoReviewCommand(parsed.args, parsed.options);
+    return;
+  }
+
+  if (parsed.command === "delivery") {
+    await runDeliveryCommand(parsed.args, parsed.options);
+    return;
+  }
+
   if (parsed.command === "mailbox") {
     await runMailboxCommand(parsed.args, parsed.options);
     return;
@@ -621,8 +636,6 @@ async function runDevicesCommand(args, options) {
 // Project registry: list / add / remove
 // ---------------------------------------------------------------------------
 
-const PROJECT_MODES = new Set(["direct-PR", "no-mistakes", "local-only"]);
-
 async function runProjectCommand(args, options) {
   const action = args[0] ?? "list";
 
@@ -639,59 +652,40 @@ async function runProjectCommand(args, options) {
     }
     const rows = projects.map((project) => ({
       name: project.name,
-      mode: project.mode ?? "direct-PR (default)",
       used: humanizeSince(project.lastUsedAt),
       path: prettyPath(project.rootPath)
     }));
     const widths = {
       name: Math.max(4, ...rows.map((row) => row.name.length)),
-      mode: Math.max(4, ...rows.map((row) => row.mode.length)),
       used: Math.max(9, ...rows.map((row) => row.used.length))
     };
     console.log(
-      `${"NAME".padEnd(widths.name)}  ${"MODE".padEnd(widths.mode)}  ${"LAST USED".padEnd(widths.used)}  PATH`
+      `${"NAME".padEnd(widths.name)}  ${"LAST USED".padEnd(widths.used)}  PATH`
     );
     for (const row of rows) {
       console.log(
-        `${row.name.padEnd(widths.name)}  ${row.mode.padEnd(widths.mode)}  ${row.used.padEnd(widths.used)}  ${row.path}`
+        `${row.name.padEnd(widths.name)}  ${row.used.padEnd(widths.used)}  ${row.path}`
       );
     }
     return;
   }
 
   if (action === "add") {
-    const { path, mode, yes } = parseProjectArgs(args.slice(1), "add");
+    const { path } = parseProjectArgs(args.slice(1), "add");
     const root = resolve(path);
     if (!existsSync(root)) {
       throw new Error(`no such directory: ${root}`);
     }
-    // O2: setting mode no-mistakes is consent to run `no-mistakes init` in the
-    // repo right away, so the CLI asks first (skipped under --yes / non-TTY).
-    if (mode === "no-mistakes" && !yes && process.stdin.isTTY) {
-      const answer = await promptLine(`initialize the no-mistakes gate in ${prettyPath(root)} now? [Y/n] `);
-      if (/^n/i.test(answer.trim())) {
-        console.log("aborted - setting the mode runs `no-mistakes init`; nothing registered");
-        return;
-      }
-    }
     const response = await fetch(httpUrl(options, "/projects"), {
       method: "POST",
       headers: jsonHeaders(options),
-      body: JSON.stringify({
-        rootPath: root,
-        ...(mode ? { mode } : {})
-      })
+      body: JSON.stringify({ rootPath: root })
     });
     if (!response.ok) {
       throw new Error(await responseError(response));
     }
     const body = await response.json();
     console.log(`registered ${body.project.name} (${prettyPath(body.project.rootPath)})`);
-    if (body.noMistakes?.warning) {
-      console.log(`warning: ${body.noMistakes.warning}`);
-    } else if (body.noMistakes?.ran) {
-      console.log("no-mistakes gate initialized");
-    }
     return;
   }
 
@@ -717,47 +711,20 @@ async function runProjectCommand(args, options) {
     if (!response.ok) throw new Error(await responseError(response));
     const project = (await response.json()).projects?.find((entry) => resolve(entry.rootPath) === root);
     if (!project) throw new Error(`unknown project: ${root}`);
-    console.log(`PROJECT  ${project.name}\nPATH     ${prettyPath(project.rootPath)}\nMODE     ${project.mode ?? "direct-PR (built-in default)"}`);
+    console.log(`PROJECT  ${project.name}\nPATH     ${prettyPath(project.rootPath)}`);
     return;
   }
 
-  if (action === "set") {
-    const { path, mode, yes } = parseProjectArgs(args.slice(1), "set");
-    if (mode === undefined) throw new Error("project set requires --mode");
-    const root = resolve(path);
-    if (mode === "no-mistakes") {
-      const config = await fetchConfig(options);
-      validateBundledRuntimeEntries(config.entries ?? {});
-      if (!yes) {
-        if (!process.stdin.isTTY) throw new Error("setting project mode=no-mistakes requires confirmation; rerun with --yes");
-        const answer = await promptLine(`initialize the no-mistakes gate in ${prettyPath(root)} now? [Y/n] `);
-        if (/^n/i.test(answer.trim())) {
-          console.log("aborted - setting the mode runs `no-mistakes init`; prior mode preserved");
-          return;
-        }
-      }
-    }
-    const response = await fetch(httpUrl(options, "/projects"), { method: "PATCH", headers: jsonHeaders(options), body: JSON.stringify({ rootPath: root, ...(mode !== undefined ? { mode } : {}) }) });
-    if (!response.ok) throw new Error(await responseError(response));
-    console.log(`updated ${prettyPath(root)}`);
-    return;
-  }
-
-  throw new Error(`unknown project action: ${action} (expected list|add|show|set|remove)`);
+  if (action === "set") throw new Error("project delivery modes were removed; choose ship, scout, or operate when creating a task");
+  throw new Error(`unknown project action: ${action} (expected list|add|show|remove)`);
 }
 
 function parseProjectArgs(args, action) {
   let path;
-  let mode;
-  let yes;
   for (let index = 0; index < args.length; index += 1) {
     const arg = args[index];
-    if (arg === "--mode") {
-      mode = requireValue(args, (index += 1), arg);
-    } else if (arg.startsWith("--mode=")) {
-      mode = arg.slice("--mode=".length);
-    } else if (arg === "--yes" || arg === "-y") {
-      yes = true;
+    if (arg === "--mode" || arg.startsWith("--mode=")) {
+      throw new Error("project delivery modes were removed; choose ship, scout, or operate when creating a task");
     } else if (arg.startsWith("-")) {
       throw new Error(`unknown option for project ${action}: ${arg}`);
     } else if (!path) {
@@ -769,10 +736,7 @@ function parseProjectArgs(args, action) {
   if (!path) {
     throw new Error(`project ${action} requires a path`);
   }
-  if (mode !== undefined && !PROJECT_MODES.has(mode)) {
-    throw new Error(`invalid --mode: ${mode} (expected ${[...PROJECT_MODES].join("|")})`);
-  }
-  return { path, mode, yes };
+  return { path };
 }
 
 // ---------------------------------------------------------------------------
@@ -1317,6 +1281,76 @@ async function runReportCommand(args, options) {
   }
 }
 
+async function runAutoReviewCommand(args, options) {
+  const { flags, positionals } = parseSubcommandFlags(args);
+  if (positionals[0] !== "run") {
+    throw new Error("usage: perch autoreview run --task <task-id> --idempotency-key <key> --test-argv-json <json-array> [--base-ref <ref>]");
+  }
+  const taskId = typeof flags.task === "string" ? flags.task : undefined;
+  const idempotencyKey = typeof flags["idempotency-key"] === "string" ? flags["idempotency-key"] : flags.key;
+  if (!taskId) throw new Error("--task <task-id> is required");
+  if (typeof idempotencyKey !== "string" || !idempotencyKey.trim()) throw new Error("--idempotency-key <key> is required");
+  if (typeof flags["test-argv-json"] !== "string") throw new Error("--test-argv-json <json-array> is required");
+  let testArgv;
+  try {
+    testArgv = JSON.parse(flags["test-argv-json"]);
+  } catch {
+    throw new Error("--test-argv-json must be a JSON string array");
+  }
+  if (!Array.isArray(testArgv) || testArgv.length === 0 || testArgv.some((part) => typeof part !== "string")) {
+    throw new Error("--test-argv-json must be a non-empty JSON string array");
+  }
+  const result = await mailboxFetch(`${hookBaseUrl(options)}/tasks/${encodeURIComponent(taskId)}/autoreview`, {
+    method: "POST",
+    headers: hookCredentialHeaders(),
+    body: JSON.stringify({
+      idempotencyKey: idempotencyKey.trim(),
+      testArgv,
+      ...(typeof flags["base-ref"] === "string" ? { baseRef: flags["base-ref"] } : {}),
+      ...(typeof flags["supersedes-attempt-id"] === "string" ? { supersedesAttemptId: flags["supersedes-attempt-id"] } : {})
+    })
+  });
+  console.log(JSON.stringify(result, null, 2));
+}
+
+async function runDeliveryCommand(args, options) {
+  const { flags, positionals } = parseSubcommandFlags(args);
+  if (positionals[0] !== "create-pr") {
+    throw new Error("usage: perch delivery create-pr --task <task-id> --idempotency-key <key>");
+  }
+  const taskId = typeof flags.task === "string" ? flags.task : undefined;
+  const idempotencyKey = typeof flags["idempotency-key"] === "string" ? flags["idempotency-key"] : flags.key;
+  if (!taskId) throw new Error("--task <task-id> is required");
+  if (typeof idempotencyKey !== "string" || !idempotencyKey.trim()) throw new Error("--idempotency-key <key> is required");
+  const result = await mailboxFetch(`${hookBaseUrl(options)}/tasks/${encodeURIComponent(taskId)}/delivery/pr`, {
+    method: "POST",
+    headers: hookCredentialHeaders(),
+    body: JSON.stringify({ idempotencyKey: idempotencyKey.trim() })
+  });
+  console.log(JSON.stringify(result, null, 2));
+}
+
+async function runTaskEventCommand(args, options) {
+  const { flags, positionals } = parseSubcommandFlags(args);
+  if (positionals[0] !== "event") {
+    throw new Error("usage: perch task event --task <task-id> --kind <event-kind> [--message <message>]");
+  }
+  const taskId = typeof flags.task === "string" ? flags.task : undefined;
+  const kind = typeof flags.kind === "string" ? flags.kind : undefined;
+  const message = typeof flags.message === "string" ? flags.message : undefined;
+  if (!taskId) throw new Error("--task <task-id> is required");
+  if (!kind) throw new Error("--kind <event-kind> is required");
+  const result = await mailboxFetch(`${hookBaseUrl(options)}/tasks/${encodeURIComponent(taskId)}/events`, {
+    method: "POST",
+    headers: hookCredentialHeaders(),
+    body: JSON.stringify({ kind, ...(message ? { message } : {}) })
+  });
+  if (kind === "done" && result?.task?.state !== "completion_requested") {
+    throw new Error("done report was not accepted as a completion request");
+  }
+  console.log(JSON.stringify(result, null, 2));
+}
+
 async function runMailboxCommand(args, options) {
   const { flags, positionals } = parseSubcommandFlags(args);
   const action = positionals[0] ?? "read";
@@ -1426,6 +1460,7 @@ function taskStateLabel(task) {
     landed: "Landed",
     ready_to_merge: "Ready to merge",
     ready_to_apply: "Ready to apply",
+    verified_done: "Verified done",
     failed: "Failed",
     closed: "Closed"
   }[state] ?? state;
@@ -2116,9 +2151,9 @@ function parseArgs(argv) {
       passthrough = true;
       continue;
     }
-    // `project`, `config`, `runtime`, `models`, `tasks`, `worktrees`, and `doctor` keep their own flags as positionals; the shared flags above
+    // Subcommands with their own flag grammar keep those flags as positionals; the shared flags above
     // (--server, --token, ...) are already consumed.
-    if (arg.startsWith("-") && command !== "project" && command !== "config" && command !== "runtime" && command !== "models" && command !== "tasks" && command !== "worktrees" && command !== "doctor" && command !== "report" && command !== "mailbox") {
+    if (arg.startsWith("-") && command !== "project" && command !== "config" && command !== "runtime" && command !== "models" && command !== "tasks" && command !== "task" && command !== "worktrees" && command !== "doctor" && command !== "report" && command !== "mailbox" && command !== "autoreview" && command !== "delivery") {
       throw new Error(`unknown option for ${command}: ${arg} (see \`perch --help\`)`);
     }
     args.push(arg);
@@ -2675,13 +2710,15 @@ function printHelp(command) {
   perch ls
   perch tasks [--json]
   perch report send --task <task-id> --summary <text> --report-file <path>
+  perch autoreview run --task <task-id> --idempotency-key <key> --test-argv-json <json-array>
+  perch delivery create-pr --task <task-id> --idempotency-key <key>
+  perch task event --task <task-id> --kind <event-kind> [--message <message>]
   perch mailbox [read|list|message <id>|ack <id> --token <t>|wait]
   perch pair
   perch devices [ls|revoke <id>]
   perch project [list]
-  perch project add <path> [--mode direct-PR|no-mistakes|local-only] [--yes]
+  perch project add <path>
   perch project show <path>
-  perch project set <path> --mode direct-PR|no-mistakes|local-only [--yes]
   perch project remove <path>
   perch runtime [show|validate] [--json]
   perch models [--json]
@@ -2715,8 +2752,8 @@ Session ids can be shortened: \`perch attach e1b4\` works if unambiguous.
 \`perch doctor\` validates the immutable no-mistakes runtime bundled with this
 perchctl package. It never downloads or repairs that runtime from PATH; reinstall
 this exact perchctl version if the bundled bytes are missing or corrupt.
-\`perch config\` shows global Mate and dispatch defaults only. Use \`perch project\`
-for delivery mode and \`perch runtime\` for bundled-runtime provenance.
+\`perch config\` shows global Mate and dispatch defaults only. Choose task kind
+(ship, scout, or operate) when creating work. Use \`perch runtime\` for bundled-runtime provenance.
 
 Examples:
   perch claude
@@ -2744,13 +2781,16 @@ function commandHelp(command) {
   if (command === "ls") return "Usage: perch ls\n\nLists Perch sessions.";
   if (command === "tasks") return "Usage: perch tasks [--json]\n\nLists active durable tasks using the same task state, runtime, and PR facts shown in the mobile app.";
   if (command === "report") return "Usage: perch report send --task <task-id> --summary <text> (--report <text> | --report-file <path>) [--evidence-file <path>] [--format <format>] [--key <idempotency-key>]\n\nDurably submits a worker's full report + evidence to the mate mailbox (byte-for-byte, no truncation). Success means the report was committed, not that the mate processed it. Uses the session's hook credentials from the environment.";
+  if (command === "autoreview") return "Usage: perch autoreview run --task <task-id> --idempotency-key <key> --test-argv-json <json-array> [--base-ref <ref>] [--supersedes-attempt-id <id>]\n\nRuns the immutable bundled AutoReview helper for the current managed root runtime and returns a durable receipt plus structured findings. test-argv-json must name a supported test launcher such as npm test or node --test; shells and arbitrary executables are rejected, and raw arguments are not persisted.";
+  if (command === "delivery") return "Usage: perch delivery create-pr --task <task-id> --idempotency-key <key>\n\nCreates the ship task PR through Perch's server-owned path after it verifies a clean AutoReview receipt.";
+  if (command === "task") return "Usage: perch task event --task <task-id> --kind <event-kind> [--message <message>]\n\nReports a managed worker lifecycle event without exposing the hook HTTP transport.";
   if (command === "mailbox") return "Usage:\n  perch mailbox read [--limit <n>]\n  perch mailbox list\n  perch mailbox message <message-id>\n  perch mailbox ack <message-id> --token <claim-token> [--key <idempotency-key>] [--disposition <text>]\n  perch mailbox wait [--timeout <seconds, max 30>]\n\nThe mate's durable worker-to-mate mailbox: read claims the oldest unacknowledged messages (returning pointers + summaries + claim tokens), message returns the original full report/event content, ack records the semantic acknowledgment, and wait is a bounded (<= 30s) latency optimization that returns immediately when messages are pending. Restricted to the live mate session's hook credentials.";
   if (command === "pair") return "Usage: perch pair [--title <device-name>]\n\nCreates a device pairing offer. Treat the printed URL and QR code as credentials.";
   if (command === "devices") return "Usage:\n  perch devices [ls]\n  perch devices revoke <id>\n\nLists paired devices or revokes one device token.";
-  if (command === "project") return `Usage:\n  perch project [list|ls]\n  perch project add <path> [--mode direct-PR|no-mistakes|local-only] [--yes]\n  perch project show <path>\n  perch project set <path> --mode direct-PR|no-mistakes|local-only [--yes]\n  perch project remove|rm <path>\n\nThe project registry is live server state. Use \`perch project list\` to inspect it.\n\`--mode no-mistakes\` initializes and verifies the bundled gate before persisting the mode; it asks once unless --yes is present.`;
+  if (command === "project") return "Usage:\n  perch project [list|ls]\n  perch project add <path>\n  perch project show <path>\n  perch project remove|rm <path>\n\nThe project registry is live server state only. It does not control delivery; choose ship, scout, or operate when creating a task.";
   if (command === "models") return "Usage: perch models [--json]\n\nLists selectable Mate and dispatch models, aliases, supported effort levels, and sources.";
   if (command === "runtime") return "Usage: perch runtime [show|validate] [--json]\n\nShows or validates the read-only bundled no-mistakes runtime provenance shipped with this perchctl package.";
-  if (command === "config") return `Usage:\n  perch config show [--global] [--effective] [--json]\n  perch config get <key> [--global] [--effective] [--json]\n  perch config set <mate|dispatch> <model> [--effort <level>] [--agent <agent>]\n  perch config set --global <key> <value>\n  perch config unset --global <key>\n  perch config validate [--global] [--effective] [--json]\n\nGlobal defaults: dispatch.* for workers and mate.* for Mate.\nProject delivery mode moved to \`perch project show|set <path>\`.\nRuntime keys are read-only provenance for this perchctl package; view them with \`perch runtime [show|validate]\`.\nUse \`perch project list\` for the live project registry.`;
+  if (command === "config") return `Usage:\n  perch config show [--global] [--effective] [--json]\n  perch config get <key> [--global] [--effective] [--json]\n  perch config set <mate|dispatch> <model> [--effort <level>] [--agent <agent>]\n  perch config set --global <key> <value>\n  perch config unset --global <key>\n  perch config validate [--global] [--effective] [--json]\n\nGlobal defaults: dispatch.* for workers and mate.* for Mate.\nTask kind controls delivery: ship, scout, or operate.\nRuntime keys are read-only provenance for this perchctl package; view them with \`perch runtime [show|validate]\`.\nUse \`perch project list\` for the live project registry.`;
   if (command === "worktrees") return "Usage:\n  perch worktrees\n  perch worktrees release <id> [--force]\n\nLists isolated task worktrees or releases an orphaned lease.";
   if (command === "doctor") return "Usage: perch doctor [--json] [--fix [--yes]]\n\nChecks the server environment and validates the immutable bundled no-mistakes runtime. It does not download or PATH-repair that runtime.";
   if (command === "uninstall") return "Usage: perch uninstall [--dry-run] [--purge-data] [--force]\n\nRemoves Perch-managed agent configuration. It preserves ~/.perch state unless --purge-data is supplied.";

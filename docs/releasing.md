@@ -25,7 +25,7 @@ npm pack --dry-run
 ```
 
 The package smoke test installs the produced tarball locally and globally with `npm --ignore-scripts` in an isolated home.
-It verifies the bundled no-mistakes inventory and byte hashes without downloading anything during consumer installation.
+It verifies the bundled AutoReview inventory, integrity manifest, executable helper, and harness without downloading anything during consumer installation.
 
 ## TestFlight
 

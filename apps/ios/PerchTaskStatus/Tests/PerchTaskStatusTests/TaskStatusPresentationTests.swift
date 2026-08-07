@@ -17,6 +17,7 @@ final class TaskStatusPresentationTests: XCTestCase {
         XCTAssertEqual(TaskStatusPresentation.primaryChip(taskState: "working", pr: nil, presentationState: "reviewing", mode: "no-mistakes").label, "Reviewing")
         XCTAssertEqual(TaskStatusPresentation.primaryChip(taskState: "done", pr: nil, presentationState: "ready_to_merge").label, "Ready to merge")
         XCTAssertEqual(TaskStatusPresentation.primaryChip(taskState: "done", pr: nil, presentationState: "ready_to_apply", mode: "local-only").label, "Ready to apply")
+        XCTAssertEqual(TaskStatusPresentation.primaryChip(taskState: "done", pr: nil, presentationState: "verified_done").label, "Verified done")
         XCTAssertEqual(TaskStatusPresentation.primaryChip(taskState: "completion_requested", pr: nil, presentationState: "awaiting_verification").label, "Awaiting verification")
         XCTAssertEqual(TaskStatusPresentation.primaryChip(taskState: "needs_you", pr: nil, presentationState: "needs_you").label, "Needs you")
         XCTAssertEqual(TaskStatusPresentation.primaryChip(taskState: "blocked", pr: nil, presentationState: "blocked").label, "Blocked")

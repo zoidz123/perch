@@ -7,6 +7,7 @@ import {
   chmodSync,
   copyFileSync,
   existsSync,
+  lstatSync,
   mkdirSync,
   mkdtempSync,
   readFileSync,
@@ -87,7 +88,8 @@ try {
   chmodSync(localBin, 0o755);
   command(localBin, ["--help"]);
   const projectHelp = command(localBin, ["project", "--help"]);
-  assert.match(projectHelp, /direct-PR\|no-mistakes\|local-only/);
+  assert.match(projectHelp, /ship, scout, or operate/);
+  assert.doesNotMatch(projectHelp, /direct-PR\|no-mistakes\|local-only/);
   assert.doesNotMatch(projectHelp, /yolo/i);
   assert.doesNotMatch(
     readFileSync(join(localPrefix, "node_modules/perchctl/apps/server/assets/mate/AGENTS.md"), "utf8"),
@@ -97,7 +99,9 @@ try {
   npm(["exec", "--prefix", localPrefix, "--", "perch", "--help"]);
   command(process.execPath, ["-e", `import(${JSON.stringify(pathToFileURL(join(localPrefix, "node_modules/perchctl/packages/shared/dist/index.js")).href)})`]);
   command(process.execPath, ["-e", `import(${JSON.stringify(pathToFileURL(join(localPrefix, "node_modules/perchctl/packages/relay/dist/index.js")).href)})`]);
+  command(process.execPath, ["-e", `import(${JSON.stringify(pathToFileURL(join(localPrefix, "node_modules/perchctl/apps/server/dist/autoreviewRuntime.js")).href)}).then(({ resolveBundledAutoReview }) => resolveBundledAutoReview())`]);
   assertBundledRuntime(join(localPrefix, "node_modules/perchctl"));
+  assertBundledAutoReview(join(localPrefix, "node_modules/perchctl"));
 
   // better-sqlite3 is an existing native dependency with its own install
   // script. The ignore-scripts lanes above and below prove the bundled
@@ -126,6 +130,7 @@ try {
   command(globalBin, ["--help"]);
   assert.equal(command(globalBin, ["--version"]).trim(), pack.version);
   assertBundledRuntime(join(globalPrefix, "lib/node_modules/perchctl"));
+  assertBundledAutoReview(join(globalPrefix, "lib/node_modules/perchctl"));
   waitForStop();
   npm(["uninstall", "--global", "--prefix", globalPrefix, pack.name]);
   assert(existsSync(stateSentinel), "global uninstall removed PERCH_HOME state");
@@ -157,6 +162,11 @@ function auditPack(pack) {
     "apps/server/dist/charts/vendor/LICENSE",
     "apps/server/assets/mate/AGENTS.md",
     "apps/server/assets/charts/chart.css",
+    "apps/server/assets/autoreview/manifest.json",
+    "apps/server/assets/autoreview/LICENSE.upstream",
+    "apps/server/assets/autoreview/skill/SKILL.md",
+    "apps/server/assets/autoreview/skill/scripts/autoreview",
+    "apps/server/assets/autoreview/skill/scripts/test-review-harness",
     "packages/shared/dist/index.js",
     "packages/relay/dist/cli.js",
     "vendor/no-mistakes/manifest.json",
@@ -194,6 +204,10 @@ function auditPack(pack) {
     const runtime = pack.files.find((file) => file.path === path);
     assert(runtime && (runtime.mode & 0o111) !== 0, `${path} is not executable`);
   }
+  for (const path of ["apps/server/assets/autoreview/skill/scripts/autoreview", "apps/server/assets/autoreview/skill/scripts/test-review-harness"]) {
+    const helper = pack.files.find((file) => file.path === path);
+    assert(helper && (helper.mode & 0o111) !== 0, `${path} is not executable`);
+  }
 }
 
 function assertBundledRuntime(packageRoot) {
@@ -206,6 +220,34 @@ function assertBundledRuntime(packageRoot) {
     const bytes = readFileSync(join(packageRoot, "vendor/no-mistakes", entry.path));
     assert.equal(createHash("sha256").update(bytes).digest("hex"), entry.binarySha256);
   }
+}
+
+function assertBundledAutoReview(packageRoot) {
+  const root = join(packageRoot, "apps/server/assets/autoreview");
+  const manifest = JSON.parse(readFileSync(join(root, "manifest.json"), "utf8"));
+  assert.equal(manifest.source.repository, "openclaw/agent-skills");
+  assert.equal(manifest.source.commit, "2a409d348a4bcf6f15e41e9a20efd0b298a32528");
+  assert.equal(manifest.excludedFiles.length, 5, "AutoReview exclusion manifest must be complete");
+  for (const entry of manifest.excludedFiles) {
+    assert(!existsSync(join(root, entry.path)), `${entry.path} must not enter the npm package`);
+  }
+  for (const entry of manifest.files) {
+    const file = join(root, entry.path);
+    const stat = lstatSync(file);
+    if (entry.mode === "120000") {
+      assert(stat.isFile(), `${entry.path} must be an npm materialized link file`);
+      assert(entry.npmMaterialization, `${entry.path} must declare npm materialization`);
+      assert.equal(stat.size, entry.npmMaterialization.bytes, `${entry.path} materialized byte count mismatch`);
+      assert.equal(createHash("sha256").update(readFileSync(file)).digest("hex"), entry.npmMaterialization.sha256, `${entry.path} materialized hash mismatch`);
+      continue;
+    }
+    assert(stat.isFile(), `${entry.path} must be a file`);
+    assert.equal(stat.size, entry.bytes, `${entry.path} byte count mismatch`);
+    assert.equal(createHash("sha256").update(readFileSync(file)).digest("hex"), entry.sha256, `${entry.path} hash mismatch`);
+    assert.equal(Boolean(stat.mode & 0o111), entry.mode === "100755", `${entry.path} executable mode mismatch`);
+  }
+  command(join(root, "skill/scripts/autoreview"), ["--help"]);
+  command(join(root, "skill/scripts/test-review-harness"), ["--help"]);
 }
 
 function npm(args, options = {}) {

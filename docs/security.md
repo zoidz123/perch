@@ -94,19 +94,17 @@ The replacement conversation identity and live session are verified before the n
 
 Solo provider sessions and arbitrary `perch run` commands do not receive managed task recovery.
 
-## Managed no-mistakes boundary
+## Bundled AutoReview and delivery boundary
 
-Perch-managed no-mistakes uses only the signed runtime inside the installed package.
-The runtime is selected by host architecture and verified against the pinned SHA-256 manifest before use.
-PATH binaries, absolute alternate paths, repository setup, skill visibility, and prompts are not authorization.
+Perch resolves AutoReview only from its immutable package assets.
+It verifies the manifest's paths, symlinks or npm-materialized link content, modes, byte counts, and hashes before use and never downloads mutable skill content or resolves `~/.agents`, `~/.codex`, or `~/.claude` skills.
 
-The runtime requests one-use authorization before run creation, gate push acceptance, and every external-agent launch.
-The verifier binds each decision to protocol, operation, durable task, live runtime generation and session, canonical project, credential-free repository identity, worktree, branch, and durable mode.
-Protocol mismatch, replay, stale context, missing verifier, timeout, malformed response, and any scope mismatch fail closed.
+The root worker operation binds a live task runtime and generation to a frozen repository, worktree, branch, base OID, HEAD OID, tree OID, canonical diff hash, clean snapshot, bundled provenance, structured findings, author dispositions, and focused test evidence.
+The delivery operation recomputes those facts and fails closed for a missing, stale, failed, or finding-bearing receipt.
 
-Authorization evidence is append-only and secret-free.
-Hook tokens remain in request headers and transient local IPC only, and are removed from external-agent child environments.
-See [No-mistakes authorization](no-mistakes-authorization.md) for the exact contract.
+The server, not a worker, pushes the reviewed branch and creates the PR.
+Perch rejects direct worker PR links and completion for new ship tasks without a matching delivery record and receipt.
+Inherited GitHub credentials are a documented residual process-boundary bypass: an out-of-band push or PR cannot satisfy Perch completion, but credential isolation remains a bounded follow-up after provider launch and recovery auditing.
 
 ## Local secrets and records
 

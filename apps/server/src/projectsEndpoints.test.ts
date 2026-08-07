@@ -100,22 +100,26 @@ function call(port: number, method: string, body?: unknown): Promise<Response> {
   });
 }
 
-test("POST /projects registers a real directory and rejects nonexistent or removed fields with 400", async () => {
+test("POST /projects registers a real directory and rejects legacy delivery modes", async () => {
   await withServer(async ({ port, home }) => {
     const dir = join(home, "repo");
     mkdirSync(dir);
 
-    const ok = await call(port, "POST", { rootPath: dir, mode: "direct-PR" });
+    const ok = await call(port, "POST", { rootPath: dir });
     assert.equal(ok.status, 200);
     const { project } = (await ok.json()) as { project: { rootPath: string; mode?: string } };
     assert.equal(project.rootPath, dir);
-    assert.equal(project.mode, "direct-PR");
+    assert.equal(project.mode, undefined);
     assert.equal(Object.hasOwn(project, "yolo"), false);
 
     const removed = await call(port, "POST", { rootPath: dir, yolo: true });
     assert.equal(removed.status, 400);
     const removedBody = (await removed.json()) as { error: string };
     assert.equal(removedBody.error, "unknown project config key: yolo");
+
+    const legacy = await call(port, "POST", { rootPath: dir, mode: "direct-PR" });
+    assert.equal(legacy.status, 409);
+    assert.match(((await legacy.json()) as { error: string }).error, /legacy-only/);
 
     const missing = await call(port, "POST", { rootPath: join(home, "nope") });
     assert.equal(missing.status, 400);
@@ -124,17 +128,19 @@ test("POST /projects registers a real directory and rejects nonexistent or remov
   });
 });
 
-test("PATCH /projects rejects the removed field without changing delivery mode", async () => {
+test("PATCH /projects rejects delivery-mode configuration", async () => {
   await withServer(async ({ port, home, projects }) => {
     const dir = join(home, "repo");
     mkdirSync(dir);
-    projects.touch(dir, { mode: "direct-PR" });
+    projects.touch(dir);
 
     const removed = await call(port, "PATCH", { rootPath: dir, yolo: false });
     assert.equal(removed.status, 400);
     const body = (await removed.json()) as { error: string };
     assert.equal(body.error, "unknown project config key: yolo");
-    assert.equal(projects.find(dir)?.mode, "direct-PR");
+    assert.equal(Object.hasOwn(projects.find(dir)!, "mode"), false);
+    const legacy = await call(port, "PATCH", { rootPath: dir, mode: "no-mistakes" });
+    assert.equal(legacy.status, 409);
   });
 });
 

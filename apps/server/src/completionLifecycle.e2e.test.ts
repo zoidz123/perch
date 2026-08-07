@@ -37,7 +37,7 @@ class LifecycleAdapter implements AgentAdapter {
 
 const wait = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 
-test("early PR link keeps a reviewing task active while checks advance before completion", async () => {
+test("an early PR observation keeps a ship task active while checks advance before completion", async () => {
   const home = mkdtempSync(join(tmpdir(), "perch-pr-link-e2e-"));
   const tasks = new TaskStore({ PERCH_HOME: home } as NodeJS.ProcessEnv);
   let phase: "pending" | "passing" = "pending";
@@ -51,13 +51,8 @@ test("early PR link keeps a reviewing task active while checks advance before co
   const poller = new PrPoller(tasks, async () => view(), { resolveLocalRepo: async () => "o/r" });
 
   try {
-    const task = tasks.create({ title: "link PR before verification", project: "/tmp/repo", mode: "no-mistakes" });
+    const task = tasks.create({ title: "link PR before verification", project: "/tmp/repo" });
     tasks.recordEvent(task.id, { kind: "working", source: "worker" });
-    tasks.recordEvent(task.id, {
-      kind: "note",
-      source: "system",
-      data: { noMistakesAuthorization: { allowed: true, operation: "run", reason: "authorized" } }
-    });
     const linked = tasks.linkPr(task.id, {
       url: "https://github.com/o/r/pull/62",
       number: 62,
@@ -67,21 +62,21 @@ test("early PR link keeps a reviewing task active while checks advance before co
       headOid: "head-a"
     }, { source: "worker", message: "https://github.com/o/r/pull/62" });
     assert.equal(linked.task.state, "working");
-    assert.equal(linked.task.presentation?.state, "reviewing");
+    assert.equal(linked.task.presentation?.state, "working");
     assert.equal(linked.task.pr?.number, 62);
     assert.equal(tasks.events(task.id).at(-1)?.kind, "pr_linked");
 
     poller.armFast(task.id);
     await poller.fastTick();
     assert.equal(tasks.find(task.id)?.state, "working");
-    assert.equal(tasks.find(task.id)?.presentation?.state, "reviewing");
+    assert.equal(tasks.find(task.id)?.presentation?.state, "working");
     assert.equal(tasks.find(task.id)?.pr?.checks, "pending");
 
     phase = "passing";
     await poller.fastTick();
     assert.equal(tasks.find(task.id)?.pr?.checks, "passing");
     assert.equal(tasks.find(task.id)?.state, "working");
-    assert.equal(tasks.find(task.id)?.presentation?.state, "reviewing");
+    assert.equal(tasks.find(task.id)?.presentation?.state, "working");
 
     tasks.recordEvent(task.id, {
       kind: "completion_requested",

@@ -388,6 +388,42 @@ codexOwned.wireEvents({
     );
     return { success: response.ok, text: await response.text() };
   },
+  // Typed delivery operations use the same root-thread relay as reports. The
+  // worker sees Perch tools, while only the local server ever speaks HTTP.
+  onAutoReviewRun: async (sessionId, input) => {
+    const runtime = tasks.stateDb.runtimes.findBySession(sessionId);
+    if (!runtime) return { success: false, text: "No task runtime is bound to this root thread." };
+    const response = await fetch(
+      `http://127.0.0.1:${config.port}/tasks/${encodeURIComponent(runtime.taskId)}/autoreview`,
+      {
+        method: "POST",
+        headers: {
+          authorization: `Bearer ${config.authToken}`,
+          "content-type": "application/json",
+          "x-perch-root-session": sessionId
+        },
+        body: JSON.stringify(input)
+      }
+    );
+    return { success: response.ok, text: await response.text() };
+  },
+  onDeliveryCreatePr: async (sessionId, input) => {
+    const runtime = tasks.stateDb.runtimes.findBySession(sessionId);
+    if (!runtime) return { success: false, text: "No task runtime is bound to this root thread." };
+    const response = await fetch(
+      `http://127.0.0.1:${config.port}/tasks/${encodeURIComponent(runtime.taskId)}/delivery/pr`,
+      {
+        method: "POST",
+        headers: {
+          authorization: `Bearer ${config.authToken}`,
+          "content-type": "application/json",
+          "x-perch-root-session": sessionId
+        },
+        body: JSON.stringify(input)
+      }
+    );
+    return { success: response.ok, text: await response.text() };
+  },
   onThreadStarted: (sessionId, threadId) => {
     runtimeManager.recordProviderSession(sessionId, "codex", threadId);
     ownerManager.recordProviderSession(sessionId, "codex", threadId);

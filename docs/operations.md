@@ -30,8 +30,8 @@ perch doctor
 ```
 
 `doctor` checks whether provider binaries are installed, but it does not verify Claude Code or Codex sign-in.
-It also reports GitHub CLI authentication because direct-PR task delivery and PR polling use `gh`.
-The compatible no-mistakes runtime is already inside the npm package and needs no separate install, PATH entry, or lifecycle download.
+It also reports GitHub CLI authentication because server-owned ship delivery and PR polling use `gh`.
+The AutoReview helper is packaged with Perch and is never downloaded during installation or review.
 
 ## Uninstall
 
@@ -48,7 +48,7 @@ The command preserves user hooks and `~/.perch` state by default.
 Use `perch uninstall --purge-data` to remove the local ledger, worktrees, pairing data, tokens, and charts too.
 The command refuses to run while the server is live unless `--force` is supplied.
 
-## Projects and task defaults
+## Projects and task kinds
 
 Mate dispatches work into registered projects.
 Sessions register their own project automatically, or you can add one explicitly:
@@ -58,23 +58,15 @@ perch project add /path/to/project
 perch project list
 ```
 
-Optional project modes control how managed code tasks are delivered:
+Projects are only a registry of places agents work.
+They do not control delivery behavior.
+Each new task has one kind:
 
-- `direct-PR` expects a pushed branch and pull request.
-- `local-only` keeps delivery on the local task branch.
-- `no-mistakes` uses the signed no-mistakes runtime bundled with Perch.
+- `ship` changes a repository, runs focused tests, receives a clean bundled AutoReview receipt for the exact final tree and diff, then uses Perch's server-owned delivery operation to create one PR.
+- `scout` is a read-only investigation with a durable report and no PR.
+- `operate` is a verified runtime or external action with gate-by-gate evidence and no repository change or code PR.
 
-Task mode is also the authorization boundary for the expensive no-mistakes pipeline.
-Only a durably persisted `no-mistakes` task may receive authorization.
-`direct-PR` and `local-only` tasks remain denied regardless of prompt language, diff size, repository initialization, or an existing gate remote.
-Perch cannot filter a globally installed Codex or Claude skill catalog per task, so mode-specific dispatch text is defense in depth rather than the security boundary.
-The packaged runtime consumes the fail-closed verifier documented in [No-mistakes authorization](no-mistakes-authorization.md).
-
-Set a mode when registering a project:
-
-```sh
-perch project add /path/to/project --mode direct-PR
-```
+Historic `direct-PR`, `local-only`, and `no-mistakes` records remain readable during the migration window, but no current project or task surface can create them.
 
 Removing a project only changes the registry:
 
@@ -91,14 +83,13 @@ perch config show --effective
 perch models
 perch config set dispatch <model-id> --agent codex --effort high
 perch config set mate <model-id> --agent claude
-perch project set /path/to/project --mode no-mistakes --yes
 ```
 
 The role commands set a complete global agent, model, and effort tuple atomically.
 The server validates model and effort combinations against its current provider catalog.
 An explicit task or launch agent, model, or effort value wins over the matching persisted default.
 Environment variables win over persisted settings.
-Use `perch project show` for delivery mode and `perch runtime` for bundled-runtime provenance.
+AutoReview provenance is stored with every receipt and in the packaged manifest.
 
 | Setting | Environment override |
 | --- | --- |
@@ -208,7 +199,7 @@ Important paths are:
 | `box-keypair.json` | Relay channel keypair |
 | `devices.json` | Paired devices and revocable tokens |
 | `settings.json` | Worker and Mate defaults |
-| `projects.json` | Project registry and delivery modes |
+| `projects.json` | Project registry |
 | `state.sqlite` | Durable control-plane database described in [Architecture](architecture.md#durable-task-state) |
 | `worktrees/` | Isolated git worktree pool |
 | `mate/` | Mate home and managed instructions |
@@ -220,7 +211,7 @@ Do not attach tokens, pairing offers, device records, keypairs, or provider conf
 
 ## Updating
 
-The pinned package for this source is `perchctl@0.1.16` and installs the `perch` executable plus both Darwin no-mistakes architectures.
+The pinned package for this source is `perchctl@0.1.16` and installs the `perch` executable plus the immutable bundled AutoReview skill and helper.
 Update to another explicit published version with npm, then restart the local server so it runs the new build:
 
 ```sh

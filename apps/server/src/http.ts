@@ -35,10 +35,8 @@ import type {
   ModelsResponse,
   ModelSwitchRequest,
   ModelSwitchResponse,
-  NoMistakesDispatchRefusal,
   NoMistakesAuthorizationRequest,
   NoMistakesAuthorizationResponse,
-  NoMistakesInitResult,
   PlanDocResponse,
   StartAgentRequest,
   StartAgentResponse,
@@ -87,10 +85,7 @@ import { buildOffer, tokensEqual, type DeviceRegistry } from "./pairing.js";
 import { EncryptedServerChannel } from "./e2ee/channel.js";
 import {
   collectDoctor,
-  noMistakesBinary,
   noMistakesRuntimeFacts,
-  repoGateState,
-  runNoMistakesInit,
   type DoctorDeps
 } from "./deps.js";
 import {
@@ -107,6 +102,8 @@ import { dispatchBrief } from "./brief.js";
 import { renderChartsGalleryHtml } from "./chartsGallery.js";
 import { renderPlanHtml, resolvePlanDocPath } from "./planRender.js";
 import { extractPrUrl, type PrPoller } from "./prPoller.js";
+import { AutoReviewService, freezeReviewTarget } from "./autoreview.js";
+import { DeliveryService, receiptMatchesCurrentTarget } from "./delivery.js";
 import type { StateMetrics } from "./stateMetrics.js";
 import type { TaskStore } from "./tasks.js";
 import type { TaskCompletionReconciler } from "./taskCompletion.js";
@@ -472,15 +469,6 @@ async function buildConfigResponse(
       };
     }
   }
-  const project = projectPath ? options.projects.find(projectPath) : undefined;
-  entries["task.mode"] = {
-    effectiveValue: project?.mode ?? "direct-PR",
-    source: project?.mode ? "project" : "built-in",
-    scope: "project",
-    storedValue: project?.mode ?? null,
-    defaultValue: "direct-PR",
-    overriddenBy: null
-  };
   const runtime = noMistakesRuntimeFacts();
   for (const [suffix, value] of Object.entries({
     version: runtime?.version ?? null,
@@ -557,16 +545,15 @@ type MateStartRequest = {
 
 // Explicit project registration (POST /projects): must name a real directory
 // on this Mac, so a typo'd or stale path never lands in the registry.
-// Setting mode: "no-mistakes" is consent to run `no-mistakes init` in the repo
-// right now (O2) - idempotent upstream, audit-logged like every other mutating
-// action. Passive session-start registration (`touch`) never reaches this
-// path, so it never initializes anything.
 async function registerProject(
   body: Record<string, unknown>,
   options: HttpServerOptions,
   auditMeta: Pick<Parameters<AuditLog["write"]>[0], "deviceId" | "remoteAddress">
 ): Promise<RpcResult> {
-  const allowedKeys = new Set(["rootPath", "mode", "name"]);
+  if (body.mode !== undefined) {
+    return rpcError(409, "project delivery modes are legacy-only; choose ship, scout, or operate when creating a task");
+  }
+  const allowedKeys = new Set(["rootPath", "name"]);
   const unknown = Object.keys(body).find((key) => !allowedKeys.has(key));
   if (unknown) return rpcError(400, `unknown project config key: ${unknown}`);
   if (typeof body.rootPath !== "string" || body.rootPath.trim().length === 0) {
@@ -582,23 +569,7 @@ async function registerProject(
   if (!isDirectory) {
     return rpcError(400, `Not a directory on this Mac: ${root}`);
   }
-  const fields = {
-    ...(typeof body.name === "string" && body.name ? { name: body.name } : {}),
-    ...(body.mode === "direct-PR" || body.mode === "no-mistakes" || body.mode === "local-only"
-      ? { mode: body.mode as Project["mode"] }
-      : {})
-  };
-  if (body.mode === "no-mistakes") {
-    const noMistakes = await initNoMistakesGate(root, options, auditMeta);
-    if (!noMistakes.ready) {
-      return {
-        status: 422,
-        body: { error: noMistakes.warning ?? "no-mistakes activation failed", noMistakes }
-      };
-    }
-    const project = options.projects.touch(root, fields);
-    return rpcOk(200, { project, noMistakes });
-  }
+  const fields = typeof body.name === "string" && body.name ? { name: body.name } : {};
   const project = options.projects.touch(root, fields);
   return rpcOk(200, { project });
 }
@@ -608,7 +579,10 @@ async function configureProject(
   options: HttpServerOptions,
   auditMeta: Pick<Parameters<AuditLog["write"]>[0], "deviceId" | "remoteAddress">
 ): Promise<RpcResult> {
-  const allowedKeys = new Set(["rootPath", "mode"]);
+  if (body.mode !== undefined) {
+    return rpcError(409, "project delivery modes are legacy-only; choose ship, scout, or operate when creating a task");
+  }
+  const allowedKeys = new Set(["rootPath"]);
   const unknown = Object.keys(body).find((key) => !allowedKeys.has(key));
   if (unknown) return rpcError(400, `unknown project config key: ${unknown}`);
   if (typeof body.rootPath !== "string" || body.rootPath.trim().length === 0) {
@@ -620,88 +594,7 @@ async function configureProject(
   } catch {
     return rpcError(400, `Not a directory on this Mac: ${root}`);
   }
-  const modes = new Set(["direct-PR", "no-mistakes", "local-only"]);
-  if (body.mode !== undefined && body.mode !== null && (typeof body.mode !== "string" || !modes.has(body.mode))) {
-    return rpcError(400, "mode must be direct-PR, no-mistakes, local-only, or null");
-  }
-  if (body.mode === undefined) return rpcError(400, "mode required");
-  let noMistakes: NoMistakesInitResult | undefined;
-  if (body.mode === "no-mistakes") {
-    noMistakes = await initNoMistakesGate(root, options, auditMeta);
-    if (!noMistakes.ready) {
-      return { status: 422, body: { error: noMistakes.warning ?? "no-mistakes activation failed", noMistakes } };
-    }
-  }
-  const project = options.projects.configure(root, {
-    ...(body.mode !== undefined ? { mode: body.mode as Project["mode"] | null } : {})
-  });
-  return rpcOk(200, { project, ...(noMistakes ? { noMistakes } : {}) });
-}
-
-// The consent-driven init run behind a mode: "no-mistakes" set. The project is
-// validated and initialized before the registry mutation. Any failure leaves
-// the prior project mode untouched.
-async function initNoMistakesGate(
-  root: string,
-  options: HttpServerOptions,
-  auditMeta: Pick<Parameters<AuditLog["write"]>[0], "deviceId" | "remoteAddress">
-): Promise<NoMistakesInitResult> {
-  if (!noMistakesBinary(options.doctorDeps)) {
-    const { initialized } = await repoGateState(root);
-    return {
-      ran: false,
-      initialized,
-      ready: false,
-      warning: "bundled no-mistakes runtime is unavailable or corrupt - reinstall this exact perchctl version"
-    };
-  }
-  const result = await runNoMistakesInit(root, options.doctorDeps);
-  await audit(options.auditLog, { action: "no_mistakes_init", ...auditMeta, cwd: root });
-  const { initialized } = await repoGateState(root);
-  if (!result.ok) {
-    // Upstream's own error text, verbatim (e.g. its no-origin-remote message).
-    return { ran: true, initialized, ready: false, warning: `no-mistakes init failed: ${result.output}` };
-  }
-  return {
-    ran: true,
-    initialized,
-    ready: initialized,
-    ...(result.output ? { output: result.output } : {})
-  };
-}
-
-// Dispatch readiness gate (T3): a task about to be dispatched with effective
-// mode no-mistakes must find the gate actually ready - binary on PATH and the
-// repo initialized. Anything less is refused with a structured 422 naming the
-// exact fix, BEFORE the task record, worktree lease, or worker session exist:
-// silently spawning a worker into a mode it cannot honor (or silently
-// downgrading to ungated direct-PR) both violate the boss's intent. Absent an
-// explicit mode the task stays direct-PR (O1), so this never fires by default.
-async function refuseUnreadyNoMistakesDispatch(
-  body: CreateTaskRequest,
-  options: HttpServerOptions
-): Promise<RpcResult | undefined> {
-  if (body.dispatch !== true) return undefined;
-  const mode = body.mode ?? options.projects.find(body.project)?.mode ?? "direct-PR";
-  if (mode !== "no-mistakes") return undefined;
-  const root = resolvePath(body.project);
-  const binaryFound = noMistakesBinary(options.doctorDeps) !== undefined;
-  const { initialized } = await repoGateState(root);
-  const missing: string[] = [];
-  if (!binaryFound) {
-    missing.push("bundled no-mistakes runtime unavailable or corrupt: reinstall this exact perchctl version");
-  }
-  if (!initialized) {
-    missing.push(
-      `repo not initialized: run \`perch project add ${root} --mode no-mistakes\` (or \`no-mistakes init\` in the repo)`
-    );
-  }
-  if (missing.length === 0) return undefined;
-  const refusal: NoMistakesDispatchRefusal = {
-    error: `no-mistakes gate is not ready for ${root} - ${missing.join("; ")}`,
-    noMistakes: { binaryFound, initialized, missing }
-  };
-  return { status: 422, body: refusal };
+  return rpcError(410, "project delivery modes were removed; choose ship, scout, or operate when creating a task");
 }
 
 // Unregister a project (DELETE /projects). Refused while any non-closed task
@@ -1431,6 +1324,20 @@ async function route(
   const taskReportsMatch = pathname.match(/^\/tasks\/([^/]+)\/reports$/);
   if (request.method === "POST" && taskReportsMatch) {
     await handleWorkerReport(request, response, options, decodeURIComponent(taskReportsMatch[1] ?? ""));
+    return;
+  }
+
+  // Typed worker operations.  Claude and other managed workers use the
+  // perch CLI, while Codex roots use dynamic tools that relay to these exact
+  // endpoints.  Neither path accepts a generic bearer token or a child run.
+  const autoreviewMatch = pathname.match(/^\/tasks\/([^/]+)\/autoreview$/);
+  if (request.method === "POST" && autoreviewMatch) {
+    await handleAutoReviewRun(request, response, options, decodeURIComponent(autoreviewMatch[1] ?? ""));
+    return;
+  }
+  const deliveryMatch = pathname.match(/^\/tasks\/([^/]+)\/delivery\/pr$/);
+  if (request.method === "POST" && deliveryMatch) {
+    await handleDeliveryCreatePr(request, response, options, decodeURIComponent(deliveryMatch[1] ?? ""));
     return;
   }
 
@@ -2834,6 +2741,19 @@ function idempotencyKeyError(key: unknown): string | undefined {
   return undefined;
 }
 
+function legacyModeCreationError(mode: unknown): string | undefined {
+  if (mode === undefined) return undefined;
+  if (mode === "direct-PR" || mode === "no-mistakes" || mode === "local-only") {
+    return `task delivery mode ${JSON.stringify(mode)} is legacy-only; create a ship, scout, or operate task instead`;
+  }
+  return "mode is no longer supported; create a ship, scout, or operate task instead";
+}
+
+function taskKindCreationError(kind: unknown): string | undefined {
+  if (kind === undefined || kind === "ship" || kind === "scout" || kind === "operate") return undefined;
+  return "kind must be ship, scout, or operate";
+}
+
 function dispatchIdempotencyKey(body: CreateTaskRequest, taskId: string): string {
   return body.idempotencyKey ? `dispatch:request:${body.idempotencyKey.trim()}` : `dispatch:task:${taskId}`;
 }
@@ -2888,6 +2808,11 @@ async function handleCreateTask(
     writeJson(response, 400, { error: idempotencyError });
     return;
   }
+  const kindError = taskKindCreationError(body.kind);
+  if (kindError) {
+    writeJson(response, 400, { error: kindError });
+    return;
+  }
 
   // Crew parentage defaults to the calling session: a request that also
   // carries its session hook credentials (x-perch-session/x-perch-token, the
@@ -2923,9 +2848,9 @@ async function handleCreateTask(
     return;
   }
 
-  const refused = await refuseUnreadyNoMistakesDispatch(body, options);
-  if (refused) {
-    writeJson(response, refused.status, refused.body);
+  const legacyModeError = legacyModeCreationError(body.mode);
+  if (legacyModeError) {
+    writeJson(response, 409, { error: legacyModeError });
     return;
   }
 
@@ -2947,8 +2872,6 @@ function createTaskRecord(body: CreateTaskRequest, options: HttpServerOptions): 
     project: body.project,
     prompt: body.prompt?.trim() || body.title.trim(),
     kind: body.kind,
-    // Per-project delivery mode is the default; an explicit mode wins.
-    mode: body.mode ?? options.projects.find(body.project)?.mode,
     planId: resolveTaskPlanId(body)
   });
 }
@@ -3275,7 +3198,8 @@ async function createTaskRpc(
   body.project = resolvedProject.rootPath;
   const idempotencyError = idempotencyKeyError(body.idempotencyKey);
   if (idempotencyError) return rpcError(400, idempotencyError);
-
+  const kindError = taskKindCreationError(body.kind);
+  if (kindError) return rpcError(400, kindError);
   if (body.planEdit) {
     const err = planEditError(body.planEdit);
     if (err) return rpcError(400, err);
@@ -3286,8 +3210,8 @@ async function createTaskRpc(
     return rpcOk(201, { task: await resumeRepeatedDispatch(body, repeated, options) });
   }
 
-  const refused = await refuseUnreadyNoMistakesDispatch(body, options);
-  if (refused) return refused;
+  const legacyModeError = legacyModeCreationError(body.mode);
+  if (legacyModeError) return rpcError(409, legacyModeError);
 
   if (body.dispatch === true && !options.adapter.startAgent) {
     return rpcError(501, "PTY agents are not supported by this server");
@@ -3544,6 +3468,25 @@ async function completionDecisionRpc(
   }
   if (task.state !== "completion_requested") {
     return rpcError(409, `Task is ${task.state}, not waiting for completion verification`);
+  }
+
+  if (body.action === "accept" && task.mode === undefined && task.kind === "ship") {
+    const delivery = options.tasks.stateDb.delivery.find(task.id);
+    const receipt = delivery ? options.tasks.stateDb.autoreview.find(delivery.receiptId) : undefined;
+    const worktreePath = (task.worktreeId ? options.worktrees.find(task.worktreeId)?.path : undefined) ?? task.project;
+    const current = receipt ? await freezeReviewTarget(worktreePath, receipt.baseRef).catch(() => undefined) : undefined;
+    if (
+      delivery?.state !== "created" || !task.pr?.headOid || delivery.headOid !== task.pr.headOid ||
+      !receipt || !current || !receiptMatchesCurrentTarget(receipt, current)
+    ) {
+      return rpcError(409, "ship completion acceptance requires the current clean AutoReview receipt and server-created PR");
+    }
+  }
+  if (body.action === "accept" && task.mode === undefined && task.kind !== "ship") {
+    const requestedDeliverable = (request.data as { deliverable?: { kind?: unknown } } | undefined)?.deliverable;
+    if (requestedDeliverable?.kind !== "report") {
+      return rpcError(409, "scout and operate completion acceptance requires verified report evidence");
+    }
   }
 
   // For local-only work the acceptance additionally records the checkout HEAD
@@ -3979,9 +3922,10 @@ async function handleTaskEvent(
   }
   let prUrl = typeof body.pr === "string" ? body.pr.trim() : body.kind === "done" ? extractPrUrl(message) : undefined;
   let pr: TaskPr | undefined;
-  // Scouts deliver reports, and local-only tasks deliberately have no remote
-  // delivery contract. Only remote ship modes discover and validate PRs.
-  const requiresPr = task.kind !== "scout" && task.mode !== "local-only";
+  const legacyTask = task.mode !== undefined;
+  // New ship tasks may only get their PR identity from delivery.create_pr.
+  // Legacy records retain the old discovery path strictly for recovery.
+  const requiresPr = legacyTask ? task.kind !== "scout" && task.mode !== "local-only" : task.kind === "ship";
   if (body.kind === "pr_linked" && source !== "worker") {
     writeJson(response, 401, { error: "pr_linked requires task-session credentials" });
     return;
@@ -3990,11 +3934,32 @@ async function handleTaskEvent(
     writeJson(response, 409, { error: "PR links are only valid for remote ship tasks" });
     return;
   }
+  if (body.kind === "pr_linked" && !legacyTask) {
+    writeJson(response, 409, { error: "ship PRs are created and linked only by perch.delivery.create_pr" });
+    return;
+  }
   if (body.kind === "pr_linked" && !prUrl) {
     writeJson(response, 400, { error: "pr is required for pr_linked" });
     return;
   }
-  if (body.kind === "done" && requiresPr && !prUrl) {
+  if (body.kind === "done" && !legacyTask && task.kind !== "ship" && prUrl) {
+    writeJson(response, 409, { error: "scout and operate tasks cannot attach a code PR" });
+    return;
+  }
+  if (body.kind === "done" && !legacyTask && task.kind === "ship") {
+    const delivery = options.tasks.stateDb.delivery.find(task.id);
+    const receipt = delivery ? options.tasks.stateDb.autoreview.find(delivery.receiptId) : undefined;
+    const worktreePath = (task.worktreeId ? options.worktrees.find(task.worktreeId)?.path : undefined) ?? task.project;
+    const current = receipt ? await freezeReviewTarget(worktreePath, receipt.baseRef).catch(() => undefined) : undefined;
+    if (
+      delivery?.state !== "created" || !task.pr?.url || !task.pr.headOid || delivery.headOid !== task.pr.headOid ||
+      !receipt || !current || !receiptMatchesCurrentTarget(receipt, current)
+    ) {
+      writeJson(response, 409, { error: "ship completion requires a matching server-created PR and clean AutoReview receipt" });
+      return;
+    }
+    prUrl = task.pr.url;
+  } else if (body.kind === "done" && requiresPr && !prUrl) {
     if (task.pr?.url) {
       prUrl = task.pr.url;
     } else if (task.branch) {
@@ -4015,7 +3980,7 @@ async function handleTaskEvent(
     }
     pr = attachment.pr;
   }
-  if (body.kind === "done" && requiresPr && prUrl) {
+  if (body.kind === "done" && requiresPr && prUrl && legacyTask) {
     const checkoutPath = (task.worktreeId ? options.worktrees.find(task.worktreeId)?.path : undefined) ?? task.project;
     const attachment = await options.prPoller.resolveTaskPr(task, prUrl, checkoutPath);
     if (!attachment.ok) {
@@ -4102,7 +4067,9 @@ async function handleTaskEvent(
       // stays conservatively withheld rather than trusting a branch name.
       const deliverable = current.mode === "local-only"
         ? { kind: "local", ...(revision ? { revision } : {}) }
-        : { kind: "pr", headOid: attachedPr?.headOid };
+        : !legacyTask && current.kind !== "ship"
+          ? { kind: "report" }
+          : { kind: "pr", headOid: attachedPr?.headOid };
       eventData = { ...(data ?? {}), deliverable };
     }
     updated = options.tasks.recordEvent(taskId, { kind, message, source, ...(eventData ? { data: eventData } : {}) });
@@ -4173,6 +4140,109 @@ function authenticateWorkerReport(
     return { status: 401, error: "Unauthorized" };
   }
   return { sessionId };
+}
+
+type AutoReviewRunRequest = {
+  baseRef?: unknown;
+  idempotencyKey?: unknown;
+  testArgv?: unknown;
+  authorDispositions?: unknown;
+  supersedesAttemptId?: unknown;
+};
+
+async function handleAutoReviewRun(
+  request: IncomingMessage,
+  response: ServerResponse,
+  options: HttpServerOptions,
+  taskId: string
+): Promise<void> {
+  const task = options.tasks.find(taskId);
+  if (!task) return writeJson(response, 404, { error: `Unknown task: ${taskId}` });
+  const auth = authenticateWorkerReport(request, options, task);
+  if ("error" in auth) return writeJson(response, auth.status, { error: auth.error });
+  const runtime = options.tasks.stateDb.runtimes.findBySession(auth.sessionId);
+  if (!runtime || runtime.taskId !== task.id || runtime.state !== "live") {
+    return writeJson(response, 409, { error: "AutoReview requires the task's current live root runtime" });
+  }
+  const body = await readJson<AutoReviewRunRequest>(request);
+  const idempotencyKey = typeof body.idempotencyKey === "string" ? body.idempotencyKey.trim() : "";
+  const testArgv = Array.isArray(body.testArgv) && body.testArgv.every((part) => typeof part === "string") ? body.testArgv : [];
+  const baseRef = typeof body.baseRef === "string" && body.baseRef.trim() ? body.baseRef.trim() : "origin/main";
+  const authorDispositions = Array.isArray(body.authorDispositions) && body.authorDispositions.every(isRecord)
+    ? body.authorDispositions as Array<Record<string, unknown>>
+    : undefined;
+  if (!idempotencyKey || idempotencyKey.length > 200) {
+    return writeJson(response, 400, { error: "idempotencyKey must be a non-empty string up to 200 characters" });
+  }
+  if (testArgv.length === 0) return writeJson(response, 400, { error: "testArgv must be a non-empty argv array" });
+  const worktreePath = (task.worktreeId ? options.worktrees.find(task.worktreeId)?.path : undefined) ?? runtime.worktreePath ?? task.project;
+  if (runtime.worktreePath && resolvePath(runtime.worktreePath) !== resolvePath(worktreePath)) {
+    return writeJson(response, 409, { error: "AutoReview runtime worktree does not match the authorized task worktree" });
+  }
+  try {
+    const result = await new AutoReviewService(options.tasks.stateDb).run({
+      task, runtime, sessionId: auth.sessionId, worktreePath, baseRef,
+      idempotencyKey: `autoreview:${task.id}:${idempotencyKey}`, testArgv, authorDispositions,
+      ...(typeof body.supersedesAttemptId === "string" ? { supersedesAttemptId: body.supersedesAttemptId } : {})
+    });
+    options.tasks.recordEvent(task.id, {
+      kind: "note", source: "system", message: `AutoReview ${result.attempt.state}`,
+      data: { autoreview: { attemptId: result.attempt.id, state: result.attempt.state, findings: result.attempt.findings.length } }
+    });
+    writeJson(response, 200, { attempt: publicAutoReviewAttempt(result.attempt), duplicate: result.duplicate });
+  } catch (error) {
+    writeJson(response, 409, { error: error instanceof Error ? error.message : String(error) });
+  }
+}
+
+async function handleDeliveryCreatePr(
+  request: IncomingMessage,
+  response: ServerResponse,
+  options: HttpServerOptions,
+  taskId: string
+): Promise<void> {
+  const task = options.tasks.find(taskId);
+  if (!task) return writeJson(response, 404, { error: `Unknown task: ${taskId}` });
+  const auth = authenticateWorkerReport(request, options, task);
+  if ("error" in auth) return writeJson(response, auth.status, { error: auth.error });
+  const runtime = options.tasks.stateDb.runtimes.findBySession(auth.sessionId);
+  if (!runtime || runtime.taskId !== task.id || runtime.state !== "live") {
+    return writeJson(response, 409, { error: "delivery requires the task's current live root runtime" });
+  }
+  const body = await readJson<{ idempotencyKey?: unknown }>(request);
+  const idempotencyKey = typeof body.idempotencyKey === "string" ? body.idempotencyKey.trim() : "";
+  if (!idempotencyKey || idempotencyKey.length > 200) {
+    return writeJson(response, 400, { error: "idempotencyKey must be a non-empty string up to 200 characters" });
+  }
+  const worktreePath = (task.worktreeId ? options.worktrees.find(task.worktreeId)?.path : undefined) ?? runtime.worktreePath ?? task.project;
+  if (runtime.worktreePath && resolvePath(runtime.worktreePath) !== resolvePath(worktreePath)) {
+    return writeJson(response, 409, { error: "delivery runtime worktree does not match the authorized task worktree" });
+  }
+  try {
+    const result = await new DeliveryService(options.tasks.stateDb).createPr({
+      task, runtime, worktreePath, idempotencyKey: `delivery:${task.id}:${idempotencyKey}`
+    });
+    const linked = options.tasks.linkPr(task.id, result.pr, {
+      source: "system", message: result.pr.url,
+      data: { delivery: { receiptId: result.receipt.id, idempotent: result.duplicate } }
+    });
+    options.prPoller.armFast(task.id);
+    void options.prPoller.tick().catch(() => {});
+    writeJson(response, 200, { task: linked.task, pr: result.pr, receipt: publicAutoReviewAttempt(result.receipt), duplicate: result.duplicate });
+  } catch (error) {
+    writeJson(response, 409, { error: error instanceof Error ? error.message : String(error) });
+  }
+}
+
+function publicAutoReviewAttempt(attempt: import("./stateDb.js").AutoReviewAttemptRecord): Record<string, unknown> {
+  return {
+    id: attempt.id, state: attempt.state, baseOid: attempt.baseOid, headOid: attempt.headOid, treeOid: attempt.treeOid,
+    diffSha256: attempt.diffSha256, findings: attempt.findings, requested: {
+      engine: attempt.requestedEngine, model: attempt.requestedModel, reasoning: attempt.requestedReasoning
+    }, actual: {
+      engine: attempt.actualEngine, model: attempt.actualModel, reasoning: attempt.actualReasoning, fallback: attempt.fallbackReason
+    }, ...(attempt.failureCode ? { failureCode: attempt.failureCode } : {})
+  };
 }
 
 async function handleWorkerReport(
@@ -5572,6 +5642,10 @@ function rpcBody<T extends Record<string, unknown>>(request: WebSocketRpcRequest
     throw new Error("body must be an object");
   }
   return request.body as T;
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return Boolean(value) && typeof value === "object" && !Array.isArray(value);
 }
 
 function auditPeerFor(auth: ClientAuth): Pick<Parameters<AuditLog["write"]>[0], "deviceId"> {

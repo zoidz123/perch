@@ -156,6 +156,8 @@ export type CodexAppServerOptions = {
   onNativeChildObservation?: (observation: NativeChildRunObservation) => void;
   onTaskEvent?: (event: TaskEventRequest) => Promise<{ success: boolean; text: string }>;
   onWorkerReport?: (report: WorkerReportRequest) => Promise<{ success: boolean; text: string }>;
+  onAutoReviewRun?: (input: Record<string, unknown>) => Promise<{ success: boolean; text: string }>;
+  onDeliveryCreatePr?: (input: Record<string, unknown>) => Promise<{ success: boolean; text: string }>;
   // "auto" starts disabled until a known native item is observed.
   // "disabled" preserves the exact pre-v2 root-only path.
   nativeMultiAgentObservation?: "auto" | "disabled";
@@ -271,6 +273,8 @@ export class CodexAppServerClient {
   private readonly onNativeChildObservation?: (observation: NativeChildRunObservation) => void;
   private readonly onTaskEvent?: (event: TaskEventRequest) => Promise<{ success: boolean; text: string }>;
   private readonly onWorkerReport?: (report: WorkerReportRequest) => Promise<{ success: boolean; text: string }>;
+  private readonly onAutoReviewRun?: (input: Record<string, unknown>) => Promise<{ success: boolean; text: string }>;
+  private readonly onDeliveryCreatePr?: (input: Record<string, unknown>) => Promise<{ success: boolean; text: string }>;
   private readonly nativeMultiAgentObservation: "auto" | "disabled";
   private readonly onUsageLimit?: (limit: UsageLimit) => void;
   private readonly onDisconnected?: () => void;
@@ -343,6 +347,8 @@ export class CodexAppServerClient {
     this.onNativeChildObservation = options.onNativeChildObservation;
     this.onTaskEvent = options.onTaskEvent;
     this.onWorkerReport = options.onWorkerReport;
+    this.onAutoReviewRun = options.onAutoReviewRun;
+    this.onDeliveryCreatePr = options.onDeliveryCreatePr;
     this.nativeMultiAgentObservation = options.nativeMultiAgentObservation ?? "auto";
     this.onUsageLimit = options.onUsageLimit;
     this.onDisconnected = options.onDisconnected;
@@ -474,7 +480,7 @@ export class CodexAppServerClient {
       sandbox: opts?.sandbox ?? null,
       config: null,
       persistExtendedHistory: true,
-      ...(this.onTaskEvent ? { dynamicTools: this.taskEventTools() } : {})
+      ...(this.onTaskEvent || this.onAutoReviewRun || this.onDeliveryCreatePr ? { dynamicTools: this.taskEventTools() } : {})
     };
     const result = (await this.request("thread/start", params)) as ThreadResult;
     this._threadId = result.thread.id;
@@ -933,6 +939,28 @@ export class CodexAppServerClient {
       return;
     }
 
+    if (method === "item/tool/call" && params.namespace === "perch" && params.tool === "autoreview.run") {
+      const args = isRecord(params.arguments) ? params.arguments : {};
+      try {
+        const result = await this.onAutoReviewRun?.(args);
+        this.respond(id, { contentItems: [{ type: "inputText", text: result?.text ?? "AutoReview is unavailable." }], success: result?.success === true });
+      } catch (error) {
+        this.respond(id, { contentItems: [{ type: "inputText", text: error instanceof Error ? error.message : String(error) }], success: false });
+      }
+      return;
+    }
+
+    if (method === "item/tool/call" && params.namespace === "perch" && params.tool === "delivery.create_pr") {
+      const args = isRecord(params.arguments) ? params.arguments : {};
+      try {
+        const result = await this.onDeliveryCreatePr?.(args);
+        this.respond(id, { contentItems: [{ type: "inputText", text: result?.text ?? "Delivery is unavailable." }], success: result?.success === true });
+      } catch (error) {
+        this.respond(id, { contentItems: [{ type: "inputText", text: error instanceof Error ? error.message : String(error) }], success: false });
+      }
+      return;
+    }
+
     const structured = this.normalizeServerRequest(id, method, params);
     if (structured && this.onServerRequest) {
       const key = requestKey(id);
@@ -1028,6 +1056,32 @@ export class CodexAppServerClient {
             idempotencyKey: { type: "string" }
           },
           required: ["summary", "report"],
+          additionalProperties: false
+        }
+      }, {
+        type: "function" as const,
+        name: "autoreview.run",
+        description: "Run bundled AutoReview for this ship task's exact final tree. The server authenticates the root runtime, runs a supported focused test command in a stripped environment, and returns a durable receipt.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            baseRef: { type: "string", description: "Git base ref to compare, normally origin/main." },
+            idempotencyKey: { type: "string" },
+            testArgv: { type: "array", items: { type: "string" }, description: "Supported test command argv such as npm test or node --test. Shells and arbitrary executables are rejected; raw arguments are not persisted." },
+            authorDispositions: { type: "array", items: { type: "object" } },
+            supersedesAttemptId: { type: "string" }
+          },
+          required: ["idempotencyKey", "testArgv"],
+          additionalProperties: false
+        }
+      }, {
+        type: "function" as const,
+        name: "delivery.create_pr",
+        description: "Create the one server-owned pull request for a clean AutoReview receipt. Refuses stale, failed, or finding-bearing receipts.",
+        inputSchema: {
+          type: "object",
+          properties: { idempotencyKey: { type: "string" } },
+          required: ["idempotencyKey"],
           additionalProperties: false
         }
       }]

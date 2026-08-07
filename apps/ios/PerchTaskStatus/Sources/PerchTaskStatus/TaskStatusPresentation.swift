@@ -91,6 +91,9 @@ public enum TaskStatusPresentation {
         if state == "ready_to_apply" {
             return TaskStatusChip(kind: .agent, label: "Ready to apply", tone: .success)
         }
+        if state == "verified_done" {
+            return TaskStatusChip(kind: .agent, label: "Verified done", tone: .success)
+        }
         guard let pr, presentationState == nil else { return stateChip(state) }
         if taskState == "closed" {
             return prStatusChip(pr, suffix: "closed", tone: .neutral)

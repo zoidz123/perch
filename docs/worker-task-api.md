@@ -56,12 +56,14 @@ The internal Codex root-tool relay also presents the server bearer, but its sepa
 | `POST /tasks` | Mate | Create a task and, with `dispatch: true`, acquire a worktree, start a worker, and link the runtime. |
 | `GET /tasks` | Mate, CLI, phone | List durable task projections. |
 | `GET /tasks/:id` | Mate, CLI, phone | Read one task and its immutable ordered event log. |
-| `POST /tasks/:id/events` | Worker or owned Codex root-tool relay | Report `working`, `pr_linked`, `needs_decision`, `blocked`, `done`, `failed`, or `note`. |
+| `POST /tasks/:id/events` | Worker or owned Codex root-tool relay | Report lifecycle progress. New ship tasks cannot attach a PR through this route. |
 | `POST /tasks/:id/reports` | Worker or owned Codex root-tool relay | Durably submit the complete worker report and evidence to the mate mailbox. |
+| `POST /tasks/:id/autoreview` | Managed ship root worker | Freeze the target, run focused tests and the bundled helper, and persist a durable receipt. |
+| `POST /tasks/:id/delivery/pr` | Managed ship root worker | Revalidate a clean receipt and create/link the one server-owned PR. |
 | `GET /mate/mailbox`, `POST /mate/mailbox/read`, `GET /mate/mailbox/message/:id`, `POST /mate/mailbox/ack`, `GET /mate/mailbox/wait` | Mate (hook credential); list and read also accept bearer auth | The mate's durable worker-to-mate mailbox: list, claim, read full content, acknowledge, bounded wait. |
 | `POST /hooks` | Installed provider hook | Report provider lifecycle signals such as turn start and turn completion. |
 | `POST /tasks/:id/completion` | Mate with the server token | Accept or reject the latest worker completion request. |
-| `POST /tasks/:id/decision` | Mate or phone | Answer a structured no-mistakes review gate reported through `needs_decision`. |
+| `POST /tasks/:id/decision` | Mate or phone | Answer a retained structured legacy gate during the migration window. |
 | `GET /sessions` | Mate, CLI, phone | Read live fleet and provider-session status. |
 | `POST /sessions/:sessionId/input` | Mate, CLI, phone | Send or queue follow-up text to the worker session. |
 | `POST /tasks/:id/recover` | Mate, CLI, phone | Recover managed provider work in a new runtime generation. |
@@ -89,13 +91,13 @@ Mate normally sends:
 }
 ```
 
-`kind` is `ship` or `scout`.
-The optional `mode` is `direct-PR`, `no-mistakes`, or `local-only`; otherwise the project setting and then the built-in default decide it.
+`kind` is `ship`, `scout`, or `operate`.
+New creation rejects the optional legacy `mode` field with a compatibility error rather than remapping it.
 Optional `agent`, `model`, and `effort` values override dispatch defaults for this task only.
 Reusing an `idempotencyKey` returns the original durable dispatch instead of launching another worker.
 
 With `dispatch: true`, the server appends the standard worker brief to `prompt`.
-That brief contains the exact event commands, worktree and branch rules, and the mode-specific definition of done.
+That brief contains typed worker operations, worktree and branch rules, and the task-kind definition of done.
 
 If dispatch fails before launch, Perch preserves the failed operation and failed task event before deciding whether to close the task automatically.
 Auto-close requires the latest durable dispatch payload to show that launch never started and requires the task to have no session, runtime, worktree linkage, or task-owned lease.
@@ -122,11 +124,11 @@ An optional `planId` query filters tasks linked to one finalized plan.
 ```
 
 Each returned task also carries a server-derived `presentation` with a single `state`:
-`working`, `reviewing`, `needs_you`, `blocked`, `awaiting_verification`, `ready_to_merge`, `ready_to_apply`, `failed`, or `closed`.
+`working`, `reviewing`, `needs_you`, `blocked`, `awaiting_verification`, `ready_to_merge`, `ready_to_apply`, `verified_done`, `failed`, or `closed`.
 It is derived from the durable lifecycle, PR, verification, and review facts, never persisted as task state, and clients render the primary task status from it instead of inferring readiness from PR checks or mergeability.
 A `landed` task presents as `closed`, so merged work leaves the active task list immediately instead of wearing a badge until teardown closes the record.
-A `working` `no-mistakes` task presents as `reviewing` only while durable review facts prove the pipeline is engaged: the latest allowed runtime authorization (`run`, `gate-push`, or `agent-launch`) recorded on the ledger, surrendered by any event that returns the state to `working`.
-Mode alone never promotes the badge, so scouting and implementation stay `working` until the gate truly starts; other modes stay `working` until `awaiting_verification`.
+A working `ship` task presents as `reviewing` only while its latest durable AutoReview attempt is running.
+`scout` and `operate` present `verified_done` only after report evidence is accepted.
 
 Mate uses this detail endpoint before acting on a wake notification.
 The event `seq` is the stable identifier used for completion decisions and turn-boundary evidence.
@@ -135,7 +137,7 @@ The event `seq` is the stable identifier used for completion decisions and turn-
 
 ### `POST /tasks/:id/events`
 
-A Claude worker or compatible legacy Codex worker reports an outcome with its session credentials:
+A Claude worker reports an outcome with `perch task event`; compatible legacy Codex workers may use their retained hook path.
 
 ```sh
 curl -sf -X POST "${PERCH_HOOK_URL%/hooks}/tasks/<task-id>/events" \
@@ -164,7 +166,7 @@ Fresh managed Codex workers call `perch.report_task_event` with the same request
 | Worker wire verb | Durable event | Resulting task state | Meaning |
 | --- | --- | --- | --- |
 | `working` | `working` | `working` | The worker started or resumed meaningful work. |
-| `pr_linked` | `pr_linked` | unchanged | A remote ship task authenticated its canonical PR identity. The server validates and records the URL, repo, number, head branch, and head commit, then begins polling it without requesting completion. |
+| `pr_linked` | `pr_linked` | unchanged | Legacy remote records only: the server validates and records a recovered historical PR identity. New ship tasks are rejected and must use server delivery. |
 | `needs_decision` | `needs_decision` | `needs_you` | Work is parked on a human or Mate decision. |
 | `blocked` | `blocked` | `blocked` | Work is parked on an external dependency. |
 | `done` | `completion_requested` | `completion_requested` | The worker claims the definition of done is met and asks Mate to verify it. |
@@ -174,15 +176,13 @@ Fresh managed Codex workers call `perch.report_task_event` with the same request
 The `done` name is retained as the worker wire verb for compatibility.
 It never directly creates trusted `done` state.
 
-For remote ship tasks, report `pr_linked` as soon as the worker or no-mistakes pipeline creates or discovers the PR.
-Its body must contain an explicit `pr` URL, never a URL scraped from ordinary working text.
-The server verifies it against the task identity, persists the PR fact and `pr_linked` event atomically, and immediately exposes it through task snapshots while lifecycle state remains unchanged.
-Repeating the same identity is harmless; a different PR is rejected.
-
-For a non-scout, non-`local-only` task, every `done` request must re-resolve a valid pull request and validate its head commit against the task checkout `HEAD`, including when the task already has an attached merged PR.
-The worker may send `pr`, include the URL in `message`, or let the server discover the unique PR for the server-minted branch.
-The server attaches the validated PR before recording the completion request.
-For `no-mistakes` tasks, the standard worker brief therefore requires inspecting `branch_sync`, running exactly `no-mistakes axi sync` when `next_action.code` is `sync`, and confirming the event response reached `task.state == completion_requested`.
+For a new `ship` task, run focused tests and `perch.autoreview.run` or `perch autoreview run` for the intended final tree.
+Verify findings against source, fix accepted actionable findings, then rerun focused tests and review with the prior attempt's supersession identity.
+Only after a clean receipt may the root worker call `perch.delivery.create_pr` or `perch delivery create-pr`.
+The server recomputes base, HEAD, tree, diff, and clean-worktree identity immediately before delivery.
+Any source change after review mechanically makes the receipt stale.
+Direct `pr_linked`, worker-authored `git push`, and worker-authored `gh pr create` cannot satisfy new ship delivery or completion.
+`scout` and `operate` must not invoke AutoReview or code delivery.
 
 ## Worker reports and the mate mailbox
 
@@ -344,7 +344,8 @@ If the attached PR merged during review, the server then records the merge and a
 After a trusted `done` PR is first observed as merge-ready, the server keeps it on the fast polling cadence until GitHub reports it merged or closed.
 A temporary readiness regression or server restart does not return that PR to the baseline cadence.
 
-Every completion request is bound to the exact deliverable it claims: the current PR head SHA for PR modes, or the exact checkout HEAD commit SHA for `local-only`.
+Every new `ship` completion request is bound to the server-created PR and the exact base, HEAD, tree, diff, and focused-test evidence recorded by its clean receipt.
+Every new `scout` or `operate` completion request is bound to an accepted report deliverable.
 The derived `ready_to_merge` presentation holds only while the mate's acceptance of the latest completion request still matches the current PR head and GitHub currently reports an open, non-draft PR with `MERGEABLE` mergeability, `CLEAN` merge state, no blocking review decision, and either passing checks or an explicit empty check rollup.
 An absent check rollup or unavailable PR observation is unknown, clears any previously derived readiness, and never counts as a zero-check repository.
 `ready_to_apply` requires the acceptance to have recorded the same checkout HEAD commit the completion request pinned; if either revision cannot be read or they differ, readiness stays absent.
@@ -359,10 +360,10 @@ Only the local server token may call this endpoint.
 A worker hook token cannot accept its own work, and a paired device token receives `403` rather than silently acting as Mate.
 Mate should re-read the task after any `409` response.
 
-## Structured no-mistakes decisions
+## Structured legacy decisions
 
 `POST /tasks/:id/decision` is narrower than ordinary worker steering.
-It answers the latest structured no-mistakes gate that the worker previously persisted with a `needs_decision` event.
+It answers the latest structured gate that a persisted legacy task previously recorded with a `needs_decision` event.
 
 ```json
 {
@@ -374,7 +375,7 @@ It answers the latest structured no-mistakes gate that the worker previously per
 
 `action` is `approve`, `fix`, or `skip`.
 `findingIds` and `instructions` are used only with `fix`.
-The server translates the decision into the no-mistakes response command and queue-gates delivery to the worker.
+No new task dispatch initializes this retained runtime or depends on this endpoint.
 Worker hook credentials are not accepted because a worker cannot answer its own review gate.
 
 ## Steering, recovery, and teardown

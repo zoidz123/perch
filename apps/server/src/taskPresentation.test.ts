@@ -32,13 +32,12 @@ test("green and mergeable PR needs mate acceptance for Ready to Merge", () => {
   assert.equal(deriveTaskPresentation(task(), { verification: verification() }).state, "ready_to_merge");
 });
 
-test("a working no-mistakes task presents Reviewing only with durable review facts", () => {
-  const review = { enteredSeq: 3 };
-  // Mode alone never promotes Working: scouting and implementation stay
-  // Working until the gate's allowed authorization is on the ledger.
+test("a working ship task presents Reviewing only with durable AutoReview facts", () => {
+  const review = { state: "running" as const, attemptId: "attempt-1" };
+  // Mode alone never promotes Working. Only a durable AutoReview attempt can.
   assert.equal(deriveTaskPresentation(task({ mode: "no-mistakes", state: "working" })).state, "working");
   assert.equal(deriveTaskPresentation(task({ mode: "no-mistakes", state: "working" }), { review }).state, "reviewing");
-  // Review facts only ever promote a working no-mistakes task.
+  // Review facts only ever promote a working ship task.
   assert.equal(deriveTaskPresentation(task({ mode: "no-mistakes", state: "queued" }), { review }).state, "working");
   assert.equal(deriveTaskPresentation(task({ mode: "no-mistakes", state: "needs_you" }), { review }).state, "needs_you");
   assert.equal(deriveTaskPresentation(task({ mode: "no-mistakes", state: "blocked" }), { review }).state, "blocked");
@@ -46,8 +45,15 @@ test("a working no-mistakes task presents Reviewing only with durable review fac
     deriveTaskPresentation(task({ mode: "no-mistakes", state: "completion_requested" }), { review }).state,
     "awaiting_verification"
   );
-  assert.equal(deriveTaskPresentation(task({ mode: "direct-PR", state: "working" }), { review }).state, "working");
-  assert.equal(deriveTaskPresentation(task({ mode: "local-only", state: "working" }), { review }).state, "working");
+  assert.equal(deriveTaskPresentation(task({ mode: "direct-PR", state: "working" }), { review }).state, "reviewing");
+  assert.equal(deriveTaskPresentation(task({ mode: "local-only", state: "working" }), { review }).state, "reviewing");
+});
+
+test("scout and operate present verified done only after report evidence is accepted", () => {
+  const facts: TaskVerificationFacts = { requestSeq: 1, deliverable: { kind: "report" }, accepted: true };
+  assert.equal(deriveTaskPresentation(task({ kind: "scout", state: "done", pr: undefined, mode: undefined }), { verification: facts }).state, "verified_done");
+  assert.equal(deriveTaskPresentation(task({ kind: "operate", state: "done", pr: undefined, mode: undefined }), { verification: facts }).state, "verified_done");
+  assert.equal(deriveTaskPresentation(task({ kind: "scout", state: "done", pr: undefined, mode: undefined }), { verification: { ...facts, accepted: false } }).state, "working");
 });
 
 test("rejection, resumption, new head, and changed checks invalidate readiness", () => {

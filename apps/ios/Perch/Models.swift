@@ -707,7 +707,9 @@ struct AgentTask: Codable, Identifiable, Equatable {
     let workerName: String?
     let project: String
     let kind: String
-    let mode: String
+    // New ship/scout/operate records omit the retired delivery mode. Keep
+    // decoding legacy persisted records that still carry one.
+    let mode: String?
     let state: String
     let sessionId: String?
     let worktreeId: String?

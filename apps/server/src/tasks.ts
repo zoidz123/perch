@@ -136,6 +136,14 @@ export class TaskStore {
     if (!input.project?.trim()) {
       throw new Error("task project is required");
     }
+    if (input.mode !== undefined) {
+      throw new Error(
+        `task delivery mode ${JSON.stringify(input.mode)} is legacy-only; create a ship, scout, or operate task instead`
+      );
+    }
+    if (input.kind !== undefined && !isTaskKind(input.kind)) {
+      throw new Error(`unsupported task kind ${JSON.stringify(input.kind)}; expected ship, scout, or operate`);
+    }
     if (this.stateDb.tasks.countOpen() >= MAX_TASKS) {
       throw new Error(`task store is full (${MAX_TASKS} open tasks); close some first`);
     }
@@ -148,7 +156,6 @@ export class TaskStore {
         title: input.title.trim(),
         project: input.project,
         kind: input.kind ?? "ship",
-        mode: input.mode ?? "direct-PR",
         state: "queued",
         ...(input.prompt ? { prompt: input.prompt } : {}),
         ...(input.planId ? { planId: input.planId } : {}),
@@ -170,13 +177,13 @@ export class TaskStore {
     const runtimes = this.stateDb.runtimes.latestByTask();
     const prFacts = this.stateDb.tasks.prFactsByTask();
     const verifications = this.stateDb.tasks.verificationFactsByTask();
-    const reviews = this.stateDb.tasks.reviewFactsByTask();
+    const reviews = this.stateDb.autoreview.latestByTask();
     return this.stateDb.tasks.list().map((task) => {
       const runtime = runtimes.get(task.id);
       return this.withPresentation(runtime ? { ...task, runtime: runtimeSnapshot(runtime) } : task, {
         pr: prFacts.get(task.id),
         verification: verifications.get(task.id),
-        review: reviews.get(task.id)
+        review: reviewFacts(reviews.get(task.id))
       });
     });
   }
@@ -184,7 +191,13 @@ export class TaskStore {
   find(id: string): Task | undefined {
     try {
       const task = this.stateDb.tasks.find(safeId(id));
-      return task ? this.withPresentation(this.withRuntime(task)) : undefined;
+      return task
+        ? this.withPresentation(this.withRuntime(task), {
+            pr: this.stateDb.tasks.prFacts(task.id),
+            verification: this.stateDb.tasks.verificationFacts(task.id),
+            review: reviewFacts(this.stateDb.autoreview.latest(task.id))
+          })
+        : undefined;
     } catch {
       return undefined;
     }
@@ -372,7 +385,7 @@ export class TaskStore {
     const facts: TaskPresentationFacts = {
       pr: this.stateDb.tasks.prFacts(task.id),
       verification: this.stateDb.tasks.verificationFacts(task.id),
-      review: this.stateDb.tasks.reviewFacts(task.id)
+      review: reviewFacts(this.stateDb.autoreview.latest(task.id))
     };
     for (const notification of notifications) {
       for (const listener of this.listeners) {
@@ -498,7 +511,7 @@ export class TaskStore {
     const resolved = facts ?? {
       pr: this.stateDb.tasks.prFacts(task.id),
       verification: this.stateDb.tasks.verificationFacts(task.id),
-      review: this.stateDb.tasks.reviewFacts(task.id)
+      review: reviewFacts(this.stateDb.autoreview.latest(task.id))
     };
     return { ...persisted, presentation: deriveTaskPresentation(persisted, resolved) };
   }
@@ -548,6 +561,15 @@ export class TaskStore {
     }
     return this.withRuntime(task);
   }
+}
+
+function reviewFacts(attempt: import("./stateDb.js").AutoReviewAttemptRecord | undefined): TaskPresentationFacts["review"] {
+  if (!attempt) return undefined;
+  return { attemptId: attempt.id, state: attempt.state };
+}
+
+function isTaskKind(kind: string): kind is NonNullable<NewTask["kind"]> {
+  return kind === "ship" || kind === "scout" || kind === "operate";
 }
 
 // Only kinds a channel actually delivers become outbox rows; events both

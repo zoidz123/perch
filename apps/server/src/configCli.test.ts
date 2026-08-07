@@ -513,41 +513,34 @@ test("config validate passes on the global view and runtime owns bundled provena
   }
 });
 
-test("project CLI lists only delivery mode, accepts every supported mode, and rejects removed flags", async () => {
+test("project CLI has no delivery-mode control and rejects legacy mode flags", async () => {
   const home = mkdtempSync(join(tmpdir(), "perch-config-home-"));
   try {
     await withStubServer(async (serverUrl, state) => {
       state.projects.push({
         rootPath: "/repo",
         name: "repo",
-        mode: "direct-PR",
         addedAt: "2026-07-20T00:00:00.000Z",
         lastUsedAt: "2026-07-20T00:00:00.000Z"
       });
       const list = await runCli(serverUrl, home, ["project", "list"]);
       assert.equal(list.code, 0, list.stderr);
-      assert.match(list.stdout, /NAME\s+MODE\s+LAST USED\s+PATH/);
-      assert.doesNotMatch(list.stdout, /yolo/i);
+      assert.match(list.stdout, /NAME\s+LAST USED\s+PATH/);
+      assert.doesNotMatch(list.stdout, /mode|yolo/i);
 
       const show = await runCli(serverUrl, home, ["project", "show", "/repo"]);
       assert.equal(show.code, 0, show.stderr);
-      assert.match(show.stdout, /MODE     direct-PR/);
-      assert.doesNotMatch(show.stdout, /yolo/i);
+      assert.doesNotMatch(show.stdout, /mode|yolo/i);
 
-      for (const mode of ["direct-PR", "local-only", "no-mistakes"]) {
-        const set = await runCli(serverUrl, home, ["project", "set", "/repo", "--mode", mode, "--yes"]);
-        assert.equal(set.code, 0, set.stderr);
-      }
-      assert.deepEqual(state.patches.slice(-3), [
-        { rootPath: "/repo", mode: "direct-PR" },
-        { rootPath: "/repo", mode: "local-only" },
-        { rootPath: "/repo", mode: "no-mistakes" }
-      ]);
+      const legacy = await runCli(serverUrl, home, ["project", "set", "/repo", "--mode", "direct-PR", "--yes"]);
+      assert.equal(legacy.code, 1);
+      assert.match(legacy.stderr, /project delivery modes were removed|unknown project action|legacy-only|unknown option/i);
+      assert.deepEqual(state.patches, []);
 
       for (const [action, flag] of [["add", "--yolo"], ["set", "--no-yolo"]] as const) {
         const removed = await runCli(serverUrl, home, ["project", action, "/repo", flag]);
         assert.equal(removed.code, 1);
-        assert.match(removed.stderr, new RegExp(`unknown option for project ${action}: ${flag}`));
+        assert.match(removed.stderr, new RegExp(`project delivery modes were removed|unknown option for project ${action}: ${flag}`));
       }
     });
   } finally {

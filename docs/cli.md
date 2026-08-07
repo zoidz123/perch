@@ -48,17 +48,17 @@ Its compact table shows the task and project, server-derived lifecycle state, wo
 ```text
 perch project [list|ls]
 perch project ls
-perch project add <path> [--mode direct-PR|no-mistakes|local-only] [--yes]
+perch project add <path>
 perch project show <path>
-perch project set <path> --mode direct-PR|no-mistakes|local-only [--yes]
 perch project remove <path>
 perch project rm <path>
 ```
 
 Project removal changes only the registry.
 `project ls` is an alias for `project list`, and `project rm` is an alias for `project remove`.
-Setting a project to `no-mistakes` validates the bundled runtime and protocol, asks once unless `--yes` is present, initializes and verifies the repository, and only then persists the new mode.
-Any failure preserves the previous mode.
+Projects do not choose delivery behavior.
+New tasks choose `ship`, `scout`, or `operate` at creation time.
+Legacy project mode fields are ignored when a registry file is decoded and cannot be set again.
 
 ## Configuration
 
@@ -73,7 +73,7 @@ perch config validate [--global] [--effective] [--json]
 ```
 
 Dotted-key mutations require explicit `--global`.
-Project delivery mode moved to `perch project show|set <path>`; a `task.mode` mutation fails with the equivalent `perch project set` command.
+Task delivery is not a configuration field.
 The mate and dispatch model commands are global by definition and resolve the model to one agent before writing the complete agent, model, and effort tuple atomically.
 An omitted effort uses the selected model's registry default.
 Unknown models report closest matches, unsupported efforts report the valid levels, and ambiguous cross-agent ids require an interactive choice or `--agent`.
@@ -107,46 +107,28 @@ Explicit launch fields similarly override the matching role default.
 See the [worker task API](worker-task-api.md#post-tasks) for the exact task request fields.
 Environment overrides also win over stored global defaults.
 
-Copy these commands to inspect and change delivery settings for one project:
+New task kinds are explicit:
 
 ```sh
-perch project list
-perch project show /path/to/project
-perch project set /path/to/project --mode no-mistakes --yes
+perch autoreview run --task <task-id> --idempotency-key <key> --test-argv-json '["npm","test"]'
+perch delivery create-pr --task <task-id> --idempotency-key <key>
 ```
 
-Task mode precedence is explicit task mode, then the project registry value, then built-in `direct-PR`.
-`perch project set ... --mode no-mistakes` validates the bundled runtime and preserves the prior mode if activation fails.
+`--test-argv-json` must name a supported test launcher, such as `npm test` or `node --test`.
+
+Perch rejects shells and arbitrary executables, executes the test in a stripped environment, and stores only redacted argv shape plus a hash in the receipt.
+
+Only a `ship` task may use those operations.
+The first creates a durable exact-tree AutoReview receipt, and the second creates the server-owned PR only after it validates that receipt.
+`scout` and `operate` tasks instead complete with accepted report evidence.
 
 Effective output includes `effectiveValue`, `source`, `scope`, `storedValue`, `defaultValue`, and `overriddenBy` for every key.
 Configuration listings warn about a saved agent and model tuple that the current registry cannot validate.
 Warnings never rewrite saved configuration.
 Text and JSON redact secret-shaped keys identically.
 Environment overrides have higher precedence than stored global launch defaults.
-Task mode precedence is explicit task, project, then built-in `direct-PR`.
-
-`perch runtime` shows these read-only provenance fields:
-
-- `runtime.no-mistakes.version`
-- `runtime.no-mistakes.path`
-- `runtime.no-mistakes.SHA-256`
-- `runtime.no-mistakes.source`
-- `runtime.no-mistakes.architecture`
-- `runtime.no-mistakes.protocol`
-
-Updating Perch is the only supported way to replace the bundled runtime.
-
-These fields identify the signed runtime shipped inside the installed `perchctl` package:
-
-- `version` is the bundled no-mistakes release version.
-- `path` is the selected executable inside the installed package.
-- `SHA-256` is that executable's expected digest.
-- `source` is `bundled`, meaning Perch owns the package provenance instead of resolving a binary from `PATH`.
-- `architecture` is the platform slice selected for this Mac.
-- `protocol` is the authorization protocol version Perch requires from the runtime.
-
-These fields are not user-stored configuration, and they never appear in `perch config` listings.
-Run `perch runtime validate` or `perch doctor` to inspect and validate the effective bundled runtime.
+The AutoReview bundle provenance is recorded in each receipt and in `apps/server/assets/autoreview/manifest.json` for source installations.
+It is package-owned and never resolves worker skills from user-global directories.
 
 ## Models
 
@@ -173,8 +155,8 @@ perch worktrees
 perch worktrees release <id> [--force]
 ```
 
-`doctor` reports the bundled no-mistakes version, path, SHA-256, source, architecture, and protocol.
-It never downloads or PATH-repairs the managed runtime.
+`doctor` checks the local provider and GitHub prerequisites.
+The bundled AutoReview helper is verified by package smoke tests and durable receipt provenance.
 Provider installation and sign-in remain separate user actions.
 
 ## Complete command index
