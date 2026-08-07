@@ -4384,17 +4384,25 @@ async function routeMateMailbox(
     const requested = Number(url.searchParams.get("timeoutSeconds") ?? 25);
     const timeoutSeconds = Math.max(0, Math.min(Number.isFinite(requested) ? requested : 25, MAILBOX_WAIT_MAX_SECONDS));
     const deadline = Date.now() + timeoutSeconds * 1000;
-    for (;;) {
-      const now = new Date().toISOString();
-      if (mailbox.pendingCount(now) > 0) {
-        const messages = mailbox.list({ limit: 50 }).map((record) => mailboxMessageProjection(options, record, false));
-        writeJson(response, 200, { messages, timedOut: false });
-        return;
+    // The socket can disappear mid-wait (client gone, server shutdown). A
+    // vanished waiter must cost nothing: stop polling and never write to a
+    // dead response - the durable mailbox still holds every message.
+    try {
+      for (;;) {
+        const now = new Date().toISOString();
+        if (mailbox.pendingCount(now) > 0) {
+          if (response.writableEnded || request.destroyed) return;
+          const messages = mailbox.list({ limit: 50 }).map((record) => mailboxMessageProjection(options, record, false));
+          writeJson(response, 200, { messages, timedOut: false });
+          return;
+        }
+        if (Date.now() >= deadline || response.writableEnded || request.destroyed) break;
+        await new Promise((resolve) => setTimeout(resolve, Math.min(250, Math.max(1, deadline - Date.now()))));
       }
-      if (Date.now() >= deadline || response.writableEnded || request.destroyed) break;
-      await new Promise((resolve) => setTimeout(resolve, Math.min(250, Math.max(1, deadline - Date.now()))));
+      if (!response.writableEnded && !request.destroyed) writeJson(response, 200, { messages: [], timedOut: true });
+    } catch {
+      // A torn-down socket while replying is a disconnect, not a server fault.
     }
-    if (!response.writableEnded) writeJson(response, 200, { messages: [], timedOut: true });
     return;
   }
 
