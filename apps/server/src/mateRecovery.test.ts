@@ -8,6 +8,7 @@ import type { AddressInfo } from "node:net";
 import type { AgentSession, RecentEventsResult, StartAgentRequest } from "@perch/shared";
 import type { AgentAdapter } from "./adapters/types.js";
 import type { CodexAppServerAdapter } from "./adapters/codexAppServerAdapter.js";
+import { CodexRpcError } from "./adapters/codexAppServer.js";
 import { FakeCodexOwnedAdapter } from "./adapters/fakeCodexAppServer.js";
 import type { PtyAgentAdapter } from "./adapters/pty.js";
 import { RoutingAgentAdapter } from "./adapters/routingAdapter.js";
@@ -780,6 +781,99 @@ test("Codex mate recovery resumes the exact thread over the app-server and binds
   } finally {
     server.closeAllConnections?.();
     if (server.listening) await new Promise<void>((resolve) => server.close(() => resolve()));
+    await scheduler.stop();
+    monitor.stop();
+    timeline.stop();
+    tasks.close();
+    rmSync(home, { recursive: true, force: true });
+  }
+});
+
+test("Codex Mate migration parks rejected handoffs with durable recovery evidence", async () => {
+  const home = mkdtempSync(join(tmpdir(), "perch-codex-mate-migration-handoff-"));
+  const tasks = new TaskStore({ PERCH_HOME: home } as NodeJS.ProcessEnv);
+  const ownerManager = new OwnerManager(tasks);
+  const runtimeManager = new RuntimeManager(tasks);
+  const adapter = new MateRecoveryAdapter();
+  const codexOwned = new FakeCodexOwnedAdapter();
+  const routing = new RoutingAgentAdapter(
+    adapter as unknown as PtyAgentAdapter,
+    codexOwned as unknown as CodexAppServerAdapter
+  );
+  const monitor = new FleetMonitor(routing);
+  const timeline = new TimelineStore();
+  const scheduler = new TaskScheduler({ stateDb: tasks.stateDb, operationKinds: ["recovery"] });
+  const options = {
+    adapter: routing,
+    codexOwned: codexOwned as unknown as CodexAppServerAdapter,
+    auditLog: new AuditLog(join(home, "audit.jsonl")),
+    monitor,
+    projects: new ProjectRegistry({ PERCH_HOME: home } as NodeJS.ProcessEnv),
+    worktrees: new WorktreePool({ env: { PERCH_HOME: home } as NodeJS.ProcessEnv }),
+    hooks: new HookRegistry(),
+    timeline,
+    tasks,
+    port: 8787,
+    runtimeManager,
+    ownerManager,
+    taskScheduler: scheduler,
+    mateProviders: [codexRecoveryDriver],
+    identityTimeoutMs: 500
+  };
+  const recovery = new MateRecoveryCoordinator(options);
+  (options as { mateRecoveryCoordinator?: MateRecoveryCoordinator }).mateRecoveryCoordinator = recovery;
+
+  try {
+    const starting = ownerManager.beginMateLaunch({
+      command: "codex",
+      agent: "codex",
+      sessionId: "pty:old-codex-mate",
+      cwd: home,
+      labels: { role: "mate" }
+    });
+    ownerManager.markLive(starting, "pty:old-codex-mate", undefined, {
+      metadata: {
+        source: "mate-launch",
+        codexDriver: "app-server-owned",
+        appServerSocketPath: "/fake/daemons/legacy-mate.sock"
+      }
+    });
+    ownerManager.recordProviderSession("pty:old-codex-mate", "codex", MATE_CONVERSATION);
+    const recoverable = ownerManager.interruptSession("pty:old-codex-mate")!;
+    codexOwned.nextSubmitError = new CodexRpcError("turn/start", "handoff denied", -32600);
+
+    await assert.rejects(recovery.recover(recoverable), /migration handoff was rejected/);
+    const live = ownerManager.latestMate()!;
+    assert.equal(live.state, "live");
+    assert.equal((live.metadata?.codexMigrationHandoff as { state?: string })?.state, "rejected");
+    const operation = tasks.stateDb.ownerOperations.findByKey(`mate-fleet:${live.ownerId}:g0`);
+    assert.equal(operation?.state, "failed");
+    assert.match(operation?.lastError ?? "", /migration handoff was rejected/);
+    const submitted = codexOwned.submitted.length;
+    await assert.rejects(recovery.recover(live), /migration handoff was rejected/);
+    assert.equal(codexOwned.submitted.length, submitted);
+
+    const retryable = tasks.stateDb.ownerRuntimes.compareAndSwap(live.ownerId, live.generation, "live", "live", {
+      metadata: {
+        ...live.metadata,
+        codexMigrationHandoff: {
+          state: "submitted",
+          clientUserMessageId: "perch:migration:owner:mate:g1",
+          handoff: "mate_state"
+        }
+      }
+    })!;
+    codexOwned.historyReadError = new Error("history unavailable");
+    await assert.rejects(recovery.recover(retryable), /acceptance is unknown/);
+    assert.equal(
+      (ownerManager.latestMate()?.metadata?.codexMigrationHandoff as { state?: string } | undefined)?.state,
+      "delivery_unknown"
+    );
+    assert.equal(
+      tasks.stateDb.ownerOperations.findByKey(`mate-fleet:${live.ownerId}:g1`)?.state,
+      "failed"
+    );
+  } finally {
     await scheduler.stop();
     monitor.stop();
     timeline.stop();

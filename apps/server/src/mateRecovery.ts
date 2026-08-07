@@ -4,7 +4,13 @@ import type { HookEventPayload } from "./hooks.js";
 import { startManagedAgent, type ManagedAgentLauncherOptions } from "./agentLauncher.js";
 import { MATE_OWNER_ID, type OwnerManager } from "./ownerManager.js";
 import { claudeRecoveryDriver } from "./providerRecovery.js";
-import { codexOwnedBindFacts, codexRecoveryDriver, type RecoveryProviderDriver } from "./recovery.js";
+import {
+  codexMigrationHandoffFromMetadata,
+  codexOwnedBindFacts,
+  codexRecoveryDriver,
+  deliverCodexMigrationHandoff,
+  type RecoveryProviderDriver
+} from "./recovery.js";
 import { isTrustedProviderIdentity } from "./runtimeManager.js";
 import type { OwnerRuntimeRecord, RuntimeRecord } from "./stateDb.js";
 import type { TaskScheduler } from "./taskScheduler.js";
@@ -108,6 +114,7 @@ export class MateRecoveryCoordinator {
 
     try {
       const mate = runtime.state === "live" ? runtime : await this.resumeMate(runtime);
+      await this.completeMigrationHandoff(mate);
       const session = (await this.options.adapter.listSessions()).find((candidate) => candidate.id === mate.ptySessionId);
       if (!session) throw new Error("restored mate PTY is not live");
       const children = await this.restoreChildren(mate, runtime.ptySessionId);
@@ -211,7 +218,22 @@ export class MateRecoveryCoordinator {
         allowProviderSessionReplacement: prepared.allowReplacementProviderSessionId === true,
         ...(result.session.model ? { model: result.session.model } : {}),
         ownership: this.options.adapter.runtimeProcess?.(launchedSessionId),
-        ...(bindFacts ? { metadata: bindFacts.metadata } : {})
+        ...(bindFacts || prepared.postBindTurn
+          ? {
+              metadata: {
+                ...(bindFacts?.metadata ?? {}),
+                ...(prepared.postBindTurn
+                  ? {
+                      codexMigrationHandoff: {
+                        state: "pending",
+                        clientUserMessageId: prepared.postBindTurn.clientUserMessageId,
+                        handoff: prepared.postBindTurn.handoff
+                      }
+                    }
+                  : {})
+              }
+            }
+          : {})
       });
       if (bindFacts?.aliasSessionId) {
         this.options.hooks.aliasSession(bindFacts.aliasSessionId, launchedSessionId);
@@ -224,21 +246,6 @@ export class MateRecoveryCoordinator {
             error instanceof Error ? error.message : String(error)
           }`
         );
-      }
-      if (prepared.postBindTurn) {
-        try {
-          if (!this.options.codexOwned) throw new Error("Codex ownership adapter is unavailable");
-          await this.options.codexOwned.submitAcknowledgedTurn(bound.ptySessionId, prepared.postBindTurn.text, {
-            clientUserMessageId: prepared.postBindTurn.clientUserMessageId,
-            source: "agent"
-          });
-        } catch (error) {
-          console.warn(
-            `codex mate migration handoff failed for ${bound.ptySessionId}: ${
-              error instanceof Error ? error.message : String(error)
-            }`
-          );
-        }
       }
       return bound;
     } catch (error) {
@@ -261,6 +268,30 @@ export class MateRecoveryCoordinator {
       this.expectations.delete(sessionId);
       this.expectations.delete(launchedSessionId);
     }
+  }
+
+  private async completeMigrationHandoff(runtime: OwnerRuntimeRecord): Promise<void> {
+    const handoff = codexMigrationHandoffFromMetadata(runtime.metadata);
+    if (!handoff || !runtime.ptySessionId) return;
+    if (!this.options.codexOwned) throw new Error("Codex ownership adapter is unavailable");
+    let current = runtime;
+    await deliverCodexMigrationHandoff({
+      codexOwned: this.options.codexOwned,
+      sessionId: runtime.ptySessionId,
+      text: "Perch migrated this owner to a fresh Codex thread to preserve root-only task authority. Inspect the current Perch task ledger and worktree state, then continue orchestration from durable state.",
+      handoff,
+      persist: (next) => {
+        const updated = this.options.tasks.stateDb.ownerRuntimes.compareAndSwap(
+          current.ownerId,
+          current.generation,
+          "live",
+          "live",
+          { metadata: { ...current.metadata, codexMigrationHandoff: next } }
+        );
+        if (!updated) throw new Error("mate migration handoff runtime ownership changed");
+        current = updated;
+      }
+    });
   }
 
   private async prepare(runtime: OwnerRuntimeRecord) {

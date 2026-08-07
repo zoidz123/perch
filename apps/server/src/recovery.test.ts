@@ -8,6 +8,7 @@ import type { AddressInfo } from "node:net";
 import type { AgentSession, RecentEventsResult, StartAgentRequest } from "@perch/shared";
 import type { AgentAdapter } from "./adapters/types.js";
 import type { CodexAppServerAdapter } from "./adapters/codexAppServerAdapter.js";
+import { CodexRpcError } from "./adapters/codexAppServer.js";
 import { FakeCodexOwnedAdapter } from "./adapters/fakeCodexAppServer.js";
 import type { PtyAgentAdapter } from "./adapters/pty.js";
 import { RoutingAgentAdapter } from "./adapters/routingAdapter.js";
@@ -449,6 +450,11 @@ test("unproven legacy Codex recovery migrates once and preserves root-only repor
   h.codexOwned.onSubmitAcknowledgedTurn = async (sessionId) => {
     const bound = h.tasks.stateDb.runtimes.findBySession(sessionId);
     assert.equal(bound?.state, "live", "migration handoff starts only after the new root is bound");
+    assert.equal(
+      (bound?.metadata?.codexMigrationHandoff as { state?: string } | undefined)?.state,
+      "submitted",
+      "migration handoff intent is durable before submission"
+    );
     h.codexOwned.events.onNativeChildObservation?.(sessionId, {
       childThreadId: "child-during-handoff",
       parentThreadId: bound!.providerSessionId!,
@@ -548,6 +554,111 @@ test("unproven legacy Codex recovery migrates once and preserves root-only repor
     await scheduler.stop();
     h.cleanup();
   }
+});
+
+test("Codex migration handoffs reconcile crash windows without blind replay", async () => {
+  const crashedBeforeSubmit = harness();
+  const crashedOptions = { ...crashedBeforeSubmit.options, providers: [codexRecoveryDriver] };
+  const crashedCoordinator = new RecoveryCoordinator(crashedOptions);
+  (crashedOptions as { recoveryCoordinator?: RecoveryCoordinator }).recoveryCoordinator = crashedCoordinator;
+  await crashedCoordinator.execute(operation(crashedBeforeSubmit.task.id), context());
+  let live = crashedBeforeSubmit.tasks.stateDb.runtimes.latestForTask(crashedBeforeSubmit.task.id)!;
+  const stableId = `perch:migration:${crashedBeforeSubmit.task.id}:g1`;
+  crashedBeforeSubmit.tasks.stateDb.runtimes.compareAndSwap(
+    live.taskId,
+    live.generation,
+    "live",
+    "live",
+    {
+      metadata: {
+        ...live.metadata,
+        codexMigrationHandoff: {
+          state: "pending",
+          clientUserMessageId: stableId,
+          handoff: "task_brief"
+        }
+      }
+    }
+  );
+  crashedBeforeSubmit.codexOwned.submitted.length = 0;
+  await crashedCoordinator.execute(operation(crashedBeforeSubmit.task.id), context());
+  live = crashedBeforeSubmit.tasks.stateDb.runtimes.latestForTask(crashedBeforeSubmit.task.id)!;
+  assert.equal((live.metadata?.codexMigrationHandoff as { state?: string })?.state, "accepted");
+  assert.deepEqual(crashedBeforeSubmit.codexOwned.submitted.map((entry) => entry.clientUserMessageId), [stableId]);
+  crashedBeforeSubmit.cleanup();
+
+  const acceptedAfterCrash = harness();
+  const acceptedOptions = { ...acceptedAfterCrash.options, providers: [codexRecoveryDriver] };
+  const acceptedCoordinator = new RecoveryCoordinator(acceptedOptions);
+  (acceptedOptions as { recoveryCoordinator?: RecoveryCoordinator }).recoveryCoordinator = acceptedCoordinator;
+  await acceptedCoordinator.execute(operation(acceptedAfterCrash.task.id), context());
+  live = acceptedAfterCrash.tasks.stateDb.runtimes.latestForTask(acceptedAfterCrash.task.id)!;
+  const acceptedId = `perch:migration:${acceptedAfterCrash.task.id}:g1`;
+  acceptedAfterCrash.tasks.stateDb.runtimes.compareAndSwap(live.taskId, live.generation, "live", "live", {
+    metadata: {
+      ...live.metadata,
+      codexMigrationHandoff: {
+        state: "submitted",
+        clientUserMessageId: acceptedId,
+        handoff: "task_brief"
+      }
+    }
+  });
+  acceptedAfterCrash.codexOwned.submitted.length = 0;
+  acceptedAfterCrash.codexOwned.history.set(acceptedId, { id: "turn-from-history" });
+  await acceptedCoordinator.execute(operation(acceptedAfterCrash.task.id), context());
+  live = acceptedAfterCrash.tasks.stateDb.runtimes.latestForTask(acceptedAfterCrash.task.id)!;
+  assert.deepEqual(live.metadata?.codexMigrationHandoff, {
+    state: "accepted",
+    clientUserMessageId: acceptedId,
+    handoff: "task_brief",
+    turnId: "turn-from-history"
+  });
+  assert.equal(acceptedAfterCrash.codexOwned.submitted.length, 0);
+  acceptedAfterCrash.cleanup();
+});
+
+test("Codex migration handoff rejection and unknown delivery park durably", async () => {
+  const rejected = harness();
+  const rejectedOptions = { ...rejected.options, providers: [codexRecoveryDriver] };
+  const rejectedCoordinator = new RecoveryCoordinator(rejectedOptions);
+  (rejectedOptions as { recoveryCoordinator?: RecoveryCoordinator }).recoveryCoordinator = rejectedCoordinator;
+  rejected.codexOwned.nextSubmitError = new CodexRpcError("turn/start", "handoff denied", -32600);
+  await assert.rejects(
+    rejectedCoordinator.execute(operation(rejected.task.id), context()),
+    /migration handoff was rejected/
+  );
+  let live = rejected.tasks.stateDb.runtimes.latestForTask(rejected.task.id)!;
+  assert.equal(live.state, "live");
+  assert.equal((live.metadata?.codexMigrationHandoff as { state?: string })?.state, "rejected");
+  assert.equal(rejected.tasks.find(rejected.task.id)?.state, "blocked");
+  rejected.cleanup();
+
+  const unknown = harness();
+  const unknownOptions = { ...unknown.options, providers: [codexRecoveryDriver] };
+  const unknownCoordinator = new RecoveryCoordinator(unknownOptions);
+  (unknownOptions as { recoveryCoordinator?: RecoveryCoordinator }).recoveryCoordinator = unknownCoordinator;
+  await unknownCoordinator.execute(operation(unknown.task.id), context());
+  live = unknown.tasks.stateDb.runtimes.latestForTask(unknown.task.id)!;
+  unknown.tasks.stateDb.runtimes.compareAndSwap(live.taskId, live.generation, "live", "live", {
+    metadata: {
+      ...live.metadata,
+      codexMigrationHandoff: {
+        state: "submitted",
+        clientUserMessageId: `perch:migration:${unknown.task.id}:g1`,
+        handoff: "task_brief"
+      }
+    }
+  });
+  unknown.codexOwned.historyReadError = new Error("history unavailable");
+  await assert.rejects(
+    unknownCoordinator.execute(operation(unknown.task.id), context()),
+    /acceptance is unknown/
+  );
+  live = unknown.tasks.stateDb.runtimes.latestForTask(unknown.task.id)!;
+  assert.equal((live.metadata?.codexMigrationHandoff as { state?: string })?.state, "delivery_unknown");
+  assert.equal(unknown.tasks.find(unknown.task.id)?.state, "blocked");
+  unknown.cleanup();
 });
 
 test("the production provider-neutral coordinator drives Claude through its verified SessionStart", async () => {

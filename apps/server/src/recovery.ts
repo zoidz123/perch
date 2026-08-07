@@ -15,6 +15,7 @@ import type { RuntimeRecord, OperationRecord } from "./stateDb.js";
 import type { OperationExecutionContext } from "./taskScheduler.js";
 import { terminateMatchingOrphan } from "./orphanProcess.js";
 import type { CodexHistorySyncCoordinator } from "./codexHistorySync.js";
+import { isCodexRpcError } from "./adapters/codexAppServer.js";
 
 const DEFAULT_IDENTITY_TIMEOUT_MS = 30_000;
 
@@ -25,6 +26,7 @@ export type PreparedProviderRecovery = {
   postBindTurn?: {
     text: string;
     clientUserMessageId: string;
+    handoff: "task_brief" | "mate_state";
   };
   // Extra launcher input the driver needs carried into startManagedAgent
   // (the codex driver passes the resume thread + recorded daemon socket).
@@ -57,6 +59,16 @@ type RecoveryPayload = {
   launchStarted?: boolean;
   sessionId?: string;
 };
+
+export type CodexMigrationHandoff = {
+  state: "pending" | "submitted" | "accepted" | "rejected" | "delivery_unknown";
+  clientUserMessageId: string;
+  handoff: "task_brief" | "mate_state";
+  turnId?: string | null;
+  failureReason?: string;
+};
+
+export class CodexMigrationHandoffError extends Error {}
 
 type IdentityExpectation = {
   provider: string;
@@ -122,7 +134,10 @@ export class RecoveryCoordinator {
     if (!currentRuntime) throw new Error(`task ${task.id} has no durable runtime`);
     let runtime = currentRuntime;
 
-    if (runtime.state === "live" && runtime.generation === payload.expectedGeneration + 1) return;
+    if (runtime.state === "live" && runtime.generation === payload.expectedGeneration + 1) {
+      await this.completeMigrationHandoff(task, runtime);
+      return;
+    }
     if (runtime.generation !== payload.expectedGeneration) {
       throw new Error(`runtime generation conflict for ${task.id}: expected g${payload.expectedGeneration}, found g${runtime.generation}`);
     }
@@ -219,6 +234,7 @@ export class RecoveryCoordinator {
     );
     let launchedSessionId = sessionId;
     let launched = false;
+    let boundRuntime: RuntimeRecord | undefined;
     try {
       if (prepared.postBindTurn) {
         this.supersedePendingKickoff(task.id, sessionId);
@@ -297,8 +313,18 @@ export class RecoveryCoordinator {
         providerSessionId: recoveredProviderSessionId,
         allowProviderSessionReplacement: prepared.allowReplacementProviderSessionId === true,
         ownership: this.options.adapter.runtimeProcess?.(result.session.id),
-        ...(bindFacts ? { metadata: bindFacts.metadata } : {})
+        ...(bindFacts || prepared.postBindTurn
+          ? {
+              metadata: {
+                ...(bindFacts?.metadata ?? {}),
+                ...(prepared.postBindTurn
+                  ? { codexMigrationHandoff: pendingMigrationHandoff(prepared.postBindTurn) }
+                  : {})
+              }
+            }
+          : {})
       });
+      boundRuntime = bound;
       if (bindFacts?.aliasSessionId) {
         this.options.hooks.aliasSession(bindFacts.aliasSessionId, result.session.id);
       }
@@ -323,9 +349,6 @@ export class RecoveryCoordinator {
               error instanceof Error ? error.message : String(error)
             }`
           );
-        }
-        if (prepared.postBindTurn) {
-          await this.submitPostBindTurn(task.id, bound.ptySessionId, prepared.postBindTurn);
         }
       }
     } catch (error) {
@@ -356,6 +379,7 @@ export class RecoveryCoordinator {
       this.expectations.delete(sessionId);
       this.expectations.delete(launchedSessionId);
     }
+    if (boundRuntime) await this.completeMigrationHandoff(task, boundRuntime);
   }
 
   private supersedePendingKickoff(taskId: string, replacementSessionId: string): void {
@@ -371,30 +395,51 @@ export class RecoveryCoordinator {
     });
   }
 
-  private async submitPostBindTurn(
-    taskId: string,
-    sessionId: string,
-    turn: NonNullable<PreparedProviderRecovery["postBindTurn"]>
-  ): Promise<void> {
+  private async completeMigrationHandoff(task: Task, runtime: RuntimeRecord): Promise<void> {
+    const handoff = codexMigrationHandoffFromMetadata(runtime.metadata);
+    if (!handoff || !runtime.ptySessionId) return;
+    let current = runtime;
     try {
       if (!this.options.codexOwned) throw new Error("Codex ownership adapter is unavailable");
-      await this.options.codexOwned.submitAcknowledgedTurn(sessionId, turn.text, {
-        clientUserMessageId: turn.clientUserMessageId,
-        source: "agent"
+      const acceptedNow = await deliverCodexMigrationHandoff({
+        codexOwned: this.options.codexOwned,
+        sessionId: runtime.ptySessionId,
+        text: codexMigrationHandoff(task, handoff.handoff),
+        handoff,
+        persist: (next) => {
+          const updated = this.options.tasks.stateDb.runtimes.compareAndSwap(
+            current.taskId,
+            current.generation,
+            "live",
+            "live",
+            { metadata: { ...current.metadata, codexMigrationHandoff: next } }
+          );
+          if (!updated) throw new Error("migration handoff runtime ownership changed");
+          current = updated;
+        }
       });
-      this.options.tasks.recordEvent(taskId, {
-        kind: "note",
-        source: "system",
-        message: "codex accepted the post-migration handoff turn",
-        data: { reason: "codex_migration_handoff_accepted", sessionId }
-      });
+      if (acceptedNow && !this.options.tasks.events(task.id).some(
+        (event) => event.data?.reason === "codex_migration_handoff_accepted"
+      )) {
+        this.options.tasks.recordEvent(task.id, {
+          kind: "note",
+          source: "system",
+          message: "codex accepted the post-migration handoff turn",
+          data: { reason: "codex_migration_handoff_accepted", sessionId: runtime.ptySessionId }
+        });
+      }
     } catch (error) {
-      this.options.tasks.recordEvent(taskId, {
-        kind: "blocked",
-        source: "system",
-        message: `codex post-migration handoff failed: ${error instanceof Error ? error.message : String(error)}`,
-        data: { reason: "codex_migration_handoff_failed", sessionId }
-      });
+      if (!this.options.tasks.events(task.id).some(
+        (event) => event.data?.reason === "codex_migration_handoff_failed"
+      )) {
+        this.options.tasks.recordEvent(task.id, {
+          kind: "blocked",
+          source: "system",
+          message: `codex post-migration handoff failed: ${error instanceof Error ? error.message : String(error)}`,
+          data: { reason: "codex_migration_handoff_failed", sessionId: runtime.ptySessionId }
+        });
+      }
+      throw error;
     }
   }
 
@@ -543,7 +588,8 @@ export const codexRecoveryDriver: RecoveryProviderDriver = {
         ? {
             postBindTurn: {
               text: codexMigrationHandoff(task, handoff),
-              clientUserMessageId: `perch:migration:${task.id}:g${runtime.generation + 1}`
+              clientUserMessageId: `perch:migration:${task.id}:g${runtime.generation + 1}`,
+              handoff
             }
           }
         : {}),
@@ -587,6 +633,83 @@ function codexMigrationHandoff(task: Task, handoff: "task_brief" | "mate_state")
   ].join("\n\n");
 }
 
+function pendingMigrationHandoff(
+  turn: NonNullable<PreparedProviderRecovery["postBindTurn"]>
+): CodexMigrationHandoff {
+  return {
+    state: "pending",
+    clientUserMessageId: turn.clientUserMessageId,
+    handoff: turn.handoff
+  };
+}
+
+export function codexMigrationHandoffFromMetadata(
+  metadata: Record<string, unknown> | undefined
+): CodexMigrationHandoff | undefined {
+  const value = metadata?.codexMigrationHandoff;
+  if (!value || typeof value !== "object" || Array.isArray(value)) return undefined;
+  const record = value as Record<string, unknown>;
+  if (
+    !["pending", "submitted", "accepted", "rejected", "delivery_unknown"].includes(String(record.state)) ||
+    typeof record.clientUserMessageId !== "string" ||
+    (record.handoff !== "task_brief" && record.handoff !== "mate_state")
+  ) return undefined;
+  return value as CodexMigrationHandoff;
+}
+
+export async function deliverCodexMigrationHandoff(input: {
+  codexOwned: Pick<CodexAppServerAdapter, "findAcceptedTurn" | "submitAcknowledgedTurn">;
+  sessionId: string;
+  text: string;
+  handoff: CodexMigrationHandoff;
+  persist: (handoff: CodexMigrationHandoff) => void;
+}): Promise<boolean> {
+  let handoff = input.handoff;
+  if (handoff.state === "accepted") return false;
+  if (handoff.state === "rejected" || handoff.state === "delivery_unknown") {
+    throw new CodexMigrationHandoffError(
+      handoff.failureReason ?? `migration handoff is ${handoff.state.replace("_", " ")}`
+    );
+  }
+  if (handoff.state === "submitted") {
+    let accepted: { id: string } | undefined;
+    try {
+      accepted = await input.codexOwned.findAcceptedTurn(input.sessionId, handoff.clientUserMessageId);
+    } catch (error) {
+      const failureReason = `migration handoff acceptance is unknown: ${error instanceof Error ? error.message : String(error)}`;
+      handoff = { ...handoff, state: "delivery_unknown", failureReason };
+      input.persist(handoff);
+      throw new CodexMigrationHandoffError(failureReason);
+    }
+    if (accepted) {
+      input.persist({ ...handoff, state: "accepted", turnId: accepted.id, failureReason: undefined });
+      return true;
+    }
+  } else {
+    handoff = { ...handoff, state: "submitted", failureReason: undefined };
+    input.persist(handoff);
+  }
+  try {
+    const accepted = await input.codexOwned.submitAcknowledgedTurn(input.sessionId, input.text, {
+      clientUserMessageId: handoff.clientUserMessageId,
+      source: "agent"
+    });
+    input.persist({ ...handoff, state: "accepted", turnId: accepted.turnId, failureReason: undefined });
+    return true;
+  } catch (error) {
+    const rejected = isCodexRpcError(error);
+    const failureReason = rejected
+      ? `migration handoff was rejected: ${error.message}`
+      : `migration handoff acceptance is unknown: ${error instanceof Error ? error.message : String(error)}`;
+    input.persist({
+      ...handoff,
+      state: rejected ? "rejected" : "delivery_unknown",
+      failureReason
+    });
+    throw new CodexMigrationHandoffError(failureReason);
+  }
+}
+
 // Driver facts a codex recovery must re-record on the freshly bound
 // generation: the CURRENT daemon socket (so the rebind guarantee holds across
 // every later restart, not just the first), and - when the launch adopted the
@@ -614,6 +737,9 @@ export function codexOwnedBindFacts(
     ...(taskReportingMode ? { codexTaskReportingMode: taskReportingMode } : {}),
     ...(taskReportingMode === "legacy_hook_compat" && recovering.metadata?.codexNativeMultiAgentCapability
       ? { codexNativeMultiAgentCapability: recovering.metadata.codexNativeMultiAgentCapability }
+      : {}),
+    ...(codexMigrationHandoffFromMetadata(recovering.metadata)
+      ? { codexMigrationHandoff: codexMigrationHandoffFromMetadata(recovering.metadata) }
       : {}),
     ...(migration ? { codexThreadMigration: migration } : {})
   };
