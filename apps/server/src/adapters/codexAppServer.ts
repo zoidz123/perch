@@ -34,6 +34,7 @@ import type { Readable, Writable } from "node:stream";
 import type {
   AgentSessionStatus,
   PendingServerRequest,
+  TaskEventRequest,
   TimelineItem,
   TimelineItemKind
 } from "@perch/shared";
@@ -152,6 +153,7 @@ export type CodexAppServerOptions = {
   // Provider-native multi-agent remains inside the root provider thread.
   // Perch only observes the safe, content-free child projection.
   onNativeChildObservation?: (observation: NativeChildRunObservation) => void;
+  onTaskEvent?: (event: TaskEventRequest) => Promise<{ success: boolean; text: string }>;
   // "auto" starts disabled until a known native item is observed.
   // "disabled" preserves the exact pre-v2 root-only path.
   nativeMultiAgentObservation?: "auto" | "disabled";
@@ -265,6 +267,7 @@ export class CodexAppServerClient {
   private readonly onTurnComplete?: (ev: { message: string }) => void;
   private readonly onTurnStarted?: () => void;
   private readonly onNativeChildObservation?: (observation: NativeChildRunObservation) => void;
+  private readonly onTaskEvent?: (event: TaskEventRequest) => Promise<{ success: boolean; text: string }>;
   private readonly nativeMultiAgentObservation: "auto" | "disabled";
   private readonly onUsageLimit?: (limit: UsageLimit) => void;
   private readonly onDisconnected?: () => void;
@@ -335,6 +338,7 @@ export class CodexAppServerClient {
     this.onTurnComplete = options.onTurnComplete;
     this.onTurnStarted = options.onTurnStarted;
     this.onNativeChildObservation = options.onNativeChildObservation;
+    this.onTaskEvent = options.onTaskEvent;
     this.nativeMultiAgentObservation = options.nativeMultiAgentObservation ?? "auto";
     this.onUsageLimit = options.onUsageLimit;
     this.onDisconnected = options.onDisconnected;
@@ -465,7 +469,8 @@ export class CodexAppServerClient {
       approvalPolicy: opts?.approvalPolicy ?? null,
       sandbox: opts?.sandbox ?? null,
       config: null,
-      persistExtendedHistory: true
+      persistExtendedHistory: true,
+      ...(this.onTaskEvent ? { dynamicTools: this.taskEventTools() } : {})
     };
     const result = (await this.request("thread/start", params)) as ThreadResult;
     this._threadId = result.thread.id;
@@ -497,6 +502,7 @@ export class CodexAppServerClient {
       approvalPolicy: opts.approvalPolicy ?? defaults.approvalPolicy ?? null,
       sandbox: opts.sandbox ?? defaults.sandbox ?? null,
       persistExtendedHistory: true,
+      ...(this.onTaskEvent ? { dynamicTools: this.taskEventTools() } : {}),
       ...(opts.excludeTurns === undefined ? {} : { excludeTurns: opts.excludeTurns })
     };
     const result = (await this.request("thread/resume", params)) as ThreadResult;
@@ -820,6 +826,12 @@ export class CodexAppServerClient {
     this.transport.stdin.write(JSON.stringify(msg) + "\n");
   }
 
+  private respondError(id: string | number, code: number, message: string): void {
+    if (!this.transport?.stdin.writable) return;
+    const msg: JsonRpcMessage = { jsonrpc: "2.0", id, error: { code, message } };
+    this.transport.stdin.write(JSON.stringify(msg) + "\n");
+  }
+
   private handleLine(line: string, sourceEpoch: number): void {
     if (sourceEpoch !== this.processEpoch || !line.trim()) return;
 
@@ -884,6 +896,23 @@ export class CodexAppServerClient {
       return;
     }
 
+    if (method === "item/tool/call" && params.namespace === "perch" && params.tool === "report_task_event") {
+      const args = isRecord(params.arguments) ? params.arguments : {};
+      try {
+        const result = await this.onTaskEvent?.(args as TaskEventRequest);
+        this.respond(id, {
+          contentItems: [{ type: "inputText", text: result?.text ?? "Task reporting is unavailable." }],
+          success: result?.success === true
+        });
+      } catch (error) {
+        this.respond(id, {
+          contentItems: [{ type: "inputText", text: error instanceof Error ? error.message : String(error) }],
+          success: false
+        });
+      }
+      return;
+    }
+
     const structured = this.normalizeServerRequest(id, method, params);
     if (structured && this.onServerRequest) {
       const key = requestKey(id);
@@ -936,8 +965,35 @@ export class CodexAppServerClient {
       return;
     }
 
-    // Unknown server request - respond so codex does not hang.
+    // Unknown root request - respond so codex does not hang.
     this.respond(id, {});
+  }
+
+  private taskEventTools() {
+    return [{
+      type: "namespace" as const,
+      name: "perch",
+      description: "Perch task lifecycle reporting. Only the owned root thread is authorized.",
+      tools: [{
+        type: "function" as const,
+        name: "report_task_event",
+        description: "Report this task's current lifecycle event to Perch.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            kind: {
+              type: "string",
+              enum: ["working", "pr_linked", "needs_decision", "blocked", "done", "failed", "note"]
+            },
+            message: { type: "string" },
+            pr: { type: "string" },
+            data: { type: "object" }
+          },
+          required: ["kind"],
+          additionalProperties: false
+        }
+      }]
+    }];
   }
 
   private declineServerRequest(id: string | number, method: string): void {
@@ -961,7 +1017,7 @@ export class CodexAppServerClient {
       this.respond(id, { answers: {} });
       return;
     }
-    this.respond(id, {});
+    this.respondError(id, -32601, `Server request ${method} is not available to child threads`);
   }
 
   respondToServerRequest(

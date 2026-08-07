@@ -18,7 +18,7 @@ import type { NativeChildRunObservation } from "../nativeChildRuns.js";
 class MockCodexServer {
   toClient = new PassThrough(); // the client's stdout
   fromClient = new PassThrough(); // the client's stdin
-  requests: Array<{ id?: string | number; method?: string; params?: any; result?: any }> = [];
+  requests: Array<{ id?: string | number; method?: string; params?: any; result?: any; error?: any }> = [];
   private buf = "";
   private responders = new Map<string, (params: any) => unknown>();
 
@@ -89,6 +89,7 @@ async function connectedClient(overrides: Partial<{
   onAssistantStream: (ev: { itemId: string; text: string; done: boolean }) => void;
   onTurnComplete: (ev: { message: string }) => void;
   onTurnStarted: () => void;
+  onTaskEvent: (event: any) => Promise<{ success: boolean; text: string }>;
   onUsageLimit: (ev: { provider: string; retryAt?: string; source?: string }) => void;
 }> = {}): Promise<{ client: CodexAppServerClient; server: MockCodexServer }> {
   const server = new MockCodexServer();
@@ -641,6 +642,7 @@ test("child-thread server requests cannot enter root approval or input state", a
       questions: [{ id: "private", question: "private child question" }]
     });
   }
+  server.requestToClient(86, "future/unknown/request", { threadId: "child-1" });
   await tick();
 
   assert.deepEqual(opened, []);
@@ -650,6 +652,41 @@ test("child-thread server requests cannot enter root approval or input state", a
     assert.deepEqual(server.requests.find((request) => request.id === id)?.result, expected);
     assert.equal(client.respondToServerRequest(id, "accept", { answers: {} }), false);
   }
+  assert.deepEqual(server.requests.find((request) => request.id === 86)?.error, {
+    code: -32601,
+    message: "Server request future/unknown/request is not available to child threads"
+  });
+});
+
+test("only the root thread can report task lifecycle events", async () => {
+  const reported: unknown[] = [];
+  const { client, server } = await connectedClient({
+    onTaskEvent: async (event) => {
+      reported.push(event);
+      return { success: true, text: '{"task":{"state":"working"}}' };
+    }
+  });
+  await client.startThread();
+  const dynamicTools = server.find("thread/start")?.params?.dynamicTools;
+  assert.equal(dynamicTools?.[0]?.tools?.[0]?.name, "report_task_event");
+
+  server.requestToClient(90, "item/tool/call", {
+    threadId: "thr_1",
+    namespace: "perch",
+    tool: "report_task_event",
+    arguments: { kind: "working", message: "root progress" }
+  });
+  server.requestToClient(91, "item/tool/call", {
+    threadId: "child-1",
+    namespace: "perch",
+    tool: "report_task_event",
+    arguments: { kind: "done", message: "child claim" }
+  });
+  await tick();
+
+  assert.deepEqual(reported, [{ kind: "working", message: "root progress" }]);
+  assert.equal(server.requests.find((request) => request.id === 90)?.result?.success, true);
+  assert.equal(server.requests.find((request) => request.id === 91)?.error?.code, -32601);
 });
 
 test("turn completion cannot clear a structured request; disconnect cleanup can", async () => {

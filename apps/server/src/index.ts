@@ -333,6 +333,23 @@ codexOwned.wireEvents({
   },
   onNativeChildObservation: (sessionId, observation) =>
     recordNativeChildRunObservation(tasks.stateDb, sessionId, observation),
+  onTaskEvent: async (sessionId, event) => {
+    const runtime = tasks.stateDb.runtimes.findBySession(sessionId);
+    if (!runtime) return { success: false, text: "No task runtime is bound to this root thread." };
+    const response = await fetch(
+      `http://127.0.0.1:${config.port}/tasks/${encodeURIComponent(runtime.taskId)}/events`,
+      {
+        method: "POST",
+        headers: {
+          authorization: `Bearer ${config.authToken}`,
+          "content-type": "application/json",
+          "x-perch-root-session": sessionId
+        },
+        body: JSON.stringify(event)
+      }
+    );
+    return { success: response.ok, text: await response.text() };
+  },
   onThreadStarted: (sessionId, threadId) => {
     runtimeManager.recordProviderSession(sessionId, "codex", threadId);
     ownerManager.recordProviderSession(sessionId, "codex", threadId);

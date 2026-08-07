@@ -142,15 +142,16 @@ test("codex worker briefs append the canonical chart note while Claude briefs st
   const codex = dispatchBrief(task(), "/tmp/wt", {}, "codex");
 
   assert.equal(claude, existing);
-  assert.equal(codex, `${claude}\n\n${CODEX_NATIVE_CHILD_GUIDANCE}\n\n${CHART_CAPABILITY_NOTE}`);
+  assert.ok(codex.endsWith(`${CODEX_NATIVE_CHILD_GUIDANCE}\n\n${CHART_CAPABILITY_NOTE}`));
+  assert.match(codex, /Report status only with the root thread's perch\.report_task_event tool/);
+  assert.ok(!codex.includes(`tasks/ship-the-thing-a1b2/events`));
 });
 
-test("codex worker briefs keep native children inside the native parent and warn about inherited hook credentials", () => {
+test("codex worker briefs keep native children inside the native parent and reserve lifecycle authority for root", () => {
   const brief = dispatchBrief(task(), "/tmp/wt", {}, "codex");
   assert.match(brief, /report back only through their native parent result path/);
-  assert.match(brief, /must not call Perch task outcome hooks or task event endpoints/);
-  assert.match(brief, /inherit the root hook credential/);
-  assert.match(brief, /Mate verification remains authoritative/);
+  assert.match(brief, /must not report Perch task lifecycle events/);
+  assert.match(brief, /only through the root thread's perch\.report_task_event tool/);
   assert.match(brief, /share the root worktree by default/);
   assert.match(brief, /never perform concurrent writes/);
 });

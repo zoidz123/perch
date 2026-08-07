@@ -155,6 +155,42 @@ test("worker summary claiming a missing deliverable requests verification withou
   });
 });
 
+test("Codex inherited hook credentials cannot report root task lifecycle events", async () => {
+  await withServer(async ({ port, tasks, hooks }) => {
+    const task = tasks.create({ title: "root-only Codex lifecycle", project: "/tmp/repo", kind: "scout" });
+    const sessionId = "pty:codex-root";
+    const { token } = hooks.register(sessionId);
+    tasks.update(task.id, { sessionId });
+    tasks.stateDb.runtimes.create({
+      id: "codex-root-runtime",
+      taskId: task.id,
+      generation: 0,
+      state: "live",
+      agent: "codex",
+      provider: "codex",
+      ptySessionId: sessionId
+    });
+
+    const inherited = await post(
+      port,
+      task.id,
+      { "x-perch-session": sessionId, "x-perch-token": token },
+      { kind: "failed", message: "child claim" }
+    );
+    assert.equal(inherited.status, 401);
+    assert.equal(tasks.find(task.id)?.state, "queued");
+
+    const root = await post(
+      port,
+      task.id,
+      { authorization: "Bearer test-token", "x-perch-root-session": sessionId },
+      { kind: "working", message: "root progress" }
+    );
+    assert.equal(root.status, 200);
+    assert.equal(tasks.find(task.id)?.state, "working");
+  });
+});
+
 test("mate accepts the exact completion request and duplicate acceptance is idempotent", async () => {
   await withServer(async ({ port, tasks, hooks }) => {
     const task = tasks.create({ title: "verified scout", project: "/tmp/repo", kind: "scout", prompt: "Return a report" });

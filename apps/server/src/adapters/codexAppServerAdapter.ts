@@ -25,6 +25,7 @@ import type {
   RecentEventsResult,
   ServerRequestResponse,
   StartAgentRequest,
+  TaskEventRequest,
   TimelineItem,
   TopologyResponse
 } from "@perch/shared";
@@ -73,6 +74,7 @@ export type CodexOwnedEventSink = {
   onTurnStarted?: (sessionId: string) => void;
   onTurnComplete?: (sessionId: string, ev: { message: string }) => void;
   onNativeChildObservation?: (sessionId: string, observation: NativeChildRunObservation) => void;
+  onTaskEvent?: (sessionId: string, event: TaskEventRequest) => Promise<{ success: boolean; text: string }>;
   onThreadStarted?: (sessionId: string, threadId: string, socketPath: string) => void;
   onModelResolved?: (sessionId: string, model: string) => void;
   onUsageLimit?: (sessionId: string, limit: UsageLimit) => void;
@@ -105,6 +107,7 @@ export type CreateOwnedClient = (args: {
     onTurnStarted: () => void;
     onTurnComplete: (ev: { message: string }) => void;
     onNativeChildObservation: (observation: NativeChildRunObservation) => void;
+    onTaskEvent: (event: TaskEventRequest) => Promise<{ success: boolean; text: string }>;
     onUsageLimit: (limit: UsageLimit) => void;
     onDisconnected: () => void;
   };
@@ -216,6 +219,7 @@ export class CodexAppServerAdapter implements AgentAdapter {
           onTurnStarted: handlers.onTurnStarted,
           onTurnComplete: handlers.onTurnComplete,
           onNativeChildObservation: handlers.onNativeChildObservation,
+          onTaskEvent: handlers.onTaskEvent,
           nativeMultiAgentObservation: this.nativeMultiAgentObservation,
           onUsageLimit: handlers.onUsageLimit,
           onDisconnected: handlers.onDisconnected,
@@ -959,6 +963,10 @@ export class CodexAppServerAdapter implements AgentAdapter {
         // No child is ever added to the adapter's session map or topology.
         this.emitFleetEvent("activity", "codex.native-child-observed", session.id);
       },
+      onTaskEvent: (event) => this.events.onTaskEvent?.(session.id, event) ?? Promise.resolve({
+        success: false,
+        text: "Task reporting is unavailable."
+      }),
       onUsageLimit: (limit) => this.events.onUsageLimit?.(session.id, limit),
       onDisconnected: () => this.handleDisconnect(session)
     };
