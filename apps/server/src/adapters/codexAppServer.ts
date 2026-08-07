@@ -36,7 +36,8 @@ import type {
   PendingServerRequest,
   TaskEventRequest,
   TimelineItem,
-  TimelineItemKind
+  TimelineItemKind,
+  WorkerReportRequest
 } from "@perch/shared";
 import { assertLocalRuntimeModelId } from "../modelSwitch.js";
 import { parseNativeChildRunObservations, type NativeChildRunObservation } from "../nativeChildRuns.js";
@@ -154,6 +155,7 @@ export type CodexAppServerOptions = {
   // Perch only observes the safe, content-free child projection.
   onNativeChildObservation?: (observation: NativeChildRunObservation) => void;
   onTaskEvent?: (event: TaskEventRequest) => Promise<{ success: boolean; text: string }>;
+  onWorkerReport?: (report: WorkerReportRequest) => Promise<{ success: boolean; text: string }>;
   // "auto" starts disabled until a known native item is observed.
   // "disabled" preserves the exact pre-v2 root-only path.
   nativeMultiAgentObservation?: "auto" | "disabled";
@@ -268,6 +270,7 @@ export class CodexAppServerClient {
   private readonly onTurnStarted?: () => void;
   private readonly onNativeChildObservation?: (observation: NativeChildRunObservation) => void;
   private readonly onTaskEvent?: (event: TaskEventRequest) => Promise<{ success: boolean; text: string }>;
+  private readonly onWorkerReport?: (report: WorkerReportRequest) => Promise<{ success: boolean; text: string }>;
   private readonly nativeMultiAgentObservation: "auto" | "disabled";
   private readonly onUsageLimit?: (limit: UsageLimit) => void;
   private readonly onDisconnected?: () => void;
@@ -339,6 +342,7 @@ export class CodexAppServerClient {
     this.onTurnStarted = options.onTurnStarted;
     this.onNativeChildObservation = options.onNativeChildObservation;
     this.onTaskEvent = options.onTaskEvent;
+    this.onWorkerReport = options.onWorkerReport;
     this.nativeMultiAgentObservation = options.nativeMultiAgentObservation ?? "auto";
     this.onUsageLimit = options.onUsageLimit;
     this.onDisconnected = options.onDisconnected;
@@ -912,6 +916,23 @@ export class CodexAppServerClient {
       return;
     }
 
+    if (method === "item/tool/call" && params.namespace === "perch" && params.tool === "send_report") {
+      const args = isRecord(params.arguments) ? params.arguments : {};
+      try {
+        const result = await this.onWorkerReport?.(args as WorkerReportRequest);
+        this.respond(id, {
+          contentItems: [{ type: "inputText", text: result?.text ?? "Worker report submission is unavailable." }],
+          success: result?.success === true
+        });
+      } catch (error) {
+        this.respond(id, {
+          contentItems: [{ type: "inputText", text: error instanceof Error ? error.message : String(error) }],
+          success: false
+        });
+      }
+      return;
+    }
+
     const structured = this.normalizeServerRequest(id, method, params);
     if (structured && this.onServerRequest) {
       const key = requestKey(id);
@@ -989,6 +1010,24 @@ export class CodexAppServerClient {
             data: { type: "object" }
           },
           required: ["kind"],
+          additionalProperties: false
+        }
+      }, {
+        type: "function" as const,
+        name: "send_report",
+        description:
+          "Durably deliver this task's full worker report to the mate mailbox. " +
+          "Success means the complete report and evidence were committed; it does not mean the mate processed them.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            summary: { type: "string", description: "Concise routing summary (bounded small)." },
+            report: { type: "string", description: "The complete report body, stored byte-for-byte." },
+            evidence: { type: "object", description: "Complete structured evidence, stored verbatim." },
+            format: { type: "string" },
+            idempotencyKey: { type: "string" }
+          },
+          required: ["summary", "report"],
           additionalProperties: false
         }
       }]

@@ -628,7 +628,7 @@ export class FleetMonitor {
   async queueOrSubmit(
     sessionId: string,
     text: string,
-    options: { queueIfGated?: boolean; source?: PromptDeliverySource } = {}
+    options: { queueIfGated?: boolean; source?: PromptDeliverySource; silent?: boolean } = {}
   ): Promise<{ queued: boolean; gated?: boolean }> {
     const canonical = this.canonicalSessionId(sessionId);
     const status =
@@ -659,8 +659,19 @@ export class FleetMonitor {
     const delivery = agent === "claude"
       ? this.promptDeliveries?.create(canonical, text, options.source ?? "agent")
       : undefined;
-    await this.submitToAdapter(canonical, text, delivery?.id);
+    await this.submitToAdapter(canonical, text, delivery?.id, options.silent);
     return { queued: false };
+  }
+
+  // The live status a server-side sender should honor before submitting
+  // non-urgent input: the externally reported state when present, else the
+  // adapter snapshot.
+  sessionStatus(sessionId: string): AgentSessionStatus | undefined {
+    const canonical = this.canonicalSessionId(sessionId);
+    return (
+      this.sessionState.get(canonical)?.status ??
+      this.sessions.find((session) => session.id === canonical)?.status
+    );
   }
 
   // Prompt provided at spawn time: hold it until the agent signals ready
@@ -750,7 +761,7 @@ export class FleetMonitor {
     );
   }
 
-  private async submitToAdapter(sessionId: string, text: string, deliveryId?: string): Promise<void> {
+  private async submitToAdapter(sessionId: string, text: string, deliveryId?: string, silent?: boolean): Promise<void> {
     if (deliveryId) this.promptDeliveries?.markTyping(deliveryId);
     try {
       if (this.adapter.submitInput) {
@@ -779,6 +790,10 @@ export class FleetMonitor {
       // Ledger observation must never turn a successful agent submission into
       // an HTTP/input failure.
     }
+    // Control prompts (mailbox nudges) are attention transport, not
+    // conversation: they skip the live user-message fan-out so no client
+    // renders them as chat.
+    if (silent) return;
     this.publish({
       type: "message",
       sessionId,

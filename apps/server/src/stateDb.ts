@@ -14,7 +14,7 @@ import type {
 import Database from "better-sqlite3";
 import type { TaskDeliverable, TaskReviewFacts, TaskVerificationFacts } from "./taskPresentation.js";
 
-const LATEST_SCHEMA_VERSION = 15;
+const LATEST_SCHEMA_VERSION = 16;
 const LEGACY_TASK_IMPORT = "tasks-json-v1";
 
 const MIGRATIONS = [
@@ -587,6 +587,57 @@ const MIGRATIONS = [
       CREATE INDEX native_child_runs_outer_idx
         ON native_child_runs(outer_runtime_kind, outer_runtime_id, outer_runtime_generation, updated_at DESC);
     `
+  },
+  {
+    version: 16,
+    name: "worker-reports-and-mate-mailbox",
+    sql: `
+      CREATE TABLE worker_reports (
+        id TEXT PRIMARY KEY,
+        task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE RESTRICT,
+        task_event_id INTEGER NOT NULL UNIQUE REFERENCES task_events(id) ON DELETE RESTRICT,
+        session_id TEXT NOT NULL,
+        runtime_id TEXT,
+        runtime_generation INTEGER CHECK (runtime_generation >= 0),
+        worker_name TEXT,
+        idempotency_key TEXT NOT NULL,
+        format TEXT NOT NULL,
+        summary TEXT NOT NULL,
+        report TEXT NOT NULL,
+        evidence_json TEXT,
+        report_bytes INTEGER NOT NULL CHECK (report_bytes >= 0),
+        report_sha256 TEXT NOT NULL,
+        accepted_at TEXT NOT NULL,
+        UNIQUE(task_id, session_id, idempotency_key)
+      ) STRICT;
+      CREATE INDEX worker_reports_task_idx ON worker_reports(task_id, task_event_id);
+      CREATE TRIGGER worker_reports_immutable_update BEFORE UPDATE ON worker_reports
+      BEGIN SELECT RAISE(ABORT, 'worker reports are immutable'); END;
+      CREATE TRIGGER worker_reports_immutable_delete BEFORE DELETE ON worker_reports
+      BEGIN SELECT RAISE(ABORT, 'worker reports are immutable'); END;
+
+      CREATE TABLE mate_mailbox_deliveries (
+        id TEXT PRIMARY KEY,
+        recipient TEXT NOT NULL CHECK (recipient IN ('mate')),
+        task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE RESTRICT,
+        task_event_id INTEGER NOT NULL UNIQUE REFERENCES task_events(id) ON DELETE RESTRICT,
+        report_id TEXT UNIQUE REFERENCES worker_reports(id) ON DELETE RESTRICT,
+        state TEXT NOT NULL DEFAULT 'pending' CHECK (state IN ('pending', 'claimed', 'acknowledged')),
+        claim_token TEXT,
+        claim_generation INTEGER CHECK (claim_generation >= 0),
+        claimed_at TEXT,
+        claim_expires_at TEXT,
+        ack_idempotency_key TEXT,
+        ack_disposition TEXT,
+        acked_by_session TEXT,
+        acked_by_generation INTEGER CHECK (acked_by_generation >= 0),
+        acked_at TEXT,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+      ) STRICT;
+      CREATE INDEX mate_mailbox_order_idx
+        ON mate_mailbox_deliveries(recipient, state, task_event_id);
+    `
   }
 ] as const;
 
@@ -597,6 +648,73 @@ export type NotificationIntentInput = {
   payload: Record<string, unknown>;
   availableAt?: string;
 };
+
+// Immutable lossless worker deliverable: exactly the summary, report, and
+// evidence the worker submitted, plus provenance and integrity facts. Never
+// summarized, truncated, or rewritten after acceptance (DB triggers enforce
+// immutability).
+export type WorkerReportRecord = {
+  id: string;
+  taskId: string;
+  taskEventId: number;
+  sessionId: string;
+  runtimeId?: string;
+  runtimeGeneration?: number;
+  workerName?: string;
+  idempotencyKey: string;
+  format: string;
+  summary: string;
+  report: string;
+  evidence?: Record<string, unknown>;
+  reportBytes: number;
+  reportSha256: string;
+  acceptedAt: string;
+};
+
+export type WorkerReportInsert = Omit<WorkerReportRecord, "taskEventId" | "acceptedAt" | "evidence"> & {
+  evidenceJson?: string;
+};
+
+export type MateMailboxState = "pending" | "claimed" | "acknowledged";
+
+// Mutable mate-side delivery projection. It references the immutable source
+// (the task event, and the worker report when one exists) and carries only
+// routing/claim/acknowledgment state - never a copy of the report body.
+// task_event_id doubles as the deterministic order key: task_events.id is a
+// global AUTOINCREMENT, so ordering by it is FIFO within a task and a stable
+// commit order across tasks.
+export type MateMailboxDeliveryRecord = {
+  id: string;
+  recipient: "mate";
+  taskId: string;
+  taskEventId: number;
+  reportId?: string;
+  state: MateMailboxState;
+  claimToken?: string;
+  claimGeneration?: number;
+  claimedAt?: string;
+  claimExpiresAt?: string;
+  ackIdempotencyKey?: string;
+  ackDisposition?: string;
+  ackedBySession?: string;
+  ackedByGeneration?: number;
+  ackedAt?: string;
+  createdAt: string;
+  updatedAt: string;
+};
+
+export type MailboxAppendInput = {
+  recipient: "mate";
+  report?: WorkerReportInsert;
+};
+
+export type MateMailboxAckResult =
+  | { outcome: "acknowledged"; delivery: MateMailboxDeliveryRecord; duplicate: boolean }
+  | { outcome: "not_found" }
+  | { outcome: "ack_conflict"; delivery: MateMailboxDeliveryRecord }
+  | { outcome: "not_claimed"; delivery: MateMailboxDeliveryRecord }
+  | { outcome: "stale_token"; delivery: MateMailboxDeliveryRecord }
+  | { outcome: "stale_generation"; delivery: MateMailboxDeliveryRecord };
 
 export type RuntimeState = "starting" | "live" | "recoverable" | "recovering" | "ended";
 
@@ -951,6 +1069,8 @@ export class StateDb {
   readonly promptDeliveries: PromptDeliveryRepository;
   readonly codexHistorySyncs: CodexHistorySyncRepository;
   readonly nativeChildRuns: NativeChildRunRepository;
+  readonly workerReports: WorkerReportRepository;
+  readonly mateMailbox: MateMailboxRepository;
   private readonly db: Database.Database;
 
   constructor(env: NodeJS.ProcessEnv = process.env) {
@@ -962,7 +1082,9 @@ export class StateDb {
     this.configure();
     this.migrate();
     this.db.prepare("UPDATE native_child_runs SET state = 'unknown' WHERE state IN ('waiting', 'running')").run();
-    this.tasks = new TaskRepository(this.db);
+    this.workerReports = new WorkerReportRepository(this.db);
+    this.mateMailbox = new MateMailboxRepository(this.db);
+    this.tasks = new TaskRepository(this.db, this.workerReports, this.mateMailbox);
     this.runtimes = new RuntimeRepository(this.db);
     this.operations = new OperationRepository(this.db);
     this.owners = new DurableOwnerRepository(this.db);
@@ -1104,7 +1226,11 @@ export class StateDb {
 }
 
 export class TaskRepository {
-  constructor(private readonly db: Database.Database) {}
+  constructor(
+    private readonly db: Database.Database,
+    private readonly workerReports: WorkerReportRepository,
+    private readonly mateMailbox: MateMailboxRepository
+  ) {}
 
   countOpen(): number {
     return (
@@ -1142,21 +1268,26 @@ export class TaskRepository {
     return create.immediate();
   }
 
-  record(task: Task, event: TaskEventInput, intents: NotificationIntentInput[] = []): TaskEvent {
+  record(
+    task: Task,
+    event: TaskEventInput,
+    intents: NotificationIntentInput[] = [],
+    mailbox?: MailboxAppendInput
+  ): TaskEvent {
     const record = this.db.transaction(() => {
       this.save(task);
-      return this.appendEvent(task.id, event, intents);
+      return this.appendEvent(task.id, event, intents, mailbox);
     });
     return record.immediate();
   }
 
   recordMany(
     task: Task,
-    entries: Array<{ event: TaskEventInput; intents: NotificationIntentInput[] }>
+    entries: Array<{ event: TaskEventInput; intents: NotificationIntentInput[]; mailbox?: MailboxAppendInput }>
   ): TaskEvent[] {
     const record = this.db.transaction(() => {
       this.save(task);
-      return entries.map(({ event, intents }) => this.appendEvent(task.id, event, intents));
+      return entries.map(({ event, intents, mailbox }) => this.appendEvent(task.id, event, intents, mailbox));
     });
     return record.immediate();
   }
@@ -1168,6 +1299,15 @@ export class TaskRepository {
       )
       .all(taskId) as TaskEventRow[];
     return rows.map(taskEventFromRow);
+  }
+
+  // One immutable event by its global id (the mailbox order key), for
+  // delivery projections that reference events across tasks.
+  eventById(id: number): (TaskEvent & { taskId: string }) | undefined {
+    const row = this.db
+      .prepare("SELECT task_id, id, seq, at, kind, source, message, data_json FROM task_events WHERE id = ?")
+      .get(id) as (TaskEventRow & { task_id: string }) | undefined;
+    return row ? { ...taskEventFromRow(row), taskId: row.task_id } : undefined;
   }
 
   // The durable GitHub observations for a task's PR, written in the same
@@ -1284,7 +1424,12 @@ export class TaskRepository {
     this.savePrFacts(task);
   }
 
-  private appendEvent(taskId: string, event: TaskEventInput, intents: NotificationIntentInput[]): TaskEvent {
+  private appendEvent(
+    taskId: string,
+    event: TaskEventInput,
+    intents: NotificationIntentInput[],
+    mailbox?: MailboxAppendInput
+  ): TaskEvent {
     const next = this.db
       .prepare("SELECT coalesce(max(seq), 0) + 1 AS seq FROM task_events WHERE task_id = ?")
       .get(taskId) as { seq: number };
@@ -1317,6 +1462,22 @@ export class TaskRepository {
         intent.availableAt ?? at,
         at
       );
+    }
+    // Mailbox obligations commit atomically with their source event: the
+    // immutable report (when one was submitted) and the mutable delivery row
+    // either both survive with the event or none of them become visible.
+    if (mailbox) {
+      const taskEventId = Number(result.lastInsertRowid);
+      if (mailbox.report) {
+        this.workerReports.insertInTransaction(mailbox.report, taskEventId, at);
+      }
+      this.mateMailbox.insertInTransaction({
+        recipient: mailbox.recipient,
+        taskId,
+        taskEventId,
+        reportId: mailbox.report?.id,
+        at
+      });
     }
     const persisted = {
       seq: next.seq,
@@ -1382,6 +1543,299 @@ export class TaskRepository {
       event.at
     );
   }
+}
+
+type WorkerReportRow = {
+  id: string;
+  task_id: string;
+  task_event_id: number;
+  session_id: string;
+  runtime_id: string | null;
+  runtime_generation: number | null;
+  worker_name: string | null;
+  idempotency_key: string;
+  format: string;
+  summary: string;
+  report: string;
+  evidence_json: string | null;
+  report_bytes: number;
+  report_sha256: string;
+  accepted_at: string;
+};
+
+export class WorkerReportRepository {
+  constructor(private readonly db: Database.Database) {}
+
+  // Insert-only, designed to run inside the task-event transaction so the
+  // report can never exist without its pointer event (and vice versa).
+  insertInTransaction(report: WorkerReportInsert, taskEventId: number, acceptedAt: string): void {
+    this.db
+      .prepare(
+        `INSERT INTO worker_reports(
+           id, task_id, task_event_id, session_id, runtime_id, runtime_generation, worker_name,
+           idempotency_key, format, summary, report, evidence_json, report_bytes, report_sha256, accepted_at
+         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+      )
+      .run(
+        report.id,
+        report.taskId,
+        taskEventId,
+        report.sessionId,
+        report.runtimeId ?? null,
+        report.runtimeGeneration ?? null,
+        report.workerName ?? null,
+        report.idempotencyKey,
+        report.format,
+        report.summary,
+        report.report,
+        report.evidenceJson ?? null,
+        report.reportBytes,
+        report.reportSha256,
+        acceptedAt
+      );
+  }
+
+  find(id: string): WorkerReportRecord | undefined {
+    const row = this.db.prepare("SELECT * FROM worker_reports WHERE id = ?").get(id) as
+      | WorkerReportRow
+      | undefined;
+    return row ? workerReportFromRow(row) : undefined;
+  }
+
+  // The sender-provided idempotency boundary: one report per
+  // (task, authorized sender session, key). A retry with the same key finds
+  // the original committed report instead of appending a duplicate.
+  findByIdempotencyKey(taskId: string, sessionId: string, key: string): WorkerReportRecord | undefined {
+    const row = this.db
+      .prepare("SELECT * FROM worker_reports WHERE task_id = ? AND session_id = ? AND idempotency_key = ?")
+      .get(taskId, sessionId, key) as WorkerReportRow | undefined;
+    return row ? workerReportFromRow(row) : undefined;
+  }
+}
+
+type MateMailboxRow = {
+  id: string;
+  recipient: "mate";
+  task_id: string;
+  task_event_id: number;
+  report_id: string | null;
+  state: MateMailboxState;
+  claim_token: string | null;
+  claim_generation: number | null;
+  claimed_at: string | null;
+  claim_expires_at: string | null;
+  ack_idempotency_key: string | null;
+  ack_disposition: string | null;
+  acked_by_session: string | null;
+  acked_by_generation: number | null;
+  acked_at: string | null;
+  created_at: string;
+  updated_at: string;
+};
+
+export class MateMailboxRepository {
+  constructor(private readonly db: Database.Database) {}
+
+  // Insert-only, designed to run inside the task-event transaction.
+  insertInTransaction(input: {
+    recipient: "mate";
+    taskId: string;
+    taskEventId: number;
+    reportId?: string;
+    at: string;
+  }): void {
+    this.db
+      .prepare(
+        `INSERT INTO mate_mailbox_deliveries(
+           id, recipient, task_id, task_event_id, report_id, state, created_at, updated_at
+         ) VALUES (?, ?, ?, ?, ?, 'pending', ?, ?)`
+      )
+      .run(randomUUID(), input.recipient, input.taskId, input.taskEventId, input.reportId ?? null, input.at, input.at);
+  }
+
+  find(id: string): MateMailboxDeliveryRecord | undefined {
+    const row = this.db.prepare("SELECT * FROM mate_mailbox_deliveries WHERE id = ?").get(id) as
+      | MateMailboxRow
+      | undefined;
+    return row ? mateMailboxFromRow(row) : undefined;
+  }
+
+  // Undelivered work awaiting mate attention: pending rows plus claims whose
+  // lease has lapsed (an expired claim is pending again). A live unexpired
+  // claim is being processed and does not need a fresh nudge.
+  pendingCount(now: string): number {
+    return (
+      this.db
+        .prepare(
+          `SELECT count(*) AS count FROM mate_mailbox_deliveries
+           WHERE recipient = 'mate'
+             AND (state = 'pending' OR (state = 'claimed' AND claim_expires_at <= ?))`
+        )
+        .get(now) as { count: number }
+    ).count;
+  }
+
+  // The newest unacknowledged order key, used to dedupe attention nudges: a
+  // re-nudge fires only when something newer than the last nudge arrived.
+  maxUnacknowledgedOrderKey(): number | undefined {
+    const row = this.db
+      .prepare(
+        "SELECT max(task_event_id) AS max_key FROM mate_mailbox_deliveries WHERE recipient = 'mate' AND state != 'acknowledged'"
+      )
+      .get() as { max_key: number | null };
+    return row.max_key ?? undefined;
+  }
+
+  // Non-mutating snapshot in deterministic mailbox order. Listing never
+  // claims and never acknowledges.
+  list(options: { includeAcknowledged?: boolean; limit?: number } = {}): MateMailboxDeliveryRecord[] {
+    const limit = Math.max(1, Math.min(options.limit ?? 100, 500));
+    const rows = this.db
+      .prepare(
+        `SELECT * FROM mate_mailbox_deliveries
+         WHERE recipient = 'mate' ${options.includeAcknowledged ? "" : "AND state != 'acknowledged'"}
+         ORDER BY task_event_id LIMIT ?`
+      )
+      .all(limit) as MateMailboxRow[];
+    return rows.map(mateMailboxFromRow);
+  }
+
+  // Lease the oldest unacknowledged messages to the current live mate
+  // generation. Claiming re-mints the token even for rows the same generation
+  // already holds (a retry after a lost response must receive usable tokens),
+  // and takes over claims from older generations immediately - the generation
+  // check at ack time is what fences stale holders, not the lease clock.
+  claim(input: { generation: number; limit: number; ttlMs: number; now: string }): MateMailboxDeliveryRecord[] {
+    const limit = Math.max(1, Math.min(input.limit, 50));
+    const expiresAt = new Date(Date.parse(input.now) + input.ttlMs).toISOString();
+    const claim = this.db.transaction(() => {
+      const rows = this.db
+        .prepare(
+          `SELECT * FROM mate_mailbox_deliveries
+           WHERE recipient = 'mate' AND state != 'acknowledged'
+           ORDER BY task_event_id LIMIT ?`
+        )
+        .all(limit) as MateMailboxRow[];
+      const update = this.db.prepare(
+        `UPDATE mate_mailbox_deliveries
+         SET state = 'claimed', claim_token = ?, claim_generation = ?, claimed_at = ?,
+             claim_expires_at = ?, updated_at = ?
+         WHERE id = ?`
+      );
+      return rows.map((row) => {
+        const token = randomUUID();
+        update.run(token, input.generation, input.now, expiresAt, input.now, row.id);
+        return mateMailboxFromRow({
+          ...row,
+          state: "claimed",
+          claim_token: token,
+          claim_generation: input.generation,
+          claimed_at: input.now,
+          claim_expires_at: expiresAt,
+          updated_at: input.now
+        });
+      });
+    });
+    return claim.immediate();
+  }
+
+  // Idempotent, token-fenced acknowledgment. Replaying the committed key
+  // returns the original receipt; a different key after acknowledgment is a
+  // conflict; stale tokens, expired leases, and stale generations are refused
+  // without mutating the row.
+  ack(input: {
+    id: string;
+    claimToken: string;
+    generation: number;
+    idempotencyKey: string;
+    disposition?: string;
+    sessionId: string;
+    now: string;
+  }): MateMailboxAckResult {
+    const ack = this.db.transaction((): MateMailboxAckResult => {
+      const row = this.db.prepare("SELECT * FROM mate_mailbox_deliveries WHERE id = ?").get(input.id) as
+        | MateMailboxRow
+        | undefined;
+      if (!row) return { outcome: "not_found" };
+      const delivery = mateMailboxFromRow(row);
+      if (row.state === "acknowledged") {
+        return row.ack_idempotency_key === input.idempotencyKey
+          ? { outcome: "acknowledged", delivery, duplicate: true }
+          : { outcome: "ack_conflict", delivery };
+      }
+      if (row.state !== "claimed") return { outcome: "not_claimed", delivery };
+      if (row.claim_token !== input.claimToken) return { outcome: "stale_token", delivery };
+      if (!row.claim_expires_at || row.claim_expires_at <= input.now) {
+        return { outcome: "stale_token", delivery };
+      }
+      if (row.claim_generation !== input.generation) return { outcome: "stale_generation", delivery };
+      this.db
+        .prepare(
+          `UPDATE mate_mailbox_deliveries
+           SET state = 'acknowledged', ack_idempotency_key = ?, ack_disposition = ?,
+               acked_by_session = ?, acked_by_generation = ?, acked_at = ?, updated_at = ?
+           WHERE id = ? AND state = 'claimed' AND claim_token = ?`
+        )
+        .run(
+          input.idempotencyKey,
+          input.disposition ?? null,
+          input.sessionId,
+          input.generation,
+          input.now,
+          input.now,
+          input.id,
+          input.claimToken
+        );
+      const updated = this.db.prepare("SELECT * FROM mate_mailbox_deliveries WHERE id = ?").get(input.id) as
+        | MateMailboxRow
+        | undefined;
+      if (!updated) return { outcome: "not_found" };
+      return { outcome: "acknowledged", delivery: mateMailboxFromRow(updated), duplicate: false };
+    });
+    return ack.immediate();
+  }
+}
+
+function workerReportFromRow(row: WorkerReportRow): WorkerReportRecord {
+  return {
+    id: row.id,
+    taskId: row.task_id,
+    taskEventId: row.task_event_id,
+    sessionId: row.session_id,
+    ...(row.runtime_id ? { runtimeId: row.runtime_id } : {}),
+    ...(row.runtime_generation !== null ? { runtimeGeneration: row.runtime_generation } : {}),
+    ...(row.worker_name ? { workerName: row.worker_name } : {}),
+    idempotencyKey: row.idempotency_key,
+    format: row.format,
+    summary: row.summary,
+    report: row.report,
+    ...(row.evidence_json ? { evidence: JSON.parse(row.evidence_json) as Record<string, unknown> } : {}),
+    reportBytes: row.report_bytes,
+    reportSha256: row.report_sha256,
+    acceptedAt: row.accepted_at
+  };
+}
+
+function mateMailboxFromRow(row: MateMailboxRow): MateMailboxDeliveryRecord {
+  return {
+    id: row.id,
+    recipient: row.recipient,
+    taskId: row.task_id,
+    taskEventId: row.task_event_id,
+    ...(row.report_id ? { reportId: row.report_id } : {}),
+    state: row.state,
+    ...(row.claim_token ? { claimToken: row.claim_token } : {}),
+    ...(row.claim_generation !== null ? { claimGeneration: row.claim_generation } : {}),
+    ...(row.claimed_at ? { claimedAt: row.claimed_at } : {}),
+    ...(row.claim_expires_at ? { claimExpiresAt: row.claim_expires_at } : {}),
+    ...(row.ack_idempotency_key ? { ackIdempotencyKey: row.ack_idempotency_key } : {}),
+    ...(row.ack_disposition ? { ackDisposition: row.ack_disposition } : {}),
+    ...(row.acked_by_session ? { ackedBySession: row.acked_by_session } : {}),
+    ...(row.acked_by_generation !== null ? { ackedByGeneration: row.acked_by_generation } : {}),
+    ...(row.acked_at ? { ackedAt: row.acked_at } : {}),
+    createdAt: row.created_at,
+    updatedAt: row.updated_at
+  };
 }
 
 export class RuntimeRepository {

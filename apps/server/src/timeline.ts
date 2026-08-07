@@ -12,7 +12,13 @@ import {
 } from "node:fs";
 import { dirname, join } from "node:path";
 import { StringDecoder } from "node:string_decoder";
-import type { CodexReasoningEffort, TimelineItem, TimelineItemKind, TimelineItemSource } from "@perch/shared";
+import {
+  MAILBOX_CONTROL_PREFIX,
+  type CodexReasoningEffort,
+  type TimelineItem,
+  type TimelineItemKind,
+  type TimelineItemSource
+} from "@perch/shared";
 
 // Structured timeline recovered by tailing the agent's own session file
 // (Claude writes ~/.claude/projects/{cwd}/{session-id}.jsonl live during the
@@ -28,6 +34,16 @@ const POLL_MS = 1000;
 // stale entry that never matched simply expires (and its turn defaults to
 // human) rather than mislabeling a much later, unrelated turn.
 const SOURCE_TTL_MS = 60_000;
+
+// Mate mailbox nudges are attention transport typed into the provider, never
+// conversation. They stay in the provider's own transcript (attach views),
+// but every boss-facing projection - the fetch endpoint and the live
+// timeline_item fan-out - drops them so a control prompt can never render as
+// a message the boss supposedly sent. Internal observers (prompt-delivery
+// receipts) still see the raw row.
+export function isMailboxControlItem(item: Pick<TimelineItem, "kind" | "text">): boolean {
+  return item.kind === "user" && (item.text?.startsWith(MAILBOX_CONTROL_PREFIX) ?? false);
+}
 
 export type TimelineListener = (item: TimelineItem) => void;
 export type TimelineCatchUpListener = (sessionId: string) => void;
@@ -567,7 +583,9 @@ export class TimelineStore {
     const all = this.items.get(sessionId) ?? [];
     const after = Number.isFinite(afterSeq) ? afterSeq : 0;
     const count = Number.isFinite(limit) ? limit : 200;
-    const items = all.filter((item) => item.seq > after).slice(0, Math.max(1, Math.min(count, 500)));
+    const items = all
+      .filter((item) => item.seq > after && !isMailboxControlItem(item))
+      .slice(0, Math.max(1, Math.min(count, 500)));
     return {
       items,
       lastSeq: this.seqs.get(sessionId) ?? 0,

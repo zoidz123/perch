@@ -57,6 +57,8 @@ The internal Codex root-tool relay also presents the server bearer, but its sepa
 | `GET /tasks` | Mate, CLI, phone | List durable task projections. |
 | `GET /tasks/:id` | Mate, CLI, phone | Read one task and its immutable ordered event log. |
 | `POST /tasks/:id/events` | Worker or owned Codex root-tool relay | Report `working`, `pr_linked`, `needs_decision`, `blocked`, `done`, `failed`, or `note`. |
+| `POST /tasks/:id/reports` | Worker or owned Codex root-tool relay | Durably submit the complete worker report and evidence to the mate mailbox. |
+| `GET /mate/mailbox`, `POST /mate/mailbox/read`, `GET /mate/mailbox/message/:id`, `POST /mate/mailbox/ack`, `GET /mate/mailbox/wait` | Mate (hook credential); list and read also accept bearer auth | The mate's durable worker-to-mate mailbox: list, claim, read full content, acknowledge, bounded wait. |
 | `POST /hooks` | Installed provider hook | Report provider lifecycle signals such as turn start and turn completion. |
 | `POST /tasks/:id/completion` | Mate with the server token | Accept or reject the latest worker completion request. |
 | `POST /tasks/:id/decision` | Mate or phone | Answer a structured no-mistakes review gate reported through `needs_decision`. |
@@ -181,6 +183,59 @@ For a non-scout, non-`local-only` task, every `done` request must re-resolve a v
 The worker may send `pr`, include the URL in `message`, or let the server discover the unique PR for the server-minted branch.
 The server attaches the validated PR before recording the completion request.
 For `no-mistakes` tasks, the standard worker brief therefore requires inspecting `branch_sync`, running exactly `no-mistakes axi sync` when `next_action.code` is `sync`, and confirming the event response reached `task.state == completion_requested`.
+
+## Worker reports and the mate mailbox
+
+Worker-authored boss-relevant events and full worker reports fan in to the mate through one durable SQLite mailbox instead of injected chat text.
+A worker message never becomes a user message in the mate's boss-facing conversation.
+
+### `POST /tasks/:id/reports`
+
+The lossless deliverable channel.
+A worker submits a concise routing `summary`, the complete worker-authored `report`, and optional structured `evidence`, plus a required sender-provided `idempotencyKey` (the `perch report send` CLI and the `perch.send_report` Codex root tool default it to a content hash).
+
+```sh
+perch report send --task <task-id> \
+  --summary "one-paragraph routing summary" \
+  --report-file ./report.md --evidence-file ./evidence.json
+```
+
+Fresh managed Codex workers call the `perch.send_report` root-thread dynamic tool instead; the app-server adapter relays it with the verified root session exactly like `perch.report_task_event`, so native children gain no reporting authority from inherited environment credentials.
+The endpoint accepts only worker identities (the task session's hook credential, or the Codex root-tool relay); plain bearer and device tokens are rejected.
+The same `root_thread_required` gate as the events route applies.
+
+Perch stores the report byte-for-byte in an immutable, trigger-protected `worker_reports` row (id, provenance, size, sha256, accepted timestamp) and commits, in the same SQLite transaction, a pointer task event (kind `note`, `data.reason: "worker_report"`, carrying the summary and stable report id - never the body) and a pending mate mailbox delivery.
+Tool success therefore means the full report is durable with a standing delivery obligation - not that the mate processed it.
+
+Explicit bounds, enforced with `413` and never silent truncation: summary 4 KiB, report 256 KiB, evidence JSON 256 KiB.
+Larger artifacts belong in committed files or charts, referenced from the report by path or content hash.
+Replaying the same `(task, sender session, idempotencyKey)` with identical content returns the original report with `duplicate: true`; the same key with different content is `409`.
+
+### Mailbox semantics
+
+Each mailbox delivery references its immutable source (the task event, plus the worker report when one exists) and moves `pending -> claimed -> acknowledged`.
+The order key is the global task-event id: FIFO within each task conversation and a deterministic commit order across tasks.
+An expired claim (10 minutes) returns to pending automatically; claiming re-mints the opaque claim token, so stale tokens can never acknowledge.
+Acknowledgment requires the live mate generation's own hook credential, the exact claim token, an unexpired lease, and an idempotency key: replaying the committed key returns the original receipt, a different key after acknowledgment is refused, and a stale mate generation cannot acknowledge at all.
+Unacknowledged messages survive server, daemon, provider-turn, and mate-generation restarts.
+Acknowledgment records mailbox processing only; trusted task completion still requires `POST /tasks/:id/completion` with the server token.
+
+Mailbox tools for the mate (`perch mailbox read | message <id> | ack <id> --token <t> | wait [--timeout <s>]`):
+
+- `read` (read_messages) claims the oldest unacknowledged messages and returns stable pointers plus safe routing metadata and a bounded summary - never the report body.
+- `message` (read_message) returns the original full report, evidence, and event content.
+- `ack` (ack_message) records the semantic acknowledgment after the mate actually processed the message.
+- `wait` (wait_for_messages) is a bounded wait capped at 30 seconds over the same durable mailbox: it returns immediately when messages are pending and empty on timeout. It is a latency optimization, never the correctness layer, and a lost wait or wake loses no message.
+
+### Attention and presentation
+
+A wake is disposable attention transport only.
+When a mailbox delivery commits, the server nudges an idle mate with a single content-free `[perch mailbox] N unread ...` control line; a mate that is mid-turn is never interrupted or steered, and the nudge repeats at the next idle transition only when newer messages arrived.
+The boss-facing timeline renders only the mate's synthesis: mailbox control prompts are filtered from the timeline projection and the live stream, and raw worker reports never enter any timeline.
+Provider-native transcripts (attach views) still contain the mate's mailbox tool calls and the nudge line; privacy from native transcripts is out of scope.
+
+System-sourced notifications (`chart_ready`, `checks_green`, `merge_ready`, `merged`, `stalled`, `runtime_interrupted`) remain on the legacy injected wake-line path.
+That legacy path, and the worker `curl` event verbs, are the explicit compatibility boundary: they remain until the mailbox subsumes system notifications, while the new report path is CLI/tool-only from day one.
 
 ## What happens when a provider turn completes
 
