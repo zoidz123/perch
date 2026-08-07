@@ -1156,10 +1156,8 @@ final class PerchStore: ObservableObject {
     // Rendered chat = canonical items + optimistic overlay at the end.
     func chatItems(_ sessionId: String) -> [TimelineItem] {
         var items = (timelinesBySession[sessionId] ?? []) + (optimisticBySession[sessionId] ?? []).map(\.item)
-        // Append the live streaming reply (codex) as a synthetic assistant
-        // bubble at the tail. seq 0 keeps it out of the typewriter-reveal path
-        // (that animates seq > revealAfterSeq); the streaming itself is the
-        // animation. Cleared once the finished message persists.
+        // Append the live Codex reply as a synthetic assistant row at the tail.
+        // TimelineChatView owns display coalescing and the canonical-row handoff.
         if let reply = streamingBySession[sessionId], !reply.text.isEmpty {
             items.append(reply.asTimelineItem(sessionId: sessionId))
         }

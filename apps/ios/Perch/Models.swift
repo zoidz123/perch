@@ -905,20 +905,169 @@ struct StreamingReply: Equatable {
     var text: String
     var done: Bool
 
-    // Synthetic timeline row for the preview. Stable id (keyed on itemId) so the
-    // row updates in place as text grows; seq 0 keeps it clear of the
-    // typewriter-reveal path (which only animates seq > revealAfterSeq).
-    func asTimelineItem(sessionId: String) -> TimelineItem {
+    // The app-server item's protocol id becomes the stable, persisted Codex
+    // timeline id. Keeping the live preview on that same id lets SwiftUI update
+    // the existing row when the tailer replaces it with the canonical item.
+    var canonicalTimelineItemID: String {
+        "cx-item-\(itemId)"
+    }
+
+    // Synthetic timeline row for the preview. The view may supply a coalesced
+    // display string while the provider continues to publish every frame.
+    func asTimelineItem(sessionId: String, text displayedText: String? = nil) -> TimelineItem {
         TimelineItem(
             seq: 0,
-            id: "stream-\(itemId)",
+            id: canonicalTimelineItemID,
             sessionId: sessionId,
             kind: .assistant,
-            text: text,
+            text: displayedText ?? text,
             tool: nil,
             at: "",
             source: .agent
         )
+    }
+}
+
+// A view-local display buffer for the provider's accumulated assistant-stream
+// frames. It never feeds back into transport or persistence: it only lets the
+// Markdown view skip redundant parses between display commits. The caller owns
+// the timer and supplies time so this state machine stays deterministic in
+// focused tests.
+struct StreamingMarkdownPresentationBuffer: Equatable {
+    enum Update: Equatable {
+        case none
+        case committed
+        case scheduled(TimeInterval)
+    }
+
+    static let maximumCommitInterval: TimeInterval = 0.05
+
+    private(set) var itemID: String?
+    private(set) var displayedText = ""
+    private(set) var pendingText: String?
+    private(set) var scheduledCommitAt: TimeInterval?
+    private(set) var commitGeneration = 0
+    private var lastCommitAt: TimeInterval?
+
+    var hasPendingCommit: Bool {
+        scheduledCommitAt != nil
+    }
+
+    func displayedText(for itemID: String) -> String? {
+        guard self.itemID == itemID, !displayedText.isEmpty else { return nil }
+        return displayedText
+    }
+
+    mutating func receive(
+        itemID: String,
+        text: String,
+        done: Bool,
+        now: TimeInterval
+    ) -> Update {
+        guard !text.isEmpty else { return .none }
+
+        if self.itemID != itemID {
+            reset()
+            self.itemID = itemID
+        }
+
+        if done {
+            pendingText = nil
+            scheduledCommitAt = nil
+            return commit(text, at: now)
+        }
+
+        if text == displayedText {
+            pendingText = nil
+            scheduledCommitAt = nil
+            return .none
+        }
+
+        if let lastCommitAt, now - lastCommitAt >= Self.maximumCommitInterval {
+            return commit(text, at: now)
+        }
+
+        if displayedText.isEmpty {
+            return commit(text, at: now)
+        }
+
+        pendingText = text
+        let deadline = (lastCommitAt ?? now) + Self.maximumCommitInterval
+        scheduledCommitAt = deadline
+        return .scheduled(deadline)
+    }
+
+    mutating func commitPending(at now: TimeInterval) -> Update {
+        guard let scheduledCommitAt else { return .none }
+        guard scheduledCommitAt <= now else { return .scheduled(scheduledCommitAt) }
+        guard let pendingText else {
+            self.scheduledCommitAt = nil
+            return .none
+        }
+        self.pendingText = nil
+        self.scheduledCommitAt = nil
+        return commit(pendingText, at: now)
+    }
+
+    mutating func reset() {
+        itemID = nil
+        displayedText = ""
+        pendingText = nil
+        scheduledCommitAt = nil
+        lastCommitAt = nil
+    }
+
+    private mutating func commit(_ text: String, at now: TimeInterval) -> Update {
+        pendingText = nil
+        scheduledCommitAt = nil
+        let changed = displayedText != text
+        displayedText = text
+        lastCommitAt = now
+        if changed {
+            commitGeneration += 1
+            return .committed
+        }
+        return .none
+    }
+}
+
+// Timeline scrolling is intentionally modeled separately from raw stream
+// arrival. Only content that has actually reached the display buffer may move
+// a sticky reader; a manual drag remains detached until an explicit return.
+struct TimelineScrollPresentation: Equatable {
+    private(set) var isSticky = true
+    private(set) var unseenWhileDetached = false
+
+    mutating func detachForManualScroll() {
+        isSticky = false
+    }
+
+    @discardableResult
+    mutating func didCommitDisplayedContent() -> Bool {
+        guard isSticky else {
+            unseenWhileDetached = true
+            return false
+        }
+        return true
+    }
+
+    mutating func returnToLatest() {
+        isSticky = true
+        unseenWhileDetached = false
+    }
+}
+
+struct TimelineMotionPolicy: Equatable {
+    let reduceMotion: Bool
+
+    var permitsAnimation: Bool {
+        !reduceMotion
+    }
+}
+
+enum TimelineTextPresentation {
+    static func completedAssistantText(for item: TimelineItem) -> String {
+        item.text ?? ""
     }
 }
 
