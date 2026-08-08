@@ -1,5 +1,4 @@
 import type { AgentKind, Task } from "@perch/shared";
-import { CHART_CAPABILITY_NOTE } from "./hooks.js";
 
 export const CODEX_NATIVE_CHILD_GUIDANCE = [
   "Native Codex multi-agent guidance:",
@@ -75,8 +74,6 @@ export function dispatchBrief(
           "This is an OPERATE task: perform the requested verified runtime or external operation and collect gate-by-gate evidence.",
           "- Do not change repository files, run AutoReview, push, or create a code PR."
         ];
-  const chartVerb =
-    `curl -sf -X POST "\${PERCH_HOOK_URL%/hooks}/charts" \\\n  -H "x-perch-session: $PERCH_SESSION_ID" -H "x-perch-token: $PERCH_HOOK_TOKEN" \\\n  -H "content-type: application/json" -d '{"file":"<absolute path to the .html file>"}'`;
   const brief = [
     "",
     "---",
@@ -100,10 +97,8 @@ export function dispatchBrief(
       ? 'Call perch.send_report with {"summary":"<routing summary>","report":"<complete report>","evidence":{}} and require success=true.'
       : `perch report send --task ${task.id} --summary "<routing summary>" --report-file <path-to-full-report.md> [--evidence-file <path.json>]`,
     "",
-    "Draw a chart only when it makes findings, a plan, or a comparison easier to review. Fetch the authoring guide first, write .charts/<slug>.html outside commits, then register it:",
-    chartVerb,
     "Report sparsely: one working update when you start, then only on real state changes.",
     "Never request completion until this task kind's definition of done is actually met."
   ].join("\n");
-  return agent === "codex" ? `${brief}\n\n${CODEX_NATIVE_CHILD_GUIDANCE}\n\n${CHART_CAPABILITY_NOTE}` : brief;
+  return agent === "codex" ? `${brief}\n\n${CODEX_NATIVE_CHILD_GUIDANCE}` : brief;
 }
