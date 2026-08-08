@@ -1,8 +1,7 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import type { Task } from "@perch/shared";
+import type { AgentKind, Task } from "@perch/shared";
 import { CODEX_NATIVE_CHILD_GUIDANCE, dispatchBrief } from "./brief.js";
-import { CHART_CAPABILITY_NOTE } from "./hooks.js";
 
 function task(overrides: Partial<Task> = {}): Task {
   const now = new Date().toISOString();
@@ -44,8 +43,28 @@ test("a planId stamps the brief with the first-commit convention", () => {
   assert.match(brief, /Commit it first/);
 });
 
-test("Codex briefs preserve root-only native child guidance and chart capability", () => {
+test("Codex briefs preserve root-only native child guidance", () => {
   const brief = dispatchBrief(task(), "/tmp/wt", {}, "codex");
-  assert.ok(brief.endsWith(`${CODEX_NATIVE_CHILD_GUIDANCE}\n\n${CHART_CAPABILITY_NOTE}`));
+  assert.ok(brief.endsWith(CODEX_NATIVE_CHILD_GUIDANCE));
   assert.match(brief, /root thread's perch\.report_task_event tool/);
+});
+
+// The ship contract prohibits curl, so the word appears in that one prohibition
+// sentence. What must never appear is an actual invocation: curl with a flag,
+// a URL, or a hook token to carry.
+const CURL_INVOCATION = /curl\s+(?:-|"|'|\$|https?:)/;
+
+test("no brief instructs a worker to run curl or draw a chart", () => {
+  const kinds: Task["kind"][] = ["ship", "scout", "operate"];
+  const agents: (AgentKind | undefined)[] = ["codex", "claude", undefined];
+  for (const kind of kinds) {
+    for (const agent of agents) {
+      const label = `${kind}/${agent ?? "default"}`;
+      const brief = dispatchBrief(task({ kind }), "/tmp/wt", {}, agent);
+      assert.doesNotMatch(brief, CURL_INVOCATION, `${label} brief contains a curl invocation`);
+      assert.doesNotMatch(brief, /chart/i, `${label} brief mentions charts`);
+      assert.ok(!brief.includes("PERCH_HOOK_URL"), `${label} brief leaks the hook URL`);
+      assert.ok(!brief.includes("PERCH_HOOK_TOKEN"), `${label} brief leaks the hook token`);
+    }
+  }
 });
