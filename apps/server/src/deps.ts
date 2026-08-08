@@ -408,7 +408,6 @@ async function projectGate(project: Project, binaryFound: boolean): Promise<Doct
   return {
     rootPath: project.rootPath,
     name: project.name,
-    ...(project.mode ? { mode: project.mode } : {}),
     initialized,
     ready: binaryFound && initialized,
     ...(note ? { note } : {})

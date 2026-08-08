@@ -32,8 +32,8 @@ function writeShim(dir: string, name: string, script: string): void {
   writeFileSync(join(dir, name), `#!/bin/sh\n${script}\n`, { mode: 0o755 });
 }
 
-function project(rootPath: string, name: string, mode?: Project["mode"]): Project {
-  return { rootPath, name, ...(mode ? { mode } : {}), addedAt: "2026-07-07T00:00:00.000Z", lastUsedAt: "2026-07-07T00:00:00.000Z" };
+function project(rootPath: string, name: string): Project {
+  return { rootPath, name, addedAt: "2026-07-07T00:00:00.000Z", lastUsedAt: "2026-07-07T00:00:00.000Z" };
 }
 
 test("collectDoctor detects tools on PATH, parses versions, and hints missing ones", async () => {
@@ -136,7 +136,7 @@ test("gate readiness reads the no-mistakes remote from repo config", async () =>
       env: { PATH: bin },
       noMistakesPath: join(bin, "no-mistakes"),
       projects: [
-        project(inited, "gated", "no-mistakes"),
+        project(inited, "gated"),
         project(bare, "plain"),
         project(join(bare, "missing-subdir"), "gone")
       ]
@@ -147,7 +147,6 @@ test("gate readiness reads the no-mistakes remote from repo config", async () =>
     const gated = gates.find((gate) => gate.name === "gated");
     assert.equal(gated?.initialized, true);
     assert.equal(gated?.ready, true, "binary present + remote present = ready");
-    assert.equal(gated?.mode, "no-mistakes");
 
     const plain = gates.find((gate) => gate.name === "plain");
     assert.equal(plain?.initialized, false);

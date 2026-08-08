@@ -80,6 +80,26 @@ function createTask(port: number, body: unknown): Promise<Response> {
   return fetch(`http://127.0.0.1:${port}/tasks`, { method: "POST", headers: bearer, body: JSON.stringify(body) });
 }
 
+test("POST /tasks accepts only ship, scout, and operate while rejecting legacy modes", async () => {
+  await withServer(async ({ port }) => {
+    for (const kind of ["ship", "scout", "operate"]) {
+      const response = await createTask(port, { title: `${kind} task`, project: "/tmp/repo", kind });
+      assert.equal(response.status, 201);
+      const task = (await response.json()) as { task: Task };
+      assert.equal(task.task.kind, kind);
+      assert.equal(task.task.mode, undefined);
+    }
+    for (const mode of ["direct-PR", "no-mistakes", "local-only"]) {
+      const response = await createTask(port, { title: `legacy ${mode}`, project: "/tmp/repo", mode });
+      assert.equal(response.status, 409);
+      assert.match(((await response.json()) as { error: string }).error, /legacy-only/);
+    }
+    const unsupported = await createTask(port, { title: "invalid", project: "/tmp/repo", kind: "direct-PR" });
+    assert.equal(unsupported.status, 400);
+    assert.match(((await unsupported.json()) as { error: string }).error, /ship, scout, or operate/);
+  });
+});
+
 test("POST /tasks stamps planId and GET /tasks?planId filters to the stamped tasks", async () => {
   await withServer(async ({ port }) => {
     const plan = "docs/plans/2026-07-08-hub.md";

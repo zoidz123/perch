@@ -90,6 +90,8 @@ async function connectedClient(overrides: Partial<{
   onTurnComplete: (ev: { message: string }) => void;
   onTurnStarted: () => void;
   onTaskEvent: (event: any) => Promise<{ success: boolean; text: string }>;
+  onAutoReviewRun: (input: Record<string, unknown>) => Promise<{ success: boolean; text: string }>;
+  onDeliveryCreatePr: (input: Record<string, unknown>) => Promise<{ success: boolean; text: string }>;
   onUsageLimit: (ev: { provider: string; retryAt?: string; source?: string }) => void;
 }> = {}): Promise<{ client: CodexAppServerClient; server: MockCodexServer }> {
   const server = new MockCodexServer();
@@ -687,6 +689,46 @@ test("only the root thread can report task lifecycle events", async () => {
   assert.deepEqual(reported, [{ kind: "working", message: "root progress" }]);
   assert.equal(server.requests.find((request) => request.id === 90)?.result?.success, true);
   assert.equal(server.requests.find((request) => request.id === 91)?.error?.code, -32601);
+});
+
+test("only the root thread can invoke typed AutoReview and delivery tools", async () => {
+  const reviews: Record<string, unknown>[] = [];
+  const deliveries: Record<string, unknown>[] = [];
+  const { client, server } = await connectedClient({
+    onAutoReviewRun: async (input) => {
+      reviews.push(input);
+      return { success: true, text: '{"attempt":{"state":"clean"}}' };
+    },
+    onDeliveryCreatePr: async (input) => {
+      deliveries.push(input);
+      return { success: true, text: '{"pr":{"url":"https://github.com/o/r/pull/1"}}' };
+    }
+  });
+  await client.startThread();
+  const tools = server.find("thread/start")?.params?.dynamicTools?.[0]?.tools ?? [];
+  assert.deepEqual(tools.map((tool: { name: string }) => tool.name), [
+    "report_task_event", "send_report", "autoreview.run", "delivery.create_pr"
+  ]);
+
+  server.requestToClient(92, "item/tool/call", {
+    threadId: "thr_1", namespace: "perch", tool: "autoreview.run",
+    arguments: { idempotencyKey: "review-1", testArgv: ["npm", "test"] }
+  });
+  server.requestToClient(93, "item/tool/call", {
+    threadId: "thr_1", namespace: "perch", tool: "delivery.create_pr",
+    arguments: { idempotencyKey: "delivery-1" }
+  });
+  server.requestToClient(94, "item/tool/call", {
+    threadId: "child-1", namespace: "perch", tool: "delivery.create_pr",
+    arguments: { idempotencyKey: "child-claim" }
+  });
+  await tick();
+
+  assert.deepEqual(reviews, [{ idempotencyKey: "review-1", testArgv: ["npm", "test"] }]);
+  assert.deepEqual(deliveries, [{ idempotencyKey: "delivery-1" }]);
+  assert.equal(server.requests.find((request) => request.id === 92)?.result?.success, true);
+  assert.equal(server.requests.find((request) => request.id === 93)?.result?.success, true);
+  assert.equal(server.requests.find((request) => request.id === 94)?.error?.code, -32601);
 });
 
 test("turn completion cannot clear a structured request; disconnect cleanup can", async () => {

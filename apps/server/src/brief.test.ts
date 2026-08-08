@@ -7,151 +7,45 @@ import { CHART_CAPABILITY_NOTE } from "./hooks.js";
 function task(overrides: Partial<Task> = {}): Task {
   const now = new Date().toISOString();
   return {
-    id: "ship-the-thing-a1b2",
-    title: "ship the thing",
-    project: "/Users/dev/projects/perch",
-    kind: "ship",
-    mode: "direct-PR",
-    state: "queued",
-    createdAt: now,
-    updatedAt: now,
-    ...overrides
+    id: "ship-the-thing-a1b2", title: "ship the thing", project: "/Users/dev/projects/perch", kind: "ship",
+    state: "queued", createdAt: now, updatedAt: now, ...overrides
   };
 }
 
-test("no-mistakes mode brief carries the gate driving section and the structured findings contract", () => {
-  const brief = dispatchBrief(task({ mode: "no-mistakes" }), "/tmp/wt");
-  assert.match(brief, /Ship through the no-mistakes gate:/);
-  assert.match(brief, /\/no-mistakes skill/);
-  assert.match(brief, /--intent/);
-  assert.match(brief, /unsandboxed: sandboxed Bash breaks the gate's post-receive hook/);
-  assert.match(brief, /never answer or bypass them yourself/);
-  assert.match(brief, /copied VERBATIM into data\.noMistakes/);
-  // The example curl posts to this task's own events endpoint with the shape.
-  assert.match(brief, /tasks\/ship-the-thing-a1b2\/events/);
-  assert.match(brief, /"data":\{"noMistakes":\{"step":"review","findings":/);
-  assert.match(brief, /no-mistakes axi respond/);
-  assert.match(brief, /As soon as no-mistakes creates or prints its PR URL/);
-  assert.match(brief, /"kind":"pr_linked"/);
-  assert.match(brief, /inspect `branch_sync`/);
-  assert.match(brief, /if `next_action\.code` is `sync`, run exactly `no-mistakes axi sync`/);
-  assert.match(brief, /POST kind `done` with the explicit PR URL/);
-  assert.match(brief, /Do not emit final prose until the response confirms `task\.state == completion_requested`/);
-  assert.match(brief, /If sync or the POST fails, report `blocked` or `failed` accurately/);
-  assert.match(brief, /curl --silent --show-error --fail-with-body/);
-  assert.match(brief, /response\.task\?\.state !== "completion_requested"/);
-  assert.match(brief, /expected task\.state == completion_requested/);
-});
-
-test("every brief carries the never-end-a-turn-silently reporting clause", () => {
-  for (const t of [task(), task({ kind: "scout" }), task({ mode: "no-mistakes" }), task({ mode: "local-only" })]) {
-    const brief = dispatchBrief(t, undefined);
-    assert.match(brief, /Never end a turn without reporting your current state/, `missing clause for ${t.kind}/${t.mode}`);
-    assert.match(brief, /report working: naming what you are waiting on first/);
-  }
-});
-
-test("completion examples require PR URLs only for remote ship modes", () => {
-  for (const mode of ["direct-PR", "no-mistakes"] as const) {
-    const brief = dispatchBrief(task({ mode }), undefined);
-    assert.match(brief, /what you did; include the explicit PR URL/);
-    assert.match(brief, /PR opened or discovered: immediately link it before continuing/);
-    assert.match(brief, /"kind":"pr_linked","pr":"<canonical GitHub PR URL>"/);
-  }
-
-  const local = dispatchBrief(task({ mode: "local-only" }), undefined);
-  assert.match(local, /what you did; no PR was opened/);
-  assert.ok(!local.includes("what you did; include the explicit PR URL"));
-  assert.ok(!local.includes("\"kind\":\"pr_linked\""));
-
-  for (const mode of ["direct-PR", "no-mistakes", "local-only"] as const) {
-    const scout = dispatchBrief(task({ kind: "scout", mode }), undefined);
-    assert.match(scout, /what you found; no PR is required/);
-    assert.ok(!scout.includes("what you did; include the explicit PR URL"));
-    assert.ok(!scout.includes("\"kind\":\"pr_linked\""));
-  }
-});
-
-test("a planId stamps the brief with the plan it builds from and the first-commit convention", () => {
-  const brief = dispatchBrief(task({ planId: "docs/plans/2026-07-08-hub.md" }), "/tmp/wt");
-  assert.match(brief, /builds from the finalized plan `docs\/plans\/2026-07-08-hub\.md`/);
-  assert.match(brief, /commit it to docs\/plans\/<date>-<name>\.md as the FIRST commit/);
-  // No planId, no plan section.
-  assert.ok(!dispatchBrief(task(), "/tmp/wt").includes("builds from the finalized plan"));
-});
-
-test("a plan-edit brief points the worker at the staged file and the commit-as-revision flow", () => {
-  const brief = dispatchBrief(task({ planId: "docs/plans/2026-07-08-hub.md" }), "/tmp/wt", {
-    edit: { relativePath: "docs/plans/2026-07-08-hub.md", stagedPath: "/home/.perch/tasks/t/plan-edit.md" }
-  });
-  assert.match(brief, /PLAN EDIT/);
-  assert.match(brief, /staged at \/home\/\.perch\/tasks\/t\/plan-edit\.md/);
-  assert.match(brief, /Copy its contents to docs\/plans\/2026-07-08-hub\.md/);
-  assert.match(brief, /commit ONLY that file as the FIRST commit/);
-  assert.match(brief, /Every revision is a git commit/);
-  // The edit section replaces the plain plan-build line (no double-briefing).
-  assert.ok(!brief.includes("builds from the finalized plan"));
-});
-
-test("direct-PR and local-only briefs prohibit no-mistakes while scouts omit gate policy", () => {
-  for (const t of [task(), task({ kind: "scout", mode: "no-mistakes" }), task({ mode: "local-only" })]) {
-    const brief = dispatchBrief(t, undefined);
-    assert.ok(!brief.includes("Ship through the no-mistakes gate"), `unexpected gate section for ${t.kind}/${t.mode}`);
-    assert.ok(!brief.includes("data.noMistakes"));
-  }
-  const direct = dispatchBrief(task(), undefined);
-  assert.match(direct, /No-mistakes is prohibited for this direct-PR task/);
-  assert.match(direct, /ordinary task-specific tests, builds, and lint/);
-  assert.match(direct, /existing gate remote/);
-
-  const local = dispatchBrief(task({ mode: "local-only" }), undefined);
-  assert.match(local, /No-mistakes is prohibited for this local-only task/);
-  assert.match(local, /keep the work on the local task branch/);
-
-  const gated = dispatchBrief(task({ mode: "no-mistakes" }), undefined);
-  assert.ok(!gated.includes("No-mistakes is prohibited"));
-
-  const scout = dispatchBrief(task({ kind: "scout", mode: "direct-PR" }), undefined);
-  assert.ok(!scout.includes("No-mistakes is prohibited"));
-});
-
-test("the brief points chart authoring at the served guide, never a repo path", () => {
-  const brief = dispatchBrief(task(), "/tmp/wt");
-  assert.match(brief, /\$\{PERCH_HOOK_URL%\/hooks\}\/charts\/authoring/);
-  // External users have no perch checkout to read.
-  assert.ok(!brief.includes("apps/server/assets/charts/AUTHORING.md"));
-});
-
-test("the brief carries the terse one-screen chart contract", () => {
-  const brief = dispatchBrief(task(), "/tmp/wt");
-  assert.match(brief, /keep the chart to one screen/);
-  assert.match(brief, /one-line verdict/);
-  assert.match(brief, /Choose one shape/);
-  assert.match(brief, /exploratory reports use a one-line verdict, Findings, Evidence/);
-  assert.match(brief, /optional Recommendation or Open question/);
-  assert.match(brief, /code-change reports use a one-line verdict, Root cause, Fix, Verification/);
-  assert.match(brief, /optional remaining risks/);
-  assert.match(brief, /Do not force exploratory reports into Problem \/ Fix framing/);
-  assert.ok(!brief.includes("roughly two screens"));
-  assert.ok(!brief.includes("end a plan with its risks and open questions"));
-});
-
-test("codex worker briefs append the canonical chart note while Claude briefs stay unchanged", () => {
-  const existing = dispatchBrief(task(), "/tmp/wt");
-  const claude = dispatchBrief(task(), "/tmp/wt", {}, "claude");
-  const codex = dispatchBrief(task(), "/tmp/wt", {}, "codex");
-
-  assert.equal(claude, existing);
-  assert.ok(codex.endsWith(`${CODEX_NATIVE_CHILD_GUIDANCE}\n\n${CHART_CAPABILITY_NOTE}`));
-  assert.match(codex, /Report status only with the root thread's perch\.report_task_event tool/);
-  assert.ok(!codex.includes(`tasks/ship-the-thing-a1b2/events`));
-});
-
-test("codex worker briefs keep native children inside the native parent and reserve lifecycle authority for root", () => {
+test("ship brief exposes server-owned AutoReview and delivery operations without direct delivery instructions", () => {
   const brief = dispatchBrief(task(), "/tmp/wt", {}, "codex");
-  assert.match(brief, /report back only through their native parent result path/);
-  assert.match(brief, /must not report Perch task lifecycle events/);
-  assert.match(brief, /only through the root thread's perch\.report_task_event tool/);
-  assert.match(brief, /share the root worktree by default/);
-  assert.match(brief, /never perform concurrent writes/);
+  assert.match(brief, /perch\.autoreview\.run/);
+  assert.match(brief, /perch\.delivery\.create_pr/);
+  assert.match(brief, /Do not run git push, gh pr create, curl, or any independent delivery command/);
+  assert.ok(!brief.includes("no-mistakes"));
+  assert.ok(!brief.includes('"kind":"pr_linked"'));
+});
+
+test("Claude ship brief has typed CLI parity and no worker-authored HTTP operation", () => {
+  const brief = dispatchBrief(task(), "/tmp/wt", {}, "claude");
+  assert.match(brief, /perch autoreview run --task ship-the-thing-a1b2/);
+  assert.match(brief, /perch delivery create-pr --task ship-the-thing-a1b2/);
+  assert.ok(!brief.includes("/autoreview"));
+  assert.ok(!brief.includes("/delivery/pr"));
+});
+
+test("scout and operate briefs prohibit source delivery", () => {
+  const scout = dispatchBrief(task({ kind: "scout" }), "/tmp/wt");
+  assert.match(scout, /investigate read-only/);
+  assert.match(scout, /Do not change repository files, run AutoReview, push, or create a PR/);
+  const operate = dispatchBrief(task({ kind: "operate" }), "/tmp/wt");
+  assert.match(operate, /verified runtime or external operation/);
+  assert.match(operate, /Do not change repository files, run AutoReview, push, or create a code PR/);
+});
+
+test("a planId stamps the brief with the first-commit convention", () => {
+  const brief = dispatchBrief(task({ planId: "docs/plans/2026-08-07-hub.md" }), "/tmp/wt");
+  assert.match(brief, /builds from finalized plan `docs\/plans\/2026-08-07-hub\.md`/);
+  assert.match(brief, /Commit it first/);
+});
+
+test("Codex briefs preserve root-only native child guidance and chart capability", () => {
+  const brief = dispatchBrief(task(), "/tmp/wt", {}, "codex");
+  assert.ok(brief.endsWith(`${CODEX_NATIVE_CHILD_GUIDANCE}\n\n${CHART_CAPABILITY_NOTE}`));
+  assert.match(brief, /root thread's perch\.report_task_event tool/);
 });

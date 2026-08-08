@@ -1,9 +1,11 @@
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
+import { randomUUID } from "node:crypto";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
+import type { Task } from "@perch/shared";
 import { PrPoller, extractPrUrl, type GhPrView } from "./prPoller.js";
 import { TaskStore } from "./tasks.js";
 
@@ -21,6 +23,22 @@ function view(overrides: Partial<GhPrView> = {}): GhPrView {
     headRepository: { nameWithOwner: "o/r" },
     ...overrides
   };
+}
+
+function importLegacyRemoteShip(tasks: TaskStore, title: string, project: string): Task {
+  const now = new Date().toISOString();
+  const task: Task = {
+    id: `legacy-poller-${randomUUID().slice(0, 10)}`,
+    title,
+    project,
+    kind: "ship",
+    mode: "direct-PR",
+    state: "queued",
+    createdAt: now,
+    updatedAt: now
+  };
+  tasks.stateDb.tasks.insertImported(task, [{ seq: 1, at: now, kind: "created", source: "system", message: title }]);
+  return tasks.find(task.id)!;
 }
 
 test("poller flips checks then merged, exactly once each", async () => {
@@ -313,7 +331,7 @@ test("merge readiness turns true and emits merge_ready for a green ready PR", as
 test("explicit zero checks and exact-head acceptance derive Ready to merge", async () => {
   const home = mkdtempSync(join(tmpdir(), "perch-poller-"));
   const tasks = new TaskStore({ PERCH_HOME: home } as NodeJS.ProcessEnv);
-  const task = tasks.create({ title: "zero-check ready pr", project: "/tmp/repo" });
+  const task = importLegacyRemoteShip(tasks, "zero-check ready pr", "/tmp/repo");
   tasks.recordEvent(task.id, { kind: "working", source: "worker" });
   tasks.update(task.id, {
     branch: "perch/zero-check-ready",
@@ -417,7 +435,7 @@ test("absent check rollup clears historical readiness and remains unknown", asyn
 test("unavailable PR view clears historical readiness and remains unknown", async () => {
   const home = mkdtempSync(join(tmpdir(), "perch-poller-"));
   const tasks = new TaskStore({ PERCH_HOME: home } as NodeJS.ProcessEnv);
-  const task = tasks.create({ title: "unavailable checks", project: "/tmp/repo" });
+  const task = importLegacyRemoteShip(tasks, "unavailable checks", "/tmp/repo");
   tasks.recordEvent(task.id, { kind: "working", source: "worker" });
   tasks.update(task.id, {
     branch: "perch/unavailable-checks",

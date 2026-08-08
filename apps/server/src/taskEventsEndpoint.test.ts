@@ -1,11 +1,12 @@
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
+import { randomUUID } from "node:crypto";
 import { existsSync, mkdtempSync, rmSync } from "node:fs";
 import type { AddressInfo } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
-import type { AgentSession, RecentEventsResult } from "@perch/shared";
+import type { AgentSession, RecentEventsResult, Task, TaskKind, TaskMode } from "@perch/shared";
 import type { AgentAdapter } from "./adapters/types.js";
 import { AuditLog } from "./audit.js";
 import { FleetMonitor } from "./fleetMonitor.js";
@@ -104,6 +105,28 @@ function makeProjectWithCommit(home: string, remote = "https://github.com/o/r.gi
   execFileSync("git", ["-C", project, "commit", "-q", "--allow-empty", "-m", "work"], { stdio: "pipe" });
   const head = execFileSync("git", ["-C", project, "rev-parse", "HEAD"], { encoding: "utf8" }).trim();
   return { project, head };
+}
+
+// Pre-control-plane records still take their retained recovery path.  This
+// helper deliberately imports a historical row instead of weakening new task
+// creation to accept a removed delivery mode.
+function importLegacyTask(
+  tasks: TaskStore,
+  input: { title: string; project: string; mode: TaskMode; kind?: TaskKind }
+): Task {
+  const now = new Date().toISOString();
+  const task: Task = {
+    id: `legacy-${randomUUID().slice(0, 12)}`,
+    title: input.title,
+    project: input.project,
+    kind: input.kind ?? "ship",
+    mode: input.mode,
+    state: "queued",
+    createdAt: now,
+    updatedAt: now
+  };
+  tasks.stateDb.tasks.insertImported(task, [{ seq: 1, at: now, kind: "created", source: "system", message: task.title }]);
+  return tasks.find(task.id)!;
 }
 
 function post(port: number, taskId: string, headers: Record<string, string>, body: unknown): Promise<Response> {
@@ -449,7 +472,7 @@ test("a resumed blocked task accepts current working and done hooks after stale 
 
 test("a worker verb with data persists it onto the event verbatim", async () => {
   await withServer(async ({ port, tasks, hooks }) => {
-    const task = tasks.create({ title: "gated ship", project: "/tmp/repo", mode: "no-mistakes" });
+    const task = tasks.create({ title: "gated ship", project: "/tmp/repo" });
     const { token } = hooks.register("pty:worker");
     tasks.update(task.id, { sessionId: "pty:worker" });
 
@@ -564,7 +587,7 @@ test("done with an already-merged PR from the wrong branch is rejected before ta
   await withServer(
     async ({ home, port, tasks, hooks }) => {
       const project = makeProject(home);
-      const task = tasks.create({ title: "ship identity check", project });
+      const task = importLegacyTask(tasks, { title: "ship identity check", project, mode: "direct-PR" });
       const { token } = hooks.register("pty:worker");
       tasks.update(task.id, { sessionId: "pty:worker", branch: "perch/expected" });
       tasks.recordEvent(task.id, { kind: "working", source: "worker" });
@@ -599,7 +622,7 @@ test("remote ship modes keep the normal matching-PR attachment path", async () =
       const project = makeProject(home);
       for (const mode of ["direct-PR", "no-mistakes"] as const) {
         const sessionId = `pty:${mode}`;
-        const task = tasks.create({ title: `ship matching pr via ${mode}`, project, mode });
+        const task = importLegacyTask(tasks, { title: `ship matching pr via ${mode}`, project, mode });
         const { token } = hooks.register(sessionId);
         tasks.update(task.id, { sessionId, branch: "perch/expected" });
         tasks.recordEvent(task.id, { kind: "working", source: "worker" });
@@ -634,7 +657,7 @@ test("worker pr_linked persists a canonical fact before completion, exposes it i
     async ({ home, port, tasks, hooks }) => {
       const { project, head } = makeProjectWithCommit(home);
       checkoutHead = head;
-      const task = tasks.create({ title: "show PR while the gate runs", project, mode: "direct-PR" });
+      const task = importLegacyTask(tasks, { title: "show PR while the gate runs", project, mode: "direct-PR" });
       const { token } = hooks.register("pty:worker");
       const headers = { "x-perch-session": "pty:worker", "x-perch-token": token };
       tasks.update(task.id, { sessionId: "pty:worker", branch: "perch/show-pr-now" });
@@ -721,7 +744,7 @@ test("no-mistakes pr_linked accepts the task branch before branch_sync but compl
   await withServer(
     async ({ home, port, tasks, hooks }) => {
       const { project } = makeProjectWithCommit(home);
-      const task = tasks.create({ title: "link gate PR early", project, mode: "no-mistakes" });
+      const task = importLegacyTask(tasks, { title: "link gate PR early", project, mode: "no-mistakes" });
       const { token } = hooks.register("pty:worker");
       const headers = { "x-perch-session": "pty:worker", "x-perch-token": token };
       tasks.update(task.id, { sessionId: "pty:worker", branch: "perch/link-gate-pr-early" });
@@ -761,7 +784,7 @@ test("done revalidates an early-linked PR after it has merged", async () => {
     async ({ home, port, tasks, hooks }) => {
       const { project, head } = makeProjectWithCommit(home);
       checkoutHead = head;
-      const task = tasks.create({ title: "validate merged linked PR", project, mode: "no-mistakes" });
+      const task = importLegacyTask(tasks, { title: "validate merged linked PR", project, mode: "no-mistakes" });
       const { token } = hooks.register("pty:worker");
       const headers = { "x-perch-session": "pty:worker", "x-perch-token": token };
       tasks.update(task.id, { sessionId: "pty:worker", branch: "perch/validate-merged" });
@@ -795,7 +818,7 @@ test("local-only done requests completion without resolving a GitHub repo", asyn
   await withServer(
     async ({ home, port, tasks, hooks }) => {
       const project = mkdtempSync(join(home, "local-only-"));
-      const task = tasks.create({ title: "commit local work", project, mode: "local-only" });
+      const task = importLegacyTask(tasks, { title: "commit local work", project, mode: "local-only" });
       const { token } = hooks.register("pty:worker");
       tasks.update(task.id, { sessionId: "pty:worker", branch: "perch/local-only" });
       tasks.recordEvent(task.id, { kind: "working", source: "worker" });
@@ -833,7 +856,7 @@ test("done with a reused-branch PR is accepted when its head commit is the check
     async ({ home, port, tasks, hooks }) => {
       const { project, head } = makeProjectWithCommit(home);
       checkoutHead = head;
-      const task = tasks.create({ title: "ship reused branch", project });
+      const task = importLegacyTask(tasks, { title: "ship reused branch", project, mode: "direct-PR" });
       const { token } = hooks.register("pty:worker");
       tasks.update(task.id, { sessionId: "pty:worker", branch: "perch/auto-assigned" });
       tasks.recordEvent(task.id, { kind: "working", source: "worker" });
@@ -871,7 +894,7 @@ test("done with a reused-branch PR that lacks the worker's commits is still reje
     async ({ home, port, tasks, hooks }) => {
       const { project, head } = makeProjectWithCommit(home);
       checkoutHead = head;
-      const task = tasks.create({ title: "ship stale reuse", project });
+      const task = importLegacyTask(tasks, { title: "ship stale reuse", project, mode: "direct-PR" });
       const { token } = hooks.register("pty:worker");
       tasks.update(task.id, { sessionId: "pty:worker", branch: "perch/auto-assigned" });
       tasks.recordEvent(task.id, { kind: "working", source: "worker" });
@@ -909,7 +932,7 @@ test("no-mistakes done rejects a pipeline-owned newer PR head until guarded sync
       pipelineHead = execFileSync("git", ["-C", project, "rev-parse", "HEAD"], { encoding: "utf8" }).trim();
       execFileSync("git", ["-C", project, "reset", "--hard", workerHead], { stdio: "pipe" });
 
-      const task = tasks.create({ title: "ship through no-mistakes", project, mode: "no-mistakes" });
+      const task = importLegacyTask(tasks, { title: "ship through no-mistakes", project, mode: "no-mistakes" });
       const { token } = hooks.register("pty:worker");
       const headers = { "x-perch-session": "pty:worker", "x-perch-token": token };
       const done = { kind: "done", message: "green checks https://github.com/o/r/pull/50" };
@@ -948,7 +971,7 @@ test("URL-less done deterministically binds the task branch before arming PR pol
   await withServer(
     async ({ home, port, tasks, hooks }) => {
       const project = makeProject(home);
-      const task = tasks.create({ title: "ship matching pr", project });
+      const task = importLegacyTask(tasks, { title: "ship matching pr", project, mode: "direct-PR" });
       const { token } = hooks.register("pty:worker");
       tasks.update(task.id, { sessionId: "pty:worker", branch: "perch/deterministic" });
       tasks.recordEvent(task.id, { kind: "working", source: "worker" });
@@ -983,7 +1006,7 @@ test("URL-less done refuses to claim completion until the deterministic branch h
   await withServer(
     async ({ home, port, tasks, hooks }) => {
       const project = makeProject(home);
-      const task = tasks.create({ title: "ship matching pr", project });
+      const task = importLegacyTask(tasks, { title: "ship matching pr", project, mode: "direct-PR" });
       const { token } = hooks.register("pty:worker");
       tasks.update(task.id, { sessionId: "pty:worker", branch: "perch/not-pushed" });
       tasks.recordEvent(task.id, { kind: "working", source: "worker" });
@@ -1004,11 +1027,11 @@ test("URL-less done refuses to claim completion until the deterministic branch h
   );
 });
 
-test("scout done accepts its terminal report without PR binding in every ship mode, then closes", async () => {
+test("scout done accepts its terminal report without PR binding, then closes", async () => {
   await withServer(async ({ port, tasks }) => {
-    for (const mode of ["direct-PR", "no-mistakes", "local-only"] as const) {
-      const task = tasks.create({ title: `scout ${mode}`, project: "/tmp/repo", kind: "scout", mode });
-      tasks.update(task.id, { branch: `perch/scout-${mode}` });
+    for (const kind of ["scout", "operate"] as const) {
+      const task = tasks.create({ title: `${kind} report`, project: "/tmp/repo", kind });
+      tasks.update(task.id, { branch: `perch/${kind}-report` });
       tasks.recordEvent(task.id, { kind: "working", source: "worker" });
 
       const done = await post(
@@ -1017,14 +1040,13 @@ test("scout done accepts its terminal report without PR binding in every ship mo
         { authorization: "Bearer test-token" },
         {
           kind: "done",
-          message:
-            mode === "direct-PR"
-              ? "report references https://github.com/o/r/pull/999 but delivers no code"
-              : `report for ${mode}`
+          message: kind === "scout"
+            ? "report delivered without code delivery"
+            : `verified operation report for ${kind}`
         }
       );
 
-      assert.equal(done.status, 200, `${mode} scout report must not require a PR`);
+      assert.equal(done.status, 200, `${kind} report must not require a PR`);
       assert.equal(tasks.find(task.id)?.state, "completion_requested");
       assert.equal(tasks.find(task.id)?.pr, undefined);
 
@@ -1032,7 +1054,7 @@ test("scout done accepts its terminal report without PR binding in every ship mo
       const accepted = await decideCompletion(port, task.id, {
         action: "accept",
         requestSeq,
-        idempotencyKey: `accept-scout-${mode}`
+        idempotencyKey: `accept-${kind}`
       });
       assert.equal(accepted.status, 200);
       assert.equal(tasks.find(task.id)?.state, "done");

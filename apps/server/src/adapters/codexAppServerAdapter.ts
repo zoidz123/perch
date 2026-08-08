@@ -77,6 +77,8 @@ export type CodexOwnedEventSink = {
   onNativeChildObservation?: (sessionId: string, observation: NativeChildRunObservation) => void;
   onTaskEvent?: (sessionId: string, event: TaskEventRequest) => Promise<{ success: boolean; text: string }>;
   onWorkerReport?: (sessionId: string, report: WorkerReportRequest) => Promise<{ success: boolean; text: string }>;
+  onAutoReviewRun?: (sessionId: string, input: Record<string, unknown>) => Promise<{ success: boolean; text: string }>;
+  onDeliveryCreatePr?: (sessionId: string, input: Record<string, unknown>) => Promise<{ success: boolean; text: string }>;
   onThreadStarted?: (sessionId: string, threadId: string, socketPath: string) => void;
   onModelResolved?: (sessionId: string, model: string) => void;
   onUsageLimit?: (sessionId: string, limit: UsageLimit) => void;
@@ -112,6 +114,8 @@ export type CreateOwnedClient = (args: {
     onNativeChildObservation: (observation: NativeChildRunObservation) => void;
     onTaskEvent: (event: TaskEventRequest) => Promise<{ success: boolean; text: string }>;
     onWorkerReport: (report: WorkerReportRequest) => Promise<{ success: boolean; text: string }>;
+    onAutoReviewRun: (input: Record<string, unknown>) => Promise<{ success: boolean; text: string }>;
+    onDeliveryCreatePr: (input: Record<string, unknown>) => Promise<{ success: boolean; text: string }>;
     onUsageLimit: (limit: UsageLimit) => void;
     onDisconnected: () => void;
   };
@@ -241,6 +245,8 @@ export class CodexAppServerAdapter implements AgentAdapter {
           onNativeChildObservation: handlers.onNativeChildObservation,
           onTaskEvent: handlers.onTaskEvent,
           onWorkerReport: handlers.onWorkerReport,
+          onAutoReviewRun: handlers.onAutoReviewRun,
+          onDeliveryCreatePr: handlers.onDeliveryCreatePr,
           nativeMultiAgentObservation,
           onUsageLimit: handlers.onUsageLimit,
           onDisconnected: handlers.onDisconnected,
@@ -1035,6 +1041,14 @@ export class CodexAppServerAdapter implements AgentAdapter {
       onWorkerReport: (report) => this.events.onWorkerReport?.(session.id, report) ?? Promise.resolve({
         success: false,
         text: "Worker report submission is unavailable."
+      }),
+      onAutoReviewRun: (input) => this.events.onAutoReviewRun?.(session.id, input) ?? Promise.resolve({
+        success: false,
+        text: "AutoReview is unavailable."
+      }),
+      onDeliveryCreatePr: (input) => this.events.onDeliveryCreatePr?.(session.id, input) ?? Promise.resolve({
+        success: false,
+        text: "Delivery is unavailable."
       }),
       onUsageLimit: (limit) => this.events.onUsageLimit?.(session.id, limit),
       onDisconnected: () => this.handleDisconnect(session)

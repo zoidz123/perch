@@ -481,7 +481,10 @@ export type StartAgentResponse = {
 // The server owns tasks as dumb CRUD + a state machine; all policy (dispatch
 // composition, absorb/escalate, teardown gate) stays in the caller/mate.
 
-export type TaskKind = "ship" | "scout";
+// A task kind describes the work's real-world effect.  Delivery modes remain
+// only as an optional legacy decode field on records persisted before the
+// AutoReview control plane; no newly-created task may select one.
+export type TaskKind = "ship" | "scout" | "operate";
 export type TaskMode = "direct-PR" | "no-mistakes" | "local-only";
 
 // queued -> working -> needs_you|blocked -> completion_requested -> done -> landed -> closed
@@ -537,6 +540,7 @@ export type TaskPresentationState =
   | "awaiting_verification"
   | "ready_to_merge"
   | "ready_to_apply"
+  | "verified_done"
   | "failed"
   | "closed";
 
@@ -577,7 +581,9 @@ export type Task = {
   workerName?: string;
   project: string; // repo root path
   kind: TaskKind;
-  mode: TaskMode;
+  // Legacy-only.  Kept optional so historic task records are readable and
+  // recoverable while newly-created tasks serialize no delivery mode at all.
+  mode?: TaskMode;
   state: TaskState;
   // Original boss/mate brief before the server appends its worker reporting
   // contract. Optional so historical projections remain readable and because
@@ -643,6 +649,8 @@ export type CreateTaskRequest = {
   title: string;
   project: string; // repo root
   kind?: TaskKind;
+  // Legacy compatibility input.  The server rejects this for new tasks with
+  // an explicit migration error rather than silently remapping the request.
   mode?: TaskMode;
   prompt?: string; // kickoff brief body
   agent?: AgentKind;

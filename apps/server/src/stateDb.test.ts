@@ -22,7 +22,7 @@ test("fresh startup creates the versioned WAL database with foreign keys enabled
 
   assert.equal(state.path, join(root, "state.sqlite"));
   assert.equal(existsSync(state.path), true);
-  assert.equal(state.schemaVersion(), 16);
+  assert.equal(state.schemaVersion(), 17);
   assert.equal(state.journalMode(), "wal");
   assert.equal(state.foreignKeysEnabled(), true);
 
@@ -43,20 +43,23 @@ test("fresh startup creates the versioned WAL database with foreign keys enabled
     { version: 13, name: "distinguish-unsubmitted-prompts" },
     { version: 14, name: "durable-codex-history-syncs" },
     { version: 15, name: "native-codex-child-run-observations" },
-    { version: 16, name: "worker-reports-and-mate-mailbox" }
+    { version: 16, name: "worker-reports-and-mate-mailbox" },
+    { version: 17, name: "durable-autoreview-receipts" }
   ]);
   assert.deepEqual(
     inspect
       .prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%' ORDER BY name")
-      .pluck()
-      .all(),
+    .pluck()
+    .all(),
     [
+      "autoreview_attempts",
       "claude_approvals",
       "claude_inbox_deltas",
       "claude_interactions",
       "claude_questions",
       "claude_tool_occurrences",
       "codex_history_syncs",
+      "delivery_pr_attempts",
       "durable_owners",
       "legacy_imports",
       "mate_mailbox_deliveries",
@@ -133,13 +136,15 @@ test("version 13 migrates an earlier prompt delivery schema without losing rows"
     DROP TABLE native_child_runs;
     DROP TABLE mate_mailbox_deliveries;
     DROP TABLE worker_reports;
-    DELETE FROM schema_migrations WHERE version IN (13, 14, 15, 16);
+    DROP TABLE delivery_pr_attempts;
+    DROP TABLE autoreview_attempts;
+    DELETE FROM schema_migrations WHERE version IN (13, 14, 15, 16, 17);
     PRAGMA user_version = 12;
   `);
   legacy.close();
 
   const migrated = new StateDb(env(root));
-  assert.equal(migrated.schemaVersion(), 16);
+  assert.equal(migrated.schemaVersion(), 17);
   assert.deepEqual(migrated.promptDeliveries.find("legacy-delivery"), {
     id: "legacy-delivery",
     perchSessionId: "pty:legacy",
@@ -375,7 +380,7 @@ test("causally-linked task event groups and their wake intents commit atomically
 test("task API state plus runtime and idempotent operation repositories persist across restart", () => {
   const root = home();
   const first = new TaskStore(env(root));
-  const task = first.create({ title: "Persistent task", project: "/tmp/repo", mode: "no-mistakes" });
+  const task = first.create({ title: "Persistent task", project: "/tmp/repo" });
   first.update(task.id, { branch: "perch/persistent-task", sessionId: "pty:first" });
   first.recordEvent(task.id, { kind: "working", source: "system" });
 

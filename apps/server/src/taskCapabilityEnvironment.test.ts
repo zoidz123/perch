@@ -19,7 +19,6 @@ test("task capability environment exposes scoped claims without treating prompt 
     const created = tasks.create({
       title: "audit safe public ship validation",
       project: repo,
-      mode: "direct-PR",
       prompt: "hardening ready-for-review"
     });
     tasks.update(created.id, { branch: `perch/${created.id}` });
@@ -35,7 +34,7 @@ test("task capability environment exposes scoped claims without treating prompt 
 
     assert.deepEqual(taskCapabilityEnvironment(tasks, request), {
       PERCH_TASK_ID: created.id,
-      PERCH_TASK_MODE: "direct-PR",
+      PERCH_TASK_KIND: "ship",
       PERCH_TASK_PROJECT: realpathSync(repo),
       PERCH_TASK_REPOSITORY: "github.com/acme/demo",
       PERCH_TASK_WORKTREE: realpathSync(repo),

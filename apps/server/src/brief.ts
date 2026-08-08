@@ -9,20 +9,14 @@ export const CODEX_NATIVE_CHILD_GUIDANCE = [
   "- Native children share the root worktree by default. Prefer read-only or decomposed work and never perform concurrent writes in that worktree."
 ].join("\n");
 
-// The dispatch brief: Perch task reporting and delivery instructions.
-// Appended to the user's kickoff prompt when a task is dispatched, it tells
-// the worker where it is, how to name its branch, and how to report - the
-// reporting verbs are curl calls authed by the session's existing hook token
-// (already in the PTY env), so no new secret ever enters the prompt.
-
-// Plan linkage carried into the kickoff:
-// `edit` is set only for the edit-a-finalized-plan-as-a-commit flow, where the
-// server has staged the revised markdown centrally (never in the repo) and the
-// worker's first commit lands it at `relativePath`.
 export type PlanBrief = {
   edit?: { relativePath: string; stagedPath: string };
 };
 
+// The delivery boundary is server-owned. The brief gives every managed worker
+// a provider-native operation, never an HTTP recipe or independent git/gh
+// delivery command. A legacy task can still be read and recovered, but no
+// newly dispatched brief starts the retired delivery-mode runtime.
 export function dispatchBrief(
   task: Task,
   worktreePath: string | undefined,
@@ -33,152 +27,83 @@ export function dispatchBrief(
   const verb = (kind: string, example: string) =>
     codex
       ? `Call perch.report_task_event with {"kind":"${kind}","message":"${example}"}`
-      : `curl --silent --show-error --fail-with-body -X POST "\${PERCH_HOOK_URL%/hooks}/tasks/${task.id}/events" \\\n` +
-        `  -H "x-perch-session: $PERCH_SESSION_ID" -H "x-perch-token: $PERCH_HOOK_TOKEN" \\\n` +
-        `  -H "content-type: application/json" -d '{"kind":"${kind}","message":"${example}"}'`;
-  const doneExample =
-    task.kind === "scout"
-      ? "what you found; no PR is required"
-      : task.mode === "local-only"
-        ? "what you did; no PR was opened"
-        : "what you did; include the explicit PR URL";
+      : `Run \`perch task event --task ${task.id} --kind ${kind} --message ${JSON.stringify(example)}\``;
+  const doneExample = task.kind === "ship"
+    ? "what you delivered; include the PR URL returned by Perch delivery"
+    : task.kind === "scout"
+      ? "what you found; name the durable report"
+      : "what operation was verified and the evidence collected";
   const doneVerb = codex
     ? `${verb("done", doneExample)} and require success=true with task.state=completion_requested in the returned JSON.`
-    : `${verb("done", doneExample)} \\\n` +
-      `  | node -e 'let body=""; process.stdin.setEncoding("utf8"); process.stdin.on("data", chunk => body += chunk); process.stdin.on("end", () => { console.log(body); const response = JSON.parse(body); if (response.task?.state !== "completion_requested") { console.error("done report was not accepted: expected task.state == completion_requested"); process.exitCode = 1; } });'`;
-  const prLinkedVerb = codex
-    ? `Call perch.report_task_event with {"kind":"pr_linked","pr":"<canonical GitHub PR URL>"}`
-    : `curl --silent --show-error --fail-with-body -X POST "\${PERCH_HOOK_URL%/hooks}/tasks/${task.id}/events" \\\n` +
-      `  -H "x-perch-session: $PERCH_SESSION_ID" -H "x-perch-token: $PERCH_HOOK_TOKEN" \\\n` +
-      `  -H "content-type: application/json" -d '{"kind":"pr_linked","pr":"<canonical GitHub PR URL>"}'`;
-
+    : `${verb("done", doneExample)} and require task.state=completion_requested in the returned JSON.`;
   const location = worktreePath
     ? `You are working in an isolated worktree at ${worktreePath}. Verify with pwd before changing anything; never cd outside it.`
     : `You are working in ${task.project}.`;
-
-  const chartVerb =
-    `curl -sf -X POST "\${PERCH_HOOK_URL%/hooks}/charts" \\\n` +
-    `  -H "x-perch-session: $PERCH_SESSION_ID" -H "x-perch-token: $PERCH_HOOK_TOKEN" \\\n` +
-    `  -H "content-type: application/json" -d '{"file":"<absolute path to the .html file>"}'`;
-
-  // The plan this task builds from. An edit revises an existing plan doc; a
-  // plain planId (a promotion) means the worker commits the plan doc as its
-  // first commit, then builds. Both keep the plan doc a git commit the worker
-  // authors - the server never writes to the repo.
   const planSection = plan.edit
     ? [
         "",
         "PLAN EDIT - your first commit revises the plan and touches nothing else:",
-        `- The revised plan markdown is staged at ${plan.edit.stagedPath} (outside the repo; the server never writes to a repo).`,
-        `- Copy its contents to ${plan.edit.relativePath} in your worktree (create docs/plans/ if missing), then commit ONLY that file as the FIRST commit of your branch (e.g. \`docs(plans): revise the plan\`).`,
-        "- Every revision is a git commit; never edit the plan anywhere else.",
-        "Then continue to the definition of done above."
+        `- The revised plan markdown is staged at ${plan.edit.stagedPath} outside the repo.`,
+        `- Copy it to ${plan.edit.relativePath}, then commit only that file first.`,
+        "- Then continue with this task's kind-specific contract."
       ]
     : task.planId
-      ? [
-          "",
-          `This task builds from the finalized plan \`${task.planId}\`. If that plan doc is not yet committed in this repo, commit it to docs/plans/<date>-<name>.md as the FIRST commit of your branch, then build against it.`
-        ]
+      ? ["", `This task builds from finalized plan \`${task.planId}\`. Commit it first if it is not already in the repository.`]
       : [];
-
-  const definitionOfDone =
-    task.kind === "scout"
-      ? "This is a SCOUT task: investigate and report. Done means a written report in your final done: message (or a file you name there). Do not change code."
-      : task.mode === "local-only"
-        ? "Done means the work is committed locally on your branch. Do not push or open a PR."
-        : task.mode === "no-mistakes"
-          ? "Done means the work passed the no-mistakes pipeline and its PR checks are green. Include the PR URL in your done: message."
-          : "Done means a pushed branch with an open PR. Include the PR URL in your done: message.";
-
-  // How to drive the gate, and the ask-user contract: findings travel to the
-  // boss as structured data on the needs_decision verb, copied verbatim from
-  // the gate's table - perch never parses pipeline output itself.
-  const askUserExample = codex
-    ? `Call perch.report_task_event with {"kind":"needs_decision","message":"review gate: 2 findings need you","data":{"noMistakes":{"step":"review","findings":[{"id":"r1","severity":"error","file":"src/app.ts","line":42,"action":"ask-user","description":"the finding text, copied in full"}]}}}`
-    : `curl --silent --show-error --fail-with-body -X POST "\${PERCH_HOOK_URL%/hooks}/tasks/${task.id}/events" \\\n` +
-      `  -H "x-perch-session: $PERCH_SESSION_ID" -H "x-perch-token: $PERCH_HOOK_TOKEN" \\\n` +
-      `  -H "content-type: application/json" \\\n` +
-      `  -d '{"kind":"needs_decision","message":"review gate: 2 findings need you","data":{"noMistakes":{"step":"review","findings":[{"id":"r1","severity":"error","file":"src/app.ts","line":42,"action":"ask-user","description":"the finding text, copied in full"}]}}}'`;
-  const noMistakesDriving =
-    task.kind !== "scout" && task.mode === "no-mistakes"
+  const autoreview = codex
+    ? 'Call perch.autoreview.run with {"idempotencyKey":"review-1","testArgv":["<supported-test-command>","<arg>"]}. It returns the durable attempt identity and structured findings.'
+    : `Run \`perch autoreview run --task ${task.id} --idempotency-key review-1 --test-argv-json '["<supported-test-command>","<arg>"]'\`. It returns the durable attempt identity and structured findings.`;
+  const delivery = codex
+    ? 'Call perch.delivery.create_pr with {"idempotencyKey":"delivery-1"}. It returns the server-created PR identity.'
+    : `Run \`perch delivery create-pr --task ${task.id} --idempotency-key delivery-1\`. It returns the server-created PR identity.`;
+  const kindContract = task.kind === "ship"
+    ? [
+        "This is a SHIP task: make the repository change, run focused tests, then obtain a clean AutoReview receipt for the exact final tree before delivery.",
+        "- Do not run git push, gh pr create, curl, or any independent delivery command.",
+        "- The review test argv must use a supported test launcher such as npm test, node --test, pytest, cargo test, or xcodebuild test. Shell commands are rejected and test arguments are redacted in the receipt.",
+        `- ${autoreview}`,
+        "- Verify every finding against source. Fix accepted actionable findings, rerun focused tests, then rerun AutoReview. A source change invalidates the prior receipt.",
+        `- Only after a clean receipt, ${delivery}`,
+        "- The server rejects stale, failed, or finding-bearing receipts and creates at most one PR."
+      ]
+    : task.kind === "scout"
       ? [
-          "",
-          "Ship through the no-mistakes gate:",
-          "- Drive the pipeline yourself with the /no-mistakes skill (`no-mistakes axi`); always pass --intent describing this task.",
-          "- Run gate pushes unsandboxed: sandboxed Bash breaks the gate's post-receive hook.",
-          "- When a gate parks the run with ask-user findings, never answer or bypass them yourself. Report needs_decision with message = a one-line summary and the findings table copied VERBATIM into data.noMistakes - every finding's id, severity, file, line, action, and description exactly as the gate printed them, no paraphrasing, no dropped findings:",
-          askUserExample,
-          "- The answer arrives as a message in your chat; resume the parked run with `no-mistakes axi respond`.",
-          "- As soon as no-mistakes creates or prints its PR URL, report it with the exact pr_linked command below. Do this before waiting for checks or running branch_sync; it links the badge only and does not request completion.",
-          "- After checks pass, inspect `branch_sync`; if `next_action.code` is `sync`, run exactly `no-mistakes axi sync` to advance the checkout to the PR head.",
-          "- Then POST kind `done` with the explicit PR URL.",
-          "- Do not emit final prose until the response confirms `task.state == completion_requested`.",
-          "- If sync or the POST fails, report `blocked` or `failed` accurately - never end silently."
+          "This is a SCOUT task: investigate read-only and deliver a durable report.",
+          "- Do not change repository files, run AutoReview, push, or create a PR."
         ]
-      : [];
-
-  const noMistakesProhibition =
-    task.kind !== "scout" && task.mode === "direct-PR"
-      ? [
-          "",
-          "No-mistakes is prohibited for this direct-PR task.",
-          "Do not invoke the no-mistakes skill, CLI, daemon, gate remote, or review agents, regardless of prompt wording, repository setup, existing gate remote, diff size, or global skill visibility.",
-          "Run ordinary task-specific tests, builds, and lint, then push the branch and open the PR directly."
-        ]
-      : task.kind !== "scout" && task.mode === "local-only"
-        ? [
-            "",
-            "No-mistakes is prohibited for this local-only task.",
-            "Do not invoke the no-mistakes skill, CLI, daemon, gate remote, review agents, push, or any remote delivery workflow, regardless of prompt wording, repository setup, existing gate remote, diff size, or global skill visibility.",
-            "Run ordinary task-specific tests, builds, and lint locally and keep the work on the local task branch."
-          ]
-        : [];
-
+      : [
+          "This is an OPERATE task: perform the requested verified runtime or external operation and collect gate-by-gate evidence.",
+          "- Do not change repository files, run AutoReview, push, or create a code PR."
+        ];
+  const chartVerb =
+    `curl -sf -X POST "\${PERCH_HOOK_URL%/hooks}/charts" \\\n  -H "x-perch-session: $PERCH_SESSION_ID" -H "x-perch-token: $PERCH_HOOK_TOKEN" \\\n  -H "content-type: application/json" -d '{"file":"<absolute path to the .html file>"}'`;
   const brief = [
     "",
     "---",
     `PERCH TASK BRIEF (task ${task.id})`,
     location,
     `Create and work on branch perch/${task.id}.`,
-    definitionOfDone,
-    ...noMistakesDriving,
-    ...noMistakesProhibition,
+    ...kindContract,
     ...planSection,
     "",
     codex
       ? "Report status only with the root thread's perch.report_task_event tool:"
-      : "Report status by POSTing task events (run these exact curl commands from your shell):",
+      : "Report status with the managed perch task event command:",
     `- started working:\n${verb("working", "short note on your approach")}`,
-    ...(task.kind !== "scout" && task.mode !== "local-only"
-      ? [
-          "- PR opened or discovered: immediately link it before continuing or reporting done. This records only durable PR identity and keeps the current task state:\n" + prLinkedVerb
-        ]
-      : []),
     `- need a human decision:\n${verb("needs_decision", "the question, with options")}`,
     `- blocked on something external:\n${verb("blocked", "what blocks you")}`,
-    `- request completion verification (the command fails unless Perch acknowledges task.state == completion_requested):\n${doneVerb}`,
+    `- request completion verification:\n${doneVerb}`,
     `- cannot complete:\n${verb("failed", "why")}`,
     "",
-    "Full report: before requesting completion on substantial work (always for scout findings), deliver your complete worker-authored report and structured evidence to the mate mailbox - the done: message stays a concise claim:",
+    "Before substantial completion, send the complete worker-authored report and structured evidence to the Mate mailbox:",
     codex
-      ? `Call perch.send_report with {"summary":"<one-paragraph routing summary>","report":"<the complete report>","evidence":{...optional structured evidence...}} and require success=true. Success means the report was durably committed.`
-      : `perch report send --task ${task.id} --summary "<one-paragraph routing summary>" --report-file <path-to-full-report.md> [--evidence-file <path.json>]`,
-    "Perch stores the report byte-for-byte (limits: 4 KiB summary, 256 KiB report, 256 KiB evidence JSON; oversize is rejected explicitly, never truncated). Reference larger artifacts by committed file path or content hash inside the report.",
+      ? 'Call perch.send_report with {"summary":"<routing summary>","report":"<complete report>","evidence":{}} and require success=true.'
+      : `perch report send --task ${task.id} --summary "<routing summary>" --report-file <path-to-full-report.md> [--evidence-file <path.json>]`,
     "",
-    "Drawing charts: when something you hand the boss is easier reviewed visually than as prose - a plan, a comparison, findings - draw a chart: one HTML file the boss annotates from desktop or phone.",
-    "Fetch the authoring guide first (curl -sf \"${PERCH_HOOK_URL%/hooks}/charts/authoring\") and follow it: every chart renders in the one fixed perch look via chart.css and its documented classes - no <style> blocks, no style= attributes, no external design systems.",
-    "Write the file to .charts/<slug>.html in your workspace (keep it out of commits) and register it once:",
+    "Draw a chart only when it makes findings, a plan, or a comparison easier to review. Fetch the authoring guide first, write .charts/<slug>.html outside commits, then register it:",
     chartVerb,
-    "Registration notifies the boss; edits to the file refresh an open review live; feedback delivery follows the authoring guide.",
-    "Content: keep the chart to one screen. Choose one shape: exploratory reports use a one-line verdict, Findings, Evidence, then an optional Recommendation or Open question; code-change reports use a one-line verdict, Root cause, Fix, Verification, then optional remaining risks. Do not force exploratory reports into Problem / Fix framing.",
-    "Charts are working documents: on registration the server keeps the canonical copy under ~/.perch/charts/, so the chart outlives your worktree. When the boss approves a chart as a plan, approval is the promotion: the worker implementing it converts the approved chart's content into a markdown plan doc committed to the target project's repo (docs/plans/<date>-<name>.md, or that project's docs convention) as the first commit of the implementation branch, then builds against it. Scratchpad centrally, canon per-repo.",
-    "",
-    "Report sparsely: one working: when you start, then only on real state changes.",
-    codex
-      ? "Never end a turn without reporting your current state through perch.report_task_event; if you are about to wait on something long (CI, a review), report working: naming what you are waiting on first."
-      : "Never end a turn without reporting your current state via one of these curls; if you are about to wait on something long (CI, a review), report working: naming what you are waiting on first.",
-    "The done: reporting verb requests mate verification; it does not mark the task done by itself.",
-    "Never request completion until the definition of done above is actually met."
+    "Report sparsely: one working update when you start, then only on real state changes.",
+    "Never request completion until this task kind's definition of done is actually met."
   ].join("\n");
   return agent === "codex" ? `${brief}\n\n${CODEX_NATIVE_CHILD_GUIDANCE}\n\n${CHART_CAPABILITY_NOTE}` : brief;
 }

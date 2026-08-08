@@ -12,11 +12,11 @@ test("project registry seeds from usage and sorts by recency", async () => {
 
   registry.touch("/tmp/alpha");
   await new Promise((resolve) => setTimeout(resolve, 5));
-  registry.touch("/tmp/beta", { mode: "direct-PR" });
+  registry.touch("/tmp/beta");
 
   const listed = registry.list();
   assert.equal(listed[0]?.name, "beta");
-  assert.equal(listed[0]?.mode, "direct-PR");
+  assert.equal(Object.hasOwn(listed[0]!, "mode"), false);
   assert.equal(listed.length, 2);
 
   // Re-touch bumps recency, keeps fields, no duplicate.
@@ -24,12 +24,12 @@ test("project registry seeds from usage and sorts by recency", async () => {
   registry.touch("/tmp/alpha");
   assert.equal(registry.list()[0]?.name, "alpha");
   assert.equal(registry.list().length, 2);
-  assert.equal(registry.find("/tmp/beta")?.mode, "direct-PR");
+  assert.equal(Object.hasOwn(registry.find("/tmp/beta")!, "mode"), false);
 
   rmSync(home, { recursive: true, force: true });
 });
 
-test("legacy yolo rows load without a startup write and prune on the next registry mutation", () => {
+test("legacy mode rows load without a startup write and prune on the next registry mutation", () => {
   const home = mkdtempSync(join(tmpdir(), "perch-proj-"));
   const file = join(home, "projects.json");
   const raw = `${JSON.stringify({
@@ -49,12 +49,14 @@ test("legacy yolo rows load without a startup write and prune on the next regist
   const loaded = registry.find("/tmp/legacy") as Record<string, unknown> | undefined;
   assert.ok(loaded);
   assert.equal(Object.hasOwn(loaded, "yolo"), false);
+  assert.equal(Object.hasOwn(loaded, "mode"), false);
   assert.equal(loaded.preserved, "value");
   assert.equal(readFileSync(file, "utf8"), raw, "loading does not rewrite the boss's registry");
 
-  registry.configure("/tmp/legacy", { mode: "local-only" });
+  registry.touch("/tmp/legacy");
   const persisted = readFileSync(file, "utf8");
   assert.doesNotMatch(persisted, /"yolo"/);
+  assert.doesNotMatch(persisted, /"mode"/);
   assert.match(persisted, /"preserved": "value"/);
 
   rmSync(home, { recursive: true, force: true });

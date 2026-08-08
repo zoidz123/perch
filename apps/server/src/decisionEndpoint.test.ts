@@ -4,7 +4,8 @@ import type { AddressInfo } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
-import type { AgentSession, RecentEventsResult } from "@perch/shared";
+import { randomUUID } from "node:crypto";
+import type { AgentSession, RecentEventsResult, Task } from "@perch/shared";
 import type { AgentAdapter } from "./adapters/types.js";
 import { AuditLog } from "./audit.js";
 import { FleetMonitor } from "./fleetMonitor.js";
@@ -113,9 +114,25 @@ const gate = {
   ]
 };
 
-// A needs_you task with a live worker parked at the fixture gate.
+// A needs_you task decoded from the pre-AutoReview ledger with a live worker
+// parked at the retained compatibility endpoint. New task creation cannot
+// select this mode.
 function parkedTask(ctx: Fixture): { taskId: string; sessionId: string } {
-  const task = ctx.tasks.create({ title: "gated ship", project: "/tmp/repo", mode: "no-mistakes" });
+  const now = new Date().toISOString();
+  const imported: Task = {
+    id: `legacy-gated-${randomUUID().slice(0, 8)}`,
+    title: "gated ship",
+    project: "/tmp/repo",
+    kind: "ship",
+    mode: "no-mistakes",
+    state: "queued",
+    createdAt: now,
+    updatedAt: now
+  };
+  ctx.tasks.stateDb.tasks.insertImported(imported, [{
+    seq: 1, at: now, kind: "created", source: "system", message: imported.title
+  }]);
+  const task = ctx.tasks.find(imported.id)!;
   const sessionId = "pty:worker";
   ctx.tasks.update(task.id, { sessionId });
   ctx.tasks.recordEvent(task.id, {

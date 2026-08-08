@@ -138,7 +138,8 @@ export function taskCapabilityEnvironment(
   if (!runtime || !repository) return {};
   return {
     PERCH_TASK_ID: task.id,
-    PERCH_TASK_MODE: task.mode,
+    PERCH_TASK_KIND: task.kind,
+    ...(task.mode ? { PERCH_TASK_LEGACY_MODE: task.mode } : {}),
     PERCH_TASK_PROJECT: canonicalLaunchPath(task.project),
     PERCH_TASK_REPOSITORY: repository,
     PERCH_TASK_WORKTREE: canonicalLaunchPath(cwd),

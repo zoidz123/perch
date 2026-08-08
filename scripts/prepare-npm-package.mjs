@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 
 import { execFileSync } from "node:child_process";
-import { cpSync, existsSync, mkdirSync, readdirSync, rmSync } from "node:fs";
+import { cpSync, existsSync, lstatSync, mkdirSync, readdirSync, readlinkSync, rmSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -40,6 +40,12 @@ const required = [
   "apps/server/assets/mate/AGENTS.md",
   "apps/server/assets/charts/chart.css",
   "apps/server/assets/charts/AUTHORING.md",
+  "apps/server/assets/autoreview/manifest.json",
+  "apps/server/assets/autoreview/LICENSE.upstream",
+  "apps/server/assets/autoreview/skill/CLAUDE.md",
+  "apps/server/assets/autoreview/skill/SKILL.md",
+  "apps/server/assets/autoreview/skill/scripts/autoreview",
+  "apps/server/assets/autoreview/skill/scripts/test-review-harness",
   "packages/shared/dist/index.js",
   "packages/relay/dist/cli.js",
   "vendor/no-mistakes/manifest.json",
@@ -54,6 +60,20 @@ const required = [
 for (const file of required) {
   if (!existsSync(join(root, file))) {
     throw new Error(`release build is missing ${file}`);
+  }
+}
+
+const autoreviewClaudeLink = join(root, "apps/server/assets/autoreview/skill/CLAUDE.md");
+if (!lstatSync(autoreviewClaudeLink).isSymbolicLink() || readlinkSync(autoreviewClaudeLink) !== "AGENTS.md") {
+  throw new Error("source AutoReview bundle must retain the upstream CLAUDE.md symlink");
+}
+
+for (const excluded of [
+  "apps/server/assets/autoreview/skill/scripts/autoreview_test.py",
+  "apps/server/assets/autoreview/skill/tests"
+]) {
+  if (existsSync(join(root, excluded))) {
+    throw new Error(`source AutoReview bundle contains excluded upstream test bytes: ${excluded}`);
   }
 }
 
