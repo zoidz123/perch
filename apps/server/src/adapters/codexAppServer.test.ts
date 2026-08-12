@@ -707,19 +707,19 @@ test("only the root thread can invoke typed AutoReview and delivery tools", asyn
   await client.startThread();
   const tools = server.find("thread/start")?.params?.dynamicTools?.[0]?.tools ?? [];
   assert.deepEqual(tools.map((tool: { name: string }) => tool.name), [
-    "report_task_event", "send_report", "autoreview.run", "delivery.create_pr"
+    "report_task_event", "send_report", "autoreview_run", "delivery_create_pr"
   ]);
 
   server.requestToClient(92, "item/tool/call", {
-    threadId: "thr_1", namespace: "perch", tool: "autoreview.run",
+    threadId: "thr_1", namespace: "perch", tool: "autoreview_run",
     arguments: { idempotencyKey: "review-1", testArgv: ["npm", "test"] }
   });
   server.requestToClient(93, "item/tool/call", {
-    threadId: "thr_1", namespace: "perch", tool: "delivery.create_pr",
+    threadId: "thr_1", namespace: "perch", tool: "delivery_create_pr",
     arguments: { idempotencyKey: "delivery-1" }
   });
   server.requestToClient(94, "item/tool/call", {
-    threadId: "child-1", namespace: "perch", tool: "delivery.create_pr",
+    threadId: "child-1", namespace: "perch", tool: "delivery_create_pr",
     arguments: { idempotencyKey: "child-claim" }
   });
   await tick();
@@ -729,6 +729,29 @@ test("only the root thread can invoke typed AutoReview and delivery tools", asyn
   assert.equal(server.requests.find((request) => request.id === 92)?.result?.success, true);
   assert.equal(server.requests.find((request) => request.id === 93)?.result?.success, true);
   assert.equal(server.requests.find((request) => request.id === 94)?.error?.code, -32601);
+});
+
+// The Responses API rejects thread/start outright when any dynamic tool name falls
+// outside this pattern, so an invalid name breaks every dispatch rather than just
+// the offending tool. Guard the whole registered set, not the names we know today.
+test("every registered dynamic tool name matches the Responses API pattern", async () => {
+  const RESPONSES_API_NAME = /^[a-zA-Z0-9_-]+$/;
+  const { client, server } = await connectedClient({
+    onTaskEvent: async () => ({ success: true, text: "" }),
+    onAutoReviewRun: async () => ({ success: true, text: "" }),
+    onDeliveryCreatePr: async () => ({ success: true, text: "" })
+  });
+  await client.startThread();
+
+  const namespaces = server.find("thread/start")?.params?.dynamicTools ?? [];
+  assert.ok(namespaces.length > 0, "thread/start registered no dynamic tools");
+  const names = namespaces.flatMap((namespace: { name: string; tools?: { name: string }[] }) =>
+    [namespace.name, ...(namespace.tools ?? []).map((tool) => tool.name)]
+  );
+  assert.ok(names.length > namespaces.length, "dynamic tool namespaces registered no tools");
+  for (const name of names) {
+    assert.match(name, RESPONSES_API_NAME);
+  }
 });
 
 test("turn completion cannot clear a structured request; disconnect cleanup can", async () => {

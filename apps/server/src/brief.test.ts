@@ -13,8 +13,8 @@ function task(overrides: Partial<Task> = {}): Task {
 
 test("ship brief exposes server-owned AutoReview and delivery operations without direct delivery instructions", () => {
   const brief = dispatchBrief(task(), "/tmp/wt", {}, "codex");
-  assert.match(brief, /perch\.autoreview\.run/);
-  assert.match(brief, /perch\.delivery\.create_pr/);
+  assert.match(brief, /perch\.autoreview_run/);
+  assert.match(brief, /perch\.delivery_create_pr/);
   assert.match(brief, /Do not run git push, gh pr create, curl, or any independent delivery command/);
   assert.ok(!brief.includes("no-mistakes"));
   assert.ok(!brief.includes('"kind":"pr_linked"'));

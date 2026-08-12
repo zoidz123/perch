@@ -50,10 +50,10 @@ export function dispatchBrief(
       ? ["", `This task builds from finalized plan \`${task.planId}\`. Commit it first if it is not already in the repository.`]
       : [];
   const autoreview = codex
-    ? 'Call perch.autoreview.run with {"idempotencyKey":"review-1","testArgv":["<supported-test-command>","<arg>"]}. It returns the durable attempt identity and structured findings.'
+    ? 'Call perch.autoreview_run with {"idempotencyKey":"review-1","testArgv":["<supported-test-command>","<arg>"]}. It returns the durable attempt identity and structured findings.'
     : `Run \`perch autoreview run --task ${task.id} --idempotency-key review-1 --test-argv-json '["<supported-test-command>","<arg>"]'\`. It returns the durable attempt identity and structured findings.`;
   const delivery = codex
-    ? 'Call perch.delivery.create_pr with {"idempotencyKey":"delivery-1"}. It returns the server-created PR identity.'
+    ? 'Call perch.delivery_create_pr with {"idempotencyKey":"delivery-1"}. It returns the server-created PR identity.'
     : `Run \`perch delivery create-pr --task ${task.id} --idempotency-key delivery-1\`. It returns the server-created PR identity.`;
   const kindContract = task.kind === "ship"
     ? [

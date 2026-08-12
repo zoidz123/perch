@@ -176,9 +176,9 @@ Fresh managed Codex workers call `perch.report_task_event` with the same request
 The `done` name is retained as the worker wire verb for compatibility.
 It never directly creates trusted `done` state.
 
-For a new `ship` task, run focused tests and `perch.autoreview.run` or `perch autoreview run` for the intended final tree.
+For a new `ship` task, run focused tests and `perch.autoreview_run` or `perch autoreview run` for the intended final tree.
 Verify findings against source, fix accepted actionable findings, then rerun focused tests and review with the prior attempt's supersession identity.
-Only after a clean receipt may the root worker call `perch.delivery.create_pr` or `perch delivery create-pr`.
+Only after a clean receipt may the root worker call `perch.delivery_create_pr` or `perch delivery create-pr`.
 The server recomputes base, HEAD, tree, diff, and clean-worktree identity immediately before delivery.
 Any source change after review mechanically makes the receipt stale.
 Direct `pr_linked`, worker-authored `git push`, and worker-authored `gh pr create` cannot satisfy new ship delivery or completion.
