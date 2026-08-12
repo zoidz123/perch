@@ -12,6 +12,7 @@ import {
   type WorktreePool
 } from "./worktrees.js";
 import type { RuntimeManager } from "./runtimeManager.js";
+import { terminateWorktreeProcesses } from "./worktreeProcesses.js";
 
 const execFileAsync = promisify(execFile);
 
@@ -208,6 +209,11 @@ export async function executeTeardown(
     await deleteReviewSimulator(current.id, deps.simctl).catch(() => {});
     const lease = ownLeaseFor(current, deps.worktrees);
     if (lease) {
+      // Stopping the session reaps the worker's shell, not the detached
+      // servers and watchers it started inside the slot. Clear them while the
+      // lease is still ours - after the release the slot may belong to someone
+      // else, and the release itself resets a tree they are still writing to.
+      await terminateWorktreeProcesses(lease.path).catch(() => {});
       // Force past the pool's own release gate: it is SHA-reachability based and
       // would re-trigger the squash-merge false positive on a merged, diverged
       // HEAD. The task-layer gate (or force) already authorized this teardown

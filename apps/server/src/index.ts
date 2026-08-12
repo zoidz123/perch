@@ -43,6 +43,7 @@ import { TaskWatchdog, reportUsageLimitToTask } from "./taskWatchdog.js";
 import { TaskCompletionReconciler } from "./taskCompletion.js";
 import { executeTeardown, landedGate, ownLeaseFor } from "./teardown.js";
 import { WorktreePool } from "./worktrees.js";
+import { reapOrphanWorktreeProcesses } from "./worktreeProcesses.js";
 import { ApnsPushSender, apnsConfigFromEnv, NoopPushSender } from "./push.js";
 import { PushRouter } from "./pushRouter.js";
 import { isMailboxControlItem, TimelineStore } from "./timeline.js";
@@ -731,6 +732,13 @@ const reclaimOrphanedLeases = () =>
     const reaped = await worktrees.reap((holder) => live.has(holder) || heldByOpenTask(holder));
     if (reaped.length > 0) {
       console.log(`worktree: reaped ${reaped.join(", ")}`);
+    }
+    // Then the processes those slots left behind. Teardown clears its own
+    // slot, so this catches what teardown never ran for: a server killed
+    // mid-task, a lease reclaimed above, a release that went through the pool
+    // directly. Only unleased slots are candidates, so live work is untouched.
+    for (const swept of await reapOrphanWorktreeProcesses(worktrees)) {
+      console.log(`worktree: terminated ${swept.pids.join(", ")} left in released ${swept.leaseId}`);
     }
   })().catch(() => {});
 void reclaimOrphanedLeases();
