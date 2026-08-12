@@ -26,6 +26,7 @@ export type SessionModel = {
 import type { RawData } from "ws";
 import type { AgentAdapter } from "./adapters/types.js";
 import type { PromptDeliverySource, PromptDeliverySurface, PromptDeliveryTracker } from "./promptDeliveries.js";
+import type { PendingSessionInputRepository } from "./stateDb.js";
 import type { AuditLog } from "./audit.js";
 import { detectPrompt, type DetectedPrompt } from "./promptDetect.js";
 import type { PushRouter } from "./pushRouter.js";
@@ -140,6 +141,10 @@ export type FleetMonitorOptions = {
   // cannot acknowledge. This tracker journals intent before typing and closes
   // it only from a provider hook or matching transcript row.
   promptDeliveries?: PromptDeliveryTracker;
+  // Boss messages aimed at the mate are held here while a turn is active.
+  // Unlike the permission-composer queue, this store is durable and releases
+  // only one record per observed turn boundary.
+  pendingSessionInputs?: PendingSessionInputRepository;
   // Durable warning text derived from the prompt-delivery ledger. It is
   // recomputed for every fleet snapshot, so disconnected clients see it on
   // reconnect instead of depending on a one-shot WebSocket event.
@@ -175,6 +180,9 @@ export class FleetMonitor {
   private readonly pendingQuestions = new Map<string, PendingQuestion>();
   private readonly pendingClaudeInteractions = new Map<string, PendingClaudeInteraction>();
   private readonly queuedInputs = new Map<string, Array<{ text: string; deliveryId?: string }>>();
+  private pendingSessionInputs?: PendingSessionInputRepository;
+  private readonly usedIdleBoundaries = new Set<string>();
+  private readonly pendingInputReleases = new Set<string>();
   // Prompts raised off the rendered screen rather than a hook, by session ->
   // prompt id. No hook will ever resolve one, so the detector retracts it when
   // the dialog leaves the screen; the id also keeps a redraw from re-raising it.
@@ -248,6 +256,7 @@ export class FleetMonitor {
     this.onUsageLimit = options.onUsageLimit;
     this.onInputSubmitted = options.onInputSubmitted;
     this.promptDeliveries = options.promptDeliveries;
+    this.pendingSessionInputs = options.pendingSessionInputs;
     this.promptDeliverySurface = options.promptDeliverySurface;
     this.onQueuedInputRejected = options.onQueuedInputRejected;
     this.onApprovalNeeded = options.onApprovalNeeded;
@@ -256,6 +265,10 @@ export class FleetMonitor {
 
   setRpcHandler(handler: WebSocketRpcHandler): void {
     this.rpcHandler = handler;
+  }
+
+  setPendingSessionInputs(repository: PendingSessionInputRepository): void {
+    this.pendingSessionInputs = repository;
   }
 
   setClaudeManualGateHandler(handler: (sessionId: string, approval: PendingApproval) => void): void {
@@ -396,6 +409,7 @@ export class FleetMonitor {
       this.promptDeliveries?.markSessionEnded(canonical);
       this.rejectQueuedInputs(canonical, `worker session ended with status ${status}`);
     }
+    this.observeTurnStatus(canonical, previous?.status, status);
     if (status === "idle" || status === "running" || status === "waiting") {
       void this.flushQueuedInputs(canonical);
     }
@@ -460,6 +474,7 @@ export class FleetMonitor {
     const pending = this.pendingApprovals.get(canonical);
     if (pending && this.pendingApprovals.delete(canonical)) {
       this.onApprovalResolved?.(canonical, pending);
+      void this.releaseOnePendingInput(canonical).catch(() => {});
       this.scheduleBroadcast();
     }
   }
@@ -535,6 +550,7 @@ export class FleetMonitor {
     if (!open || !pending) return undefined;
     open.delete(key);
     if (open.size === 0) this.pendingServerRequests.delete(canonical);
+    void this.releaseOnePendingInput(canonical).catch(() => {});
     this.scheduleBroadcast();
     return pending;
   }
@@ -573,6 +589,7 @@ export class FleetMonitor {
   resolveQuestion(sessionId: string): void {
     const canonical = this.canonicalSessionId(sessionId);
     if (this.pendingQuestions.delete(canonical)) {
+      void this.releaseOnePendingInput(canonical).catch(() => {});
       this.scheduleBroadcast();
     }
   }
@@ -619,6 +636,7 @@ export class FleetMonitor {
       return;
     }
     if (!this.inputGated(canonical)) void this.flushQueuedInputs(canonical);
+    if (!this.inputGated(canonical)) void this.releaseOnePendingInput(canonical).catch(() => {});
     if (removed) this.scheduleBroadcast();
   }
 
@@ -628,23 +646,69 @@ export class FleetMonitor {
   async queueOrSubmit(
     sessionId: string,
     text: string,
-    options: { queueIfGated?: boolean; source?: PromptDeliverySource; silent?: boolean } = {}
+    options: {
+      queueIfGated?: boolean;
+      queueMateUntilTurnBoundary?: boolean;
+      interrupt?: boolean;
+      source?: PromptDeliverySource;
+      silent?: boolean;
+    } = {}
   ): Promise<{ queued: boolean; gated?: boolean }> {
     const canonical = this.canonicalSessionId(sessionId);
+    const session =
+      this.sessions.find((candidate) => candidate.id === canonical) ??
+      (await this.adapter.listSessions()).find((candidate) => candidate.id === canonical);
     const status =
       this.sessionState.get(canonical)?.status ??
-      this.sessions.find((session) => session.id === canonical)?.status;
+      session?.status;
     if (status === "done" || status === "error") {
       throw new Error("worker session has ended; follow-up input was not accepted");
     }
 
+    const isMateBossInput =
+      options.queueMateUntilTurnBoundary === true &&
+      session?.labels?.role === "mate";
+    const source = isMateBossInput ? "human" : options.source ?? "agent";
+    const shouldQueueForMateTurn = isMateBossInput && options.interrupt !== true;
+    if (shouldQueueForMateTurn) {
+      if (!this.pendingSessionInputs) {
+        throw new Error("durable pending-input queue is unavailable");
+      }
+      const hasPending = this.pendingSessionInputs.count(canonical) > 0;
+      const idleBoundaryAvailable =
+        status === "idle" &&
+        !this.usedIdleBoundaries.has(canonical) &&
+        !this.inputGated(canonical);
+      if (hasPending || !idleBoundaryAvailable) {
+        this.pendingSessionInputs.enqueue({
+          perchSessionId: canonical,
+          promptText: text,
+          source
+        });
+        this.scheduleBroadcast();
+        if (idleBoundaryAvailable) {
+          await this.releaseOnePendingInput(canonical, session);
+        }
+        return { queued: true };
+      }
+
+      this.usedIdleBoundaries.add(canonical);
+      const delivery = session.agent === "claude"
+        ? this.promptDeliveries?.create(canonical, text, source)
+        : undefined;
+      try {
+        await this.submitToAdapter(canonical, text, delivery?.id, options.silent);
+      } catch (error) {
+        this.usedIdleBoundaries.delete(canonical);
+        throw error;
+      }
+      return { queued: false };
+    }
+
     if (this.inputGated(canonical)) {
       if (options.queueIfGated === false) return { queued: false, gated: true };
-      const agent =
-        this.sessions.find((session) => session.id === canonical)?.agent ??
-        (await this.adapter.listSessions()).find((session) => session.id === canonical)?.agent;
-      const delivery = agent === "claude"
-        ? this.promptDeliveries?.create(canonical, text, options.source ?? "agent")
+      const delivery = session?.agent === "claude"
+        ? this.promptDeliveries?.create(canonical, text, source)
         : undefined;
       const queue = this.queuedInputs.get(canonical) ?? [];
       queue.push({ text, ...(delivery ? { deliveryId: delivery.id } : {}) });
@@ -653,14 +717,57 @@ export class FleetMonitor {
       return { queued: true };
     }
 
-    const agent =
-      this.sessions.find((session) => session.id === canonical)?.agent ??
-      (await this.adapter.listSessions()).find((session) => session.id === canonical)?.agent;
-    const delivery = agent === "claude"
-      ? this.promptDeliveries?.create(canonical, text, options.source ?? "agent")
+    const delivery = session?.agent === "claude"
+      ? this.promptDeliveries?.create(canonical, text, source)
       : undefined;
     await this.submitToAdapter(canonical, text, delivery?.id, options.silent);
     return { queued: false };
+  }
+
+  private async releaseOnePendingInput(sessionId: string, knownSession?: AgentSession): Promise<void> {
+    if (!this.pendingSessionInputs || this.pendingInputReleases.has(sessionId)) return;
+    this.pendingInputReleases.add(sessionId);
+    try {
+      if (this.usedIdleBoundaries.has(sessionId) || this.inputGated(sessionId)) return;
+      const session = knownSession ??
+        this.sessions.find((candidate) => candidate.id === sessionId) ??
+        (await this.adapter.listSessions()).find((candidate) => candidate.id === sessionId);
+      const status = this.sessionState.get(sessionId)?.status ?? session?.status;
+      if (
+        session?.labels?.role !== "mate" ||
+        status !== "idle" ||
+        this.usedIdleBoundaries.has(sessionId) ||
+        this.inputGated(sessionId)
+      ) {
+        return;
+      }
+      const pending = this.pendingSessionInputs.list(sessionId)[0];
+      if (!pending) return;
+
+      this.usedIdleBoundaries.add(sessionId);
+      const delivery = session.agent === "claude"
+        ? this.promptDeliveries?.create(sessionId, pending.promptText, pending.source)
+        : undefined;
+      await this.submitToAdapter(sessionId, pending.promptText, delivery?.id);
+      if (!this.pendingSessionInputs.remove(pending.id)) {
+        throw new Error("released pending input was not removed from the durable queue");
+      }
+    } finally {
+      this.pendingInputReleases.delete(sessionId);
+      this.scheduleBroadcast();
+    }
+  }
+
+  private observeTurnStatus(
+    sessionId: string,
+    previous: AgentSessionStatus | undefined,
+    status: AgentSessionStatus
+  ): void {
+    if (status !== "idle") return;
+    if (previous && previous !== "idle") {
+      this.usedIdleBoundaries.delete(sessionId);
+    }
+    void this.releaseOnePendingInput(sessionId).catch(() => {});
   }
 
   // The live status a server-side sender should honor before submitting
@@ -1093,6 +1200,9 @@ export class FleetMonitor {
           source: "adapter"
         });
       }
+      if (event.status) {
+        this.observeTurnStatus(event.sessionId, previous?.status, event.status);
+      }
       if (event.status === "done" || event.status === "error") {
         // The process is gone: an open approval/question card would be
         // actionable against nothing, and queued composer text can never be
@@ -1157,6 +1267,11 @@ export class FleetMonitor {
     }
 
     this.pruneSessionState(previousSessionIds);
+    for (const session of this.sessions) {
+      if (session.status === "idle") {
+        void this.releaseOnePendingInput(session.id, session).catch(() => {});
+      }
+    }
     this.scheduleBroadcast();
   }
 
@@ -1188,6 +1303,9 @@ export class FleetMonitor {
       if (!active.has(sessionId)) {
         this.rejectQueuedInputs(sessionId, "worker session disappeared before queued follow-up delivery");
       }
+    }
+    for (const sessionId of this.usedIdleBoundaries) {
+      if (!active.has(sessionId)) this.usedIdleBoundaries.delete(sessionId);
     }
     for (const timers of [this.tailTimers, this.detailTimers]) {
       for (const [sessionId, timer] of timers) {
@@ -1294,7 +1412,9 @@ export class FleetMonitor {
             result.status = "needs_approval";
           }
         }
-        const queued = this.queuedInputs.get(session.id)?.length ?? 0;
+        const queued =
+          (this.queuedInputs.get(session.id)?.length ?? 0) +
+          (this.pendingSessionInputs?.count(session.id) ?? 0);
         if (queued > 0) {
           result.queuedCount = queued;
         }

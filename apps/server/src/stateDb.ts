@@ -14,7 +14,7 @@ import type {
 import Database from "better-sqlite3";
 import type { TaskDeliverable, TaskVerificationFacts } from "./taskPresentation.js";
 
-const LATEST_SCHEMA_VERSION = 18;
+const LATEST_SCHEMA_VERSION = 19;
 const LEGACY_TASK_IMPORT = "tasks-json-v1";
 
 const MIGRATIONS = [
@@ -713,6 +713,21 @@ const MIGRATIONS = [
     sql: `
       ALTER TABLE delivery_pr_attempts ADD COLUMN lease_head_oid TEXT;
     `
+  },
+  {
+    version: 19,
+    name: "durable-pending-session-inputs",
+    sql: `
+      CREATE TABLE pending_session_inputs (
+        id TEXT PRIMARY KEY,
+        perch_session_id TEXT NOT NULL,
+        source TEXT NOT NULL CHECK (source IN ('human', 'agent')),
+        prompt_text TEXT NOT NULL,
+        created_at TEXT NOT NULL
+      ) STRICT;
+      CREATE INDEX pending_session_inputs_session_idx
+        ON pending_session_inputs(perch_session_id, created_at);
+    `
   }
 ] as const;
 
@@ -1143,6 +1158,14 @@ export type PromptDeliverySurfaceRecord = Pick<
   | "updatedAt"
 >;
 
+export type PendingSessionInputRecord = {
+  id: string;
+  perchSessionId: string;
+  source: "human" | "agent";
+  promptText: string;
+  createdAt: string;
+};
+
 export type CodexHistorySyncState = "pending" | "running" | "succeeded" | "truncated" | "failed";
 
 export type CodexHistorySyncRecord = {
@@ -1219,6 +1242,7 @@ export class StateDb {
   readonly claudeToolOccurrences: ClaudeToolOccurrenceRepository;
   readonly claudeInbox: ClaudeInboxRepository;
   readonly promptDeliveries: PromptDeliveryRepository;
+  readonly pendingSessionInputs: PendingSessionInputRepository;
   readonly codexHistorySyncs: CodexHistorySyncRepository;
   readonly nativeChildRuns: NativeChildRunRepository;
   readonly workerReports: WorkerReportRepository;
@@ -1253,6 +1277,7 @@ export class StateDb {
     this.claudeToolOccurrences = new ClaudeToolOccurrenceRepository(this.db);
     this.claudeInbox = new ClaudeInboxRepository(this.db);
     this.promptDeliveries = new PromptDeliveryRepository(this.db);
+    this.pendingSessionInputs = new PendingSessionInputRepository(this.db);
     this.codexHistorySyncs = new CodexHistorySyncRepository(this.db);
     this.nativeChildRuns = new NativeChildRunRepository(this.db);
     this.importLegacyTasks(join(home, "tasks"));
@@ -3264,6 +3289,49 @@ export class ClaudeInboxRepository {
   }
 }
 
+export class PendingSessionInputRepository {
+  constructor(private readonly db: Database.Database) {}
+
+  enqueue(input: {
+    perchSessionId: string;
+    promptText: string;
+    source: "human" | "agent";
+  }): PendingSessionInputRecord {
+    const record: PendingSessionInputRecord = {
+      id: randomUUID(),
+      perchSessionId: input.perchSessionId,
+      source: input.source,
+      promptText: input.promptText,
+      createdAt: new Date().toISOString()
+    };
+    this.db.prepare(
+      `INSERT INTO pending_session_inputs(id, perch_session_id, source, prompt_text, created_at)
+       VALUES (?, ?, ?, ?, ?)`
+    ).run(record.id, record.perchSessionId, record.source, record.promptText, record.createdAt);
+    return record;
+  }
+
+  list(sessionId: string): PendingSessionInputRecord[] {
+    return (this.db.prepare(
+      `SELECT * FROM pending_session_inputs
+       WHERE perch_session_id = ?
+       ORDER BY rowid`
+    ).all(sessionId) as PendingSessionInputRow[]).map(pendingSessionInputFromRow);
+  }
+
+  count(sessionId: string): number {
+    return Number(
+      this.db.prepare("SELECT count(*) FROM pending_session_inputs WHERE perch_session_id = ?")
+        .pluck()
+        .get(sessionId)
+    );
+  }
+
+  remove(id: string): boolean {
+    return this.db.prepare("DELETE FROM pending_session_inputs WHERE id = ?").run(id).changes === 1;
+  }
+}
+
 export class PromptDeliveryRepository {
   constructor(private readonly db: Database.Database) {}
 
@@ -3803,6 +3871,14 @@ type PromptDeliveryRow = {
   updated_at: string;
 };
 
+type PendingSessionInputRow = {
+  id: string;
+  perch_session_id: string;
+  source: "human" | "agent";
+  prompt_text: string;
+  created_at: string;
+};
+
 type PromptDeliverySurfaceRow = Pick<
   PromptDeliveryRow,
   | "id"
@@ -4143,6 +4219,16 @@ function promptDeliveryFromRow(row: PromptDeliveryRow): PromptDeliveryRecord {
     ...(row.unknown_notified_at ? { unknownNotifiedAt: row.unknown_notified_at } : {}),
     ...(row.accepted_notified_at ? { acceptedNotifiedAt: row.accepted_notified_at } : {}),
     updatedAt: row.updated_at
+  };
+}
+
+function pendingSessionInputFromRow(row: PendingSessionInputRow): PendingSessionInputRecord {
+  return {
+    id: row.id,
+    perchSessionId: row.perch_session_id,
+    source: row.source,
+    promptText: row.prompt_text,
+    createdAt: row.created_at
   };
 }
 

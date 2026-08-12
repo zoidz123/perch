@@ -104,7 +104,8 @@ export type AgentSession = {
   // choice among options, not an allow/deny.
   pendingQuestion?: PendingQuestion;
   pendingClaudeInteraction?: PendingClaudeInteraction;
-  // Composer messages held server-side until the session can accept input.
+  // Messages held server-side until the session can accept input. This
+  // includes the durable boss-to-mate turn-boundary queue.
   queuedCount?: number;
   // Durable logical-worker/runtime identity. PTY sessions are replaceable
   // generations; this snapshot survives reconnects and is separate from the
@@ -425,6 +426,10 @@ export type RecentEventsResult = {
 
 export type InputRequest = {
   text: string;
+  // Boss-to-mate input normally waits for the mate's next turn boundary.
+  // Set true only for an intentional mid-turn override. Provider-interaction
+  // gates still take precedence so text cannot land in a permission widget.
+  interrupt?: boolean;
   // Optional per-turn model/effort override, folded into the submit so the
   // model chip is a single round trip on the app-server path (Codex
   // `turn/start` takes `model`/`effort` "for this turn and subsequent turns").
@@ -1191,8 +1196,8 @@ export type AnswerRequest = {
 
 export type SubmitResponse = {
   ok: true;
-  // True when the message was queued server-side because the session cannot
-  // accept input right now (e.g. a permission prompt is open).
+  // True when the message is held server-side, including boss-to-mate input
+  // waiting for a turn boundary and input waiting behind a permission prompt.
   queued: boolean;
 };
 

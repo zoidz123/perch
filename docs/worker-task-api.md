@@ -66,6 +66,7 @@ The internal Codex root-tool relay also presents the server bearer, but its sepa
 | `POST /tasks/:id/decision` | Mate or phone | Answer a retained structured legacy gate during the migration window. |
 | `GET /sessions` | Mate, CLI, phone | Read live fleet and provider-session status. |
 | `POST /sessions/:sessionId/input` | Mate, CLI, phone | Send or queue follow-up text to the worker session. |
+| `POST /sessions/:sessionId/submit` | Boss phone or terminal client | Submit boss text, with durable turn-boundary serialization when the target is the mate. |
 | `POST /tasks/:id/recover` | Mate, CLI, phone | Recover managed provider work in a new runtime generation. |
 | `POST /tasks/:id/teardown` | Mate, CLI, phone | Stop the worker, release its worktree, and close the task when the landed gate permits it. |
 
@@ -381,6 +382,7 @@ Worker hook credentials are not accepted because a worker cannot answer its own 
 ## Steering, recovery, and teardown
 
 `GET /sessions` returns the live fleet view, including the worker session ID needed by the input endpoint and provider statuses such as running, waiting, or needing approval.
+Each session's optional `queuedCount` reports how many accepted inputs are still held server-side.
 
 ### `POST /sessions/:sessionId/input`
 
@@ -393,6 +395,21 @@ Mate sends a concise follow-up with:
 The server either submits the text or queues it behind a provider interaction that must be resolved first.
 For Claude, a successful HTTP response means Perch accepted the text into this durable delivery path; provider acceptance is confirmed separately by the receipt rules above.
 Accepted follow-up input starts a new turn and can return a rejected or parked task to `working` only through the normal activity path.
+
+When this endpoint or `POST /sessions/:sessionId/submit` targets the live mate, boss input is serialized at turn boundaries.
+Input sent while the mate is idle is submitted immediately.
+Input sent while a mate turn is active is stored durably, returns `"queued": true`, and releases one message after each completed turn in FIFO order.
+This behavior is provider-neutral and applies to both Claude PTY mates and Codex app-server mates.
+Worker-session steering remains immediate and can still interrupt a worker turn.
+
+An intentional boss override can bypass the mate turn-boundary queue with:
+
+```json
+{ "text": "Stop and address this now.\n", "interrupt": true }
+```
+
+The interrupt flag restores immediate mid-turn submission.
+It does not bypass an open provider permission or question gate because typing into that focused widget would be unsafe.
 
 ### `POST /tasks/:id/recover`
 

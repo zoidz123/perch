@@ -245,6 +245,7 @@ function codexResolvableOnPath(): boolean {
 }
 
 export function createControlServer(options: HttpServerOptions) {
+  options.monitor.setPendingSessionInputs(options.tasks.stateDb.pendingSessionInputs);
   options.claudeApprovals ??= new ClaudeApprovalCoordinator(options.tasks, options.monitor, {
     deadlineMs: process.env.PERCH_CLAUDE_APPROVAL_DEADLINE_MS
       ? Number(process.env.PERCH_CLAUDE_APPROVAL_DEADLINE_MS)
@@ -859,7 +860,8 @@ async function dispatchWebSocketRpc(
       options,
       canonicalSessionId,
       String(body.text),
-      auth.kind === "device" ? "human" : "agent"
+      auth.kind === "device" ? "human" : "agent",
+      { queueMateUntilTurnBoundary: true, interrupt: body.interrupt === true }
     );
     await audit(options.auditLog, {
       action: "input",
@@ -875,7 +877,10 @@ async function dispatchWebSocketRpc(
     const sessionId = decodeURIComponent(submitMatch[1] ?? "");
     const canonicalSessionId = canonicalSessionIdFor(options.adapter, sessionId);
     validateInput(body as InputRequest);
-    const { queued } = await deliverInputAccepted(options, canonicalSessionId, String(body.text), "human");
+    const { queued } = await deliverInputAccepted(options, canonicalSessionId, String(body.text), "human", {
+      queueMateUntilTurnBoundary: true,
+      interrupt: body.interrupt === true
+    });
     await audit(options.auditLog, {
       action: "submit",
       sessionId: canonicalSessionId,
@@ -1739,7 +1744,8 @@ async function route(
         options,
         canonicalSessionId,
         body.text,
-        auth.kind === "device" ? "human" : "agent"
+        auth.kind === "device" ? "human" : "agent",
+        { queueMateUntilTurnBoundary: true, interrupt: body.interrupt === true }
       );
       await audit(options.auditLog, {
         action: "input",
@@ -1757,7 +1763,10 @@ async function route(
       const canonicalSessionId = canonicalSessionIdFor(options.adapter, sessionId);
       const body = await readJson<InputRequest>(request);
       validateInput(body);
-      const { queued } = await deliverInputAccepted(options, canonicalSessionId, body.text, "human");
+      const { queued } = await deliverInputAccepted(options, canonicalSessionId, body.text, "human", {
+        queueMateUntilTurnBoundary: true,
+        interrupt: body.interrupt === true
+      });
       await audit(options.auditLog, {
         action: "submit",
         sessionId: canonicalSessionId,
@@ -2572,9 +2581,10 @@ async function deliverInput(
   options: HttpServerOptions,
   canonicalSessionId: string,
   text: string,
-  source: "human" | "agent"
+  source: "human" | "agent",
+  behavior: { queueMateUntilTurnBoundary?: boolean; interrupt?: boolean } = {}
 ): Promise<{ queued: boolean }> {
-  return options.monitor.queueOrSubmit(canonicalSessionId, text, { source });
+  return options.monitor.queueOrSubmit(canonicalSessionId, text, { source, ...behavior });
 }
 
 const INPUT_ACCEPT_WAIT_MS = 1000;
@@ -2587,9 +2597,10 @@ async function deliverInputAccepted(
   options: HttpServerOptions,
   canonicalSessionId: string,
   text: string,
-  source: "human" | "agent"
+  source: "human" | "agent",
+  behavior: { queueMateUntilTurnBoundary?: boolean; interrupt?: boolean } = {}
 ): Promise<{ queued: boolean }> {
-  const delivery = deliverInput(options, canonicalSessionId, text, source);
+  const delivery = deliverInput(options, canonicalSessionId, text, source, behavior);
   let accepted = false;
 
   const result = await Promise.race([
@@ -5341,5 +5352,8 @@ async function readJsonOrEmpty<T extends object>(request: IncomingMessage): Prom
 function validateInput(body: InputRequest): void {
   if (!body || typeof body.text !== "string" || body.text.length === 0) {
     throw new Error("text is required");
+  }
+  if (body.interrupt !== undefined && typeof body.interrupt !== "boolean") {
+    throw new Error("interrupt must be a boolean");
   }
 }
