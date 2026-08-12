@@ -1976,6 +1976,14 @@ export class MateMailboxRepository {
     return row ? mateMailboxFromRow(row) : undefined;
   }
 
+  hasTaskEvent(taskEventId: number): boolean {
+    return Boolean(
+      this.db
+        .prepare("SELECT 1 FROM mate_mailbox_deliveries WHERE recipient = 'mate' AND task_event_id = ?")
+        .get(taskEventId)
+    );
+  }
+
   // Undelivered work awaiting mate attention: pending rows plus claims whose
   // lease has lapsed (an expired claim is pending again). A live unexpired
   // claim is being processed and does not need a fresh nudge.

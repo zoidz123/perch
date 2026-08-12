@@ -3,7 +3,7 @@ import { homedir } from "node:os";
 import { basename, join } from "node:path";
 import { createHash, randomBytes, randomUUID } from "node:crypto";
 import type { Task, TaskEvent, TaskEventKind, TaskEventSource, TaskPr, TaskState } from "@perch/shared";
-import { BOSS_EVENT_KINDS, MATE_MAILBOX_EVENT_KINDS } from "./mateWake.js";
+import { BOSS_EVENT_KINDS } from "./mateWake.js";
 import { PUSH_EVENT_KINDS } from "./pushRouter.js";
 import {
   StateDb,
@@ -590,17 +590,14 @@ function taskEventNotificationIntents(
   return intents;
 }
 
-// Worker-authored boss-relevant events are mailbox fan-in: the delivery row
-// commits with the event, and the mate drains it at a safe checkpoint instead
-// of receiving injected chat text. System/hook/poller-sourced notifications
-// keep the legacy wake path (see mateWake.ts).
+// Boss-relevant lifecycle events are mailbox fan-in regardless of source: the
+// delivery row commits with the event, and the mate drains it at a safe
+// checkpoint instead of receiving injected chat text.
 function mailboxAppendFor(event: {
   kind: TaskEventKind;
   source: TaskEventSource;
 }): MailboxAppendInput | undefined {
-  return event.source === "worker" && MATE_MAILBOX_EVENT_KINDS.has(event.kind)
-    ? { recipient: "mate" }
-    : undefined;
+  return BOSS_EVENT_KINDS.has(event.kind) ? { recipient: "mate" } : undefined;
 }
 
 function isUniqueConstraint(error: unknown): boolean {

@@ -148,25 +148,46 @@ test("sender retries are idempotent per (task, session, key); the same key with 
   rmSync(root, { recursive: true, force: true });
 });
 
-test("worker boss events create mailbox deliveries; system events and heartbeats do not", () => {
+test("every boss lifecycle event creates a mailbox delivery; heartbeats and notes do not", () => {
   const root = home();
   const tasks = new TaskStore(env(root));
   const task = makeWorkedTask(tasks, "routing", "pty:worker");
 
-  tasks.recordEvent(task.id, { kind: "working", source: "worker" });
-  tasks.recordEvent(task.id, { kind: "note", source: "worker", message: "bookkeeping" });
+  tasks.recordEvent(task.id, { kind: "chart_ready", source: "system", message: "chart" });
+  tasks.recordEvent(task.id, { kind: "pr_linked", source: "worker", message: "PR" });
   tasks.recordEvent(task.id, { kind: "stalled", source: "system", message: "watchdog" });
-  assert.equal(tasks.stateDb.mateMailbox.list().length, 0);
-
+  tasks.recordEvent(task.id, { kind: "checks_green", source: "poller", message: "CI green" });
+  tasks.recordEvent(task.id, { kind: "merge_ready", source: "poller", message: "ready" });
+  tasks.recordEvent(task.id, { kind: "runtime_interrupted", source: "system", message: "runtime" });
+  tasks.recordEvent(task.id, { kind: "needs_decision", source: "worker", message: "choose" });
+  tasks.recordEvent(task.id, { kind: "working", source: "worker" });
   tasks.recordEvent(task.id, { kind: "blocked", source: "worker", message: "waiting on credential" });
   tasks.recordEvent(task.id, { kind: "working", source: "worker" });
+  tasks.recordEvent(task.id, { kind: "completion_requested", source: "worker", message: "verify" });
+  tasks.recordEvent(task.id, { kind: "completion_accepted", source: "system", message: "accepted" });
   tasks.recordEvent(task.id, { kind: "done", source: "worker", message: "claim" });
+  tasks.recordEvent(task.id, { kind: "merged", source: "poller", message: "landed" });
+  tasks.recordEvent(task.id, { kind: "failed", source: "system", message: "post-merge failure" });
+  tasks.recordEvent(task.id, { kind: "note", source: "worker", message: "bookkeeping" });
   const deliveries = tasks.stateDb.mateMailbox.list();
-  assert.equal(deliveries.length, 2);
+  assert.equal(deliveries.length, 12);
   const kinds = deliveries.map(
     (delivery) => tasks.stateDb.tasks.eventById(delivery.taskEventId)?.kind
   );
-  assert.deepEqual(kinds, ["blocked", "done"]);
+  assert.deepEqual(kinds, [
+    "chart_ready",
+    "pr_linked",
+    "stalled",
+    "checks_green",
+    "merge_ready",
+    "runtime_interrupted",
+    "needs_decision",
+    "blocked",
+    "completion_requested",
+    "done",
+    "merged",
+    "failed"
+  ]);
 
   tasks.close();
   rmSync(root, { recursive: true, force: true });

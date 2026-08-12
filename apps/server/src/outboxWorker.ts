@@ -4,6 +4,7 @@ import { isInjectedCrash } from "./failureInjection.js";
 import type { NotificationChannel, NotificationOutboxRecord, StateDb } from "./stateDb.js";
 
 export type TaskEventDelivery = {
+  taskEventId: number;
   task: Task;
   event: {
     kind: TaskEventKind;
@@ -121,7 +122,7 @@ function parseDelivery(intent: NotificationOutboxRecord): TaskEventDelivery {
   if (!task || typeof task !== "object" || !event || typeof event !== "object") {
     throw new Error(`invalid ${intent.channel} outbox payload`);
   }
-  return intent.payload as TaskEventDelivery;
+  return { ...intent.payload, taskEventId: intent.taskEventId } as TaskEventDelivery;
 }
 
 function errorText(error: unknown): string {
