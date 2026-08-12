@@ -3399,7 +3399,10 @@ async function completionDecisionRpc(
     const delivery = options.tasks.stateDb.delivery.find(task.id);
     const receipt = delivery ? options.tasks.stateDb.autoreview.find(delivery.receiptId) : undefined;
     const worktreePath = (task.worktreeId ? options.worktrees.find(task.worktreeId)?.path : undefined) ?? task.project;
-    const current = receipt ? await freezeReviewTarget(worktreePath, receipt.baseRef).catch(() => undefined) : undefined;
+    // The receipt's immutable base proves the reviewed diff. A later advance
+    // of origin/main is GitHub branch-protection work, not a reason to make a
+    // still-identical reviewed delivery impossible to accept.
+    const current = receipt ? await freezeReviewTarget(worktreePath, receipt.baseOid).catch(() => undefined) : undefined;
     if (
       delivery?.state !== "created" || !task.pr?.headOid || delivery.headOid !== task.pr.headOid ||
       !receipt || !current || !receiptMatchesCurrentTarget(receipt, current)
@@ -3756,7 +3759,7 @@ async function handleTaskEvent(
     const delivery = options.tasks.stateDb.delivery.find(task.id);
     const receipt = delivery ? options.tasks.stateDb.autoreview.find(delivery.receiptId) : undefined;
     const worktreePath = (task.worktreeId ? options.worktrees.find(task.worktreeId)?.path : undefined) ?? task.project;
-    const current = receipt ? await freezeReviewTarget(worktreePath, receipt.baseRef).catch(() => undefined) : undefined;
+    const current = receipt ? await freezeReviewTarget(worktreePath, receipt.baseOid).catch(() => undefined) : undefined;
     if (
       delivery?.state !== "created" || !task.pr?.url || !task.pr.headOid || delivery.headOid !== task.pr.headOid ||
       !receipt || !current || !receiptMatchesCurrentTarget(receipt, current)

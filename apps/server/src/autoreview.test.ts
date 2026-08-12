@@ -51,13 +51,13 @@ function fixture() {
   return { home, repo, tasks, task, runtime };
 }
 
-function input(value: Fixture, idempotencyKey: string, supersedesAttemptId?: string) {
+function input(value: Fixture, idempotencyKey: string, supersedesAttemptId?: string, baseRef = "HEAD~1") {
   return {
     task: value.task,
     runtime: value.runtime,
     sessionId: "pty:root",
     worktreePath: value.repo,
-    baseRef: "HEAD~1",
+    baseRef,
     idempotencyKey,
     testArgv: ["node", "--test", "focused-test.mjs"],
     ...(supersedesAttemptId ? { supersedesAttemptId } : {})
@@ -322,6 +322,135 @@ test("a delivery retry after a failed attempt binds the PR to the receipt it act
     assert.equal(retried.pr.headOid, second.headOid, "the linked PR identity matches the delivered head");
   } finally {
     cleanup(value);
+  }
+});
+
+test("a created delivery redelivers a rebased clean receipt to its existing PR after a force-with-lease refusal", async () => {
+  const value = fixture();
+  const git = (args: string[]) => execFileSync("git", ["-C", value.repo, ...args], { stdio: "pipe", encoding: "utf8" }).trim();
+  let deliveryCalls = 0;
+  let refuseFirstRedelivery = true;
+  const deliveryInputs: Array<{ headOid: string; existingPr?: { url: string; number?: number }; forceWithLeaseHeadOid?: string }> = [];
+  try {
+    const review = new AutoReviewService(value.tasks.stateDb, async () => ({
+      exitCode: 0, stdout: "", stderr: "", report: { findings: [] }
+    }));
+    git(["update-ref", "refs/remotes/origin/main", "HEAD~1"]);
+    const firstReceipt = (await review.run(input(value, "first-review", undefined, "origin/main"))).attempt;
+    const delivery = new DeliveryService(value.tasks.stateDb, async (received) => {
+      deliveryCalls += 1;
+      deliveryInputs.push(received);
+      if (received.forceWithLeaseHeadOid && refuseFirstRedelivery) {
+        refuseFirstRedelivery = false;
+        throw new Error("remote rejected force-with-lease");
+      }
+      return { url: "https://github.com/o/r/pull/74", number: 74 };
+    });
+    const first = await delivery.createPr({ task: value.task, runtime: value.runtime, worktreePath: value.repo, idempotencyKey: "redeliver" });
+
+    const featureBranch = firstReceipt.branch;
+    git(["checkout", "-qb", "moved-main", "origin/main"]);
+    writeFileSync(join(value.repo, "main-only.txt"), "unrelated base advance\n");
+    git(["add", "main-only.txt"]);
+    git(["commit", "-qm", "unrelated base advance"]);
+    const movedBase = git(["rev-parse", "HEAD"]);
+    git(["update-ref", "refs/remotes/origin/main", movedBase]);
+    git(["checkout", "-q", featureBranch]);
+    git(["rebase", "origin/main"]);
+
+    const rebasedReceipt = (await review.run(input(value, "rebased-review", undefined, "origin/main"))).attempt;
+    assert.equal(rebasedReceipt.state, "clean");
+    assert.notEqual(rebasedReceipt.headOid, firstReceipt.headOid);
+
+    // Before the redelivery fix this returned the first PR identity as a
+    // duplicate, leaving the created delivery row and PR head on the first
+    // receipt while the only current clean receipt named this rebased head.
+    await assert.rejects(
+      delivery.createPr({ task: value.task, runtime: value.runtime, worktreePath: value.repo, idempotencyKey: "redeliver" }),
+      /force-with-lease/
+    );
+    assert.equal(value.tasks.stateDb.delivery.find(value.task.id)?.state, "failed");
+    assert.equal(value.tasks.stateDb.delivery.find(value.task.id)?.leaseHeadOid, firstReceipt.headOid);
+    assert.equal(deliveryInputs[1]?.headOid, rebasedReceipt.headOid);
+    assert.deepEqual(deliveryInputs[1]?.existingPr, { url: first.pr.url, number: first.pr.number });
+    assert.equal(deliveryInputs[1]?.forceWithLeaseHeadOid, firstReceipt.headOid);
+
+    const redelivered = await delivery.createPr({ task: value.task, runtime: value.runtime, worktreePath: value.repo, idempotencyKey: "redeliver" });
+    assert.equal(redelivered.duplicate, false);
+    assert.equal(redelivered.pr.url, first.pr.url);
+    assert.equal(redelivered.pr.number, first.pr.number);
+    assert.equal(redelivered.pr.headOid, rebasedReceipt.headOid);
+    assert.equal(value.tasks.stateDb.delivery.find(value.task.id)?.receiptId, rebasedReceipt.id);
+    assert.equal(deliveryCalls, 3);
+
+    const duplicate = await delivery.createPr({ task: value.task, runtime: value.runtime, worktreePath: value.repo, idempotencyKey: "redeliver" });
+    assert.equal(duplicate.duplicate, true);
+    assert.equal(duplicate.pr.headOid, rebasedReceipt.headOid);
+    assert.equal(deliveryCalls, 3, "retrying after redelivery must not push or create another PR");
+  } finally {
+    cleanup(value);
+  }
+});
+
+test("server redelivery force-pushes only the recorded PR head and refuses a moved remote", async () => {
+  const value = fixture();
+  const git = (args: string[], cwd = value.repo) => execFileSync("git", ["-C", cwd, ...args], { stdio: "pipe", encoding: "utf8" }).trim();
+  const remote = mkdtempSync(join(tmpdir(), "perch-delivery-remote-"));
+  const rival = mkdtempSync(join(tmpdir(), "perch-delivery-rival-"));
+  try {
+    execFileSync("git", ["init", "--bare", "-q", remote], { stdio: "pipe" });
+    const review = new AutoReviewService(value.tasks.stateDb, async () => ({
+      exitCode: 0, stdout: "", stderr: "", report: { findings: [] }
+    }));
+    git(["update-ref", "refs/remotes/origin/main", "HEAD~1"]);
+    const firstReceipt = (await review.run(input(value, "lease-first", undefined, "origin/main"))).attempt;
+    git(["remote", "add", "origin", remote]);
+    git(["push", "--set-upstream", "origin", firstReceipt.branch]);
+    const now = new Date().toISOString();
+    value.tasks.stateDb.delivery.create({
+      taskId: value.task.id, receiptId: firstReceipt.id, idempotencyKey: "lease-delivery", state: "created",
+      baseOid: firstReceipt.baseOid, headOid: firstReceipt.headOid, treeOid: firstReceipt.treeOid, diffSha256: firstReceipt.diffSha256,
+      prUrl: "https://github.com/o/r/pull/76", prNumber: 76, createdAt: now, updatedAt: now
+    });
+
+    git(["checkout", "-qb", "moved-main", "origin/main"]);
+    writeFileSync(join(value.repo, "main-only.txt"), "unrelated base advance\n");
+    git(["add", "main-only.txt"]);
+    git(["commit", "-qm", "unrelated base advance"]);
+    git(["update-ref", "refs/remotes/origin/main", "HEAD"]);
+    git(["checkout", "-q", firstReceipt.branch]);
+    git(["rebase", "origin/main"]);
+    const rebasedReceipt = (await review.run(input(value, "lease-rebased", undefined, "origin/main"))).attempt;
+
+    const delivery = new DeliveryService(value.tasks.stateDb);
+    const redelivered = await delivery.createPr({
+      task: value.task, runtime: value.runtime, worktreePath: value.repo, idempotencyKey: "lease-delivery"
+    });
+    assert.equal(redelivered.pr.url, "https://github.com/o/r/pull/76");
+    assert.equal(git(["rev-parse", `refs/heads/${firstReceipt.branch}`], remote), rebasedReceipt.headOid);
+
+    writeFileSync(join(value.repo, "app.txt"), "third reviewed delivery\n");
+    git(["commit", "-am", "third reviewed delivery", "-q"]);
+    const thirdReceipt = (await review.run(input(value, "lease-third", undefined, "origin/main"))).attempt;
+    execFileSync("git", ["clone", "-q", remote, rival], { stdio: "pipe" });
+    git(["config", "user.email", "rival@example.test"], rival);
+    git(["config", "user.name", "Rival"], rival);
+    git(["checkout", "-q", firstReceipt.branch], rival);
+    writeFileSync(join(rival, "remote-only.txt"), "concurrent remote advance\n");
+    git(["add", "remote-only.txt"], rival);
+    git(["commit", "-qm", "concurrent remote advance"], rival);
+    git(["push", "origin", firstReceipt.branch], rival);
+
+    await assert.rejects(
+      delivery.createPr({ task: value.task, runtime: value.runtime, worktreePath: value.repo, idempotencyKey: "lease-delivery" }),
+      /remote delivery branch no longer matches/
+    );
+    assert.equal(git(["rev-parse", `refs/heads/${firstReceipt.branch}`], remote), git(["rev-parse", "HEAD"], rival));
+    assert.equal(value.tasks.stateDb.delivery.find(value.task.id)?.receiptId, thirdReceipt.id);
+  } finally {
+    cleanup(value);
+    rmSync(remote, { recursive: true, force: true });
+    rmSync(rival, { recursive: true, force: true });
   }
 });
 

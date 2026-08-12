@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
 import { randomUUID } from "node:crypto";
-import { existsSync, mkdtempSync, rmSync } from "node:fs";
+import { existsSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import type { AddressInfo } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -9,6 +9,7 @@ import { test } from "node:test";
 import type { AgentSession, RecentEventsResult, Task, TaskKind, TaskMode } from "@perch/shared";
 import type { AgentAdapter } from "./adapters/types.js";
 import { AuditLog } from "./audit.js";
+import { AutoReviewService } from "./autoreview.js";
 import { FleetMonitor } from "./fleetMonitor.js";
 import { HookRegistry } from "./hooks.js";
 import { createControlServer, MAX_TASK_EVENT_MESSAGE_BYTES } from "./http.js";
@@ -154,6 +155,75 @@ const structured = {
   step: "review",
   findings: [{ id: "r1", severity: "error", file: "src/db.ts", action: "ask-user", description: "index drop" }]
 };
+
+test("ship completion accepts a clean receipt against its recorded base after origin/main advances", async () => {
+  await withServer(async ({ home, port, tasks, hooks }) => {
+    const project = makeProject(home);
+    const git = (args: string[]) => execFileSync("git", ["-C", project, ...args], { stdio: "pipe", encoding: "utf8" }).trim();
+    git(["config", "user.email", "review@example.test"]);
+    git(["config", "user.name", "AutoReview test"]);
+    writeFileSync(join(project, "app.txt"), "base\n");
+    writeFileSync(join(project, "focused-test.mjs"), [
+      'import assert from "node:assert/strict";',
+      'import test from "node:test";',
+      'test("focused", () => assert.ok(true));',
+      ""
+    ].join("\n"));
+    git(["add", "app.txt", "focused-test.mjs"]);
+    git(["commit", "-qm", "base"]);
+    git(["update-ref", "refs/remotes/origin/main", "HEAD"]);
+    git(["checkout", "-qb", "perch/receipt-owned-base"]);
+    writeFileSync(join(project, "app.txt"), "reviewed delivery\n");
+    git(["commit", "-am", "reviewed delivery", "-q"]);
+
+    const task = tasks.create({ title: "receipt-owned completion base", project, kind: "ship" });
+    const runtime = tasks.stateDb.runtimes.create({
+      id: "runtime-receipt-owned-base", taskId: task.id, generation: 1, state: "live",
+      agent: "claude", provider: "claude", ptySessionId: "pty:worker", worktreePath: project
+    });
+    const review = new AutoReviewService(tasks.stateDb, async () => ({
+      exitCode: 0, stdout: "", stderr: "", report: { findings: [] }
+    }));
+    const receipt = (await review.run({
+      task, runtime, sessionId: "pty:worker", worktreePath: project, baseRef: "origin/main",
+      idempotencyKey: "receipt-owned-base", testArgv: ["node", "--test", "focused-test.mjs"]
+    })).attempt;
+    assert.equal(receipt.state, "clean");
+
+    git(["checkout", "-qb", "moved-main", receipt.baseOid]);
+    writeFileSync(join(project, "unrelated-main-change.txt"), "main advanced after review\n");
+    git(["add", "unrelated-main-change.txt"]);
+    git(["commit", "-qm", "unrelated main advance"]);
+    git(["update-ref", "refs/remotes/origin/main", "HEAD"]);
+    git(["checkout", "-q", receipt.branch]);
+
+    const now = new Date().toISOString();
+    tasks.stateDb.delivery.create({
+      taskId: task.id, receiptId: receipt.id, idempotencyKey: "delivery:receipt-owned-base", state: "created",
+      baseOid: receipt.baseOid, headOid: receipt.headOid, treeOid: receipt.treeOid, diffSha256: receipt.diffSha256,
+      prUrl: "https://github.com/o/r/pull/75", prNumber: 75, createdAt: now, updatedAt: now
+    });
+    tasks.update(task.id, { sessionId: "pty:worker", branch: receipt.branch });
+    tasks.linkPr(task.id, {
+      url: "https://github.com/o/r/pull/75", number: 75, head: receipt.branch, headOid: receipt.headOid
+    }, { source: "system", message: "server-owned delivery" });
+    tasks.recordEvent(task.id, { kind: "working", source: "worker" });
+    const { token } = hooks.register("pty:worker");
+
+    const requested = await post(port, task.id, { "x-perch-session": "pty:worker", "x-perch-token": token }, {
+      kind: "done", message: "reviewed and delivered"
+    });
+    assert.equal(requested.status, 200);
+    const requestSeq = tasks.events(task.id).at(-1)?.seq;
+    assert.ok(requestSeq);
+
+    const accepted = await decideCompletion(port, task.id, {
+      action: "accept", requestSeq, idempotencyKey: "accept-receipt-owned-base"
+    });
+    assert.equal(accepted.status, 200);
+    assert.equal(tasks.find(task.id)?.state, "done");
+  });
+});
 
 test("worker summary claiming a missing deliverable requests verification without becoming done", async () => {
   await withServer(async ({ home, port, tasks, hooks }) => {

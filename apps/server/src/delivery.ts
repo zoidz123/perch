@@ -24,6 +24,9 @@ export type DeliveryRunner = (input: {
   branch: string;
   baseRef: string;
   title: string;
+  headOid: string;
+  existingPr?: { url: string; number?: number };
+  forceWithLeaseHeadOid?: string;
 }) => Promise<{ url: string; number?: number }>;
 
 // The only code path that pushes a current ship task and creates its PR.  The
@@ -36,12 +39,7 @@ export class DeliveryService {
     if (input.task.kind !== "ship") throw new Error("code PR delivery is available only for ship tasks");
     if (input.runtime.state !== "live") throw new Error("delivery requires the task's current live root runtime");
     const existing = this.state.delivery.find(input.task.id);
-    if (existing?.state === "created" && existing.prUrl) {
-      const receipt = this.state.autoreview.find(existing.receiptId);
-      if (!receipt) throw new Error("delivery record is missing its AutoReview receipt");
-      return { pr: { url: existing.prUrl, ...(existing.prNumber ? { number: existing.prNumber } : {}), headOid: existing.headOid }, receipt, duplicate: true };
-    }
-    if (existing && existing.idempotencyKey !== input.idempotencyKey) {
+    if (existing && !existing.prUrl && existing.idempotencyKey !== input.idempotencyKey) {
       throw new Error("a delivery attempt already exists for this task; retry with its original idempotency key");
     }
     const receipt = this.state.autoreview.latest(input.task.id);
@@ -60,6 +58,19 @@ export class DeliveryService {
       receiptId: receipt.id, baseOid: current.baseOid, headOid: current.headOid,
       treeOid: current.treeOid, diffSha256: current.diffSha256
     };
+    if (existing?.state === "created" && existing.prUrl && existing.headOid === target.headOid) {
+      const deliveredReceipt = this.state.autoreview.find(existing.receiptId);
+      if (!deliveredReceipt) throw new Error("delivery record is missing its AutoReview receipt");
+      return {
+        pr: { url: existing.prUrl, ...(existing.prNumber ? { number: existing.prNumber } : {}), headOid: existing.headOid },
+        receipt: deliveredReceipt,
+        duplicate: true
+      };
+    }
+    const existingPr = existing?.prUrl
+      ? { url: existing.prUrl, ...(existing.prNumber ? { number: existing.prNumber } : {}) }
+      : undefined;
+    const forceWithLeaseHeadOid = existingPr ? existing?.leaseHeadOid ?? existing?.headOid : undefined;
     // A reused row is retried against the receipt and target validated just
     // now, never the ones its earlier failed attempt recorded.
     if (existing) this.state.delivery.rebind(input.task.id, target);
@@ -68,7 +79,10 @@ export class DeliveryService {
       ...target, createdAt: now, updatedAt: now
     });
     try {
-      const created = await this.runner({ cwd: input.worktreePath, branch: current.branch, baseRef: receipt.baseRef, title: input.task.title });
+      const created = await this.runner({
+        cwd: input.worktreePath, branch: current.branch, baseRef: receipt.baseRef, title: input.task.title,
+        headOid: current.headOid, ...(existingPr ? { existingPr, forceWithLeaseHeadOid } : {})
+      });
       const completed = this.state.delivery.complete(input.task.id, created.url, created.number);
       return {
         pr: { url: completed.prUrl ?? created.url, ...(completed.prNumber ? { number: completed.prNumber } : {}), head: current.branch, headOid: completed.headOid },
@@ -98,6 +112,24 @@ function hasPassingFinalTestEvidence(receipt: AutoReviewAttemptRecord): boolean 
 }
 
 async function pushAndCreatePr(input: Parameters<DeliveryRunner>[0]): Promise<{ url: string; number?: number }> {
+  if (input.existingPr) {
+    const leaseHeadOid = input.forceWithLeaseHeadOid;
+    if (!leaseHeadOid) throw new Error("redelivery is missing the prior PR head required for force-with-lease");
+    const remoteHeadOid = await remoteBranchHead(input);
+    // A prior process may have pushed successfully just before crashing. The
+    // remote head is the only authoritative confirmation in that narrow
+    // window, so return the same PR without a second force push.
+    if (remoteHeadOid === input.headOid) return input.existingPr;
+    if (remoteHeadOid !== leaseHeadOid) {
+      throw new Error("redelivery refused: the remote delivery branch no longer matches the last server-delivered head");
+    }
+    await execFileAsync(
+      "git",
+      ["-C", input.cwd, "push", "--set-upstream", `--force-with-lease=refs/heads/${input.branch}:${leaseHeadOid}`, "origin", input.branch],
+      { timeout: 2 * 60_000, maxBuffer: 2 * 1024 * 1024 }
+    );
+    return input.existingPr;
+  }
   const alreadyCreated = await discoverExistingPr(input);
   if (alreadyCreated) return alreadyCreated;
   await execFileAsync("git", ["-C", input.cwd, "push", "--set-upstream", "origin", input.branch], { timeout: 2 * 60_000, maxBuffer: 2 * 1024 * 1024 });
@@ -112,6 +144,16 @@ async function pushAndCreatePr(input: Parameters<DeliveryRunner>[0]): Promise<{ 
   if (!url) throw new Error("GitHub did not confirm a created pull request URL");
   const number = Number(url.match(/\/pull\/(\d+)$/)?.[1]);
   return { url, ...(Number.isSafeInteger(number) ? { number } : {}) };
+}
+
+async function remoteBranchHead(input: Parameters<DeliveryRunner>[0]): Promise<string | undefined> {
+  const result = await execFileAsync(
+    "git",
+    ["-C", input.cwd, "ls-remote", "--heads", "origin", `refs/heads/${input.branch}`],
+    { timeout: 30_000, maxBuffer: 512 * 1024 }
+  );
+  const head = result.stdout.trim().split(/\s+/)[0];
+  return head && /^[0-9a-f]{40,64}$/i.test(head) ? head : undefined;
 }
 
 async function discoverExistingPr(input: Parameters<DeliveryRunner>[0]): Promise<{ url: string; number?: number } | undefined> {

@@ -14,7 +14,7 @@ import type {
 import Database from "better-sqlite3";
 import type { TaskDeliverable, TaskVerificationFacts } from "./taskPresentation.js";
 
-const LATEST_SCHEMA_VERSION = 17;
+const LATEST_SCHEMA_VERSION = 18;
 const LEGACY_TASK_IMPORT = "tasks-json-v1";
 
 const MIGRATIONS = [
@@ -706,6 +706,13 @@ const MIGRATIONS = [
       ) STRICT;
       CREATE INDEX delivery_pr_attempts_receipt_idx ON delivery_pr_attempts(receipt_id);
     `
+  },
+  {
+    version: 18,
+    name: "delivery-redelivery-force-with-lease",
+    sql: `
+      ALTER TABLE delivery_pr_attempts ADD COLUMN lease_head_oid TEXT;
+    `
   }
 ] as const;
 
@@ -948,6 +955,7 @@ export type DeliveryPrAttemptRecord = {
   diffSha256: string;
   prUrl?: string;
   prNumber?: number;
+  leaseHeadOid?: string;
   failureCode?: string;
   createdAt: string;
   updatedAt: string;
@@ -1795,9 +1803,8 @@ export class DeliveryPrRepository {
   }
 
   // A retry after a failed attempt is a new delivery of whatever receipt is
-  // valid now. Rebinding before the push keeps the durable row's receipt and
-  // target identity the ones actually delivered, so the completion gates that
-  // compare against them stay satisfiable.
+  // valid now. A pre-existing PR retains the last head that the server is
+  // allowed to replace, so a restart can retry the same force-with-lease.
   rebind(
     taskId: string,
     target: Pick<DeliveryPrAttemptRecord, "receiptId" | "baseOid" | "headOid" | "treeOid" | "diffSha256">
@@ -1805,15 +1812,21 @@ export class DeliveryPrRepository {
     this.db.prepare(
       `UPDATE delivery_pr_attempts
        SET receipt_id = ?, base_oid = ?, head_oid = ?, tree_oid = ?, diff_sha256 = ?,
-           state = 'creating', failure_code = NULL, updated_at = ?
-       WHERE task_id = ? AND state != 'created'`
+           state = 'creating', failure_code = NULL,
+           lease_head_oid = CASE
+             WHEN pr_url IS NULL THEN NULL
+             WHEN lease_head_oid IS NULL THEN head_oid
+             ELSE lease_head_oid
+           END,
+           updated_at = ?
+       WHERE task_id = ?`
     ).run(target.receiptId, target.baseOid, target.headOid, target.treeOid, target.diffSha256, new Date().toISOString(), taskId);
     return this.find(taskId)!;
   }
 
   complete(taskId: string, prUrl: string, prNumber: number | undefined): DeliveryPrAttemptRecord {
     this.db.prepare(
-      "UPDATE delivery_pr_attempts SET state = 'created', pr_url = ?, pr_number = ?, failure_code = NULL, updated_at = ? WHERE task_id = ?"
+      "UPDATE delivery_pr_attempts SET state = 'created', pr_url = ?, pr_number = ?, lease_head_oid = NULL, failure_code = NULL, updated_at = ? WHERE task_id = ?"
     ).run(prUrl, prNumber ?? null, new Date().toISOString(), taskId);
     return this.find(taskId)!;
   }
@@ -1861,6 +1874,7 @@ function deliveryPrAttemptFromRow(row: Record<string, unknown>): DeliveryPrAttem
     state: String(row.state) as DeliveryPrAttemptRecord["state"], baseOid: String(row.base_oid), headOid: String(row.head_oid), treeOid: String(row.tree_oid),
     diffSha256: String(row.diff_sha256), ...(typeof row.pr_url === "string" ? { prUrl: row.pr_url } : {}),
     ...(typeof row.pr_number === "number" ? { prNumber: row.pr_number } : {}),
+    ...(typeof row.lease_head_oid === "string" ? { leaseHeadOid: row.lease_head_oid } : {}),
     ...(typeof row.failure_code === "string" ? { failureCode: row.failure_code } : {}), createdAt: String(row.created_at), updatedAt: String(row.updated_at)
   };
 }
