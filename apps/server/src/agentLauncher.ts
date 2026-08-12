@@ -118,9 +118,9 @@ export type StartManagedAgentResult = {
   worktreeId?: string;
 };
 
-// Non-secret launch context for pipeline clients. These values are useful for
-// forming an authorization request but are never authority by themselves;
-// /hooks/no-mistakes/authorize verifies them against the hook credential and
+// Non-secret launch context for the dispatched worker: the durable task
+// identity its managed `perch` verbs report against. Never authority by
+// itself - every worker verb is verified against the hook credential and the
 // durable task/runtime records.
 export function taskCapabilityEnvironment(
   tasks: TaskStore,

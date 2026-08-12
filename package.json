@@ -34,7 +34,6 @@
     "apps/server/assets/**",
     "packages/shared/dist/**/*.js",
     "packages/relay/dist/**/*.js",
-    "vendor/no-mistakes/**",
     "THIRD_PARTY_NOTICES.md",
     "!packages/relay/README.md",
     "README.md",

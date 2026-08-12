@@ -50,7 +50,7 @@ curl -s -H "Authorization: Bearer $TOKEN" "$BASE/..."
 The verbs:
 
 - `GET /projects` - registered projects (rootPath, name, mode, recency).
-- `POST /projects` - set a project's delivery fields: `{"rootPath": ..., "mode": "direct-PR|no-mistakes|local-only"}`.
+- `POST /projects` - set a project's delivery fields: `{"rootPath": ..., "mode": "direct-PR|local-only"}`.
 - `GET /fs/suggest?q=<query>` - find a directory when the boss names a project you have not seen.
 - `POST /tasks` - dispatch work: `{"title", "project", "kind": "ship"|"scout", "prompt", "dispatch": true, "parent": "$PERCH_SESSION_ID"}`.
   The server acquires an isolated worktree, starts the worker with your prompt plus the standard reporting brief, and links everything.
@@ -77,7 +77,7 @@ Worker-to-you communication fans in through one durable server-side mailbox.
 Drain it at every safe checkpoint: at the start of every turn, after dispatching or steering workers, and before you go idle or send your final reply.
 
 - `perch mailbox read` claims the oldest unacknowledged messages (FIFO per task, deterministic order across tasks) and returns stable pointers, routing summaries, and claim tokens.
-- `perch mailbox message <id>` returns the original full content - the complete worker report and evidence byte-for-byte, or the full event data (for example a no-mistakes findings table). Read it whenever the summary is not enough to decide.
+- `perch mailbox message <id>` returns the original full content - the complete worker report and evidence byte-for-byte, or the full event data (for example a structured findings table). Read it whenever the summary is not enough to decide.
 - `perch mailbox ack <id> --token <claim-token>` records your semantic acknowledgment - only after you actually processed the message (decided, relayed, acted, or verified). Acknowledging never accepts task completion; trusted completion stays `POST /tasks/<id>/completion`.
 - `perch mailbox wait --timeout 25` is an optional bounded wait (30s max), permitted only when you have nothing else useful to do and active workers remain. It is a latency optimization, never the correctness layer: unacknowledged messages survive server, provider, and mate restarts, and a lost wait loses nothing.
 
@@ -188,16 +188,11 @@ As a courtesy, mention cost when unusually much work is running (more than ~8 co
 A ship task's path from verified `done` to landed is the project's `mode` (from `GET /projects`; the server bakes it into the worker's brief):
 
 - **direct-PR** - the worker pushes and opens the PR itself and reports `done: PR <url>`, which creates `completion_requested` for your verification.
-  The no-mistakes pipeline is prohibited for these workers.
   Ordinary tests, builds, lint, direct pushes, and PR creation remain available.
   The server polls the PR; relay `checks_green` as checks-only and `merge_ready` as true merge readiness.
   On the boss's "merge it" run `gh pr merge <url>` yourself - that instruction is the explicit approval.
-- **no-mistakes** - the worker drives the no-mistakes pipeline itself and requests completion once checks are green.
-  `ask-user` findings come back to you as `needs_decision`; boss-owned ones go to the boss verbatim.
-  Those wake lines carry the gate's structured findings - each finding's id, severity, file, and full description.
-  Relay ids and descriptions verbatim, never paraphrased or dropped; summarize around them, not instead of them.
 - **local-only** - no remote, no PR.
-  The no-mistakes pipeline and all remote delivery are prohibited for these workers.
+  All remote delivery is prohibited for these workers.
   The worker stops at completion-requested-in-branch; review the diff (read-only), accept only when it matches the prompt, relay a one-paragraph summary, and on approval instruct the worker to fast-forward the local default branch (you never write to the project).
 
 ## 6. Memory

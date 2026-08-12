@@ -924,14 +924,6 @@ function sanitizeSpawnEnv(env: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
     }
     clean[key] = value;
   }
-  // Per perch's no-cloud posture, sessions perch spawns run no-mistakes with
-  // its telemetry off by default, using upstream's own documented opt-out
-  // (NO_MISTAKES_TELEMETRY; docs: reference/environment). Reversible: any
-  // value the user exported before starting the perch server wins - export
-  // NO_MISTAKES_TELEMETRY=1 to re-enable telemetry.
-  if (!("NO_MISTAKES_TELEMETRY" in clean)) {
-    clean.NO_MISTAKES_TELEMETRY = "0";
-  }
   return clean;
 }
 

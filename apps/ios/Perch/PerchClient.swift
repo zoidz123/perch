@@ -36,10 +36,6 @@ final class PerchStore: ObservableObject {
     // Freshly answered questions by session, so the chat's question chip can
     // collapse to the chosen answers until the conversation moves on.
     @Published var answeredQuestions: [String: AnsweredQuestion] = [:]
-    // Freshly answered no-mistakes gates by task id, so the decision chip can
-    // collapse to what was sent until the worker resumes (state leaves
-    // needs_you). Local by design, like answeredQuestions.
-    @Published var sentDecisions: [String: String] = [:]
     // The session whose detail view is open (chat subscription).
     @Published var selectedSessionId: String?
     // The open session (item-based navigation): rows, deep links, and push
@@ -347,7 +343,6 @@ final class PerchStore: ObservableObject {
         recoveryActions = [:]
         projects = []
         answeredQuestions = [:]
-        sentDecisions = [:]
         selectedSessionId = nil
         selectionToken = nil
         openSessionRef = nil
@@ -1318,38 +1313,6 @@ final class PerchStore: ObservableObject {
         draft = text
         await sendDraftAndEnter()
         return true
-    }
-
-    // The full event log behind one task (GET /tasks/:id): the decision card
-    // reads the latest parked gate and any recorded answer from it.
-    func taskEvents(_ id: String) async -> [TaskEventModel] {
-        do {
-            let result: TaskDetailResult = try await request(path: "/tasks/\(id)")
-            return result.events
-        } catch {
-            return []
-        }
-    }
-
-    // Answer a parked no-mistakes gate (POST /tasks/:id/decision). The server
-    // translates the answer into the matching `no-mistakes axi respond ...`
-    // line, injects it into the worker's composer, and FYIs the mate so it
-    // never double-answers. Returns the server's message on failure.
-    func decideTask(_ id: String, action: String, findingIds: [String] = [], instructions: String? = nil) async -> String? {
-        var body: [String: Any] = ["action": action]
-        if !findingIds.isEmpty {
-            body["findingIds"] = findingIds
-        }
-        if let instructions, !instructions.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-            body["instructions"] = instructions
-        }
-        do {
-            try await postAny(path: "/tasks/\(id)/decision", body: body)
-            await refresh()
-            return nil
-        } catch {
-            return error.localizedDescription
-        }
     }
 
     // Teardown runs the server's landed-gate; a 409 surfaces its reason.

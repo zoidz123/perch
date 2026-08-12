@@ -6,7 +6,6 @@ import type {
   Task,
   TaskEventKind
 } from "@perch/shared";
-import { findingsPushBody, parseNoMistakesGate } from "./findings.js";
 import type { PushSender } from "./push.js";
 
 // Push routing: a push is a request for the boss's attention, so only
@@ -249,10 +248,10 @@ export class PushRouter {
 
     if (event.kind === "needs_decision" || event.kind === "blocked" || event.kind === "runtime_interrupted") {
       if (crew) {
-        this.armFallback(task, event.kind, event.message, event.data);
+        this.armFallback(task, event.kind, event.message);
         return;
       }
-      await this.pushDecisionMoment(task, event.kind, event.message, event.data);
+      await this.pushDecisionMoment(task, event.kind, event.message);
       return;
     }
 
@@ -379,17 +378,12 @@ export class PushRouter {
     });
   }
 
-  private armFallback(
-    task: Task,
-    kind: ArmedFallback["kind"],
-    message?: string,
-    data?: Record<string, unknown>
-  ): void {
+  private armFallback(task: Task, kind: ArmedFallback["kind"], message?: string): void {
     // Re-arm per event: the newest question/blocker is the one worth pushing.
     this.disarmFallback(task.id);
     const timer = setTimeout(() => {
       this.fallbacks.delete(task.id);
-      void this.pushDecisionMoment(task, kind, message, data).catch((error) => {
+      void this.pushDecisionMoment(task, kind, message).catch((error) => {
         console.warn(`push: fallback delivery failed: ${error instanceof Error ? error.message : error}`);
       });
     }, this.fallbackMs);
@@ -405,12 +399,7 @@ export class PushRouter {
     }
   }
 
-  private async pushDecisionMoment(
-    task: Task,
-    kind: ArmedFallback["kind"],
-    message?: string,
-    data?: Record<string, unknown>
-  ): Promise<void> {
+  private async pushDecisionMoment(task: Task, kind: ArmedFallback["kind"], message?: string): Promise<void> {
     const project = this.deps.projectName(task.project) ?? "a project";
     const sessionId = task.sessionId ?? "system";
     if (kind === "runtime_interrupted") {
@@ -422,14 +411,10 @@ export class PushRouter {
         category: "error"
       });
     } else if (kind === "needs_decision") {
-      // A no-mistakes ask-user gate carries its findings table as structured
-      // data: the push names the gate, the count, and the worst finding
-      // verbatim instead of whatever prose the worker put in message.
-      const gate = parseNoMistakesGate(data);
       await this.deps.push.send({
         title: "Needs your call",
         subtitle: taskSubtitle(task),
-        body: `${project}: ${gate ? truncateAtWord(findingsPushBody(gate)) : (message ?? "the worker is waiting on your decision.")}`,
+        body: `${project}: ${message ?? "the worker is waiting on your decision."}`,
         sessionId,
         category: "turn_done"
       });

@@ -35,10 +35,6 @@ const STARTUP_TIMEOUT_MS = 8000;
 const STOP_TIMEOUT_MS = 45_000;
 const PACKAGE_ROOT = dirname(dirname(fileURLToPath(import.meta.url)));
 const PACKAGE_VERSION = JSON.parse(readFileSync(join(PACKAGE_ROOT, "package.json"), "utf8")).version;
-const NO_MISTAKES_MANIFEST = JSON.parse(
-  readFileSync(join(PACKAGE_ROOT, "vendor/no-mistakes/manifest.json"), "utf8")
-);
-
 // Mirrors apps/server/src/home.ts; keep the paths in sync.
 const PERCH_HOME = process.env.PERCH_HOME ?? join(homedir(), ".perch");
 const TOKEN_PATH = join(PERCH_HOME, "token");
@@ -146,11 +142,6 @@ async function main() {
 
   if (parsed.command === "config") {
     await runConfigCommand(parsed.args, parsed.options);
-    return;
-  }
-
-  if (parsed.command === "runtime") {
-    await runRuntimeCommand(parsed.args, parsed.options);
     return;
   }
 
@@ -1053,12 +1044,6 @@ async function mutateConfig(parsed, options) {
   const key = parsed.positionals[0];
   const spec = CONFIG_KEYS[key];
   if (!spec) {
-    if (key === "task.mode") {
-      throw new Error(`${key} moved to the project registry; use \`${projectSetHint(key, parsed)}\``);
-    }
-    if (key?.startsWith("runtime.no-mistakes.")) {
-      throw new Error(`${key} is read-only and managed by perchctl; update Perch to change it`);
-    }
     throw new Error(`unknown config key: ${key ?? "(none)"}`);
   }
   if (!parsed.global) {
@@ -1081,12 +1066,6 @@ async function mutateConfig(parsed, options) {
   else console.log(`${key} = ${formatConfigValue(entry?.storedValue)}`);
 }
 
-function projectSetHint(key, parsed) {
-  const path = parsed.project ?? "<path>";
-  const value = parsed.action === "set" ? parsed.positionals[1] : undefined;
-  return `perch project set ${path} --mode ${value ?? "<direct-PR|no-mistakes|local-only>"}`;
-}
-
 function redactConfigEntries(entries) {
   return Object.fromEntries(Object.entries(entries).map(([key, entry]) => {
     if (!/(token|secret|password|credential)/i.test(key)) return [key, entry];
@@ -1104,40 +1083,6 @@ function validateConfigEntries(entries) {
   for (const [key, entry] of Object.entries(entries)) {
     if (!entry || entry.scope !== "global") throw new Error(`invalid config entry: ${key}`);
   }
-}
-
-function validateBundledRuntimeEntries(entries) {
-  const expected = {
-    "runtime.no-mistakes.version": NO_MISTAKES_MANIFEST.version,
-    "runtime.no-mistakes.protocol": NO_MISTAKES_MANIFEST.authorizationProtocol,
-    "runtime.no-mistakes.source": "bundled"
-  };
-  for (const [key, value] of Object.entries(expected)) {
-    if (entries[key]?.effectiveValue !== value) {
-      throw new Error(`bundled no-mistakes validation failed for ${key}`);
-    }
-  }
-  if (!entries["runtime.no-mistakes.path"]?.effectiveValue || !entries["runtime.no-mistakes.SHA-256"]?.effectiveValue) {
-    throw new Error("bundled no-mistakes runtime path or SHA-256 is unavailable");
-  }
-}
-
-async function runRuntimeCommand(args, options) {
-  const action = args[0] && !args[0].startsWith("--") ? args[0] : "show";
-  const json = args.includes("--json");
-  if (!["show", "validate"].includes(action) || args.some((arg) => arg !== action && arg !== "--json")) {
-    throw new Error("runtime expects `perch runtime [show|validate] [--json]`");
-  }
-  const entries = redactConfigEntries((await fetchConfig(options)).entries ?? {});
-  const runtime = Object.fromEntries(Object.entries(entries).filter(([key]) => key.startsWith("runtime.no-mistakes.")));
-  if (action === "validate") {
-    validateBundledRuntimeEntries(runtime);
-    if (json) console.log(JSON.stringify({ valid: true, runtime }, null, 2));
-    else console.log("bundled no-mistakes runtime valid");
-    return;
-  }
-  if (json) console.log(JSON.stringify(runtime, null, 2));
-  else for (const [key, entry] of Object.entries(runtime)) console.log(`${key.padEnd(34)} ${formatConfigValue(entry.effectiveValue)}`);
 }
 
 function formatConfigValue(value) {
@@ -1730,24 +1675,6 @@ function renderDoctorReport(report) {
     );
   }
 
-  const gate = report.noMistakes ?? { binaryFound: false, projects: [] };
-  if (gate.projects.length) {
-    console.log("");
-    console.log("no-mistakes gate:");
-    const nameWidth = Math.max(4, ...gate.projects.map((project) => project.name.length));
-    const pathWidth = Math.max(4, ...gate.projects.map((project) => prettyPath(project.rootPath).length));
-    for (const project of gate.projects) {
-      const state = project.ready
-        ? "ready"
-        : project.note ??
-          (project.initialized
-            ? "initialized (reinstall this perchctl version if its bundled runtime is unavailable)"
-            : `not initialized - run \`perch project set ${prettyPath(project.rootPath)} --mode no-mistakes\` to initialize transactionally`);
-      console.log(
-        `${project.ready ? "✓" : "-"} ${project.name.padEnd(nameWidth)}  ${prettyPath(project.rootPath).padEnd(pathWidth)}  ${state}`.trimEnd()
-      );
-    }
-  }
 }
 
 // Execute the fix plan the server computed (report.fix). Safety properties
@@ -1852,7 +1779,7 @@ async function runDoctorFix(report, { yes }, options) {
       // `curl | sh` reports the pipe tail's exit status, so a failed download
       // can still exit 0 - judge by evidence: did the binary land where the
       // installer links it?
-      const linkDir = effectiveEnv.NO_MISTAKES_LINK_DIR;
+      const linkDir = effectiveEnv.PERCH_FIX_LINK_DIR;
       console.log("");
       if (linkDir && existsSync(join(linkDir, action.name))) {
         console.log(
@@ -2190,7 +2117,7 @@ function parseArgs(argv) {
     }
     // Subcommands with their own flag grammar keep those flags as positionals; the shared flags above
     // (--server, --token, ...) are already consumed.
-    if (arg.startsWith("-") && command !== "project" && command !== "config" && command !== "runtime" && command !== "models" && command !== "tasks" && command !== "task" && command !== "worktrees" && command !== "doctor" && command !== "report" && command !== "mailbox" && command !== "autoreview" && command !== "delivery") {
+    if (arg.startsWith("-") && command !== "project" && command !== "config" && command !== "models" && command !== "tasks" && command !== "task" && command !== "worktrees" && command !== "doctor" && command !== "report" && command !== "mailbox" && command !== "autoreview" && command !== "delivery") {
       throw new Error(`unknown option for ${command}: ${arg} (see \`perch --help\`)`);
     }
     args.push(arg);
@@ -2757,7 +2684,6 @@ function printHelp(command) {
   perch project add <path>
   perch project show <path>
   perch project remove <path>
-  perch runtime [show|validate] [--json]
   perch models [--json]
   perch config show [--global] [--effective] [--json]
   perch config get <key> [--global] [--effective] [--json]
@@ -2786,11 +2712,8 @@ Options:
 
 The server starts automatically when needed (log: ~/.perch/server.log).
 Session ids can be shortened: \`perch attach e1b4\` works if unambiguous.
-\`perch doctor\` validates the immutable no-mistakes runtime bundled with this
-perchctl package. It never downloads or repairs that runtime from PATH; reinstall
-this exact perchctl version if the bundled bytes are missing or corrupt.
 \`perch config\` shows global Mate and dispatch defaults only. Choose task kind
-(ship, scout, or operate) when creating work. Use \`perch runtime\` for bundled-runtime provenance.
+(ship, scout, or operate) when creating work.
 
 Examples:
   perch claude
@@ -2826,10 +2749,9 @@ function commandHelp(command) {
   if (command === "devices") return "Usage:\n  perch devices [ls]\n  perch devices revoke <id>\n\nLists paired devices or revokes one device token.";
   if (command === "project") return "Usage:\n  perch project [list|ls]\n  perch project add <path>\n  perch project show <path>\n  perch project remove|rm <path>\n\nThe project registry is live server state only. It does not control delivery; choose ship, scout, or operate when creating a task.";
   if (command === "models") return "Usage: perch models [--json]\n\nLists selectable Mate and dispatch models, aliases, supported effort levels, and sources.";
-  if (command === "runtime") return "Usage: perch runtime [show|validate] [--json]\n\nShows or validates the read-only bundled no-mistakes runtime provenance shipped with this perchctl package.";
-  if (command === "config") return `Usage:\n  perch config show [--global] [--effective] [--json]\n  perch config get <key> [--global] [--effective] [--json]\n  perch config set <mate|dispatch> <model> [--effort <level>] [--agent <agent>]\n  perch config set --global <key> <value>\n  perch config unset --global <key>\n  perch config validate [--global] [--effective] [--json]\n\nGlobal defaults: dispatch.* for workers and mate.* for Mate.\nTask kind controls delivery: ship, scout, or operate.\nRuntime keys are read-only provenance for this perchctl package; view them with \`perch runtime [show|validate]\`.\nUse \`perch project list\` for the live project registry.`;
+  if (command === "config") return `Usage:\n  perch config show [--global] [--effective] [--json]\n  perch config get <key> [--global] [--effective] [--json]\n  perch config set <mate|dispatch> <model> [--effort <level>] [--agent <agent>]\n  perch config set --global <key> <value>\n  perch config unset --global <key>\n  perch config validate [--global] [--effective] [--json]\n\nGlobal defaults: dispatch.* for workers and mate.* for Mate.\nTask kind controls delivery: ship, scout, or operate.\nUse \`perch project list\` for the live project registry.`;
   if (command === "worktrees") return "Usage:\n  perch worktrees\n  perch worktrees release <id> [--force]\n\nLists isolated task worktrees or releases an orphaned lease.";
-  if (command === "doctor") return "Usage: perch doctor [--json] [--fix [--yes]]\n\nChecks the server environment and validates the immutable bundled no-mistakes runtime. It does not download or PATH-repair that runtime.";
+  if (command === "doctor") return "Usage: perch doctor [--json] [--fix [--yes]]\n\nChecks the server environment for the external tools perch depends on, and reports what `--fix` would do.";
   if (command === "uninstall") return "Usage: perch uninstall [--dry-run] [--purge-data] [--force]\n\nRemoves Perch-managed agent configuration. It preserves ~/.perch state unless --purge-data is supplied.";
   if (command === "server") return "Usage: perch server [status|start|stop|logs]\n\nControls the local Perch server.";
   return undefined;

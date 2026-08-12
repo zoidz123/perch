@@ -48,7 +48,7 @@ test("task capability environment exposes scoped claims without treating prompt 
   }
 });
 
-test("repository canonicalization matches no-mistakes protocol version 1", () => {
+test("repository canonicalization is credential-free and case-normalized", () => {
   assert.equal(canonicalRepository("https://user:secret@GitHub.com:443/Owner/Repo.git"), "github.com:443/Owner/Repo");
   assert.equal(canonicalRepository("git@GitHub.com:Owner/Repo.git"), "github.com/owner/repo");
 });

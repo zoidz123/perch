@@ -32,18 +32,17 @@ function stubReport(installCommand: string, env: Record<string, string>, found: 
         installHint: "npm install -g @anthropic-ai/claude-code"
       },
       {
-        name: "no-mistakes",
+        name: "stub-tool",
         required: false,
         found,
-        ...(found ? { path: "/stub/no-mistakes", version: "v1.31.2" } : {}),
+        ...(found ? { path: "/stub/stub-tool", version: "v1.31.2" } : {}),
         installHint: installCommand,
         installer: true
       }
     ],
-    noMistakes: { binaryFound: found, projects: [] },
     fix: found
       ? []
-      : [{ name: "no-mistakes", kind: "install", command: installCommand, env, note: "stub note" }]
+      : [{ name: "stub-tool", kind: "install", command: installCommand, env, note: "stub note" }]
   };
 }
 
@@ -86,10 +85,19 @@ async function runDoctorFix(
   args: string[],
   extraEnv: Record<string, string> = {}
 ): Promise<CliResult> {
+  return runCli(serverUrl, home, ["doctor", "--fix", ...args], extraEnv);
+}
+
+async function runCli(
+  serverUrl: string,
+  home: string,
+  argv: string[],
+  extraEnv: Record<string, string> = {}
+): Promise<CliResult> {
   try {
     const { stdout, stderr } = await execFileAsync(
       process.execPath,
-      [PERCH_BIN, "doctor", "--fix", ...args],
+      [PERCH_BIN, ...argv],
       {
         timeout: 15000,
         env: { ...process.env, PERCH_HOME: home, PERCH_SERVER_URL: serverUrl, ...extraEnv }
@@ -131,7 +139,7 @@ test("doctor --fix --yes prints the exact command, applies env defaults, and run
       assert.equal(readFileSync(marker, "utf8").trim(), "default-value", "plan env default was applied");
       const printedAt = result.stdout.indexOf(`PERCH_FIX_PROBE="default-value" printenv PERCH_FIX_PROBE`);
       assert.ok(printedAt >= 0, "the full command, env prefix included, is printed before running");
-      assert.match(result.stdout, /stub note/, "the plan's note (telemetry opt-out) is shown");
+      assert.match(result.stdout, /stub note/, "the plan's note is shown");
     });
   } finally {
     rmSync(home, { recursive: true, force: true });
@@ -143,7 +151,7 @@ test("doctor --fix flags an install that exited 0 but produced no binary", async
   // still exit 0; --fix must judge by re-detection, not the exit code.
   const home = mkdtempSync(join(tmpdir(), "perch-fix-home-"));
   const command = "true";
-  const env = { NO_MISTAKES_LINK_DIR: join(home, "link") };
+  const env = { PERCH_FIX_LINK_DIR: join(home, "link") };
   const report = stubReport(command, env, false);
   try {
     await withStubServer([report, report], async (serverUrl) => {
@@ -167,6 +175,28 @@ test("doctor --fix never overrides an env variable the user exported", async () 
       assert.equal(result.code, 0);
       assert.equal(readFileSync(marker, "utf8").trim(), "user-set", "the exported value wins");
       assert.match(result.stdout, /keeping your PERCH_FIX_PROBE=user-set/);
+    });
+  } finally {
+    rmSync(home, { recursive: true, force: true });
+  }
+});
+
+// The retired no-mistakes system must leave no trace on the two surfaces a
+// new user reads first: `perch doctor` and `perch --help`.
+test("doctor and --help output never mention the retired no-mistakes system", async () => {
+  const home = mkdtempSync(join(tmpdir(), "perch-fix-home-"));
+  try {
+    await withStubServer([stubReport("true", {}, true)], async (serverUrl) => {
+      for (const argv of [["doctor"], ["doctor", "--json"], ["--help"], ["help", "doctor"], ["help", "config"]]) {
+        const result = await runCli(serverUrl, home, argv);
+        const output = `${result.stdout}${result.stderr}`;
+        assert.doesNotMatch(output, /no-mistakes/i, `${argv.join(" ")} still mentions no-mistakes`);
+        assert.doesNotMatch(output, /perch project set .* --mode/, `${argv.join(" ")} still suggests a removed command`);
+      }
+      // `perch runtime` was the bundled no-mistakes provenance command.
+      const runtime = await runCli(serverUrl, home, ["runtime", "show"]);
+      assert.equal(runtime.code, 1);
+      assert.match(runtime.stderr, /unknown command: runtime/);
     });
   } finally {
     rmSync(home, { recursive: true, force: true });

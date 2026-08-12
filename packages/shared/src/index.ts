@@ -688,8 +688,7 @@ export type TaskEventRequest = {
   // done. The server canonicalizes and verifies it before persisting a fact.
   pr?: string;
   // Structured payload persisted onto the event verbatim (server-bounded in
-  // size). data.noMistakes carries a NoMistakesGate when a worker's ask-user
-  // gate parks the no-mistakes pipeline. Append-only wire change.
+  // size). Append-only wire change.
   data?: Record<string, unknown>;
 };
 
@@ -737,99 +736,6 @@ export type CompletionDecisionResponse = {
   queued?: boolean;
   task: Task;
 };
-
-// The documented shape of TaskEvent.data.noMistakes: a worker driving the
-// no-mistakes pipeline hits an ask-user gate and POSTs needs_decision with
-// the gate's findings table copied verbatim - perch never parses pipeline
-// output itself, so upstream vocabulary (severity, action) passes through
-// as-is. Append-only: add optional fields, never remove or narrow.
-export type NoMistakesFinding = {
-  id: string;
-  severity: string; // upstream's word, verbatim (error, warning, ...)
-  file?: string;
-  line?: number;
-  action?: string; // what the gate proposes (fix, ask-user, ...)
-  description: string; // full finding text, verbatim, never paraphrased
-};
-
-export type NoMistakesGate = {
-  step: string; // the pipeline step that parked the run (review, test, ...)
-  runId?: string;
-  findings: NoMistakesFinding[];
-};
-
-// Rides the POST /projects response when the request set mode: "no-mistakes"
-// (O2: the mode set is the consent, so init runs immediately). Append-only.
-export type NoMistakesInitResult = {
-  ran: boolean; // init executed (binary present)
-  initialized: boolean; // gate remote present after the attempt
-  ready: boolean; // binary present AND initialized
-  // What is missing or what upstream printed, verbatim, with the fix command.
-  warning?: string;
-  output?: string; // upstream init output on success
-};
-
-// 422 body when POST /tasks refuses to dispatch a no-mistakes task into a
-// gate that is not ready: each missing piece names the command that fixes it.
-export type NoMistakesDispatchRefusal = {
-  error: string;
-  noMistakes: {
-    binaryFound: boolean;
-    initialized: boolean;
-    missing: string[];
-  };
-};
-
-// Server-verified authorization contract consumed by the no-mistakes launch
-// boundary. The worker supplies its non-secret task scope; the server derives
-// mode and runtime generation from the durable ledger behind its per-session
-// hook credential.
-export type NoMistakesAuthorizationRequest = {
-  protocolVersion: "1";
-  requestId: string;
-  operation: "run" | "gate-push" | "agent-launch";
-  taskId: string;
-  runtimeGeneration: number;
-  sessionId: string;
-  projectPath: string;
-  repository: string;
-  worktreePath: string;
-  branch: string;
-  durableMode: TaskMode;
-};
-
-export type NoMistakesAuthorizationResponse = {
-  protocolVersion: "1";
-  requestId: string;
-  operation: "run" | "gate-push" | "agent-launch";
-  taskId: string;
-  runtimeGeneration: number;
-  sessionId: string;
-  projectPath: string;
-  repository: string;
-  worktreePath: string;
-  branch: string;
-  durableMode: TaskMode;
-  allowed: boolean;
-  reason: string;
-};
-
-// The boss's answer to a parked no-mistakes gate (POST /tasks/:id/decision,
-// device/server token; also a relay RPC). One action per gate, mirroring
-// upstream's `axi respond` verbs; findingIds and instructions ride only with
-// "fix" (the other actions take neither). The server translates the answer
-// into the matching `no-mistakes axi respond ...` line and injects it into
-// the worker session's composer through the queue-gated path - perch itself
-// never drives axi.
-export type TaskDecisionAction = "approve" | "fix" | "skip";
-
-export type TaskDecisionRequest = {
-  action: TaskDecisionAction;
-  findingIds?: string[];
-  instructions?: string;
-};
-
-export type TaskDecisionResponse = { ok: true; queued: boolean; task: Task };
 
 export type TasksResponse = { tasks: Task[] };
 export type TaskDetailResponse = { task: Task; events: TaskEvent[] };
@@ -1461,12 +1367,12 @@ export type ModelsResponse = {
 };
 
 // Environment doctor (GET /doctor): the external tools perch depends on -
-// agent CLIs, gh, the no-mistakes gate - checked on the Mac the server runs
-// on (the environment that actually spawns agents). The CLI renders this;
+// agent CLIs and gh - checked on the Mac the server runs on (the environment
+// that actually spawns agents). The CLI renders this;
 // `perch doctor --fix` (T2) installs from the same install hints.
 // Append-only: clients tolerate unknown tool names and extra fields.
 export type DoctorToolStatus = {
-  // "claude" | "codex" | "gh" | "no-mistakes" today; append-only.
+  // "claude" | "codex" | "gh" today; append-only.
   name: string;
   required: boolean;
   found: boolean;
@@ -1475,8 +1381,8 @@ export type DoctorToolStatus = {
   // Parsed version string (e.g. "2.1.19", "v1.31.2"); absent when the
   // binary was found but did not report one.
   version?: string;
-  // Extra state beyond presence: gh auth state, no-mistakes daemon state,
-  // or why the version probe failed.
+  // Extra state beyond presence: gh auth state, or why the version probe
+  // failed.
   note?: string;
   // The exact command that installs this tool (shown when missing).
   installHint: string;
@@ -1501,8 +1407,7 @@ export type DoctorFixAction = {
   // knobs (configuration, never patching). The CLI applies each variable only
   // when the user has not already set it, so an exported value always wins.
   env?: Record<string, string>;
-  // kind=install: plain-language note shown with the action (e.g. the
-  // no-mistakes telemetry opt-out and how to re-enable it).
+  // kind=install: plain-language note shown with the action.
   note?: string;
   // kind=manual: the exact next commands the user runs themselves.
   commands?: string[];
@@ -1510,27 +1415,11 @@ export type DoctorFixAction = {
   reason?: string;
 };
 
-// Per-registered-project no-mistakes gate readiness: a repo is initialized
-// when `no-mistakes init` added its `no-mistakes` git remote, and ready when
-// the binary is also installed.
-export type DoctorProjectGate = {
-  rootPath: string;
-  name: string;
-  mode?: string;
-  initialized: boolean;
-  ready: boolean;
-  note?: string;
-};
-
 export type DoctorResponse = {
   at: string;
   // True when every required tool is present.
   ok: boolean;
   tools: DoctorToolStatus[];
-  noMistakes: {
-    binaryFound: boolean;
-    projects: DoctorProjectGate[];
-  };
   // What `perch doctor --fix` would do right now; empty when there is
   // nothing to install and nothing manual outstanding.
   fix: DoctorFixAction[];

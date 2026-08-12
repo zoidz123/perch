@@ -247,7 +247,7 @@ test("legacy active workers receive an atomic persisted name without rewriting h
 test("event data rides the ledger verbatim and reaches subscribers", () => {
   const { store: tasks, home } = store();
   const task = tasks.create({ title: "gated ship", project: "/tmp/repo" });
-  const noMistakes = {
+  const structured = {
     step: "review",
     findings: [{ id: "r1", severity: "error", file: "src/db.ts", line: 8, action: "ask-user", description: "index drop" }]
   };
@@ -262,12 +262,12 @@ test("event data rides the ledger verbatim and reaches subscribers", () => {
     kind: "needs_decision",
     source: "worker",
     message: "review gate: 1 finding needs you",
-    data: { noMistakes }
+    data: { structured }
   });
 
-  assert.deepEqual(observed, { noMistakes });
+  assert.deepEqual(observed, { structured });
   const persisted = tasks.events(task.id).find((event) => event.kind === "needs_decision");
-  assert.deepEqual(persisted?.data, { noMistakes });
+  assert.deepEqual(persisted?.data, { structured });
   // Events without data keep the field absent entirely (append-only wire).
   tasks.recordEvent(task.id, { kind: "working", source: "worker" });
   const working = tasks.events(task.id).find((event) => event.kind === "working");

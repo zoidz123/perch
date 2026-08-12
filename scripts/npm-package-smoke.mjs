@@ -89,7 +89,7 @@ try {
   command(localBin, ["--help"]);
   const projectHelp = command(localBin, ["project", "--help"]);
   assert.match(projectHelp, /ship, scout, or operate/);
-  assert.doesNotMatch(projectHelp, /direct-PR\|no-mistakes\|local-only/);
+  assert.doesNotMatch(projectHelp, /direct-PR\|local-only/);
   assert.doesNotMatch(projectHelp, /yolo/i);
   assert.doesNotMatch(
     readFileSync(join(localPrefix, "node_modules/perchctl/apps/server/assets/mate/AGENTS.md"), "utf8"),
@@ -100,12 +100,11 @@ try {
   command(process.execPath, ["-e", `import(${JSON.stringify(pathToFileURL(join(localPrefix, "node_modules/perchctl/packages/shared/dist/index.js")).href)})`]);
   command(process.execPath, ["-e", `import(${JSON.stringify(pathToFileURL(join(localPrefix, "node_modules/perchctl/packages/relay/dist/index.js")).href)})`]);
   command(process.execPath, ["-e", `import(${JSON.stringify(pathToFileURL(join(localPrefix, "node_modules/perchctl/apps/server/dist/autoreviewRuntime.js")).href)}).then(({ resolveBundledAutoReview }) => resolveBundledAutoReview())`]);
-  assertBundledRuntime(join(localPrefix, "node_modules/perchctl"));
   assertBundledAutoReview(join(localPrefix, "node_modules/perchctl"));
 
   // better-sqlite3 is an existing native dependency with its own install
   // script. The ignore-scripts lanes above and below prove the bundled
-  // no-mistakes runtime itself needs no lifecycle hook or network download.
+  // AutoReview helper itself needs no lifecycle hook or network download.
   // Use an ordinary isolated install for the full server smoke.
   npm(["install", "--prefix", functionalPrefix, tarball]);
   const functionalBin = join(functionalPrefix, "node_modules/.bin/perch");
@@ -129,7 +128,6 @@ try {
   const globalBin = join(globalPrefix, "bin/perch");
   command(globalBin, ["--help"]);
   assert.equal(command(globalBin, ["--version"]).trim(), pack.version);
-  assertBundledRuntime(join(globalPrefix, "lib/node_modules/perchctl"));
   assertBundledAutoReview(join(globalPrefix, "lib/node_modules/perchctl"));
   waitForStop();
   npm(["uninstall", "--global", "--prefix", globalPrefix, pack.name]);
@@ -169,11 +167,6 @@ function auditPack(pack) {
     "apps/server/assets/autoreview/skill/scripts/test-review-harness",
     "packages/shared/dist/index.js",
     "packages/relay/dist/cli.js",
-    "vendor/no-mistakes/manifest.json",
-    "vendor/no-mistakes/LICENSE.upstream",
-    "vendor/no-mistakes/LICENSE.fork",
-    "vendor/no-mistakes/darwin-arm64/no-mistakes",
-    "vendor/no-mistakes/darwin-x64/no-mistakes",
     "THIRD_PARTY_NOTICES.md"
   ];
   for (const path of required) {
@@ -189,7 +182,6 @@ function auditPack(pack) {
     /^apps\/server\/dist\/charts\/vendor\/LICENSE$/,
     /^apps\/server\/assets\//,
     /^packages\/(shared|relay)\/dist\/.*\.js$/,
-    /^vendor\/no-mistakes\/(manifest\.json|LICENSE\.(upstream|fork)|darwin-(arm64|x64)\/no-mistakes)$/,
     /^THIRD_PARTY_NOTICES\.md$/
   ];
   for (const path of paths) {
@@ -200,25 +192,9 @@ function auditPack(pack) {
 
   const bin = pack.files.find((file) => file.path === "bin/perch.mjs");
   assert(bin && (bin.mode & 0o111) !== 0, "perch bin is not executable");
-  for (const path of ["vendor/no-mistakes/darwin-arm64/no-mistakes", "vendor/no-mistakes/darwin-x64/no-mistakes"]) {
-    const runtime = pack.files.find((file) => file.path === path);
-    assert(runtime && (runtime.mode & 0o111) !== 0, `${path} is not executable`);
-  }
   for (const path of ["apps/server/assets/autoreview/skill/scripts/autoreview", "apps/server/assets/autoreview/skill/scripts/test-review-harness"]) {
     const helper = pack.files.find((file) => file.path === path);
     assert(helper && (helper.mode & 0o111) !== 0, `${path} is not executable`);
-  }
-}
-
-function assertBundledRuntime(packageRoot) {
-  const manifest = JSON.parse(readFileSync(join(packageRoot, "vendor/no-mistakes/manifest.json"), "utf8"));
-  assert.equal(manifest.releaseTag, "v1.39.0-perch.1");
-  assert.equal(manifest.authorizationProtocol, "1");
-  assert.equal(manifest.forkCommit, "2d35e552b4cbc191b06abcadc3b05fd3da510d26");
-  for (const key of ["darwin-arm64", "darwin-x64"]) {
-    const entry = manifest.platforms[key];
-    const bytes = readFileSync(join(packageRoot, "vendor/no-mistakes", entry.path));
-    assert.equal(createHash("sha256").update(bytes).digest("hex"), entry.binarySha256);
   }
 }
 

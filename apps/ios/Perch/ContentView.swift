@@ -1563,9 +1563,6 @@ struct SessionDetailView: View {
     @State private var showPlansHub = false
     @FocusState private var composerFocused: Bool
     @StateObject private var dictation = VoiceDictation()
-    // The no-mistakes gate this session's task is parked on, if any (resolved
-    // from the task's event log while the task is in needs_you).
-    @State private var pendingGate: PendingGate?
 
     private var session: AgentSession? {
         store.session(for: sessionId)
@@ -1636,12 +1633,6 @@ struct SessionDetailView: View {
         .task {
             await store.select(sessionId, token: selectionToken)
         }
-        // Re-resolve the parked gate whenever the task's ledger moves (every
-        // event bumps updatedAt, so re-parked gates and decisions recorded
-        // elsewhere both retrigger through the tasks poll).
-        .task(id: "\(sessionTask?.id ?? "none"):\(sessionTask?.updatedAt ?? "-")") {
-            await refreshPendingGate()
-        }
         .onDisappear {
             store.closeDetail(sessionId, token: selectionToken)
         }
@@ -1662,24 +1653,6 @@ struct SessionDetailView: View {
         } else {
             AgentChatPlaceholder(agent: session?.agent ?? .unknown)
         }
-    }
-
-    // Resolve the gate this session's task is parked on: the latest
-    // needs_decision event carrying findings, plus whether a decision note
-    // already answers it on the ledger.
-    private func refreshPendingGate() async {
-        guard let task = sessionTask, task.state == "needs_you" else {
-            pendingGate = nil
-            return
-        }
-        let events = await store.taskEvents(task.id)
-        guard let gateEvent = events.last(where: { $0.kind == "needs_decision" && $0.data?.noMistakes != nil }),
-              let gate = gateEvent.data?.noMistakes else {
-            pendingGate = nil
-            return
-        }
-        let answered = events.contains { $0.seq > gateEvent.seq && $0.data?.noMistakesDecision != nil }
-        pendingGate = PendingGate(taskId: task.id, gate: gate, eventSeq: gateEvent.seq, answered: answered)
     }
 
     private var header: some View {
@@ -1801,37 +1774,6 @@ struct SessionDetailView: View {
                         await store.approve(sessionId, decision: decision, approvalId: approval.id)
                     }
                     .padding(.horizontal, 12)
-                }
-
-                // A parked no-mistakes gate renders as a native decision card while
-                // the task needs the boss; answered from this phone, it collapses
-                // to what was sent until the worker resumes; answered elsewhere
-                // (the mate, another phone), no card. Non-no-mistakes
-                // needs_decision moments keep today's rendering (no gate data,
-                // no card).
-                if let task = sessionTask, task.state == "needs_you",
-                   let pending = pendingGate, pending.taskId == task.id {
-                    if let summary = store.sentDecisions[pending.sentKey] {
-                        SentDecisionChip(summary: summary)
-                            .padding(.horizontal, 12)
-                    } else if !pending.answered {
-                        DecisionChip(pending: pending) { action, findingIds, instructions in
-                            let error = await store.decideTask(
-                                task.id,
-                                action: action,
-                                findingIds: findingIds,
-                                instructions: instructions
-                            )
-                            if error == nil {
-                                store.sentDecisions[pending.sentKey] = decisionSummaryLabel(
-                                    action: action,
-                                    findingIds: findingIds
-                                )
-                            }
-                            return error
-                        }
-                        .padding(.horizontal, 12)
-                    }
                 }
 
                 if let question = session?.pendingQuestion {

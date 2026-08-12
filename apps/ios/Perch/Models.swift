@@ -769,63 +769,6 @@ extension ProviderUsage {
 struct TasksResult: Codable { let tasks: [AgentTask] }
 struct TaskCreateResult: Codable { let task: AgentTask }
 
-// One row of a task's event log (GET /tasks/:id). Only the no-mistakes
-// shapes inside `data` are modeled; anything else in there is ignored.
-struct TaskEventModel: Codable, Equatable {
-    let seq: Int
-    let at: String
-    let kind: String
-    let message: String?
-    let data: TaskEventDataModel?
-}
-
-// Decoded leniently: a malformed gate or decision fails only its own field,
-// so the event (and the whole log) still decodes and the chat keeps its
-// plain-text rendering instead of losing the timeline to one bad row.
-struct TaskEventDataModel: Codable, Equatable {
-    let noMistakes: NoMistakesGateModel?
-    let noMistakesDecision: NoMistakesDecisionModel?
-
-    init(from decoder: Decoder) throws {
-        let container = try decoder.container(keyedBy: CodingKeys.self)
-        noMistakes = (try? container.decodeIfPresent(NoMistakesGateModel.self, forKey: .noMistakes)) ?? nil
-        noMistakesDecision =
-            (try? container.decodeIfPresent(NoMistakesDecisionModel.self, forKey: .noMistakesDecision)) ?? nil
-    }
-}
-
-// The gate a worker's no-mistakes pipeline parked on (data.noMistakes on a
-// needs_decision event): the findings table verbatim, as the worker copied it
-// from the gate. Severity/action are upstream's words, not an enum.
-struct NoMistakesFindingModel: Codable, Equatable, Identifiable {
-    let id: String
-    let severity: String?
-    let file: String?
-    let line: Int?
-    let action: String?
-    let description: String
-}
-
-struct NoMistakesGateModel: Codable, Equatable {
-    let step: String
-    let runId: String?
-    let findings: [NoMistakesFindingModel]
-}
-
-// A decision recorded back onto the ledger (data.noMistakesDecision on a
-// note event): its presence after the gate means the gate is answered.
-struct NoMistakesDecisionModel: Codable, Equatable {
-    let step: String?
-    let action: String
-    let findingIds: [String]?
-    let instructions: String?
-}
-
-struct TaskDetailResult: Codable {
-    let task: AgentTask
-    let events: [TaskEventModel]
-}
-
 struct ProjectsResult: Codable { let projects: [Project] }
 struct SuggestResult: Codable { let paths: [String] }
 

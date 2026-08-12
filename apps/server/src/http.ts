@@ -35,16 +35,12 @@ import type {
   ModelsResponse,
   ModelSwitchRequest,
   ModelSwitchResponse,
-  NoMistakesAuthorizationRequest,
-  NoMistakesAuthorizationResponse,
   PlanDocResponse,
   StartAgentRequest,
   StartAgentResponse,
   ServerRequestResponse,
   SubmitResponse,
   Task,
-  TaskDecisionRequest,
-  TaskDecisionResponse,
   TaskDetailResponse,
   TaskEventKind,
   TaskEventRequest,
@@ -83,19 +79,7 @@ import { isVerifiedPrelaunchDispatchFailure } from "./dispatchFailures.js";
 import { ASK_USER_QUESTION_TOOL, KEY_DELAY_MS, questionKeystrokes } from "./askQuestion.js";
 import { buildOffer, tokensEqual, type DeviceRegistry } from "./pairing.js";
 import { EncryptedServerChannel } from "./e2ee/channel.js";
-import {
-  collectDoctor,
-  noMistakesRuntimeFacts,
-  type DoctorDeps
-} from "./deps.js";
-import {
-  decisionInjectionLine,
-  decisionMateFyi,
-  decisionSummary,
-  parseNoMistakesGate,
-  type GateDecision
-} from "./findings.js";
-import { taskWakeIdentity } from "./mateWake.js";
+import { collectDoctor, type DoctorDeps } from "./deps.js";
 import type { Project, ProjectRegistry } from "./projects.js";
 import { suggestDirectories } from "./fsSuggest.js";
 import { dispatchBrief } from "./brief.js";
@@ -210,9 +194,8 @@ export type HttpServerOptions = {
   charts?: ChartRegistry;
   // State-machine measurements (G6), served at GET /doctor/state-metrics.
   metrics?: StateMetrics;
-  // Environment-doctor and fake-runtime injection. Production always uses
-  // the signed bundled runtime and never resolves no-mistakes from PATH.
-  doctorDeps?: Pick<DoctorDeps, "env" | "noMistakesPath">;
+  // Environment-doctor injection (PATH source); absent in production.
+  doctorDeps?: Pick<DoctorDeps, "env">;
   // Fleet-level user settings (dispatch defaults, `perch config`). Optional so
   // existing tests keep working; absent means no defaults are ever applied.
   settings?: FleetSettings;
@@ -468,25 +451,6 @@ async function buildConfigResponse(
           : null
       };
     }
-  }
-  const runtime = noMistakesRuntimeFacts();
-  for (const [suffix, value] of Object.entries({
-    version: runtime?.version ?? null,
-    path: runtime?.path ?? null,
-    "SHA-256": runtime?.sha256 ?? null,
-    source: runtime?.source ?? "bundled",
-    architecture: runtime?.architecture ?? null,
-    protocol: runtime?.protocol ?? null
-  })) {
-    entries[`runtime.no-mistakes.${suffix}`] = {
-      effectiveValue: value,
-      source: "bundled",
-      scope: "runtime",
-      storedValue: null,
-      defaultValue: null,
-      overriddenBy: null,
-      readOnly: true
-    };
   }
   response.entries = entries;
   return response;
@@ -808,16 +772,6 @@ async function dispatchWebSocketRpc(
   const recoverMatch = pathname.match(/^\/tasks\/([^/]+)\/recover$/);
   if (method === "POST" && recoverMatch) {
     return recoverTaskRpc(decodeURIComponent(recoverMatch[1] ?? ""), body, options, auditPeer);
-  }
-
-  const decisionMatch = pathname.match(/^\/tasks\/([^/]+)\/decision$/);
-  if (method === "POST" && decisionMatch) {
-    return taskDecisionRpc(
-      decodeURIComponent(decisionMatch[1] ?? ""),
-      body as TaskDecisionRequest,
-      options,
-      auditPeer
-    );
   }
 
   const completionMatch = pathname.match(/^\/tasks\/([^/]+)\/completion$/);
@@ -1298,16 +1252,6 @@ async function route(
     return;
   }
 
-  // The external no-mistakes CLI/daemon calls this immediately before run
-  // creation, gate push, and review-agent launch. A per-session hook token is
-  // non-forgeable and short-lived; every supplied scope field is checked
-  // against the durable task and current runtime generation before mode can
-  // authorize the expensive capability.
-  if (request.method === "POST" && pathname === "/hooks/no-mistakes/authorize") {
-    await handleNoMistakesAuthorization(request, response, options);
-    return;
-  }
-
   // Worker verbs: the dispatched agent reports task state with its own
   // per-session hook token (already in its PTY env), so this route accepts
   // either normal bearer/device auth or hook-token auth - like /hooks, but
@@ -1578,14 +1522,10 @@ async function route(
     }
 
     // Environment doctor: every external tool perch depends on (agent CLIs,
-    // gh, no-mistakes) plus per-registered-project gate readiness, checked in
-    // the environment that actually spawns agents. `perch doctor` renders it.
+    // gh), checked in the environment that actually spawns agents.
+    // `perch doctor` renders it.
     if (request.method === "GET" && pathname === "/doctor") {
-      writeJson(
-        response,
-        200,
-        await collectDoctor({ ...options.doctorDeps, projects: options.projects.list() })
-      );
+      writeJson(response, 200, await collectDoctor({ ...options.doctorDeps }));
       return;
     }
 
@@ -1697,21 +1637,6 @@ async function route(
       const body = await readJsonOrEmpty<{ idempotencyKey?: string }>(request);
       const result = await recoverTaskRpc(
         decodeURIComponent(recoverMatch[1] ?? ""),
-        body,
-        options,
-        auditPeerFor(auth)
-      );
-      writeJson(response, result.status, result.body);
-      return;
-    }
-
-    // The boss answers a parked no-mistakes gate from the phone (device or
-    // server token; hook tokens never - a worker must not answer its own gate).
-    const decisionMatch = pathname.match(/^\/tasks\/([^/]+)\/decision$/);
-    if (request.method === "POST" && decisionMatch) {
-      const body = await readJson<TaskDecisionRequest>(request);
-      const result = await taskDecisionRpc(
-        decodeURIComponent(decisionMatch[1] ?? ""),
         body,
         options,
         auditPeerFor(auth)
@@ -3575,125 +3500,6 @@ async function completionDecisionRpc(
   return rpcOk(200, responseBody);
 }
 
-// The boss's answer to a parked no-mistakes gate (v2 phone surface, O3): the
-// decision becomes the matching `no-mistakes axi respond ...` line injected
-// into the worker session's composer (queue-gated like every mobile message),
-// with a ledger note, an audit record, and an FYI wake to the mate so it
-// never double-answers a gate the boss already resolved.
-async function taskDecisionRpc(
-  taskId: string,
-  body: TaskDecisionRequest,
-  options: HttpServerOptions,
-  auditPeer: Pick<Parameters<AuditLog["write"]>[0], "deviceId">
-): Promise<RpcResult> {
-  const task = options.tasks.find(taskId);
-  if (!task) {
-    return rpcError(404, `Unknown task: ${taskId}`);
-  }
-
-  if (body.action !== "approve" && body.action !== "fix" && body.action !== "skip") {
-    return rpcError(400, "action must be approve, fix, or skip");
-  }
-  if (body.findingIds !== undefined) {
-    if (
-      !Array.isArray(body.findingIds) ||
-      body.findingIds.some((id) => typeof id !== "string" || id.trim().length === 0)
-    ) {
-      return rpcError(400, "findingIds must be an array of non-empty strings");
-    }
-  }
-  if (body.instructions !== undefined) {
-    if (typeof body.instructions !== "string") {
-      return rpcError(400, "instructions must be a string");
-    }
-    if (body.instructions.length > MAX_DECISION_INSTRUCTIONS_CHARS) {
-      return rpcError(400, `instructions too long (max ${MAX_DECISION_INSTRUCTIONS_CHARS} characters)`);
-    }
-  }
-  const findingIds = body.findingIds?.length ? body.findingIds : undefined;
-  const instructions = body.instructions?.trim() ? body.instructions.trim() : undefined;
-  // Upstream's respond only takes --findings/--instructions with fix; anything
-  // the boss typed must reach the pipeline, so refuse rather than drop it.
-  if (body.action !== "fix" && (findingIds || instructions)) {
-    return rpcError(400, 'findingIds and instructions only apply to action "fix"');
-  }
-
-  if (task.state !== "needs_you") {
-    return rpcError(409, `Task is ${task.state}, not waiting on a decision`);
-  }
-  // The gate being answered: the latest needs_decision carrying findings.
-  const gate = [...options.tasks.events(taskId)]
-    .reverse()
-    .map((event) => (event.kind === "needs_decision" ? parseNoMistakesGate(event.data) : undefined))
-    .find((parsed) => parsed !== undefined);
-  if (!gate) {
-    return rpcError(409, "No parked no-mistakes gate on this task");
-  }
-  if (findingIds) {
-    const known = new Set(gate.findings.map((finding) => finding.id));
-    const unknown = findingIds.filter((id) => !known.has(id));
-    if (unknown.length > 0) {
-      return rpcError(409, `Unknown finding ids (the gate may have changed): ${unknown.join(", ")}`);
-    }
-  }
-
-  // The injection target is the worker session driving the pipeline; a dead
-  // worker cannot receive the answer, so fail loudly instead of queueing into
-  // the void.
-  if (!task.sessionId) {
-    return rpcError(409, "Task has no worker session to deliver the decision to");
-  }
-  const sessionId = canonicalSessionIdFor(options.adapter, task.sessionId);
-  const sessions = await options.adapter.listSessions();
-  const worker = sessions.find((session) => session.id === sessionId);
-  if (!worker || worker.status === "done" || worker.status === "error") {
-    return rpcError(409, "The worker session is gone; the decision cannot be delivered");
-  }
-
-  const decision: GateDecision = {
-    action: body.action,
-    ...(findingIds ? { findingIds } : {}),
-    ...(instructions ? { instructions } : {})
-  };
-  const line = decisionInjectionLine(gate, decision);
-  const { queued } = await deliverInput(options, sessionId, line, "human");
-
-  // The ledger keeps the story: a note never moves state (the worker's own
-  // `working` resume does), and the card reads it to stop re-asking.
-  let updated = task;
-  try {
-    updated = options.tasks.recordEvent(taskId, {
-      kind: "note",
-      source: "system",
-      message: `boss decision on ${gate.step} gate: ${decisionSummary(decision)}`,
-      data: { noMistakesDecision: { step: gate.step, ...decision } }
-    });
-  } catch {
-    // The injection already landed; a failed note must not fail the verb.
-  }
-
-  await audit(options.auditLog, {
-    action: "task_decision",
-    sessionId,
-    ...auditPeer,
-    taskId,
-    textLength: line.length
-  });
-
-  // O3: FYI-wake the mate so it never double-answers this gate.
-  const mate = sessions.find((session) => session.labels?.role === "mate");
-  if (mate && mate.id !== sessionId) {
-    try {
-      await options.monitor.queueOrSubmit(mate.id, decisionMateFyi(taskWakeIdentity(updated), gate, decision));
-    } catch {
-      // The mate wake is best-effort; the decision already reached the worker.
-    }
-  }
-
-  const responseBody: TaskDecisionResponse = { ok: true, queued, task: updated };
-  return rpcOk(202, responseBody);
-}
-
 // Free a pool slot whose lease was orphaned: a session that died without a
 // clean release, or a closed task's leftover tree. Live work is refused - a
 // lease whose holder session is still running, or whose task is not closed,
@@ -3973,7 +3779,7 @@ async function handleTaskEvent(
   }
   if (body.kind === "pr_linked" && prUrl) {
     const checkoutPath = (task.worktreeId ? options.worktrees.find(task.worktreeId)?.path : undefined) ?? task.project;
-    const attachment = await options.prPoller.resolveLinkedTaskPr(task, prUrl, checkoutPath);
+    const attachment = await options.prPoller.resolveTaskPr(task, prUrl, checkoutPath);
     if (!attachment.ok) {
       writeJson(response, 409, { error: attachment.reason });
       return;
@@ -3990,9 +3796,8 @@ async function handleTaskEvent(
     pr = attachment.pr;
   }
 
-  // Structured payload (data.noMistakes findings and friends): persisted onto
-  // the event verbatim, bounded so one verb cannot bloat the ledger or the
-  // fan-out to phones and the mate.
+  // Structured payload: persisted onto the event verbatim, bounded so one
+  // verb cannot bloat the ledger or the fan-out to phones and the mate.
   let data: Record<string, unknown> | undefined;
   if (body.data !== undefined) {
     if (body.data === null || typeof body.data !== "object" || Array.isArray(body.data)) {
@@ -4578,167 +4383,6 @@ async function routeMateMailbox(
   }
 
   writeJson(response, 404, { error: "Not found" });
-}
-
-async function handleNoMistakesAuthorization(
-  request: IncomingMessage,
-  response: ServerResponse,
-  options: HttpServerOptions
-): Promise<void> {
-  const presentedSessionId = String(request.headers["x-perch-session"] ?? "");
-  const token = String(request.headers["x-perch-token"] ?? "");
-  if (!presentedSessionId || !token || !options.hooks.verify(presentedSessionId, token)) {
-    writeJson(response, 401, { error: "Unauthorized" });
-    return;
-  }
-  // A rebound codex daemon authenticates with the identity baked into its env
-  // at spawn; the alias (registered only while the recovered generation is
-  // live) resolves it to the live session and runtime.
-  const sessionId = options.hooks.resolveAlias(presentedSessionId);
-
-  // Runtime ownership is authoritative and is bound before the kickoff prompt
-  // can run. Task projection linkage follows immediately after launch, so
-  // deriving through the runtime also closes that small initial dispatch race.
-  const sessionRuntime = options.tasks.stateDb.runtimes.findBySession(sessionId);
-  const task = sessionRuntime
-    ? options.tasks.find(sessionRuntime.taskId)
-    : options.tasks.list().find((candidate) => candidate.sessionId === sessionId);
-  if (!task) {
-    writeJson(response, 403, { error: "No durable task is linked to this worker session" });
-    return;
-  }
-
-  const body = await readJson<NoMistakesAuthorizationRequest>(request);
-  const protocolVersion = boundedPolicyString(body.protocolVersion, 16);
-  const requestId = boundedPolicyString(body.requestId, 128);
-  const taskId = boundedPolicyString(body.taskId, 256);
-  const requestSessionId = boundedPolicyString(body.sessionId, 256);
-  const projectPath = boundedPolicyString(body.projectPath, 4_096);
-  const repository = boundedPolicyString(body.repository, 4_096);
-  const worktreePath = boundedPolicyString(body.worktreePath, 4_096);
-  const branch = boundedPolicyString(body.branch, 512);
-  const operation = boundedPolicyString(body.operation, 32);
-  const durableMode = boundedPolicyString(body.durableMode, 32);
-  const requestGeneration = Number.isSafeInteger(body.runtimeGeneration) ? body.runtimeGeneration : -1;
-  const runtime = sessionRuntime ?? options.tasks.stateDb.runtimes.latestForTask(task.id);
-  // Env cannot change in a surviving daemon: an aliased caller truthfully
-  // echoes the generation recorded at daemon spawn, which the recovery bind
-  // persisted on the live runtime. Anything else must match the live
-  // generation exactly.
-  const daemonEnvGeneration =
-    presentedSessionId !== sessionId && typeof runtime?.metadata?.appServerDaemonGeneration === "number"
-      ? (runtime.metadata.appServerDaemonGeneration as number)
-      : undefined;
-  const expectedWorktree = runtime?.worktreePath ??
-    (task.worktreeId ? options.worktrees.find(task.worktreeId)?.path : undefined);
-  const expectedBranch = task.branch ?? `perch/${task.id}`;
-  const expectedRepository = canonicalRepositoryForPath(expectedWorktree ?? task.project) ??
-    canonicalRepositoryForPath(task.project);
-  const replayed = requestId.length > 0 && options.tasks.events(task.id).some((event) => {
-    const evidence = event.data?.noMistakesAuthorization;
-    return Boolean(
-      evidence &&
-      typeof evidence === "object" &&
-      "requestId" in evidence &&
-      (evidence as { requestId?: unknown }).requestId === requestId
-    );
-  });
-
-  let reason = "authorized";
-  if (
-    protocolVersion !== "1" ||
-    !/^[a-f0-9]{32}$/.test(requestId) ||
-    !taskId ||
-    !requestSessionId ||
-    !projectPath ||
-    !repository ||
-    !worktreePath ||
-    !branch ||
-    !operation ||
-    !durableMode ||
-    requestGeneration < 0
-  ) {
-    reason = "invalid_request";
-  } else if (replayed) {
-    reason = "request_replayed";
-  } else if (taskId !== task.id) {
-    reason = "task_mismatch";
-  } else if (requestSessionId !== presentedSessionId) {
-    reason = "session_mismatch";
-  } else if (canonicalPolicyPath(projectPath) !== canonicalPolicyPath(task.project)) {
-    reason = "project_mismatch";
-  } else if (!expectedRepository || canonicalRepository(repository) !== expectedRepository) {
-    reason = "repository_mismatch";
-  } else if (!runtime) {
-    reason = "runtime_missing";
-  } else if (requestGeneration !== runtime.generation && requestGeneration !== daemonEnvGeneration) {
-    reason = "runtime_generation_mismatch";
-  } else if (runtime.ptySessionId !== sessionId) {
-    reason = "runtime_session_mismatch";
-  } else if (runtime.state !== "live") {
-    reason = "runtime_not_live";
-  } else if (!expectedWorktree || canonicalPolicyPath(worktreePath) !== canonicalPolicyPath(expectedWorktree)) {
-    reason = "worktree_mismatch";
-  } else if (branch !== expectedBranch) {
-    reason = "branch_mismatch";
-  } else if (!new Set(["run", "gate-push", "agent-launch"]).has(operation)) {
-    reason = "unsupported_operation";
-  } else if (durableMode !== task.mode) {
-    reason = "durable_mode_mismatch";
-  } else if (task.mode !== "no-mistakes") {
-    reason = "durable_task_mode_denied";
-  }
-
-  let allowed = reason === "authorized";
-  const decision = (): NoMistakesAuthorizationResponse => ({
-    protocolVersion: "1",
-    requestId,
-    operation: operation as NoMistakesAuthorizationResponse["operation"],
-    taskId,
-    runtimeGeneration: requestGeneration,
-    sessionId: requestSessionId,
-    projectPath,
-    repository: canonicalRepository(repository),
-    worktreePath,
-    branch,
-    durableMode: durableMode as NoMistakesAuthorizationResponse["durableMode"],
-    allowed,
-    reason
-  });
-  try {
-    options.tasks.recordEvent(task.id, {
-      kind: "note",
-      source: "system",
-      message: `no-mistakes authorization ${allowed ? "allowed" : "denied"}: ${reason}`,
-      data: {
-        noMistakesAuthorization: {
-          ...decision(),
-          evidenceVersion: 1
-        }
-      }
-    });
-  } catch {
-    allowed = false;
-    reason = "durable_audit_failed";
-    writeJson(response, 503, decision());
-    return;
-  }
-
-  await audit(options.auditLog, {
-    action: "no_mistakes_authorization",
-    sessionId,
-    taskId: task.id,
-    worktreeId: runtime?.worktreeId,
-    runtimeGeneration: runtime?.generation ?? -1,
-    durableMode: task.mode,
-    requestId,
-    protocolVersion,
-    operation,
-    repository: canonicalRepository(repository),
-    decision: allowed ? "allow" : "deny",
-    reason
-  });
-  writeJson(response, allowed ? 200 : 403, decision());
 }
 
 function canonicalPolicyPath(path: unknown): string {

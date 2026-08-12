@@ -267,63 +267,16 @@ test("solo needs_decision pushes immediately with the friendly copy", () => {
   assert.equal(sent[0]?.body, "perch: which branch?");
 });
 
-const gateData = {
-  noMistakes: {
-    step: "review",
-    findings: [
-      { id: "r1", severity: "warning", file: "src/app.ts", description: "prefer the shared helper" },
-      { id: "r2", severity: "error", file: "src/db.ts", description: "dropping this index changes query plans" }
-    ]
-  }
-};
-
-test("solo needs_decision with a no-mistakes gate pushes the findings, worst first, verbatim", () => {
-  const { router, sent } = harness({ findSession: (id) => (id === "pty:solo" ? soloSession : undefined) });
-  router.taskEvent(task("t-2", { sessionId: "pty:solo", state: "needs_you" }), {
-    kind: "needs_decision",
-    message: "the worker's own prose, superseded by the structured table",
-    data: gateData
-  });
-  assert.equal(sent.length, 1);
-  assert.equal(sent[0]?.title, "Needs your call");
-  assert.equal(
-    sent[0]?.body,
-    "perch: review gate: 2 findings need you - r2 (error): dropping this index changes query plans"
-  );
-});
-
-test("findings push bodies still obey the ~150 char truncation", () => {
-  const { router, sent } = harness({ findSession: (id) => (id === "pty:solo" ? soloSession : undefined) });
-  router.taskEvent(task("t-2", { sessionId: "pty:solo", state: "needs_you" }), {
-    kind: "needs_decision",
-    data: { noMistakes: { step: "review", findings: [{ id: "r1", severity: "error", description: "word ".repeat(60) }] } }
-  });
-  const body = sent[0]?.body ?? "";
-  assert.ok(body.length <= "perch: ".length + 151, `body too long: ${body.length}`);
-  assert.ok(body.endsWith("…"));
-});
-
-test("needs_decision with unparseable data falls back to the message", () => {
-  const { router, sent } = harness({ findSession: (id) => (id === "pty:solo" ? soloSession : undefined) });
-  router.taskEvent(task("t-2", { sessionId: "pty:solo", state: "needs_you" }), {
-    kind: "needs_decision",
-    message: "which branch?",
-    data: { noMistakes: "junk" }
-  });
-  assert.equal(sent[0]?.body, "perch: which branch?");
-});
-
-test("crew gate findings survive the escalation fallback: the late push is findings-formatted", async () => {
+test("crew needs_decision survives the escalation fallback: the late push carries the message", async () => {
   const { router, sent } = harness({ findSession: (id) => (id === "pty:crew" ? crewSession : undefined) });
   router.taskEvent(task("t-1", { sessionId: "pty:crew", state: "needs_you" }), {
     kind: "needs_decision",
-    message: "review gate parked",
-    data: gateData
+    message: "which branch?"
   });
   assert.equal(sent.length, 0);
   await sleep(90);
   assert.equal(sent.length, 1);
-  assert.match(sent[0]?.body ?? "", /review gate: 2 findings need you - r2 \(error\)/);
+  assert.equal(sent[0]?.body, "perch: which branch?");
   router.stop();
 });
 
