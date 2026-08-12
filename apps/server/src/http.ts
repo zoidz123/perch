@@ -3923,7 +3923,7 @@ async function handleTaskEvent(
   let prUrl = typeof body.pr === "string" ? body.pr.trim() : body.kind === "done" ? extractPrUrl(message) : undefined;
   let pr: TaskPr | undefined;
   const legacyTask = task.mode !== undefined;
-  // New ship tasks may only get their PR identity from delivery.create_pr.
+  // New ship tasks may only get their PR identity from delivery_create_pr.
   // Legacy records retain the old discovery path strictly for recovery.
   const requiresPr = legacyTask ? task.kind !== "scout" && task.mode !== "local-only" : task.kind === "ship";
   if (body.kind === "pr_linked" && source !== "worker") {
@@ -3935,7 +3935,7 @@ async function handleTaskEvent(
     return;
   }
   if (body.kind === "pr_linked" && !legacyTask) {
-    writeJson(response, 409, { error: "ship PRs are created and linked only by perch.delivery.create_pr" });
+    writeJson(response, 409, { error: "ship PRs are created and linked only by perch.delivery_create_pr" });
     return;
   }
   if (body.kind === "pr_linked" && !prUrl) {

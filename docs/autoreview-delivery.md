@@ -38,7 +38,7 @@ The bundled skill's Codex Sol high-reasoning default and access-only Terra fallb
 
 ## Worker operations
 
-Codex root workers use `perch.autoreview.run` and `perch.delivery.create_pr` dynamic tools.
+Codex root workers use `perch.autoreview_run` and `perch.delivery_create_pr` dynamic tools.
 
 Claude and other managed workers use `perch autoreview run` and `perch delivery create-pr` with the same task-session authentication and request shape.
 

@@ -939,7 +939,7 @@ export class CodexAppServerClient {
       return;
     }
 
-    if (method === "item/tool/call" && params.namespace === "perch" && params.tool === "autoreview.run") {
+    if (method === "item/tool/call" && params.namespace === "perch" && params.tool === "autoreview_run") {
       const args = isRecord(params.arguments) ? params.arguments : {};
       try {
         const result = await this.onAutoReviewRun?.(args);
@@ -950,7 +950,7 @@ export class CodexAppServerClient {
       return;
     }
 
-    if (method === "item/tool/call" && params.namespace === "perch" && params.tool === "delivery.create_pr") {
+    if (method === "item/tool/call" && params.namespace === "perch" && params.tool === "delivery_create_pr") {
       const args = isRecord(params.arguments) ? params.arguments : {};
       try {
         const result = await this.onDeliveryCreatePr?.(args);
@@ -1060,7 +1060,7 @@ export class CodexAppServerClient {
         }
       }, {
         type: "function" as const,
-        name: "autoreview.run",
+        name: "autoreview_run",
         description: "Run bundled AutoReview for this ship task's exact final tree. The server authenticates the root runtime, runs a supported focused test command in a stripped environment, and returns a durable receipt.",
         inputSchema: {
           type: "object",
@@ -1076,7 +1076,7 @@ export class CodexAppServerClient {
         }
       }, {
         type: "function" as const,
-        name: "delivery.create_pr",
+        name: "delivery_create_pr",
         description: "Create the one server-owned pull request for a clean AutoReview receipt. Refuses stale, failed, or finding-bearing receipts.",
         inputSchema: {
           type: "object",
