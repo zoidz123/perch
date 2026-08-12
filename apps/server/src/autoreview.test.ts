@@ -320,6 +320,21 @@ test("helper failures and actionable findings never produce a clean receipt", as
     cleanup(failure);
   }
 
+  const unrelatedFailure = fixture();
+  try {
+    const review = new AutoReviewService(unrelatedFailure.tasks.stateDb, async () => ({
+      exitCode: 1,
+      stdout: "trufflehog: clean",
+      stderr: "review helper failed after the security scan",
+      report: { findings: [] }
+    }));
+    const result = await review.run(input(unrelatedFailure, "non-trufflehog-failure"));
+    assert.equal(result.attempt.state, "failed");
+    assert.equal(result.attempt.failureCode, "helper_failed");
+  } finally {
+    cleanup(unrelatedFailure);
+  }
+
   const finding = fixture();
   try {
     const review = new AutoReviewService(finding.tasks.stateDb, async () => ({

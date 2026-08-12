@@ -45,7 +45,7 @@ npm rm --global perchctl
 
 `perch uninstall --dry-run` prints the exact changes without writing them.
 The command preserves user hooks and `~/.perch` state by default.
-Use `perch uninstall --purge-data` to remove the local ledger, worktrees, pairing data, tokens, and charts too.
+Use `perch uninstall --purge-data` to remove the local ledger, worktrees, pairing data, tokens, and attachments too.
 The command refuses to run while the server is live unless `--force` is supplied.
 
 ## Projects and task kinds
@@ -203,7 +203,6 @@ Important paths are:
 | `state.sqlite` | Durable control-plane database described in [Architecture](architecture.md#durable-task-state) |
 | `worktrees/` | Isolated git worktree pool |
 | `mate/` | Mate home and managed instructions |
-| `charts/` | Canonical registered charts |
 | `attachments/` | Session attachment scratch space |
 | `audit.jsonl` | Best-effort metadata-only mobile mutation audit; append failure does not fail the mutation |
 

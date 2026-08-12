@@ -376,24 +376,6 @@ export type AgentEvent =
       sessionId: string;
       status: AgentSessionStatus;
       at: string;
-    }
-  | {
-      // A registered chart appeared, its HTML file changed on disk, its owning
-      // task closed (archived), or it was approved (finalized); clients showing
-      // it refetch GET /charts/:id. Routed to the owning session's detail
-      // subscribers, and additionally to the parent (mate) session's
-      // subscribers for crew charts. Append-only: older clients ignore it and
-      // ignore reasons they do not know.
-      type: "chart";
-      sessionId: string;
-      chartId: string;
-      name: string;
-      reason: "registered" | "updated" | "archived" | "finalized";
-      // Task linkage for crew charts, so a supervising surface can tag the
-      // card with the originating task.
-      taskId?: string;
-      taskTitle?: string;
-      at: string;
     };
 
 export type HealthResponse = {
@@ -600,11 +582,8 @@ export type Task = {
   branch?: string;
   pr?: TaskPr;
   presentation?: TaskPresentation;
-  // The finalized plan this task builds from, stamped at dispatch. An opaque
-  // key (the plan doc's repo-relative path, e.g. "docs/plans/2026-07-08-foo.md",
-  // or the finalizing chart's id) so a plan edit can look up its affected
-  // in-flight tasks deterministically instead of guessing. Absent on
-  // unstamped tasks.
+  // Legacy-only. Kept optional so historic task records remain decodable
+  // without a destructive migration. No current task surface creates it.
   planId?: string;
   // Derived from the authoritative runtimes table. It is returned by APIs but
   // is not part of the persisted task projection.
@@ -614,8 +593,8 @@ export type Task = {
 };
 
 // Worker verbs, plus poller/system-sourced reconciliations.
-// "stalled" and "chart_ready" are server-emitted only. They move no task
-// state and exist to wake the orchestrator at the moment attention is needed.
+// "stalled" is server-emitted only. It moves no task state and exists to wake
+// the orchestrator at the moment attention is needed.
 export type TaskEventKind =
   | "created"
   | "working"
@@ -635,7 +614,6 @@ export type TaskEventKind =
   | "landed"
   | "closed"
   | "stalled"
-  | "chart_ready"
   | "runtime_interrupted"
   | "note";
 
@@ -668,22 +646,6 @@ export type CreateTaskRequest = {
   // Reusing it returns the original task and never launches a second worker.
   idempotencyKey?: string;
   parent?: string; // crew parentage (labels.parent)
-  // The finalized plan this task builds from.
-  // Stamped onto the Task so plan edits find affected work by lookup, not guess.
-  // When `planEdit` is set and `planId` is omitted, the server defaults it to
-  // the edited plan's path.
-  planId?: string;
-  // Edit-a-finalized-plan-as-a-commit: the boss's revised plan markdown, landed
-  // as a git commit by the dispatched worker (never a server fs write - the
-  // HARD INVARIANT is the server never touches a project repo). The server
-  // stages the content centrally under the task dir and the dispatch brief
-  // tells the worker to commit it to `path` as the first commit of its branch.
-  planEdit?: {
-    // Repo-relative destination, must live under docs/plans/ and end in .md.
-    path: string;
-    // The full new markdown content of the plan doc.
-    content: string;
-  };
 };
 
 export type TaskEventRequest = {
@@ -744,169 +706,6 @@ export type CompletionDecisionResponse = {
 
 export type TasksResponse = { tasks: Task[] };
 export type TaskDetailResponse = { task: Task; events: TaskEvent[] };
-
-// --- Charts: artifact review built into the perch server -------------------
-// A chart is an HTML file an agent draws up for boss review, bound at
-// registration to its owning session (and task, when the session has one).
-// Key = hash of the canonical file path. All shapes are append-only.
-
-// A chart's pipeline stage: a brainstorm draft, or finalized (approved) into
-// an implementation plan. Two states only; orthogonal to the task-lifecycle
-// `archived` flag below.
-export type ChartStatus = "draft" | "finalized";
-
-export type Chart = {
-  id: string;
-  // Display name: the file's basename without .html.
-  name: string;
-  // Canonical absolute path of the chart HTML on this Mac.
-  file: string;
-  // Pipeline stage: "draft" (brainstorm) or "finalized" (approved). Absent on
-  // charts registered before the two-state model shipped; read as "draft".
-  status?: ChartStatus;
-  // When the chart was marked finalized (approved).
-  finalizedAt?: string;
-  // The session feedback routes to (composer injection into its PTY).
-  sessionId: string;
-  // Task linkage when the owning session was a dispatched worker.
-  taskId?: string;
-  // Owning project declared at registration (the mate path): the resolved
-  // absolute rootPath of a tracked project this chart is about. Lets a chart
-  // group under its project even without task linkage. Absent on charts that
-  // never declared one; grouping then falls back to task linkage.
-  projectRoot?: string;
-  // The owning task's title at registration, so surfaces can tag a crew
-  // chart without a task lookup.
-  taskTitle?: string;
-  // Crew parentage at registration (the owning session's labels.parent,
-  // normally the mate): crew charts also surface in this session's chat.
-  parentSessionId?: string;
-  // When the durable copy under ~/.perch/charts/<id>/ was last written.
-  // The server serves from that snapshot, so a chart outlives its worktree.
-  snapshotAt?: string;
-  // Set when the owning task closed: still servable and viewable, but no
-  // longer part of "what is latest".
-  archived?: boolean;
-  archivedAt?: string;
-  registeredAt: string;
-  updatedAt: string;
-};
-
-export type RegisterChartRequest = {
-  // Path to the chart HTML file. Hook-token callers send only this; the
-  // server resolves the owning session from the token. Server-token callers
-  // must name the owning session explicitly (the mate registering charts).
-  file: string;
-  sessionId?: string;
-  // The project this chart is about (the mate path, where there is no task to
-  // infer it from). Accepts a tracked project's absolute rootPath OR its name;
-  // the server resolves it to a rootPath and persists it as `chart.projectRoot`.
-  // Optional: omitting it preserves task-linkage grouping. An unresolvable
-  // value is rejected (400), never silently dropped.
-  project?: string;
-};
-
-export type RegisterChartResponse = {
-  chart: Chart;
-  // Server-relative URL the chart is served at (SDK injected).
-  url: string;
-};
-
-export type ChartsResponse = { charts: Chart[] };
-
-// A committed implementation plan discovered by scanning a project's
-// docs/plans/*.md. Every committed plan doc is a finalized plan, regardless
-// of its own `Status:` header (which
-// tracks implementation status, a different axis).
-export type ChartPlanDoc = {
-  // Absolute path of the plan markdown on this Mac.
-  path: string;
-  // Repo-relative path, e.g. "docs/plans/2026-07-08-foo.md".
-  relativePath: string;
-  // First `# ` heading, or the filename when the doc has none.
-  title: string;
-  // YYYY-MM-DD parsed from the filename prefix, when present.
-  date?: string;
-};
-
-// One tracked project's slice of the hub: its registered charts (with
-// Draft/Finalized status) and its committed implementation plans.
-export type ChartsHubProject = {
-  rootPath: string;
-  name: string;
-  charts: Chart[];
-  plans: ChartPlanDoc[];
-};
-
-// The unified hub listing both front-ends consume (the mobile Charts sheet and
-// the desktop /charts gallery): everything grouped by project, plus charts that
-// resolve to no tracked project (drawn outside a task).
-export type ChartsHubResponse = {
-  projects: ChartsHubProject[];
-  ungrouped: Chart[];
-};
-
-// The result of approving a chart (POST /charts/:id/finalize): the chart in its
-// finalized state.
-export type FinalizeChartResponse = { chart: Chart };
-
-// A committed plan doc rendered in chart styling (GET /charts/plan?path=...):
-// the raw HTTP route returns this HTML directly as text/html; the relay RPC
-// wraps it as JSON so relay clients (which cannot fetch raw HTML) load it into
-// a WKWebView. Read-only; the server confines reads to tracked projects'
-// docs/plans.
-export type PlanDocResponse = { html: string };
-
-// One annotation from the review surface, in the injected SDK's shape:
-// element (selector + quoted text), text-range, or Mermaid node target.
-export type ChartAnnotation = {
-  prompt?: string;
-  selector?: string;
-  tag?: string;
-  text?: string;
-  target?: Record<string, unknown>;
-};
-
-export type ChartFeedbackRequest = {
-  // Free-form message alongside (or instead of) the annotations.
-  message?: string;
-  annotations?: ChartAnnotation[];
-};
-
-export type ChartFeedbackResponse = {
-  ok: true;
-  // True when the block was queued server-side (permission prompt open).
-  queued: boolean;
-};
-
-// A layout-audit finding from the injected SDK (machine feedback).
-export type ChartLayoutWarning = {
-  selector: string;
-  kind: string;
-  overflowPx: number;
-  viewportWidth: number;
-  severity: "error" | "warning";
-};
-
-export type ChartLayoutWarningsRequest = {
-  layout_warnings?: ChartLayoutWarning[];
-  layoutWarnings?: ChartLayoutWarning[];
-};
-
-// JSON-wrapped chart document for transports that cannot fetch raw HTML
-// (the relay RPC surface, where every response rides a JSON rpc_response).
-// `html` already has the annotation SDK injected, same as GET /charts/:id.
-export type ChartHtmlResponse = {
-  chart: Chart;
-  html: string;
-};
-
-// A chart sibling asset (or chart.css) as base64, for the same JSON-only
-// transports. Directory confinement matches the raw asset route.
-export type ChartAssetResponse = {
-  base64: string;
-  contentType: string;
-};
 
 export type CommandResponse = {
   ok: true;

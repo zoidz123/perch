@@ -88,8 +88,6 @@ final class PerchStore: ObservableObject {
     // to serve /config - the settings popup then shows what it can and its
     // writes fail loudly rather than silently doing nothing.
     @Published var config: ConfigResponse?
-    // The committed plan whose read-only render is open (hub taps set this).
-    @Published var openPlan: PlanDocument?
     // In-flight timeline hole fetches (gap detection), per session.
     private var timelineCatchUps = Set<String>()
     private var timelineRevisionsBySession: [String: Int] = [:]
@@ -358,7 +356,6 @@ final class PerchStore: ObservableObject {
         pendingEffortBySession = [:]
         models = nil
         config = nil
-        openPlan = nil
         timelineCatchUps = []
         errorMessage = nil
         taskRefreshErrorMessage = nil
@@ -2133,42 +2130,9 @@ final class PerchStore: ObservableObject {
             if let updated = WorkspaceGrouping.applyingStatus(status, to: sessionId, in: sessions) {
                 sessions = updated
             }
-        case .chart:
-            // Keep decoding the append-only wire event so an old or newer
-            // server cannot drop the socket. Charts no longer have a mobile
-            // presentation or fetch path.
-            break
         default:
             break
         }
-    }
-
-    // The server's established plans route also contains deprecated chart
-    // fields. PlansHubResponse decodes only the committed plans needed here.
-    func fetchPlansHub() async throws -> PlansHubResponse {
-        try await request(path: "/charts/hub")
-    }
-
-    // A committed plan rendered server-side. The route remains the server's
-    // compatibility endpoint; the phone loads one self-contained document on
-    // LAN or through relay RPC.
-    func planHtml(_ relativePath: String) async throws -> String {
-        let query = relativePath.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) ?? relativePath
-        if isRelayActive {
-            let result: PlanHtmlResult = try await rpcDecoding(
-                method: "GET",
-                path: "/charts/plan?path=\(query)"
-            )
-            return result.html
-        }
-        var request = try makeRequest(path: "/charts/plan?path=\(query)")
-        request.httpMethod = "GET"
-        let (data, response) = try await URLSession.shared.data(for: request)
-        try validate(response, data: data)
-        guard let html = String(data: data, encoding: .utf8) else {
-            throw PerchClientError.invalidResponse
-        }
-        return html
     }
 
     // Apply a live assistant-reply frame. Each frame carries the full text so

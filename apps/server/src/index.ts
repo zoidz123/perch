@@ -15,7 +15,6 @@ import {
   taskCapabilityEnvironment,
   surfaceApprovalToTask
 } from "./agentLauncher.js";
-import { ChartRegistry, wireChartArchive } from "./charts.js";
 import { claudeStateFilePath } from "./claudeTrust.js";
 import { readConfig } from "./config.js";
 import {
@@ -31,7 +30,7 @@ import { DeviceRegistry, serverIdentity, tokensEqual } from "./pairing.js";
 import { readOrCreateBoxKeyPair } from "./e2ee/keys.js";
 import { RelayClient } from "./relayClient.js";
 import type { ClientAuth } from "./fleetMonitor.js";
-import { deliverMateAttention, MateMailboxNudger, wireChartWake } from "./mateWake.js";
+import { deliverMateAttention, MateMailboxNudger } from "./mateWake.js";
 import { PrPoller } from "./prPoller.js";
 import { ProjectRegistry } from "./projects.js";
 import { StatusReconciler } from "./reconciler.js";
@@ -502,37 +501,6 @@ const outboxWorker = new OutboxWorker({
   }
 });
 
-// Charts: registration and file changes ride the fleet WebSocket to the
-// owning session's subscribers (append-only "chart" message), and a fresh
-// registration is a boss-facing moment - it pushes like approvals do, never
-// absorbed as crew noise. Crew charts additionally fan out to the supervising
-// (mate) session's subscribers, so they surface in the mate's chat too.
-const charts = new ChartRegistry();
-charts.subscribe((chart, event) => {
-  const message = {
-    type: "chart" as const,
-    chartId: chart.id,
-    name: chart.name,
-    reason: event.kind,
-    ...(chart.taskId ? { taskId: chart.taskId } : {}),
-    ...(chart.taskTitle ? { taskTitle: chart.taskTitle } : {}),
-    at: new Date().toISOString()
-  };
-  monitor.publish({ ...message, sessionId: chart.sessionId });
-  if (chart.parentSessionId && chart.parentSessionId !== chart.sessionId) {
-    monitor.publish({ ...message, sessionId: chart.parentSessionId });
-  }
-  if (event.kind === "registered") {
-    pushRouter.chartReady(chart.sessionId, monitor.findSession(chart.sessionId), chart.name);
-  }
-});
-// A crew chart records one durable chart_ready task event at registration.
-// The normal parent/mate wake path relays it immediately; a closing task
-// archives its charts (still servable from the snapshot, just no longer
-// "latest").
-wireChartWake(charts, tasks, (chartId) => `http://127.0.0.1:${config.port}/charts/${chartId}/review`);
-wireChartArchive(tasks, charts);
-
 // Task-transition measurements (G6): the ledger stamps every event with its
 // source; edges (state actually moved) feed the metrics.
 tasks.subscribe((task, event) => {
@@ -776,7 +744,6 @@ const server = createControlServer({
   taskCompletion,
   promptDeliveries,
   metrics,
-  charts,
   settings,
   taskScheduler,
   runtimeManager,
@@ -887,7 +854,6 @@ async function shutdown(): Promise<void> {
     reconciler.stop();
     taskWatchdog?.stop();
     pushRouter.stop();
-    charts.stop();
     relayClient?.stop();
     monitor.stop();
     for (const runtime of tasks.stateDb.runtimes.active()) {

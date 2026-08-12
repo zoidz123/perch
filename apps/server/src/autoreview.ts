@@ -161,7 +161,7 @@ export class AutoReviewService {
               ? "review_target_changed"
               : result.report === undefined && result.exitCode === 0
                 ? "structured_report_missing"
-                : helperFailureCode(`${result.stdout}\n${result.stderr}`)
+                : helperFailureCode(result.stderr)
           } : {})
         }),
         duplicate: false

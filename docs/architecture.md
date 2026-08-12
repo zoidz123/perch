@@ -45,7 +45,7 @@ The real native-collaboration contract test remains opt-in (`PERCH_CODEX_NATIVE_
 `perch claude` and `perch codex` launch real provider sessions.
 `perch run` can host another command, but arbitrary processes do not gain provider timelines or managed recovery.
 
-Repositories, provider processes, credentials, task state, worktrees, attachments, charts, and successfully appended audit records stay on the Mac.
+Repositories, provider processes, credentials, task state, worktrees, attachments, and successfully appended audit records stay on the Mac.
 Perch has no hosted repository runtime or user account.
 
 ## Mate and workers
@@ -114,7 +114,7 @@ The replacement session must still be alive before Perch commits the next runtim
 
 ## iPhone control surface
 
-The native iPhone app shows fleet state, structured timelines, attachments, model controls, usage, plans, charts, and supported approval or question cards.
+The native iPhone app shows fleet state, structured timelines, attachments, model controls, usage, and supported approval or question cards.
 It is chat-first rather than a miniature terminal.
 
 Mutating actions from the phone are authenticated and authorized against current state.

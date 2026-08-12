@@ -1,4 +1,3 @@
-import { mkdirSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { basename, join } from "node:path";
 import { createHash, randomBytes, randomUUID } from "node:crypto";
@@ -91,9 +90,6 @@ export type NewTask = {
   prompt?: string;
   kind?: Task["kind"];
   mode?: Task["mode"];
-  // The finalized plan this task builds from (task <-> plan linkage). Stored
-  // verbatim so `listByPlan` can find a plan's in-flight work deterministically.
-  planId?: string;
 };
 
 export type TaskEventListener = (
@@ -158,7 +154,6 @@ export class TaskStore {
         kind: input.kind ?? "ship",
         state: "queued",
         ...(input.prompt ? { prompt: input.prompt } : {}),
-        ...(input.planId ? { planId: input.planId } : {}),
         createdAt: now,
         updatedAt: now
       };
@@ -234,29 +229,6 @@ export class TaskStore {
       }
     }
     return claimed;
-  }
-
-  // Every task stamped with this plan (task <-> plan linkage): the deterministic
-  // lookup a plan edit uses to find its affected in-flight work instead of
-  // guessing. Recency-sorted, like
-  // `list`. An empty/absent planId matches nothing.
-  listByPlan(planId: string): Task[] {
-    if (!planId) {
-      return [];
-    }
-    return this.list().filter((task) => task.planId === planId);
-  }
-
-  // Stage a plan-edit's proposed markdown centrally under the task's own dir
-  // (~/.perch/tasks/<id>/), NEVER in a project repo - the server never writes
-  // to a repo. The dispatched worker reads this file and commits it to the
-  // plan's docs/plans/ path itself. Returns the staged file's absolute path.
-  stagePlanEdit(id: string, content: string): string {
-    const dir = join(this.root, safeId(id));
-    mkdirSync(dir, { recursive: true });
-    const path = join(dir, "plan-edit.md");
-    writeFileSync(path, content, { mode: 0o600 });
-    return path;
   }
 
   // Merge partial fields (session/worktree linkage, pr, branch) without

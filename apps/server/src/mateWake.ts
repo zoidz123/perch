@@ -1,6 +1,5 @@
 import type { Task, TaskEventKind, TaskEventSource } from "@perch/shared";
 import type { AgentAdapter } from "./adapters/types.js";
-import type { ChartRegistry } from "./charts.js";
 import type { FleetMonitor, SessionStatusChange } from "./fleetMonitor.js";
 import type { MateMailboxRepository } from "./stateDb.js";
 import type { TaskStore } from "./tasks.js";
@@ -11,7 +10,6 @@ import { MAILBOX_CONTROL_PREFIX } from "./timeline.js";
 // silent. "stalled" is watchdog-emitted (a worker went quiet) - it wakes the
 // mate but never pushes the phone.
 export const BOSS_EVENT_KINDS = new Set<TaskEventKind>([
-  "chart_ready",
   "pr_linked",
   "needs_decision",
   "blocked",
@@ -132,13 +130,7 @@ export async function deliverMateWake(
 ): Promise<void> {
   if (!BOSS_EVENT_KINDS.has(event.kind)) return;
   const sessions = await adapter.listSessions();
-  const requestedParent =
-    event.kind === "chart_ready" && typeof event.data?.parentSessionId === "string"
-      ? event.data.parentSessionId
-      : undefined;
-  const target =
-    sessions.find((session) => session.id === requestedParent) ??
-    sessions.find((session) => session.labels?.role === "mate");
+  const target = sessions.find((session) => session.labels?.role === "mate");
   if (!target || (task.sessionId && target.id === task.sessionId)) return;
   await monitor.queueOrSubmit(target.id, wakeLine(task, event));
 }
@@ -230,32 +222,4 @@ export class MateMailboxNudger {
       throw error;
     }
   }
-}
-
-// Charts surface through the durable task-event channel at registration time.
-// The normal mate wake subscriber then routes the event to the exact parent
-// when it is live, or the live mate fallback when the recorded parent has
-// already disappeared. Recording first keeps scout completion irrelevant.
-export function wireChartWake(
-  charts: ChartRegistry,
-  tasks: TaskStore,
-  reviewUrl: (chartId: string) => string
-): void {
-  charts.subscribe((chart, event) => {
-    if (event.kind !== "registered" || !chart.taskId) {
-      return;
-    }
-    const url = reviewUrl(chart.id);
-    tasks.recordEvent(chart.taskId, {
-      kind: "chart_ready",
-      source: "system",
-      message: `"${chart.name}" - review at ${url}`,
-      data: {
-        chartId: chart.id,
-        chartName: chart.name,
-        reviewUrl: url,
-        ...(chart.parentSessionId ? { parentSessionId: chart.parentSessionId } : {})
-      }
-    });
-  });
 }

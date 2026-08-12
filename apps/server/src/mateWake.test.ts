@@ -119,7 +119,6 @@ test("isMailboxRouted separates worker fan-in from system notifications", () => 
   assert.equal(isMailboxRouted({ kind: "note", source: "worker", data: { reason: "worker_report" } }), true);
   assert.equal(isMailboxRouted({ kind: "note", source: "worker" }), false);
   assert.equal(isMailboxRouted({ kind: "stalled", source: "system" }), true);
-  assert.equal(isMailboxRouted({ kind: "chart_ready", source: "system" }), true);
   assert.equal(isMailboxRouted({ kind: "merged", source: "poller" }), true);
   // Legacy outbox payloads without a source stay on the legacy wake path.
   assert.equal(isMailboxRouted({ kind: "completion_requested" }), false);

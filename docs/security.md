@@ -5,7 +5,7 @@ This document describes what pairing authorizes, how local and remote connection
 
 ## Trust boundary
 
-The Mac stores repositories, provider credentials, Claude PTYs, Codex app-server daemons, task records, worktrees, attachments, charts, device records, and audit logs.
+The Mac stores repositories, provider credentials, Claude PTYs, Codex app-server daemons, task records, worktrees, attachments, device records, and audit logs.
 The iPhone is an authenticated control surface for that local server.
 
 Perch does not provide a hosted user account or hosted code-execution environment.
@@ -120,7 +120,7 @@ File modes protect locally created secret files where supported, but the Mac acc
 Protect the user account, disk, backups, and shell environment accordingly.
 
 Successful audit appends record metadata about mutating mobile actions, not provider transcript contents.
-Provider transcripts, Codex rollouts, attachments, and charts can still contain sensitive project material and should be protected as local project data.
+Provider transcripts, Codex rollouts, and attachments can still contain sensitive project material and should be protected as local project data.
 
 ## Push notifications
 

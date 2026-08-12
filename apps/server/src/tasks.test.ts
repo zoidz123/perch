@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
@@ -276,42 +276,21 @@ test("event data rides the ledger verbatim and reaches subscribers", () => {
   rmSync(home, { recursive: true, force: true });
 });
 
-test("planId is stamped, persisted, and looked up by plan", () => {
+test("historic planId records remain decodable without a current linkage surface", () => {
   const { store: tasks, home } = store();
+  const at = new Date().toISOString();
+  tasks.stateDb.tasks.create({
+    id: "historic-plan-task",
+    title: "historic plan task",
+    project: "/tmp/repo",
+    kind: "ship",
+    state: "closed",
+    planId: "docs/plans/2026-07-08-hub.md",
+    createdAt: at,
+    updatedAt: at
+  }, { kind: "created", source: "system" });
 
-  const a = tasks.create({ title: "build the hub", project: "/tmp/repo", planId: "docs/plans/2026-07-08-hub.md" });
-  const b = tasks.create({ title: "hub follow-up", project: "/tmp/repo", planId: "docs/plans/2026-07-08-hub.md" });
-  tasks.create({ title: "unrelated", project: "/tmp/repo" });
-  tasks.create({ title: "other plan", project: "/tmp/repo", planId: "docs/plans/2026-07-08-other.md" });
-
-  // Stamped and durable across a fresh read.
-  assert.equal(tasks.find(a.id)?.planId, "docs/plans/2026-07-08-hub.md");
-  // A task with no planId keeps the field absent entirely (append-only wire).
-  const plain = tasks.list().find((task) => task.title === "unrelated");
-  assert.ok(plain && !("planId" in plain));
-
-  // Lookup finds exactly the two stamped with this plan, recency-sorted.
-  const affected = tasks.listByPlan("docs/plans/2026-07-08-hub.md");
-  assert.deepEqual(
-    affected.map((task) => task.id).sort(),
-    [a.id, b.id].sort()
-  );
-  assert.equal(tasks.listByPlan("docs/plans/2026-07-08-other.md").length, 1);
-  // An unknown or empty planId matches nothing.
-  assert.equal(tasks.listByPlan("docs/plans/nope.md").length, 0);
-  assert.equal(tasks.listByPlan("").length, 0);
-
-  rmSync(home, { recursive: true, force: true });
-});
-
-test("stagePlanEdit writes the revised markdown centrally, never in a repo", () => {
-  const { store: tasks, home } = store();
-  const task = tasks.create({ title: "revise the plan", project: "/tmp/repo" });
-
-  const staged = tasks.stagePlanEdit(task.id, "# New plan\n\nbody\n");
-  // Staged under the task's own dir in PERCH_HOME, not the project repo.
-  assert.ok(staged.startsWith(join(home, "tasks", task.id)));
-  assert.equal(readFileSync(staged, "utf8"), "# New plan\n\nbody\n");
+  assert.equal(tasks.find("historic-plan-task")?.planId, "docs/plans/2026-07-08-hub.md");
 
   rmSync(home, { recursive: true, force: true });
 });

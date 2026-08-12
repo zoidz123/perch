@@ -21,10 +21,6 @@ export type AuditAction =
   | "remove_project"
   | "set_config"
   | "release_worktree"
-  | "register_chart"
-  | "finalize_chart"
-  | "chart_feedback"
-  | "chart_layout"
   | "task_completion_decision";
 
 export type AuditRecord = {
@@ -43,8 +39,6 @@ export type AuditRecord = {
   forced?: boolean;
   // Pool linkage (M0): set when the action ran on a worktree slot.
   worktreeId?: string;
-  // Chart linkage: set when the action ran on a registered chart.
-  chartId?: string;
   approvalId?: string;
   decision?: string;
   runtimeGeneration?: number;

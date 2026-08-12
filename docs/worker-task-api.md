@@ -5,7 +5,7 @@ A Claude or Codex turn ending is runtime evidence only.
 A worker must report an outcome for the turn, and a worker's `done` report becomes a completion request that Mate must verify before the task enters `done`.
 
 This guide documents the HTTP surface used to dispatch and supervise workers, the event endpoint workers call, and the hooks that enforce the per-turn reporting contract.
-It does not catalog unrelated device, configuration, usage, or chart-review routes.
+It does not catalog unrelated device, configuration, or usage routes.
 
 ## Actors and credentials
 
@@ -39,7 +39,7 @@ curl -s -H "Authorization: Bearer $TOKEN" "$BASE/tasks"
 
 | Credential | Intended caller | Accepted by |
 | --- | --- | --- |
-| Session headers `x-perch-session` and `x-perch-token` | Provider hooks, Claude workers, and proven legacy Codex workers | `POST /hooks`, the compatible worker form of `POST /tasks/:id/events`, and adjacent worker capabilities such as chart registration |
+| Session headers `x-perch-session` and `x-perch-token` | Provider hooks, Claude workers, and proven legacy Codex workers | `POST /hooks` and the compatible worker form of `POST /tasks/:id/events` |
 | Owned Codex root-thread identity | Fresh managed Codex worker root | The `perch.report_task_event` dynamic tool, which the app-server adapter relays to `POST /tasks/:id/events` |
 | `Authorization: Bearer <server-token>` | Mate and local CLI tools | Authenticated task and session routes |
 | Paired device bearer token | iPhone | Most authenticated read and control routes, but not completion verification |
@@ -110,7 +110,7 @@ At startup, Perch applies the same predicate once to repair matching historical 
 
 `GET /tasks` returns `{ "tasks": [...] }` for non-closed tasks and omits their stored prompts.
 CLI history consumers may explicitly request `GET /tasks?includeClosed=1` to receive the full ledger with prompts intact.
-An optional `planId` query filters tasks linked to one finalized plan.
+Historic task records may still decode an optional `planId`, but no current endpoint creates or queries that linkage.
 
 `GET /tasks/:id` returns:
 
@@ -209,7 +209,7 @@ Perch stores the report byte-for-byte in an immutable, trigger-protected `worker
 Tool success therefore means the full report is durable with a standing delivery obligation - not that the mate processed it.
 
 Explicit bounds, enforced with `413` and never silent truncation: summary 4 KiB, report 256 KiB, evidence JSON 256 KiB.
-Larger artifacts belong in committed files or charts, referenced from the report by path or content hash.
+Larger artifacts belong in committed files referenced from the report by path or content hash.
 Replaying the same `(task, sender session, idempotencyKey)` with identical content returns the original report with `duplicate: true`; the same key with different content is `409`.
 
 ### Mailbox semantics
@@ -235,7 +235,7 @@ When a mailbox delivery commits, the server nudges an idle mate with a single co
 The boss-facing timeline renders only the mate's synthesis: mailbox control prompts are filtered from the timeline projection and the live stream, and raw worker reports never enter any timeline.
 Provider-native transcripts (attach views) still contain the mate's mailbox tool calls and the nudge line; privacy from native transcripts is out of scope.
 
-System-sourced notifications (`chart_ready`, `checks_green`, `merge_ready`, `merged`, `stalled`, `runtime_interrupted`) remain on the legacy injected wake-line path.
+System-sourced notifications (`checks_green`, `merge_ready`, `merged`, `stalled`, `runtime_interrupted`) remain on the legacy injected wake-line path.
 That legacy path, and the worker `curl` event verbs, are the explicit compatibility boundary: they remain until the mailbox subsumes system notifications, while the new report path is CLI/tool-only from day one.
 
 ## What happens when a provider turn completes

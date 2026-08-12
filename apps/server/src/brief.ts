@@ -8,10 +8,6 @@ export const CODEX_NATIVE_CHILD_GUIDANCE = [
   "- Native children share the root worktree by default. Prefer read-only or decomposed work and never perform concurrent writes in that worktree."
 ].join("\n");
 
-export type PlanBrief = {
-  edit?: { relativePath: string; stagedPath: string };
-};
-
 // The delivery boundary is server-owned. The brief gives every managed worker
 // a provider-native operation, never an HTTP recipe or independent git/gh
 // delivery command. A legacy task can still be read and recovered, but no
@@ -19,7 +15,6 @@ export type PlanBrief = {
 export function dispatchBrief(
   task: Task,
   worktreePath: string | undefined,
-  plan: PlanBrief = {},
   agent?: AgentKind
 ): string {
   const codex = agent === "codex";
@@ -38,17 +33,6 @@ export function dispatchBrief(
   const location = worktreePath
     ? `You are working in an isolated worktree at ${worktreePath}. Verify with pwd before changing anything; never cd outside it.`
     : `You are working in ${task.project}.`;
-  const planSection = plan.edit
-    ? [
-        "",
-        "PLAN EDIT - your first commit revises the plan and touches nothing else:",
-        `- The revised plan markdown is staged at ${plan.edit.stagedPath} outside the repo.`,
-        `- Copy it to ${plan.edit.relativePath}, then commit only that file first.`,
-        "- Then continue with this task's kind-specific contract."
-      ]
-    : task.planId
-      ? ["", `This task builds from finalized plan \`${task.planId}\`. Commit it first if it is not already in the repository.`]
-      : [];
   const autoreview = codex
     ? 'Call perch.autoreview_run with {"idempotencyKey":"review-1","testArgv":["<supported-test-command>","<arg>"]}. It returns the durable attempt identity and structured findings.'
     : `Run \`perch autoreview run --task ${task.id} --idempotency-key review-1 --test-argv-json '["<supported-test-command>","<arg>"]'\`. It returns the durable attempt identity and structured findings.`;
@@ -81,7 +65,6 @@ export function dispatchBrief(
     location,
     `Create and work on branch perch/${task.id}.`,
     ...kindContract,
-    ...planSection,
     "",
     codex
       ? "Report status only with the root thread's perch.report_task_event tool:"
