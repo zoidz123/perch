@@ -165,7 +165,6 @@ test("POST /mate/start seeds the mate home and spawns the labeled mate; a live m
     assert.ok(spec.length > 0);
     assert.doesNotMatch(spec, /yolo/i);
     assert.match(spec, /\*\*direct-PR\*\*/, "mate policy keeps direct-PR semantics");
-    assert.match(spec, /\*\*no-mistakes\*\*/, "mate policy keeps no-mistakes semantics");
     assert.match(spec, /\*\*local-only\*\*/, "mate policy keeps local-only semantics");
     assert.ok(lstatSync(join(mateHome, "CLAUDE.md")).isSymbolicLink());
 

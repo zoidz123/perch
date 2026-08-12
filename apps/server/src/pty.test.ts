@@ -204,30 +204,6 @@ test("PTY adapter drops inherited NO_COLOR but preserves a Claude session overri
   }
 });
 
-test("spawned sessions default the no-mistakes telemetry opt-out; a user export wins", async () => {
-  let spawnEnv: NodeJS.ProcessEnv | undefined;
-  const spawn: SpawnPty = (_command, _args, options) => {
-    spawnEnv = options.env;
-    return new FakePtyProcess();
-  };
-  const adapter = new PtyAgentAdapter(spawn);
-  const saved = process.env.NO_MISTAKES_TELEMETRY;
-  try {
-    delete process.env.NO_MISTAKES_TELEMETRY;
-    const first = await adapter.startAgent({ command: "claude", args: [], cwd: "/tmp" });
-    assert.equal(spawnEnv?.NO_MISTAKES_TELEMETRY, "0", "no-cloud posture: telemetry off by default");
-    await adapter.stopSession(first.id);
-
-    process.env.NO_MISTAKES_TELEMETRY = "1";
-    await adapter.startAgent({ command: "claude", args: [], cwd: "/tmp" });
-    assert.equal(spawnEnv?.NO_MISTAKES_TELEMETRY, "1", "the exported value is the re-enable knob");
-  } finally {
-    if (saved === undefined) delete process.env.NO_MISTAKES_TELEMETRY;
-    else process.env.NO_MISTAKES_TELEMETRY = saved;
-    adapter.stop();
-  }
-});
-
 test("an explicit live PTY session id is rejected instead of silently replaced", async () => {
   const adapter = new PtyAgentAdapter(() => new FakePtyProcess());
   const sessionId = "pty:11111111-1111-4111-8111-111111111111";

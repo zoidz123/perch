@@ -152,12 +152,3 @@ Never commit key identifiers, issuer identifiers, team identifiers, certificate 
 The key path, key identifier, issuer identifier, and team identifier should be moved out of transcript-only history into a durable private configuration.
 Use either the standard private-key directory or a local configuration file outside the repository with fields shaped like `ASC_KEY_PATH=<path>`, `ASC_KEY_ID=<value>`, `ASC_ISSUER_ID=<value>`, and `PERCH_IOS_TEAM_ID=<value>`.
 Keep that file gitignored, readable only by its owner, and never populate or relocate it as part of a repository change.
-
-## Bundled runtime gate
-
-The no-mistakes runtime release is independent from the Perch package tag.
-Its exact immutable inputs live in `vendor/no-mistakes/manifest.json`.
-Release tooling must verify both Darwin assets against the manifest before packaging.
-
-Never replace the pinned release with `latest`, a branch archive, an unsigned local build, or a PATH-resolved binary.
-Updating the runtime requires the upstream-sync procedure in [No-mistakes upstream sync](no-mistakes-upstream-sync.md).

@@ -156,24 +156,6 @@ function stubConfig(state: StubState) {
       };
     }
   }
-  for (const [key, effectiveValue] of Object.entries({
-    version: "1.39.0-perch.1",
-    protocol: "1",
-    source: "bundled",
-    path: "/package/vendor/no-mistakes/darwin-arm64/no-mistakes",
-    "SHA-256": "abc123",
-    architecture: "arm64"
-  })) {
-    entries[`runtime.no-mistakes.${key}`] = {
-      effectiveValue,
-      source: "bundled",
-      scope: "runtime",
-      storedValue: null,
-      defaultValue: null,
-      overriddenBy: null,
-      readOnly: true
-    };
-  }
   entries["task.mode"] = {
     effectiveValue: state.project.mode ?? "direct-PR",
     source: state.project.mode ? "project" : "built-in",
@@ -232,7 +214,7 @@ test("wrapper help covers top-level and nested commands without starting the ser
       [["models", "--help"], /selectable Mate and dispatch models/],
       [["config", "set", "--help"], /Global defaults: dispatch\.\* for workers and mate\.\* for Mate/],
       [["worktrees", "release", "--help"], /worktrees release <id> \[--force\]/],
-      [["doctor", "--help"], /immutable bundled no-mistakes runtime/],
+      [["doctor", "--help"], /Checks the server environment/],
       [["uninstall", "--help"], /Removes Perch-managed agent configuration/],
       [["server", "logs", "--help"], /Controls the local Perch server/]
     ];
@@ -245,7 +227,7 @@ test("wrapper help covers top-level and nested commands without starting the ser
 
     const alias = await runCli(unreachable, home, ["help", "config"]);
     assert.equal(alias.code, 0, alias.stderr);
-    assert.match(alias.stdout, /Runtime keys are read-only provenance/);
+    assert.match(alias.stdout, /Task kind controls delivery: ship, scout, or operate/);
     assert.doesNotMatch(alias.stdout, /yolo/i);
   } finally {
     rmSync(home, { recursive: true, force: true });
@@ -469,13 +451,13 @@ test("config set validates client-side: bad agent and unknown key never reach th
   }
 });
 
-test("config moves only task.mode to perch project and rejects the removed key", async () => {
+test("config rejects the removed delivery-mode keys", async () => {
   const home = mkdtempSync(join(tmpdir(), "perch-config-home-"));
   try {
     await withStubServer(async (serverUrl, state) => {
-      const moved = await runConfig(serverUrl, home, ["set", "--project", "/repo", "task.mode", "no-mistakes"]);
+      const moved = await runConfig(serverUrl, home, ["set", "--project", "/repo", "task.mode", "direct-PR"]);
       assert.equal(moved.code, 1);
-      assert.match(moved.stderr, /task\.mode moved to the project registry; use `perch project set \/repo --mode no-mistakes`/);
+      assert.match(moved.stderr, /unknown config key: task\.mode/);
 
       const removed = await runConfig(serverUrl, home, ["set", "--project", "/repo", "task.yolo", "true"]);
       assert.equal(removed.code, 1);
@@ -487,7 +469,7 @@ test("config moves only task.mode to perch project and rejects the removed key",
   }
 });
 
-test("config validate passes on the global view and runtime owns bundled provenance", async () => {
+test("config validate passes on the global view and the retired runtime command is gone", async () => {
   const home = mkdtempSync(join(tmpdir(), "perch-config-home-"));
   try {
     await withStubServer(async (serverUrl) => {
@@ -497,16 +479,11 @@ test("config validate passes on the global view and runtime owns bundled provena
 
       const show = await runConfig(serverUrl, home, ["show"]);
       assert.equal(show.code, 0, show.stderr);
-      assert.doesNotMatch(show.stdout, /runtime\.no-mistakes|task\.mode|yolo/i);
+      assert.doesNotMatch(show.stdout, /runtime\.|task\.mode|yolo/i);
 
       const runtime = await runCli(serverUrl, home, ["runtime", "validate"]);
-      assert.equal(runtime.code, 0, runtime.stderr);
-      assert.match(runtime.stdout, /bundled no-mistakes runtime valid/);
-
-      const runtimeJson = await runCli(serverUrl, home, ["runtime", "--json"]);
-      assert.equal(runtimeJson.code, 0, runtimeJson.stderr);
-      const body = JSON.parse(runtimeJson.stdout) as Record<string, { effectiveValue: unknown }>;
-      assert.equal(body["runtime.no-mistakes.source"]?.effectiveValue, "bundled");
+      assert.equal(runtime.code, 1, "the bundled-runtime provenance command was retired");
+      assert.match(runtime.stderr, /unknown command: runtime/);
     });
   } finally {
     rmSync(home, { recursive: true, force: true });

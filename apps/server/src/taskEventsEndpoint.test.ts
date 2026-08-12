@@ -150,7 +150,7 @@ function decideCompletion(
   });
 }
 
-const noMistakes = {
+const structured = {
   step: "review",
   findings: [{ id: "r1", severity: "error", file: "src/db.ts", action: "ask-user", description: "index drop" }]
 };
@@ -480,12 +480,12 @@ test("a worker verb with data persists it onto the event verbatim", async () => 
       port,
       task.id,
       { "x-perch-session": "pty:worker", "x-perch-token": token },
-      { kind: "needs_decision", message: "review gate: 1 finding needs you", data: { noMistakes } }
+      { kind: "needs_decision", message: "review gate: 1 finding needs you", data: { structured } }
     );
     assert.equal(ok.status, 200);
     const persisted = tasks.events(task.id).find((event) => event.kind === "needs_decision");
     assert.equal(persisted?.source, "worker");
-    assert.deepEqual(persisted?.data, { noMistakes });
+    assert.deepEqual(persisted?.data, { structured });
   });
 });
 
@@ -548,7 +548,7 @@ test("oversize worker reports are rejected explicitly and atomically for every r
 test("data is bounded: over 32 KB is a 400 naming the limit, nothing is written", async () => {
   await withServer(async ({ port, tasks }) => {
     const task = tasks.create({ title: "gated ship", project: "/tmp/repo" });
-    const huge = { noMistakes: { step: "review", findings: [{ id: "r1", description: "x".repeat(33 * 1024) }] } };
+    const huge = { structured: { step: "review", findings: [{ id: "r1", description: "x".repeat(33 * 1024) }] } };
 
     const refused = await post(
       port,
@@ -739,52 +739,13 @@ test("worker pr_linked persists a canonical fact before completion, exposes it i
   );
 });
 
-test("no-mistakes pr_linked accepts the task branch before branch_sync but completion remains head-pinned", async () => {
-  let prHead = "pipeline-head";
-  await withServer(
-    async ({ home, port, tasks, hooks }) => {
-      const { project } = makeProjectWithCommit(home);
-      const task = importLegacyTask(tasks, { title: "link gate PR early", project, mode: "no-mistakes" });
-      const { token } = hooks.register("pty:worker");
-      const headers = { "x-perch-session": "pty:worker", "x-perch-token": token };
-      tasks.update(task.id, { sessionId: "pty:worker", branch: "perch/link-gate-pr-early" });
-      tasks.recordEvent(task.id, { kind: "working", source: "worker" });
-
-      const linked = await post(port, task.id, headers, { kind: "pr_linked", pr: "https://github.com/o/r/pull/64" });
-      assert.equal(linked.status, 200);
-      assert.equal(tasks.find(task.id)?.state, "working");
-      assert.equal(tasks.find(task.id)?.pr?.headOid, "pipeline-head");
-
-      const prematureDone = await post(port, task.id, headers, { kind: "done", pr: "https://github.com/o/r/pull/64" });
-      assert.equal(prematureDone.status, 409);
-      assert.match((await prematureDone.json() as { error: string }).error, /does not match checkout HEAD/);
-      assert.equal(tasks.find(task.id)?.state, "working");
-
-      execFileSync("git", ["-C", project, "commit", "-q", "--allow-empty", "-m", "branch sync"], { stdio: "pipe" });
-      prHead = execFileSync("git", ["-C", project, "rev-parse", "HEAD"], { encoding: "utf8" }).trim();
-
-      const completed = await post(port, task.id, headers, { kind: "done" });
-      assert.equal(completed.status, 200);
-      assert.equal(tasks.find(task.id)?.state, "completion_requested");
-      assert.equal(tasks.find(task.id)?.pr?.headOid, prHead);
-      assert.equal(tasks.events(task.id).filter((event) => event.kind === "pr_linked").length, 1);
-    },
-    async () => ({
-      state: "OPEN",
-      headRefName: "perch/link-gate-pr-early",
-      headRefOid: prHead,
-      headRepository: { nameWithOwner: "o/r" }
-    })
-  );
-});
-
 test("done revalidates an early-linked PR after it has merged", async () => {
   let checkoutHead = "";
   await withServer(
     async ({ home, port, tasks, hooks }) => {
       const { project, head } = makeProjectWithCommit(home);
       checkoutHead = head;
-      const task = importLegacyTask(tasks, { title: "validate merged linked PR", project, mode: "no-mistakes" });
+      const task = importLegacyTask(tasks, { title: "validate merged linked PR", project, mode: "direct-PR" });
       const { token } = hooks.register("pty:worker");
       const headers = { "x-perch-session": "pty:worker", "x-perch-token": token };
       tasks.update(task.id, { sessionId: "pty:worker", branch: "perch/validate-merged" });
@@ -921,7 +882,7 @@ test("done with a reused-branch PR that lacks the worker's commits is still reje
   );
 });
 
-test("no-mistakes done rejects a pipeline-owned newer PR head until guarded sync advances the checkout", async () => {
+test("done rejects a PR head ahead of the checkout until the checkout advances", async () => {
   let pipelineHead = "";
   await withServer(
     async ({ home, port, tasks, hooks }) => {
@@ -932,7 +893,7 @@ test("no-mistakes done rejects a pipeline-owned newer PR head until guarded sync
       pipelineHead = execFileSync("git", ["-C", project, "rev-parse", "HEAD"], { encoding: "utf8" }).trim();
       execFileSync("git", ["-C", project, "reset", "--hard", workerHead], { stdio: "pipe" });
 
-      const task = importLegacyTask(tasks, { title: "ship through no-mistakes", project, mode: "no-mistakes" });
+      const task = importLegacyTask(tasks, { title: "ship a remote PR", project, mode: "direct-PR" });
       const { token } = hooks.register("pty:worker");
       const headers = { "x-perch-session": "pty:worker", "x-perch-token": token };
       const done = { kind: "done", message: "green checks https://github.com/o/r/pull/50" };
@@ -946,8 +907,8 @@ test("no-mistakes done rejects a pipeline-owned newer PR head until guarded sync
       assert.equal(tasks.find(task.id)?.state, "working");
       assert.equal(tasks.find(task.id)?.pr, undefined);
 
-      // Simulate the guarded `no-mistakes axi sync` advancing the checkout to
-      // the pipeline-owned PR head without weakening the endpoint's OID check.
+      // Advancing the checkout to the remote PR head is what makes done
+      // legitimate; the endpoint's OID check itself never relaxes.
       execFileSync("git", ["-C", project, "reset", "--hard", pipelineHead], { stdio: "pipe" });
 
       const accepted = await post(port, task.id, headers, done);

@@ -1,7 +1,6 @@
 import type { Task, TaskEventKind, TaskEventSource } from "@perch/shared";
 import type { AgentAdapter } from "./adapters/types.js";
 import type { ChartRegistry } from "./charts.js";
-import { findingsWakeSummary, parseNoMistakesGate } from "./findings.js";
 import type { FleetMonitor, SessionStatusChange } from "./fleetMonitor.js";
 import type { MateMailboxRepository } from "./stateDb.js";
 import type { TaskStore } from "./tasks.js";
@@ -73,25 +72,20 @@ export function taskWakeIdentity(task: Pick<Task, "id" | "workerName">): string 
 }
 
 // One wake line per boss-relevant event, always single-line (a newline would
-// submit the mate's composer early). A needs_decision carrying a no-mistakes
-// gate renders the full findings table - ids, severities, files, descriptions
-// verbatim - so the mate can relay them without re-fetching the ledger.
+// submit the mate's composer early).
 export function wakeLine(
   task: Task,
   event: { kind: TaskEventKind; message?: string; data?: Record<string, unknown> }
 ): string {
-  const gate = event.kind === "needs_decision" ? parseNoMistakesGate(event.data) : undefined;
   const fallbackBody = event.message ?? task.title;
   const approvalBody = event.kind === "needs_decision" && event.data?.reason === "approval_request"
     ? approvalWakeBody(fallbackBody, event.data)
     : undefined;
-  const body = gate
-    ? `${event.message ? `${event.message.replace(/\s+/g, " ").trim()} - ` : ""}${findingsWakeSummary(gate)}`
-    : approvalBody ?? (event.kind === "checks_green"
-      ? `${fallbackBody} - CI checks green; merge readiness not confirmed`
-      : event.kind === "merge_ready"
-        ? `${fallbackBody} - GitHub reports this PR is ready to merge`
-        : fallbackBody);
+  const body = approvalBody ?? (event.kind === "checks_green"
+    ? `${fallbackBody} - CI checks green; merge readiness not confirmed`
+    : event.kind === "merge_ready"
+      ? `${fallbackBody} - GitHub reports this PR is ready to merge`
+      : fallbackBody);
   return `[perch] ${taskWakeIdentity(task)} · ${event.kind}: ${body}`;
 }
 

@@ -22,7 +22,7 @@ The manifest records the exact runtime bytes, source blobs, modes, and SHA-256 h
 
 The pinned upstream test suite and fixture files are not packaged.
 
-Bootstrap TruffleHog found four VERIFIED live Lob API credentials in two upstream test sources, `skills/autoreview/tests/test_autoreview_hardening.py` (three) and `skills/autoreview/scripts/autoreview_test.py` (one).
+Bootstrap TruffleHog found four VERIFIED live third-party API credentials across two upstream test sources.
 
 The pinned helper is itself the bootstrap gate, it fails closed on verified secrets, and it cannot exclude paths, so vendoring those bytes would make a clean receipt structurally impossible.
 

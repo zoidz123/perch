@@ -145,12 +145,10 @@ async function createCliFixture(shutdownDelayMs: number, failurePhase?: string):
   mkdirSync(home, { recursive: true });
   mkdirSync(join(bin, ".."), { recursive: true });
   mkdirSync(join(entry, ".."), { recursive: true });
-  mkdirSync(join(root, "vendor", "no-mistakes"), { recursive: true });
   mkdirSync(join(root, "node_modules", "ws"), { recursive: true });
   copyFileSync(PERCH_BIN, bin);
   chmodSync(bin, 0o755);
   writeFileSync(join(root, "package.json"), '{"type":"module","version":"0.0.0"}\n');
-  writeFileSync(join(root, "vendor", "no-mistakes", "manifest.json"), "{}\n");
   writeFileSync(join(root, "node_modules", "ws", "package.json"), '{"type":"module","exports":"./index.js"}\n');
   writeFileSync(join(root, "node_modules", "ws", "index.js"), "export default class WebSocket {}\n");
   writeFileSync(

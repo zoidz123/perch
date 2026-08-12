@@ -1542,7 +1542,6 @@ export class TaskRepository {
       eventCount += result.changes;
       if (result.changes > 0) {
         this.saveVerificationFacts(task.id, event);
-        this.saveReviewFacts(task.id, event);
       }
     }
     return { task: taskResult.changes, events: eventCount };
@@ -1619,7 +1618,6 @@ export class TaskRepository {
       ...(event.data ? { data: event.data } : {})
     };
     this.saveVerificationFacts(taskId, persisted);
-    this.saveReviewFacts(taskId, persisted);
     return persisted;
   }
 
@@ -1629,24 +1627,6 @@ export class TaskRepository {
       `INSERT INTO task_pr_facts(task_id, facts_json, observed_at) VALUES (?, ?, ?)
        ON CONFLICT(task_id) DO UPDATE SET facts_json = excluded.facts_json, observed_at = excluded.observed_at`
     ).run(task.id, JSON.stringify(task.pr), task.updatedAt);
-  }
-
-  // An allowed authorization proves the pipeline engaged; the two event kinds
-  // that move durable state back to working (working, completion_rejected)
-  // surrender the proof. Denied authorizations never mark review.
-  private saveReviewFacts(taskId: string, event: TaskEvent): void {
-    if (event.kind === "working" || event.kind === "completion_rejected") {
-      this.db.prepare("DELETE FROM task_review_facts WHERE task_id = ?").run(taskId);
-      return;
-    }
-    if (event.source !== "system") return;
-    const authorization = (event.data as { noMistakesAuthorization?: { allowed?: unknown } } | undefined)
-      ?.noMistakesAuthorization;
-    if (authorization?.allowed !== true) return;
-    this.db.prepare(
-      `INSERT INTO task_review_facts(task_id, entered_seq, recorded_at) VALUES (?, ?, ?)
-       ON CONFLICT(task_id) DO UPDATE SET entered_seq = excluded.entered_seq, recorded_at = excluded.recorded_at`
-    ).run(taskId, event.seq, event.at);
   }
 
   private saveVerificationFacts(taskId: string, event: TaskEvent): void {

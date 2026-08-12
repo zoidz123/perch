@@ -17,7 +17,6 @@ function task(overrides: Partial<Task> = {}): Task {
     title: "fix the auth flow",
     project: "/Users/dev/projects/perch",
     kind: "ship",
-    mode: "no-mistakes",
     state: "needs_you",
     createdAt: now,
     updatedAt: now,
@@ -55,35 +54,11 @@ test("wakeLine separates green checks from true merge readiness", () => {
   );
 });
 
-test("wakeLine renders a needs_decision gate as the full findings table, single-line", () => {
-  const line = wakeLine(task(), {
-    kind: "needs_decision",
-    message: "review gate: 2 findings need you",
-    data: {
-      noMistakes: {
-        step: "review",
-        findings: [
-          { id: "r1", severity: "error", file: "src/db.ts", line: 8, action: "ask-user", description: "index drop\nchanges plans" },
-          { id: "r2", severity: "warning", description: "prefer the shared helper" }
-        ]
-      }
-    }
-  });
-  assert.equal(
-    line,
-    "[perch] fix-the-auth-a1b2 · needs_decision: review gate: 2 findings need you - " +
-      "review gate parked with 2 findings: " +
-      "r1 (error) src/db.ts:8 [ask-user]: index drop changes plans | " +
-      "r2 (warning): prefer the shared helper"
-  );
-  assert.ok(!line.includes("\n"));
-});
-
-test("wakeLine with unparseable gate data falls back to the message", () => {
+test("wakeLine renders a needs_decision from the worker's own message", () => {
   const line = wakeLine(task(), {
     kind: "needs_decision",
     message: "which branch?",
-    data: { noMistakes: "not a table" }
+    data: { structured: "carried verbatim, never rendered" }
   });
   assert.equal(line, "[perch] fix-the-auth-a1b2 · needs_decision: which branch?");
 });

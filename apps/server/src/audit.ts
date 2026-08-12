@@ -20,14 +20,11 @@ export type AuditAction =
   | "add_project"
   | "remove_project"
   | "set_config"
-  | "no_mistakes_init"
-  | "no_mistakes_authorization"
   | "release_worktree"
   | "register_chart"
   | "finalize_chart"
   | "chart_feedback"
   | "chart_layout"
-  | "task_decision"
   | "task_completion_decision";
 
 export type AuditRecord = {

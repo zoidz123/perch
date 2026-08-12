@@ -193,12 +193,7 @@ export class PrPoller {
   // branch) can still report done. Only when the checkout HEAD cannot be read
   // do we fall back to the deterministic task-branch binding, so an arbitrary
   // or foreign PR URL is never accepted blind.
-  async resolveTaskPr(
-    task: Task,
-    prUrl: string,
-    checkoutPath = task.project,
-    options: { allowTaskBranchWhenHeadDiff?: boolean } = {}
-  ): Promise<TaskPrAttachment> {
+  async resolveTaskPr(task: Task, prUrl: string, checkoutPath = task.project): Promise<TaskPrAttachment> {
     const canonical = canonicalGithubPr(prUrl);
     if (!canonical) {
       return { ok: false, reason: `not a GitHub pull request URL: ${prUrl}` };
@@ -228,7 +223,7 @@ export class PrPoller {
       // The PR head commit must be exactly the worker's checkout HEAD. This both
       // admits reused branches (whatever their name) and refuses a stale PR that
       // is missing the worker's latest commits.
-      if (view.headRefOid !== expectedOid && !(options.allowTaskBranchWhenHeadDiff && branchMatches)) {
+      if (view.headRefOid !== expectedOid) {
         return {
           ok: false,
           reason: view.headRefOid
@@ -260,16 +255,6 @@ export class PrPoller {
         ...(view.headRefOid ? { headOid: view.headRefOid } : {})
       }
     };
-  }
-
-  // no-mistakes creates its PR from the task's server-minted branch, then can
-  // advance that remote head with gate-owned commits before `branch_sync`
-  // moves the worker checkout. The branch is still an exact durable identity;
-  // completion later reuses the strict checkout-head proof above.
-  async resolveLinkedTaskPr(task: Task, prUrl: string, checkoutPath = task.project): Promise<TaskPrAttachment> {
-    return this.resolveTaskPr(task, prUrl, checkoutPath, {
-      allowTaskBranchWhenHeadDiff: task.mode === "no-mistakes"
-    });
   }
 
   // A dispatched task has a server-minted branch, so it never needs to rely
