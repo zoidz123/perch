@@ -143,16 +143,36 @@ export async function deliverMateWake(
 // between drain checkpoints).
 export class MateMailboxNudger {
   private lastNudgedOrderKey = 0;
+  private lastNudgeAttemptAt: string | undefined;
   private pendingNudgeTarget: string | undefined;
   private nudgeInFlight: Promise<void> | undefined;
+  private sweepTimer: ReturnType<typeof setInterval> | undefined;
+  private readonly sweepMs: number;
 
   constructor(
     private readonly options: {
       mailbox: MateMailboxRepository;
       adapter: AgentAdapter;
       monitor: FleetMonitor;
+      sweepMs?: number;
     }
-  ) {}
+  ) {
+    this.sweepMs = options.sweepMs ?? 60_000;
+  }
+
+  start(): void {
+    if (this.sweepTimer) return;
+    this.sweepTimer = setInterval(() => {
+      void this.sweep().catch(() => {});
+    }, this.sweepMs);
+    this.sweepTimer.unref?.();
+  }
+
+  stop(): void {
+    if (!this.sweepTimer) return;
+    clearInterval(this.sweepTimer);
+    this.sweepTimer = undefined;
+  }
 
   hasDelivery(taskEventId: number): boolean {
     try {
@@ -177,7 +197,7 @@ export class MateMailboxNudger {
     })().catch(() => {});
   }
 
-  async nudge(input: { excludeSessionId?: string; target?: string } = {}): Promise<void> {
+  async nudge(input: { excludeSessionId?: string; target?: string; force?: boolean } = {}): Promise<void> {
     // Coalesce concurrent outbox deliveries and newer arrivals while the
     // existing control prompt is still waiting for the mate to process it.
     if (this.nudgeInFlight || this.pendingNudgeTarget) return;
@@ -190,12 +210,43 @@ export class MateMailboxNudger {
     }
   }
 
-  private async performNudge(input: { excludeSessionId?: string; target?: string }): Promise<void> {
+  // Retry a lost control prompt once per interval while the same pending
+  // mailbox remains untouched. This intentionally bypasses the normal
+  // high-water check: the durable mailbox, not the prompt, is the source of
+  // truth, and a restarted server begins with no in-memory nudge state.
+  async sweep(): Promise<void> {
+    if (this.nudgeInFlight) return;
+    const now = new Date().toISOString();
+    if (this.options.mailbox.pendingCount(now) === 0) return;
+    if (
+      this.lastNudgeAttemptAt &&
+      Date.parse(now) - Date.parse(this.lastNudgeAttemptAt) < this.sweepMs
+    ) {
+      return;
+    }
+
+    const sessions = await this.options.adapter.listSessions();
+    const mate = sessions.find((session) => session.labels?.role === "mate");
+    if (!mate) return;
+    const status = this.options.monitor.sessionStatus(mate.id) ?? mate.status;
+    if (status !== "idle") return;
+    const activityAt = this.options.mailbox.latestClaimOrAckAt();
+    if (this.lastNudgeAttemptAt && activityAt && activityAt > this.lastNudgeAttemptAt) return;
+
+    // A prior accepted nudge normally clears this marker when the mate starts
+    // its turn. If the input was lost, it remains idle forever; this interval
+    // proves the old marker stale before submitting exactly one replacement.
+    if (this.pendingNudgeTarget && this.pendingNudgeTarget !== mate.id) return;
+    this.pendingNudgeTarget = undefined;
+    await this.nudge({ target: mate.id, force: true });
+  }
+
+  private async performNudge(input: { excludeSessionId?: string; target?: string; force?: boolean }): Promise<void> {
     const now = new Date().toISOString();
     const pending = this.options.mailbox.pendingCount(now);
     if (pending === 0) return;
     const maxKey = this.options.mailbox.maxUnacknowledgedOrderKey() ?? 0;
-    if (maxKey <= this.lastNudgedOrderKey) return;
+    if (!input.force && maxKey <= this.lastNudgedOrderKey) return;
     let targetId = input.target;
     if (!targetId) {
       const sessions = await this.options.adapter.listSessions();
@@ -208,6 +259,7 @@ export class MateMailboxNudger {
     if (this.options.monitor.sessionStatus(targetId) === "running") return;
     this.pendingNudgeTarget = targetId;
     try {
+      const attemptAt = new Date().toISOString();
       const result = await this.options.monitor.queueOrSubmit(targetId, mailboxNudgeLine(pending), {
         queueIfGated: false,
         silent: true
@@ -217,6 +269,7 @@ export class MateMailboxNudger {
         return;
       }
       this.lastNudgedOrderKey = maxKey;
+      this.lastNudgeAttemptAt = attemptAt;
     } catch (error) {
       this.pendingNudgeTarget = undefined;
       throw error;

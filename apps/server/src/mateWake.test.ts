@@ -97,12 +97,15 @@ type NudgeFixture = {
   task: Task;
 };
 
-async function withNudger(run: (ctx: NudgeFixture) => Promise<void>): Promise<void> {
+async function withNudger(
+  run: (ctx: NudgeFixture) => Promise<void>,
+  options: { sweepMs?: number } = {}
+): Promise<void> {
   const home = mkdtempSync(join(tmpdir(), "perch-nudge-"));
   const tasks = new TaskStore({ PERCH_HOME: home } as NodeJS.ProcessEnv);
   const adapter = new MateAdapter();
   const monitor = new FleetMonitor(adapter, { broadcastMs: 5 });
-  const nudger = new MateMailboxNudger({ mailbox: tasks.stateDb.mateMailbox, adapter, monitor });
+  const nudger = new MateMailboxNudger({ mailbox: tasks.stateDb.mateMailbox, adapter, monitor, ...options });
   const created = tasks.create({ title: "routed work", project: "/tmp/repo", kind: "ship" });
   tasks.update(created.id, { sessionId: "pty:worker" });
   try {
@@ -112,6 +115,8 @@ async function withNudger(run: (ctx: NudgeFixture) => Promise<void>): Promise<vo
     rmSync(home, { recursive: true, force: true });
   }
 }
+
+const delay = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 
 test("isMailboxRouted separates worker fan-in from system notifications", () => {
   assert.equal(isMailboxRouted({ kind: "completion_requested", source: "worker" }), true);
@@ -195,6 +200,113 @@ test("one pending nudge coalesces newer mail; acknowledged mail never re-nudges"
     await new Promise((resolve) => setTimeout(resolve, 25));
     assert.equal(adapter.submissions.length, 1);
   });
+});
+
+test("sweep re-nudges an idle mate when a recorded nudge was lost", async () => {
+  await withNudger(async ({ tasks, adapter, monitor, nudger, task: routed }) => {
+    monitor.applyExternalStatus("pty:mate", "idle", "claude");
+    tasks.recordEvent(routed.id, { kind: "blocked", source: "worker", message: "lost wake" });
+    await nudger.nudge();
+    assert.equal(adapter.submissions.length, 1, "the original nudge was recorded as submitted");
+
+    // Simulate the prompt-delivery-unknown hole: the mate remains idle and
+    // claims nothing from the durable mailbox. The periodic pass deliberately
+    // bypasses the ordinary high-water check for this untouched backlog.
+    await delay(10);
+    await nudger.sweep();
+    assert.equal(adapter.submissions.length, 2, "the unchanged mailbox is re-rung");
+
+    // A caller cannot turn repeated passes into a prompt storm between timer
+    // intervals; the fresh retry attempt is the next interval's lower bound.
+    await nudger.sweep();
+    assert.equal(adapter.submissions.length, 2);
+  }, { sweepMs: 5 });
+});
+
+test("sweep never nudges a mate that is busy or behind a permission gate", async () => {
+  await withNudger(async ({ tasks, adapter, monitor, nudger, task: routed }) => {
+    tasks.recordEvent(routed.id, { kind: "blocked", source: "worker", message: "wait" });
+    monitor.applyExternalStatus("pty:mate", "running", "claude");
+    await nudger.sweep();
+    assert.equal(adapter.submissions.length, 0, "a running mate is never interrupted");
+
+    monitor.applyExternalStatus("pty:mate", "idle", "claude");
+    monitor.setPendingApproval("pty:mate", { id: "approval", summary: "waiting", at: "" });
+    await nudger.sweep();
+    assert.equal(adapter.submissions.length, 0, "a gated mate never receives composer input");
+  });
+});
+
+test("sweep leaves an empty mailbox alone and stops its timer cleanly", async () => {
+  await withNudger(async ({ tasks, adapter, nudger, task: routed }) => {
+    nudger.start();
+    await delay(20);
+    nudger.stop();
+    tasks.recordEvent(routed.id, { kind: "blocked", source: "worker", message: "after stop" });
+    await delay(20);
+
+    assert.equal(adapter.submissions.length, 0, "stopped nudger leaves no live timer");
+  }, { sweepMs: 5 });
+});
+
+test("a server restart re-nudges durable mail that was never acknowledged", async () => {
+  const home = mkdtempSync(join(tmpdir(), "perch-nudge-restart-"));
+  const first = new TaskStore({ PERCH_HOME: home } as NodeJS.ProcessEnv);
+  let firstClosed = false;
+  let restarted: TaskStore | undefined;
+  try {
+    const created = first.create({ title: "routed work", project: "/tmp/repo", kind: "ship" });
+    const firstAdapter = new MateAdapter();
+    const firstMonitor = new FleetMonitor(firstAdapter, { broadcastMs: 5 });
+    const firstNudger = new MateMailboxNudger({
+      mailbox: first.stateDb.mateMailbox,
+      adapter: firstAdapter,
+      monitor: firstMonitor
+    });
+    first.recordEvent(created.id, { kind: "blocked", source: "worker", message: "restart wake" });
+    firstMonitor.applyExternalStatus("pty:mate", "idle", "claude");
+    await firstNudger.nudge();
+    assert.equal(firstAdapter.submissions.length, 1);
+
+    first.close();
+    firstClosed = true;
+
+    restarted = new TaskStore({ PERCH_HOME: home } as NodeJS.ProcessEnv);
+    const restartedAdapter = new MateAdapter();
+    const restartedMonitor = new FleetMonitor(restartedAdapter, { broadcastMs: 5 });
+    const restartedNudger = new MateMailboxNudger({
+      mailbox: restarted.stateDb.mateMailbox,
+      adapter: restartedAdapter,
+      monitor: restartedMonitor
+    });
+    restartedMonitor.applyExternalStatus("pty:mate", "idle", "claude");
+    await restartedNudger.sweep();
+
+    assert.equal(restartedAdapter.submissions.length, 1, "fresh in-memory state heals the durable backlog");
+  } finally {
+    restarted?.close();
+    if (!firstClosed) first.close();
+    rmSync(home, { recursive: true, force: true });
+  }
+});
+
+test("sweep waits for new inactivity after mailbox claim activity", async () => {
+  await withNudger(async ({ tasks, adapter, monitor, nudger, task: routed }) => {
+    monitor.applyExternalStatus("pty:mate", "idle", "claude");
+    tasks.recordEvent(routed.id, { kind: "blocked", source: "worker", message: "claimed" });
+    await nudger.nudge();
+    await delay(5);
+    tasks.stateDb.mateMailbox.claim({
+      generation: 0,
+      limit: 10,
+      ttlMs: 1,
+      now: new Date().toISOString()
+    });
+    await delay(5);
+
+    await nudger.sweep();
+    assert.equal(adapter.submissions.length, 1, "claim activity suppresses a duplicate retry");
+  }, { sweepMs: 1 });
 });
 
 test("system and poller lifecycle events use the mailbox and never inject their raw wake line", async () => {
