@@ -100,6 +100,11 @@ async function main() {
     return;
   }
 
+  if (parsed.command === "show") {
+    await runShowCommand(parsed.args, parsed.options);
+    return;
+  }
+
   if (parsed.command === "report") {
     await runReportCommand(parsed.args, parsed.options);
     return;
@@ -1428,6 +1433,164 @@ async function runTasksCommand(args, options) {
   );
 }
 
+const SHOW_BACKENDS = {
+  cmux: {
+    detect: detectCmuxContext,
+    sync: syncCmuxFleet
+  }
+};
+
+async function runShowCommand(args, options) {
+  const parsed = parseShowArgs(args);
+  if (!parsed.backend) {
+    const detected = Object.entries(SHOW_BACKENDS)
+      .filter(([, candidate]) => candidate.detect())
+      .map(([name]) => name);
+    if (detected.length !== 1) {
+      throw new Error(`could not auto-detect a terminal backend; supported backends: ${Object.keys(SHOW_BACKENDS).join(", ")}`);
+    }
+    parsed.backend = detected[0];
+  }
+  const backend = resolveShowBackend(parsed.backend);
+  const context = parsed.once ? undefined : backend.detect();
+
+  const snapshot = await fetchFleetSnapshot(options);
+  const targets = showAttachTargets(snapshot.sessions, snapshot.tasks, parsed.all);
+  if (!targets.length) {
+    console.log(parsed.all ? "no live workers or Mate to show" : "no live workers to show");
+    return;
+  }
+
+  // --once is the script-friendly fallback. Explicit cmux also falls back to
+  // commands when it is not the terminal that invoked perch.
+  if (parsed.once || !context) {
+    for (const target of targets) console.log(target.attachCommand);
+    return;
+  }
+
+  const result = backend.sync(targets, context);
+  console.log(`cmux fleet: added ${result.added}, already present ${result.existing}`);
+}
+
+function parseShowArgs(args) {
+  let backend;
+  let all = false;
+  let once = false;
+  for (const arg of args) {
+    if (arg === "--all") all = true;
+    else if (arg === "--once") once = true;
+    else if (!arg.startsWith("-") && !backend) backend = arg;
+    else throw new Error(`unknown show option: ${arg} (expected \`perch show [cmux] [--all] [--once]\`)`);
+  }
+  return { backend, all, once };
+}
+
+function resolveShowBackend(name) {
+  const backend = SHOW_BACKENDS[name];
+  if (!backend) throw new Error(`unknown show backend: ${name} (supported: ${Object.keys(SHOW_BACKENDS).join(", ")})`);
+  return backend;
+}
+
+async function fetchFleetSnapshot(options) {
+  const [sessions, taskResponse] = await Promise.all([
+    fetchSessions(options),
+    fetch(httpUrl(options, "/tasks"), { headers: jsonHeaders(options) })
+  ]);
+  if (!taskResponse.ok) throw new Error(await responseError(taskResponse));
+  const body = await taskResponse.json();
+  return { sessions, tasks: body.tasks ?? [] };
+}
+
+function showAttachTargets(sessions, tasks, all) {
+  const taskBySessionId = new Map();
+  for (const task of tasks) {
+    for (const sessionId of [task.sessionId, task.runtime?.ptySessionId, task.runtime?.sessionId]) {
+      if (sessionId) taskBySessionId.set(sessionId, task);
+    }
+  }
+
+  return sessions
+    .filter((session) => session.status !== "done" && session.status !== "error")
+    .map((session) => ({ session, task: taskBySessionId.get(session.id) }))
+    .filter(({ session, task }) => session.labels?.role === "mate" ? all : Boolean(task))
+    .map(({ session, task }) => {
+      const mate = session.labels?.role === "mate";
+      const name = mate ? "Mate" : session.workerName ?? session.labels?.workerName ?? task.workerName ?? shortSessionId(session.id);
+      const taskTitle = task?.title ?? session.title ?? "Fleet orchestrator";
+      return {
+        sessionId: session.id,
+        attachCommand: `perch attach ${session.id}`,
+        title: clip(`Perch: ${name} - ${taskTitle}`, 96),
+        marker: `perch-show session=${session.id}`
+      };
+    });
+}
+
+function detectCmuxContext() {
+  if (!process.env.CMUX_WORKSPACE_ID) return undefined;
+  const result = runCmux(["identify", "--json"]);
+  if (!result.ok) return undefined;
+  try {
+    const identity = JSON.parse(result.stdout);
+    if (!identity.caller?.workspace_ref || !identity.caller?.window_ref) return undefined;
+    return { windowRef: identity.caller.window_ref };
+  } catch {
+    return undefined;
+  }
+}
+
+function syncCmuxFleet(targets, context) {
+  const listed = runCmux(["workspace", "list", "--json", "--window", context.windowRef]);
+  if (!listed.ok) throw new Error(`cmux workspace list failed: ${cmuxError(listed)}`);
+  let workspaces;
+  try {
+    workspaces = JSON.parse(listed.stdout).workspaces ?? [];
+  } catch {
+    throw new Error("cmux workspace list returned invalid JSON");
+  }
+  const existing = new Set(workspaces.map((workspace) => workspace.description).filter(Boolean));
+  let added = 0;
+  let alreadyPresent = 0;
+  for (const target of targets) {
+    if (existing.has(target.marker)) {
+      alreadyPresent += 1;
+      continue;
+    }
+    const created = runCmux([
+      "workspace", "create",
+      "--window", context.windowRef,
+      "--name", target.title,
+      "--description", target.marker,
+      "--command", target.attachCommand,
+      "--focus", "false"
+    ]);
+    if (!created.ok) throw new Error(`cmux workspace create failed: ${cmuxError(created)}`);
+    added += 1;
+  }
+  return { added, existing: alreadyPresent };
+}
+
+function runCmux(args) {
+  const result = spawnSync("cmux", args, { encoding: "utf8", timeout: 3_000 });
+  return {
+    ok: !result.error && result.status === 0,
+    status: result.status,
+    stdout: result.stdout ?? "",
+    stderr: result.stderr ?? "",
+    error: result.error
+  };
+}
+
+function cmuxError(result) {
+  return result.stderr.trim() || result.error?.message || `exit ${result.status ?? "unknown"}`;
+}
+
+function clip(value, width) {
+  const text = String(value ?? "");
+  if (text.length <= width) return text;
+  return width <= 1 ? "…" : `${text.slice(0, width - 1)}…`;
+}
+
 function taskStateLabel(task) {
   const state = task.presentation?.state ?? task.state;
   return {
@@ -2117,7 +2280,7 @@ function parseArgs(argv) {
     }
     // Subcommands with their own flag grammar keep those flags as positionals; the shared flags above
     // (--server, --token, ...) are already consumed.
-    if (arg.startsWith("-") && command !== "project" && command !== "config" && command !== "models" && command !== "tasks" && command !== "task" && command !== "worktrees" && command !== "doctor" && command !== "report" && command !== "mailbox" && command !== "autoreview" && command !== "delivery") {
+    if (arg.startsWith("-") && command !== "project" && command !== "config" && command !== "models" && command !== "tasks" && command !== "show" && command !== "task" && command !== "worktrees" && command !== "doctor" && command !== "report" && command !== "mailbox" && command !== "autoreview" && command !== "delivery") {
       throw new Error(`unknown option for ${command}: ${arg} (see \`perch --help\`)`);
     }
     args.push(arg);
@@ -2673,6 +2836,7 @@ function printHelp(command) {
   perch stop <session-id>
   perch ls
   perch tasks [--json]
+  perch show [cmux] [--all] [--once]
   perch report send --task <task-id> --summary <text> --report-file <path>
   perch autoreview run --task <task-id> --idempotency-key <key> --test-argv-json <json-array>
   perch delivery create-pr --task <task-id> --idempotency-key <key>
@@ -2740,6 +2904,7 @@ function commandHelp(command) {
   if (command === "stop") return "Usage: perch stop <session-id>\n\nStops a live Perch session. Session ids may be shortened when unambiguous.";
   if (command === "ls") return "Usage: perch ls\n\nLists Perch sessions.";
   if (command === "tasks") return "Usage: perch tasks [--json]\n\nLists active durable tasks using the same task state, runtime, and PR facts shown in the mobile app.";
+  if (command === "show") return "Usage: perch show [cmux] [--all] [--once]\n\nCreates one named cmux workspace for each live worker, running its exact `perch attach <session-id>` command. Re-running adds only new workers. `--all` includes Mate. `--once`, or an explicit cmux backend outside cmux, prints the commands without opening workspaces. Bare `perch show` auto-detects an unambiguous backend; otherwise name one of: cmux.";
   if (command === "report") return "Usage: perch report send --task <task-id> --summary <text> (--report <text> | --report-file <path>) [--evidence-file <path>] [--format <format>] [--key <idempotency-key>]\n\nDurably submits a worker's full report + evidence to the mate mailbox (byte-for-byte, no truncation). Success means the report was committed, not that the mate processed it. Uses the session's hook credentials from the environment.";
   if (command === "autoreview") return "Usage: perch autoreview run --task <task-id> --idempotency-key <key> --test-argv-json <json-array> [--base-ref <ref>] [--supersedes-attempt-id <id>]\n\nRuns the immutable bundled AutoReview helper for the current managed root runtime and returns a durable receipt plus structured findings. test-argv-json must name a supported test launcher such as npm test or node --test; shells and arbitrary executables are rejected, and raw arguments are not persisted.";
   if (command === "delivery") return "Usage: perch delivery create-pr --task <task-id> --idempotency-key <key>\n\nCreates the ship task PR through Perch's server-owned path after it verifies a clean AutoReview receipt.";
