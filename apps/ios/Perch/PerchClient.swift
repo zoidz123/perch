@@ -549,26 +549,48 @@ final class PerchStore: ObservableObject {
         reconcileOptimistic(sessionId, fresh)
     }
 
-    // Ordinal reconciliation for whole-row arrival: each
-    // fresh canonical user row absorbs the oldest pending optimistic message.
-    // Unmatched optimistic items stay visible - never eat the user's message.
-    // A row with nothing pending left to absorb belongs to a message we already
-    // gave up on (a queued send that landed after its deadline), so it retires
-    // the oldest failed row instead of stranding a duplicate bubble.
-    private func reconcileOptimistic(_ sessionId: String, _ fresh: [TimelineItem]) {
+    // A canonical user row is the history of what the Mate received, so it
+    // replaces every optimistic message whose ordered newline join equals the
+    // row. A normal multi-line submission matches itself first and consumes
+    // one; a server-drained batch consumes all of its constituent messages.
+    // Unmatched rows preserve the established one-row ordinal fallback, which
+    // covers old servers and a canonical row that arrived after its timeout.
+    func reconcileOptimistic(_ sessionId: String, _ fresh: [TimelineItem]) {
         var pending = optimisticBySession[sessionId, default: []]
         guard !pending.isEmpty else {
             return
         }
-        var absorb = fresh.filter { $0.kind == .user }.count
-        guard absorb > 0 else {
-            return
-        }
-        while absorb > 0, !pending.isEmpty {
-            pending.remove(at: pending.firstIndex { !$0.failed } ?? 0)
-            absorb -= 1
+        for item in fresh where item.kind == .user {
+            let absorb = optimisticMessagesMatched(by: item.text, in: pending)
+            for _ in 0..<absorb where !pending.isEmpty {
+                pending.remove(at: pending.firstIndex { !$0.failed } ?? 0)
+            }
         }
         optimisticBySession[sessionId] = pending
+    }
+
+    private func optimisticMessagesMatched(by canonicalText: String?, in pending: [OptimisticMessage]) -> Int {
+        guard
+            let canonicalText,
+            let firstPending = pending.firstIndex(where: { !$0.failed })
+        else {
+            return 1
+        }
+
+        var joined = ""
+        for (offset, message) in pending[firstPending...].enumerated() {
+            guard !message.failed, let text = message.item.text else {
+                break
+            }
+            joined = joined.isEmpty ? text : "\(joined)\n\(text)"
+            if joined == canonicalText {
+                return offset + 1
+            }
+            if joined.count > canonicalText.count {
+                break
+            }
+        }
+        return 1
     }
 
     // How long an optimistic message waits for its canonical row before it is
