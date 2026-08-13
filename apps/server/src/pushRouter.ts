@@ -206,6 +206,22 @@ export class PushRouter {
     });
   }
 
+  pendingInputDeliveryFailed(
+    sessionId: string,
+    session: AgentSession | undefined,
+    attempts: number
+  ): void {
+    this.classify(sessionId, session);
+    this.sendDetached({
+      title: "Mate message was not delivered",
+      subtitle: pushContext(session),
+      body: `Perch tried ${attempts} times and released later queued messages. Tap to resend.`,
+      sessionId,
+      category: "error",
+      threadId: "mate"
+    });
+  }
+
   // Task ledger events. Crew tasks stay silent (the mate relays), except that
   // needs_decision/blocked arm the escalation fallback. Tasks the boss
   // dispatched directly (no mate parentage) push immediately.

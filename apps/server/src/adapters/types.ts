@@ -36,6 +36,10 @@ export type AgentAdapter = {
   // this so a perch-answered dialog is never also surfaced to the phone.
   // Adapters that never answer dialogs omit it and are always answerable.
   promptAnswerInFlight?(sessionId: string): boolean;
+  // PTY-backed adapters use the rendered cursor line to prove the shared
+  // composer is empty before server-owned input is typed. False means either
+  // a human draft is present or emptiness cannot be proven, so callers wait.
+  composerIsEmpty?(sessionId: string): Promise<boolean>;
   sendEnter(sessionId: string): Promise<void>;
   interrupt(sessionId: string): Promise<void>;
   startAgent?(request: StartAgentRequest): Promise<AgentSession>;
