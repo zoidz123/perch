@@ -22,7 +22,7 @@ test("fresh startup creates the versioned WAL database with foreign keys enabled
 
   assert.equal(state.path, join(root, "state.sqlite"));
   assert.equal(existsSync(state.path), true);
-  assert.equal(state.schemaVersion(), 20);
+  assert.equal(state.schemaVersion(), 21);
   assert.equal(state.journalMode(), "wal");
   assert.equal(state.foreignKeysEnabled(), true);
 
@@ -47,7 +47,8 @@ test("fresh startup creates the versioned WAL database with foreign keys enabled
     { version: 17, name: "durable-autoreview-receipts" },
     { version: 18, name: "delivery-redelivery-force-with-lease" },
     { version: 19, name: "durable-pending-session-inputs" },
-    { version: 20, name: "retryable-pending-session-inputs" }
+    { version: 20, name: "retryable-pending-session-inputs" },
+    { version: 21, name: "mate-input-delivery-stages" }
   ]);
   assert.deepEqual(
     inspect
@@ -142,7 +143,8 @@ test("pending session input batches share attempt identity and mutate atomically
 
   const attempted = state.pendingSessionInputs.beginBatchAttempt([one.id, two.id], {
     deliveryId: delivery.id,
-    nextAttemptAt: "2026-08-13T04:00:00.000Z"
+    nextAttemptAt: "2026-08-13T04:00:00.000Z",
+    releasedAt: "2026-08-13T03:59:59.000Z"
   });
   assert.deepEqual(
     attempted?.map((input) => [input.promptText, input.deliveryId, input.attemptCount]),
@@ -156,12 +158,20 @@ test("pending session input batches share attempt identity and mutate atomically
   assert.equal(
     state.pendingSessionInputs.beginBatchAttempt([one.id, "missing"], {
       deliveryId: "delivery-2",
-      nextAttemptAt: "2026-08-13T04:01:00.000Z"
+      nextAttemptAt: "2026-08-13T04:01:00.000Z",
+      releasedAt: "2026-08-13T04:00:59.000Z"
     }),
     undefined
   );
   assert.equal(state.pendingSessionInputs.find(one.id)?.attemptCount, 1);
-  assert.equal(state.pendingSessionInputs.removeBatch([one.id, two.id]), true);
+  const confirmed = state.pendingSessionInputs.markBatchConfirmed(
+    [one.id, two.id],
+    "2026-08-13T04:00:01.000Z"
+  );
+  assert.deepEqual(confirmed?.map((input) => [input.state, input.releasedAt, input.confirmedAt]), [
+    ["confirmed", "2026-08-13T03:59:59.000Z", "2026-08-13T04:00:01.000Z"],
+    ["confirmed", "2026-08-13T03:59:59.000Z", "2026-08-13T04:00:01.000Z"]
+  ]);
   assert.deepEqual(state.pendingSessionInputs.list("pty:mate").map((input) => input.id), [later.id]);
 
   state.close();
@@ -204,14 +214,14 @@ test("version 20 adopts the wedged head's unknown delivery for retry", () => {
     DROP TABLE pending_session_inputs_current;
     CREATE INDEX pending_session_inputs_session_idx
       ON pending_session_inputs(perch_session_id, created_at);
-    DELETE FROM schema_migrations WHERE version = 20;
+    DELETE FROM schema_migrations WHERE version IN (20, 21);
     PRAGMA user_version = 19;
   `);
   legacy.close();
 
   const migrated = new StateDb(env(root));
   const adopted = migrated.pendingSessionInputs.find(pending.id);
-  assert.equal(migrated.schemaVersion(), 20);
+  assert.equal(migrated.schemaVersion(), 21);
   assert.equal(adopted?.deliveryId, delivery.id);
   assert.equal(adopted?.attemptCount, 1);
   assert.ok(adopted?.nextAttemptAt);
@@ -273,13 +283,13 @@ test("version 13 migrates an earlier prompt delivery schema without losing rows"
     DROP TABLE delivery_pr_attempts;
     DROP TABLE autoreview_attempts;
     DROP TABLE pending_session_inputs;
-    DELETE FROM schema_migrations WHERE version IN (13, 14, 15, 16, 17, 18, 19, 20);
+    DELETE FROM schema_migrations WHERE version IN (13, 14, 15, 16, 17, 18, 19, 20, 21);
     PRAGMA user_version = 12;
   `);
   legacy.close();
 
   const migrated = new StateDb(env(root));
-  assert.equal(migrated.schemaVersion(), 20);
+  assert.equal(migrated.schemaVersion(), 21);
   assert.deepEqual(migrated.promptDeliveries.find("legacy-delivery"), {
     id: "legacy-delivery",
     perchSessionId: "pty:legacy",
@@ -288,6 +298,8 @@ test("version 13 migrates an earlier prompt delivery schema without losing rows"
     promptText: "Legacy prompt",
     promptHash: "legacy-hash",
     failureReason: "receipt timeout",
+    enqueuedAt: "2026-07-23T00:00:00.000Z",
+    releasedAt: "2026-07-23T00:00:01.000Z",
     createdAt: "2026-07-23T00:00:00.000Z",
     typingAt: "2026-07-23T00:00:01.000Z",
     submittedAt: "2026-07-23T00:00:02.000Z",

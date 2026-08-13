@@ -153,8 +153,10 @@ const taskCompletion = new TaskCompletionReconciler({
   tasks,
   lastAssistantText: (sessionId) => timeline.lastAssistantText(sessionId)
 });
+let observePromptDelivery: ((delivery: import("./stateDb.js").PromptDeliveryRecord, state: "accepted" | "unknown") => void) | undefined;
 const promptDeliveries = new PromptDeliveryTracker(tasks.stateDb, {
   onAccepted: (delivery) => {
+    observePromptDelivery?.(delivery, "accepted");
     markTaskWorkingFromActivity({ tasks }, delivery.perchSessionId, { newTurn: true });
     if (!delivery.unknownNotifiedAt) return;
     const task = delivery.taskId
@@ -175,6 +177,7 @@ const promptDeliveries = new PromptDeliveryTracker(tasks.stateDb, {
     });
   },
   onUnknown: (delivery) => {
+    observePromptDelivery?.(delivery, "unknown");
     const task = delivery.taskId
       ? tasks.find(delivery.taskId)
       : tasks.list().find((candidate) => candidate.sessionId === delivery.perchSessionId);
@@ -247,6 +250,13 @@ const monitor = new FleetMonitor(adapter, {
     });
   }
 });
+observePromptDelivery = (delivery, state) => {
+  if (state === "accepted") {
+    monitor.onPromptDeliveryAccepted(delivery);
+  } else {
+    monitor.onPromptDeliveryUnknown(delivery);
+  }
+};
 monitor.setRuntimeSnapshot((sessionId) => runtimeManager.snapshotForSession(sessionId));
 mailboxNudger = new MateMailboxNudger({ mailbox: tasks.stateDb.mateMailbox, adapter, monitor });
 mailboxNudger.start();

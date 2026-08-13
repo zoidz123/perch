@@ -8,6 +8,7 @@ import { test } from "node:test";
 import type { AgentSession, FleetEvent, RecentEventsResult } from "@perch/shared";
 import type { WebSocket } from "ws";
 import type { AgentAdapter } from "./adapters/types.js";
+import { PtyAgentAdapter, type PtyProcess } from "./adapters/pty.js";
 import { resolveApprovalForTask, surfaceApprovalToTask } from "./agentLauncher.js";
 import { AuditLog } from "./audit.js";
 import { FleetMonitor, type FleetMonitorOptions } from "./fleetMonitor.js";
@@ -104,6 +105,37 @@ class RecordingAdapter implements AgentAdapter {
   }
 }
 
+class ScriptedMatePty implements PtyProcess {
+  pid = process.pid;
+  readonly writes: Array<{ data: string; at: number }> = [];
+  private readonly dataListeners = new Set<(data: string) => void>();
+  private readonly exitListeners = new Set<(event: { exitCode: number; signal?: number }) => void>();
+
+  write(data: string): void {
+    this.writes.push({ data, at: Date.now() });
+    // A real terminal echoes composed input before Claude processes Enter.
+    this.emitData(data);
+  }
+
+  kill(): void {
+    for (const listener of this.exitListeners) listener({ exitCode: 0 });
+  }
+
+  onData(listener: (data: string) => void) {
+    this.dataListeners.add(listener);
+    return { dispose: () => this.dataListeners.delete(listener) };
+  }
+
+  onExit(listener: (event: { exitCode: number; signal?: number }) => void) {
+    this.exitListeners.add(listener);
+    return { dispose: () => this.exitListeners.delete(listener) };
+  }
+
+  emitData(data: string): void {
+    for (const listener of this.dataListeners) listener(data);
+  }
+}
+
 class MonitorSocket extends EventEmitter {
   readonly OPEN = 1;
   readyState = 1;
@@ -117,7 +149,6 @@ class MonitorSocket extends EventEmitter {
 type TestServerOptions = Pick<
   FleetMonitorOptions,
   | "pendingInputMaxAttempts"
-  | "pendingInputPollMs"
   | "pendingInputRetryBackoffMs"
   | "pushRouter"
 > & { receiptTimeoutMs?: number };
@@ -129,8 +160,11 @@ async function startServer(
 ) {
   const env = { PERCH_HOME: home } as NodeJS.ProcessEnv;
   const tasks = new TaskStore(env);
+  let observePromptDelivery: ((delivery: import("./stateDb.js").PromptDeliveryRecord, state: "accepted" | "unknown") => void) | undefined;
   const promptDeliveries = new PromptDeliveryTracker(tasks.stateDb, {
-    receiptTimeoutMs: options.receiptTimeoutMs ?? 5_000
+    receiptTimeoutMs: options.receiptTimeoutMs ?? 5_000,
+    onAccepted: (delivery) => observePromptDelivery?.(delivery, "accepted"),
+    onUnknown: (delivery) => observePromptDelivery?.(delivery, "unknown")
   });
   const monitor = new FleetMonitor(adapter, {
     broadcastMs: 5,
@@ -143,14 +177,18 @@ async function startServer(
     ...(options.pendingInputMaxAttempts !== undefined
       ? { pendingInputMaxAttempts: options.pendingInputMaxAttempts }
       : {}),
-    ...(options.pendingInputPollMs !== undefined
-      ? { pendingInputPollMs: options.pendingInputPollMs }
-      : {}),
     ...(options.pendingInputRetryBackoffMs
       ? { pendingInputRetryBackoffMs: options.pendingInputRetryBackoffMs }
       : {}),
     ...(options.pushRouter ? { pushRouter: options.pushRouter } : {})
   });
+  observePromptDelivery = (delivery, state) => {
+    if (state === "accepted") {
+      monitor.onPromptDeliveryAccepted(delivery);
+    } else {
+      monitor.onPromptDeliveryUnknown(delivery);
+    }
+  };
   const hooks = new HookRegistry();
   const timeline = new TimelineStore();
   timeline.observe((item) => promptDeliveries.acknowledgeTimeline(item));
@@ -253,12 +291,22 @@ async function waitForMessage(socket: MonitorSocket, id: string): Promise<Record
   return undefined;
 }
 
-async function waitForWrites(adapter: RecordingAdapter, count: number): Promise<void> {
-  const deadline = Date.now() + 1_000;
+async function waitForWrites(adapter: RecordingAdapter, count: number, timeoutMs = 1_000): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
   while (adapter.writes.length < count && Date.now() < deadline) {
     await new Promise((resolve) => setTimeout(resolve, 5));
   }
   assert.equal(adapter.writes.length, count);
+}
+
+async function waitForPtyWrite(child: ScriptedMatePty, data: string, after: number): Promise<number> {
+  const deadline = Date.now() + 1_000;
+  while (Date.now() < deadline) {
+    const write = child.writes.find((candidate) => candidate.data === data && candidate.at >= after);
+    if (write) return write.at;
+    await new Promise((resolve) => setTimeout(resolve, 5));
+  }
+  assert.fail(`PTY did not receive ${JSON.stringify(data)} within one second`);
 }
 
 async function waitFor(predicate: () => boolean | Promise<boolean>): Promise<void> {
@@ -299,11 +347,62 @@ test("an idle mate durably queues and starts release near-immediately", async ()
     await waitForWrites(adapter, 2);
     assert.deepEqual(adapter.writes, ["please also update the tests\n", "\r"]);
     assert.equal(await queuedCount(port), 1);
+    const released = await sessionSnapshot(port);
+    assert.equal(released?.inputDelivery?.state, "released");
+    assert.ok(released?.inputDelivery?.enqueuedAt);
+    assert.ok(released?.inputDelivery?.releasedAt);
 
     promptDeliveries.acknowledgeHook(SESSION_ID, "please also update the tests\n");
     monitor.applyExternalStatus(SESSION_ID, "running", "claude", "hook");
     await waitFor(async () => (await queuedCount(port)) === undefined);
+    const confirmed = await sessionSnapshot(port);
+    assert.equal(confirmed?.inputDelivery?.state, "confirmed");
+    assert.ok(confirmed?.inputDelivery?.confirmedAt);
   });
+});
+
+test("idle mate PTY tap-to-terminal p95 stays below five seconds", async () => {
+  let child: ScriptedMatePty | undefined;
+  const adapter = new PtyAgentAdapter(() => {
+    child = new ScriptedMatePty();
+    return child;
+  });
+  await adapter.startAgent({
+    command: "claude",
+    sessionId: SESSION_ID,
+    title: "mate",
+    labels: { role: "mate" }
+  });
+
+  try {
+    await withServer(async ({ port, monitor, promptDeliveries }) => {
+      const phone = new MonitorSocket();
+      monitor.addClient(phone as unknown as WebSocket);
+      child!.emitData("❯ ");
+      await waitFor(async () => (await sessionSnapshot(port))?.status === "idle");
+
+      const latencies: number[] = [];
+      for (let index = 0; index < 20; index += 1) {
+        const text = `m${index}`;
+        const started = Date.now();
+        const response = await postInput(port, text);
+        assert.equal(response.status, 202);
+        const typedAt = await waitForPtyWrite(child!, text, started);
+        latencies.push(typedAt - started);
+
+        await waitForPtyWrite(child!, "\r", typedAt);
+        promptDeliveries.acknowledgeHook(SESSION_ID, text);
+        // Claude redraws the fenced empty composer at the next turn boundary.
+        child!.emitData("\r\x1b[2K❯ ");
+        await waitFor(async () => (await sessionSnapshot(port))?.status === "idle");
+      }
+
+      const p95 = [...latencies].sort((left, right) => left - right)[18]!;
+      assert.ok(p95 < 5_000, `expected tap-to-terminal p95 under 5s, got ${p95}ms`);
+    }, {}, adapter as unknown as RecordingAdapter);
+  } finally {
+    adapter.stop();
+  }
 });
 
 test("an idle mate receives a three-message burst as one ordered delivery", async (t) => {
@@ -396,15 +495,16 @@ test("an idle mate release waits for a shared PTY desktop draft to clear", async
     assert.equal(tasks.stateDb.pendingSessionInputs.list(SESSION_ID)[0]?.attemptCount, 0);
 
     adapter.composerEmpty = true;
+    // The PTY's verified composer-ready event wakes release. There is no
+    // eligibility poll to discover that a shared desktop draft was cleared.
+    monitor.applyExternalStatus(SESSION_ID, "idle", "claude", "adapter");
     await waitForWrites(adapter, 2);
     assert.deepEqual(adapter.writes, ["queued boss message", "\r"]);
 
     promptDeliveries.acknowledgeHook(SESSION_ID, "queued boss message");
     monitor.applyExternalStatus(SESSION_ID, "running", "claude", "hook");
     await waitFor(async () => (await queuedCount(port)) === undefined);
-  }, {
-    pendingInputPollMs: 10
-  }, adapter);
+  }, {}, adapter);
 });
 
 test("Claude PTY input stays submitted until its matching hook receipt accepts it", async () => {
@@ -580,9 +680,30 @@ test("a receipt timeout retries through stale running status when the shared com
     await waitFor(() => tasks.stateDb.pendingSessionInputs.count(SESSION_ID) === 0);
   }, {
     receiptTimeoutMs: 20,
-    pendingInputPollMs: 5,
     pendingInputRetryBackoffMs: [10]
   });
+});
+
+test("an unconfirmed mate delivery retries within fifteen seconds", async () => {
+  await withServer(async ({ port, adapter, monitor, promptDeliveries, tasks }) => {
+    monitor.applyExternalStatus(SESSION_ID, "idle", "claude", "hook");
+    const started = Date.now();
+    const response = await postInput(port, "retry at production timeout");
+    assert.equal(response.status, 202);
+    await waitForWrites(adapter, 4, 6_000);
+    const elapsed = Date.now() - started;
+    assert.deepEqual(adapter.writes, [
+      "retry at production timeout",
+      "\r",
+      "retry at production timeout",
+      "\r"
+    ]);
+    assert.ok(elapsed < 15_000, `expected retry under 15s, got ${elapsed}ms`);
+    assert.equal(tasks.stateDb.pendingSessionInputs.list(SESSION_ID)[0]?.attemptCount, 2);
+
+    promptDeliveries.acknowledgeHook(SESSION_ID, "retry at production timeout");
+    await waitFor(() => tasks.stateDb.pendingSessionInputs.count(SESSION_ID) === 0);
+  }, { receiptTimeoutMs: 4_000 });
 });
 
 test("an unknown mate delivery retries the durable head instead of wedging later human input", async () => {
@@ -656,8 +777,7 @@ test("an unknown mate delivery retries the durable head instead of wedging later
     await waitFor(async () => (await queuedCount(port)) === undefined);
     assert.deepEqual(tasks.stateDb.pendingSessionInputs.list(SESSION_ID), []);
   }, {
-    pendingInputRetryBackoffMs: [20],
-    pendingInputPollMs: 5
+    pendingInputRetryBackoffMs: [20]
   });
 });
 
@@ -698,7 +818,6 @@ test("an exhausted mate head warns the session and boss, then releases later inp
     assert.equal((await sessionSnapshot(port))?.promptDeliveryWarning, undefined);
   }, {
     pendingInputMaxAttempts: 2,
-    pendingInputPollMs: 5,
     pendingInputRetryBackoffMs: [10],
     pushRouter
   }, adapter);
@@ -734,7 +853,6 @@ test("server start retries a wedged in-flight mate delivery for an idle live ses
   const firstAdapter = new RecordingAdapter();
   firstAdapter.session.status = "idle";
   const retryOptions = {
-    pendingInputPollMs: 5,
     pendingInputRetryBackoffMs: [10]
   } as const;
   const first = await startServer(home, firstAdapter, retryOptions);

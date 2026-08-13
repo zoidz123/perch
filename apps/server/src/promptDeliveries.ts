@@ -2,7 +2,7 @@ import type { AgentSession, TimelineItem } from "@perch/shared";
 import type { PromptDeliveryRecord, PromptDeliverySurfaceRecord, StateDb } from "./stateDb.js";
 import { TIMELINE_TEXT_MAX_LENGTH } from "./timeline.js";
 
-const DEFAULT_RECEIPT_TIMEOUT_MS = 15_000;
+const DEFAULT_RECEIPT_TIMEOUT_MS = 4_000;
 
 export type PromptDeliverySource = "human" | "agent";
 
@@ -131,7 +131,7 @@ export class PromptDeliveryTracker {
     sessionId: string,
     text: string,
     source: PromptDeliverySource,
-    options: { allowLateReceipt?: boolean } = {}
+    options: { allowLateReceipt?: boolean; enqueuedAt?: string } = {}
   ): PromptDeliveryRecord {
     const runtime = this.stateDb.runtimes.findBySession(sessionId);
     const ownerRuntime = runtime ? undefined : this.stateDb.ownerRuntimes.findBySession(sessionId);
@@ -140,6 +140,7 @@ export class PromptDeliveryTracker {
       promptText: text,
       source,
       ...(options.allowLateReceipt ? { allowLateReceipt: true } : {}),
+      ...(options.enqueuedAt ? { enqueuedAt: options.enqueuedAt } : {}),
       ...(runtime ? { runtimeGeneration: runtime.generation, taskId: runtime.taskId } : {}),
       ...(ownerRuntime ? { runtimeGeneration: ownerRuntime.generation } : {})
     });

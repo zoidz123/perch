@@ -14,7 +14,7 @@ import type {
 import Database from "better-sqlite3";
 import type { TaskDeliverable, TaskVerificationFacts } from "./taskPresentation.js";
 
-const LATEST_SCHEMA_VERSION = 20;
+const LATEST_SCHEMA_VERSION = 21;
 const LEGACY_TASK_IMPORT = "tasks-json-v1";
 
 const MIGRATIONS = [
@@ -768,6 +768,13 @@ const MIGRATIONS = [
           next_attempt_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
       WHERE delivery_id IS NOT NULL;
     `
+  },
+  {
+    version: 21,
+    name: "mate-input-delivery-stages",
+    // StateDb checks existing columns before rebuilding the strict table.
+    // That makes an interrupted or manually repaired schema recoverable.
+    sql: ""
   }
 ] as const;
 
@@ -1175,6 +1182,11 @@ export type PromptDeliveryRecord = {
   transcriptReceiptAt?: string;
   transcriptReceiptId?: string;
   failureReason?: string;
+  // These stage timestamps begin at tap-time for durable mate input. `createdAt`
+  // remains the prompt-delivery row creation time for legacy callers.
+  enqueuedAt: string;
+  releasedAt?: string;
+  confirmedAt?: string;
   createdAt: string;
   typingAt?: string;
   submittedAt?: string;
@@ -1202,13 +1214,16 @@ export type PendingSessionInputRecord = {
   id: string;
   perchSessionId: string;
   source: "human" | "agent";
-  state: "pending" | "failed";
+  state: "pending" | "confirmed" | "failed";
   promptText: string;
   attemptCount: number;
   deliveryId?: string;
   nextAttemptAt?: string;
   lastError?: string;
   failedAt?: string;
+  enqueuedAt: string;
+  releasedAt?: string;
+  confirmedAt?: string;
   createdAt: string;
 };
 
@@ -1406,7 +1421,11 @@ export class StateDb {
         if (migration.version === 13) {
           this.normalizePromptDeliveriesV12();
         }
-        this.db.exec(migration.sql);
+        if (migration.version === 21) {
+          this.migrateMateInputDeliveryStages();
+        } else {
+          this.db.exec(migration.sql);
+        }
         this.db
           .prepare("INSERT INTO schema_migrations(version, name, applied_at) VALUES (?, ?, ?)")
           .run(migration.version, migration.name, new Date().toISOString());
@@ -1449,6 +1468,68 @@ export class StateDb {
         this.db.exec(`ALTER TABLE prompt_deliveries ADD COLUMN ${addition}`);
       }
     }
+  }
+
+  private migrateMateInputDeliveryStages(): void {
+    const promptColumns = new Set(
+      (this.db.pragma("table_info(prompt_deliveries)") as Array<{ name: string }>).map((column) => column.name)
+    );
+    for (const column of ["enqueued_at", "released_at", "confirmed_at"] as const) {
+      if (!promptColumns.has(column)) {
+        this.db.exec(`ALTER TABLE prompt_deliveries ADD COLUMN ${column} TEXT`);
+      }
+    }
+    this.db.exec(`
+      UPDATE prompt_deliveries
+      SET enqueued_at = coalesce(enqueued_at, created_at),
+          released_at = coalesce(released_at, typing_at),
+          confirmed_at = coalesce(confirmed_at, accepted_at);
+    `);
+
+    const pendingColumns = new Set(
+      (this.db.pragma("table_info(pending_session_inputs)") as Array<{ name: string }>).map((column) => column.name)
+    );
+    if (!pendingColumns.has("enqueued_at")) {
+      this.db.exec(`
+        DROP INDEX IF EXISTS pending_session_inputs_session_idx;
+        DROP INDEX IF EXISTS pending_session_inputs_release_idx;
+        ALTER TABLE pending_session_inputs RENAME TO pending_session_inputs_v20;
+        CREATE TABLE pending_session_inputs (
+          id TEXT PRIMARY KEY,
+          perch_session_id TEXT NOT NULL,
+          source TEXT NOT NULL CHECK (source IN ('human', 'agent')),
+          state TEXT NOT NULL CHECK (state IN ('pending', 'confirmed', 'failed')),
+          prompt_text TEXT NOT NULL,
+          attempt_count INTEGER NOT NULL CHECK (attempt_count >= 0),
+          delivery_id TEXT REFERENCES prompt_deliveries(id) ON DELETE RESTRICT,
+          next_attempt_at TEXT,
+          last_error TEXT,
+          failed_at TEXT,
+          enqueued_at TEXT NOT NULL,
+          released_at TEXT,
+          confirmed_at TEXT,
+          created_at TEXT NOT NULL
+        ) STRICT;
+        INSERT INTO pending_session_inputs(
+          id, perch_session_id, source, state, prompt_text, attempt_count,
+          delivery_id, next_attempt_at, last_error, failed_at,
+          enqueued_at, released_at, confirmed_at, created_at
+        )
+        SELECT
+          id, perch_session_id, source, state, prompt_text, attempt_count,
+          delivery_id, next_attempt_at, last_error, failed_at,
+          created_at, NULL, NULL, created_at
+        FROM pending_session_inputs_v20
+        ORDER BY rowid;
+        DROP TABLE pending_session_inputs_v20;
+      `);
+    }
+    this.db.exec(`
+      CREATE INDEX IF NOT EXISTS pending_session_inputs_session_idx
+        ON pending_session_inputs(perch_session_id, created_at);
+      CREATE INDEX IF NOT EXISTS pending_session_inputs_release_idx
+        ON pending_session_inputs(perch_session_id, state, created_at);
+    `);
   }
 }
 
@@ -3367,6 +3448,7 @@ export class PendingSessionInputRepository {
     promptText: string;
     source: "human" | "agent";
   }): PendingSessionInputRecord {
+    const now = new Date().toISOString();
     const record: PendingSessionInputRecord = {
       id: randomUUID(),
       perchSessionId: input.perchSessionId,
@@ -3374,12 +3456,23 @@ export class PendingSessionInputRepository {
       state: "pending",
       promptText: input.promptText,
       attemptCount: 0,
-      createdAt: new Date().toISOString()
+      enqueuedAt: now,
+      createdAt: now
     };
     this.db.prepare(
-      `INSERT INTO pending_session_inputs(id, perch_session_id, source, prompt_text, created_at)
-       VALUES (?, ?, ?, ?, ?)`
-    ).run(record.id, record.perchSessionId, record.source, record.promptText, record.createdAt);
+      `INSERT INTO pending_session_inputs(
+        id, perch_session_id, source, state, prompt_text, attempt_count, enqueued_at, created_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
+    ).run(
+      record.id,
+      record.perchSessionId,
+      record.source,
+      record.state,
+      record.promptText,
+      record.attemptCount,
+      record.enqueuedAt,
+      record.createdAt
+    );
     return record;
   }
 
@@ -3406,6 +3499,15 @@ export class PendingSessionInputRepository {
     return row ? pendingSessionInputFromRow(row) : undefined;
   }
 
+  latest(sessionId: string): PendingSessionInputRecord | undefined {
+    const row = this.db.prepare(
+      `SELECT * FROM pending_session_inputs
+       WHERE perch_session_id = ?
+       ORDER BY rowid DESC LIMIT 1`
+    ).get(sessionId) as PendingSessionInputRow | undefined;
+    return row ? pendingSessionInputFromRow(row) : undefined;
+  }
+
   count(sessionId: string): number {
     return Number(
       this.db.prepare(
@@ -3418,26 +3520,27 @@ export class PendingSessionInputRepository {
 
   beginAttempt(
     id: string,
-    input: { deliveryId?: string; nextAttemptAt: string }
+    input: { deliveryId?: string; nextAttemptAt: string; releasedAt: string }
   ): PendingSessionInputRecord | undefined {
     return this.beginBatchAttempt([id], input)?.[0];
   }
 
   beginBatchAttempt(
     ids: readonly string[],
-    input: { deliveryId?: string; nextAttemptAt: string }
+    input: { deliveryId?: string; nextAttemptAt: string; releasedAt: string }
   ): PendingSessionInputRecord[] | undefined {
     const update = this.db.prepare(
       `UPDATE pending_session_inputs
        SET attempt_count = attempt_count + 1,
            delivery_id = coalesce(?, delivery_id),
+           released_at = coalesce(released_at, ?),
            next_attempt_at = ?,
            last_error = NULL
        WHERE id = ? AND state = 'pending'`
     );
     return this.mutatePendingBatch(
       ids,
-      (id) => update.run(input.deliveryId ?? null, input.nextAttemptAt, id).changes
+      (id) => update.run(input.deliveryId ?? null, input.releasedAt, input.nextAttemptAt, id).changes
     );
   }
 
@@ -3470,6 +3573,18 @@ export class PendingSessionInputRepository {
        WHERE id = ? AND state = 'pending'`
     );
     return this.mutatePendingBatch(ids, (id) => update.run(error, at, id).changes);
+  }
+
+  markBatchConfirmed(
+    ids: readonly string[],
+    at = new Date().toISOString()
+  ): PendingSessionInputRecord[] | undefined {
+    const update = this.db.prepare(
+      `UPDATE pending_session_inputs
+       SET state = 'confirmed', confirmed_at = ?, next_attempt_at = NULL, last_error = NULL
+       WHERE id = ? AND state = 'pending'`
+    );
+    return this.mutatePendingBatch(ids, (id) => update.run(at, id).changes);
   }
 
   remove(id: string): boolean {
@@ -3532,6 +3647,7 @@ export class PromptDeliveryRepository {
     promptText: string;
     source: "human" | "agent";
     allowLateReceipt?: boolean;
+    enqueuedAt?: string;
     runtimeGeneration?: number;
     taskId?: string;
   }): PromptDeliveryRecord {
@@ -3547,14 +3663,16 @@ export class PromptDeliveryRepository {
       state: "queued",
       promptText: input.promptText,
       promptHash: createHash("sha256").update(normalized).digest("hex"),
+      enqueuedAt: input.enqueuedAt ?? now,
+      releasedAt: now,
       createdAt: now,
       updatedAt: now
     };
     this.db.prepare(
       `INSERT INTO prompt_deliveries(
         id, perch_session_id, runtime_generation, task_id, source, allow_late_receipt,
-        state, prompt_text, prompt_hash, created_at, updated_at
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+        state, prompt_text, prompt_hash, enqueued_at, released_at, created_at, updated_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
     ).run(
       record.id,
       record.perchSessionId,
@@ -3565,6 +3683,8 @@ export class PromptDeliveryRepository {
       record.state,
       record.promptText,
       record.promptHash,
+      record.enqueuedAt,
+      record.releasedAt,
       record.createdAt,
       record.updatedAt
     );
@@ -3803,7 +3923,7 @@ export class PromptDeliveryRepository {
        hook_receipt_id = coalesce(hook_receipt_id, ?),
        transcript_receipt_at = coalesce(transcript_receipt_at, ?),
        transcript_receipt_id = coalesce(transcript_receipt_id, ?),
-       accepted_at = ?, accepted_order = ?, failure_reason = NULL, updated_at = ?
+       accepted_at = ?, confirmed_at = ?, accepted_order = ?, failure_reason = NULL, updated_at = ?
        WHERE id = ? AND state IN ('typing', 'submitted', 'delivery_unknown')`
     ).run(
       input.receiptKind,
@@ -3812,6 +3932,7 @@ export class PromptDeliveryRepository {
       hookReceiptId,
       transcriptReceiptAt,
       transcriptReceiptId,
+      now,
       now,
       acceptedOrder,
       now,
@@ -4046,6 +4167,9 @@ type PromptDeliveryRow = {
   transcript_receipt_at: string | null;
   transcript_receipt_id: string | null;
   failure_reason: string | null;
+  enqueued_at: string | null;
+  released_at: string | null;
+  confirmed_at: string | null;
   created_at: string;
   typing_at: string | null;
   typing_order: number | null;
@@ -4063,13 +4187,16 @@ type PendingSessionInputRow = {
   id: string;
   perch_session_id: string;
   source: "human" | "agent";
-  state: "pending" | "failed";
+  state: "pending" | "confirmed" | "failed";
   prompt_text: string;
   attempt_count: number;
   delivery_id: string | null;
   next_attempt_at: string | null;
   last_error: string | null;
   failed_at: string | null;
+  enqueued_at: string;
+  released_at: string | null;
+  confirmed_at: string | null;
   created_at: string;
 };
 
@@ -4404,6 +4531,9 @@ function promptDeliveryFromRow(row: PromptDeliveryRow): PromptDeliveryRecord {
     ...(row.transcript_receipt_at ? { transcriptReceiptAt: row.transcript_receipt_at } : {}),
     ...(row.transcript_receipt_id ? { transcriptReceiptId: row.transcript_receipt_id } : {}),
     ...(row.failure_reason ? { failureReason: row.failure_reason } : {}),
+    enqueuedAt: row.enqueued_at ?? row.created_at,
+    ...(row.released_at ? { releasedAt: row.released_at } : {}),
+    ...(row.confirmed_at ? { confirmedAt: row.confirmed_at } : {}),
     createdAt: row.created_at,
     ...(row.typing_at ? { typingAt: row.typing_at } : {}),
     ...(row.submitted_at ? { submittedAt: row.submitted_at } : {}),
@@ -4428,6 +4558,9 @@ function pendingSessionInputFromRow(row: PendingSessionInputRow): PendingSession
     ...(row.next_attempt_at ? { nextAttemptAt: row.next_attempt_at } : {}),
     ...(row.last_error ? { lastError: row.last_error } : {}),
     ...(row.failed_at ? { failedAt: row.failed_at } : {}),
+    enqueuedAt: row.enqueued_at,
+    ...(row.released_at ? { releasedAt: row.released_at } : {}),
+    ...(row.confirmed_at ? { confirmedAt: row.confirmed_at } : {}),
     createdAt: row.created_at
   };
 }

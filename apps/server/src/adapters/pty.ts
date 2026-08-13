@@ -765,6 +765,15 @@ export class PtyAgentAdapter implements AgentAdapter {
       seq: state.seq,
       at: state.session.lastActivityAt
     });
+    // Claude's final rendered composer is a stronger, immediate idle signal
+    // than a delayed Stop hook or the monitor's reconciliation sweep. Publish
+    // it only after xterm has applied the bytes and only for an empty fenced
+    // composer, preserving draft and dialog fencing.
+    void state.writeQueue.then(() => {
+      if (state.endedAt === undefined && state.session.agent === "claude" && cursorComposerIsEmpty(state.terminal)) {
+        this.touch(sessionId, "idle");
+      }
+    }).catch(() => {});
   }
 
   // Rendered plain-text view of the screen, computed on demand (throttled by

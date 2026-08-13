@@ -26,7 +26,11 @@ export type SessionModel = {
 import type { RawData } from "ws";
 import type { AgentAdapter } from "./adapters/types.js";
 import type { PromptDeliverySource, PromptDeliverySurface, PromptDeliveryTracker } from "./promptDeliveries.js";
-import type { PendingSessionInputRecord, PendingSessionInputRepository } from "./stateDb.js";
+import type {
+  PendingSessionInputRecord,
+  PendingSessionInputRepository,
+  PromptDeliveryRecord
+} from "./stateDb.js";
 import type { AuditLog } from "./audit.js";
 import { detectPrompt, type DetectedPrompt } from "./promptDetect.js";
 import type { PushRouter } from "./pushRouter.js";
@@ -38,9 +42,8 @@ import { detectUsageLimit, type UsageLimit } from "./usageLimitDetect.js";
 // bottom-anchored boxes, so a dialog a handful of content lines up sits far more
 // raw lines from the bottom.
 const SCREEN_CAPTURE_LINES = 60;
-const DEFAULT_PENDING_INPUT_RETRY_BACKOFF_MS = [1_000, 3_000, 10_000] as const;
+const DEFAULT_PENDING_INPUT_RETRY_BACKOFF_MS = [250, 500, 1_000] as const;
 const DEFAULT_PENDING_INPUT_MAX_ATTEMPTS = 4;
-const DEFAULT_PENDING_INPUT_POLL_MS = 1_000;
 const DEFAULT_PENDING_INPUT_BATCH_WINDOW_MS = 50;
 
 // A session status change with its provenance, observable via
@@ -154,7 +157,6 @@ export type FleetMonitorOptions = {
   // the E2E suite does not spend production seconds waiting on each attempt.
   pendingInputRetryBackoffMs?: readonly number[];
   pendingInputMaxAttempts?: number;
-  pendingInputPollMs?: number;
   pendingInputBatchWindowMs?: number;
   // Durable warning text derived from the prompt-delivery ledger. It is
   // recomputed for every fleet snapshot, so disconnected clients see it on
@@ -228,7 +230,6 @@ export class FleetMonitor {
   private readonly broadcastMs: number;
   private readonly pendingInputRetryBackoffMs: readonly number[];
   private readonly pendingInputMaxAttempts: number;
-  private readonly pendingInputPollMs: number;
   private readonly pendingInputBatchWindowMs: number;
   private readonly auditLog?: AuditLog;
   private pushRouter?: PushRouter;
@@ -266,7 +267,6 @@ export class FleetMonitor {
       ? options.pendingInputRetryBackoffMs
       : DEFAULT_PENDING_INPUT_RETRY_BACKOFF_MS;
     this.pendingInputMaxAttempts = options.pendingInputMaxAttempts ?? DEFAULT_PENDING_INPUT_MAX_ATTEMPTS;
-    this.pendingInputPollMs = options.pendingInputPollMs ?? DEFAULT_PENDING_INPUT_POLL_MS;
     this.pendingInputBatchWindowMs = options.pendingInputBatchWindowMs ?? DEFAULT_PENDING_INPUT_BATCH_WINDOW_MS;
     this.auditLog = options.auditLog;
     this.pushRouter = options.pushRouter;
@@ -703,7 +703,9 @@ export class FleetMonitor {
         source
       });
       this.scheduleBroadcast();
-      this.schedulePendingInputCheck(canonical, this.pendingInputBatchWindowMs);
+      // This is only a short burst-coalescing window. Eligibility is driven by
+      // status and PTY-composer events below, never by a recurring poll.
+      this.schedulePendingInputRelease(canonical, this.pendingInputBatchWindowMs);
       return { queued: true };
     }
 
@@ -724,6 +726,17 @@ export class FleetMonitor {
       : undefined;
     await this.submitToAdapter(canonical, text, delivery?.id, options.silent);
     return { queued: false };
+  }
+
+  // Prompt receipts are the confirmation/retry events for the durable mate
+  // queue. They wake the exact session immediately instead of waiting for a
+  // monitor sweep to notice a changed delivery record.
+  onPromptDeliveryAccepted(delivery: PromptDeliveryRecord): void {
+    void this.releasePendingInputBatch(this.canonicalSessionId(delivery.perchSessionId)).catch(() => {});
+  }
+
+  onPromptDeliveryUnknown(delivery: PromptDeliveryRecord): void {
+    void this.releasePendingInputBatch(this.canonicalSessionId(delivery.perchSessionId)).catch(() => {});
   }
 
   private async releasePendingInputBatch(sessionId: string, knownSession?: AgentSession): Promise<void> {
@@ -756,21 +769,20 @@ export class FleetMonitor {
         ? this.promptDeliveries?.find(pending.deliveryId)
         : undefined;
       if (tracked?.state === "accepted") {
-        if (!this.pendingSessionInputs.removeBatch(batchIds)) {
-          throw new Error("confirmed pending input batch was not removed from the durable queue");
+        if (!this.pendingSessionInputs.markBatchConfirmed(batchIds, tracked.confirmedAt ?? tracked.acceptedAt)) {
+          throw new Error("confirmed pending input batch was not marked in the durable queue");
         }
         this.clearPendingInputTimer(sessionId);
         return;
       }
       if (tracked && ["queued", "typing", "submitted"].includes(tracked.state)) {
-        this.schedulePendingInputCheck(sessionId, this.pendingInputPollMs);
         return;
       }
 
       const now = Date.now();
       const nextAttemptAt = Date.parse(pending.nextAttemptAt ?? "");
       if (Number.isFinite(nextAttemptAt) && nextAttemptAt > now) {
-        this.schedulePendingInputCheck(sessionId, nextAttemptAt - now);
+        this.schedulePendingInputRelease(sessionId, nextAttemptAt - now);
         return;
       }
       if (pending.attemptCount >= this.pendingInputMaxAttempts) {
@@ -802,7 +814,8 @@ export class FleetMonitor {
         this.inputGated(sessionId) ||
         composerEmpty === false
       ) {
-        this.schedulePendingInputCheck(sessionId, this.pendingInputPollMs);
+        // A hook turn boundary or the PTY's verified empty composer event
+        // re-enters this method. Do not turn a stale status into a poll loop.
         return;
       }
 
@@ -810,11 +823,12 @@ export class FleetMonitor {
       const delivery = session.agent === "claude" && this.promptDeliveries
         ? pending.deliveryId
           ? this.promptDeliveries.retryUnknown(pending.deliveryId)
-          : this.promptDeliveries.create(sessionId, promptText, pending.source)
+          : this.promptDeliveries.create(sessionId, promptText, pending.source, {
+              enqueuedAt: pending.enqueuedAt
+            })
         : undefined;
       if (pending.deliveryId && session.agent === "claude" && !delivery) {
         this.usedIdleBoundaries.delete(sessionId);
-        this.schedulePendingInputCheck(sessionId, this.pendingInputPollMs);
         return;
       }
       const attempt = pending.attemptCount + 1;
@@ -823,7 +837,8 @@ export class FleetMonitor {
       ]!;
       const attempted = this.pendingSessionInputs.beginBatchAttempt(batchIds, {
         ...(delivery ? { deliveryId: delivery.id } : {}),
-        nextAttemptAt: new Date(now + backoff).toISOString()
+        nextAttemptAt: new Date(now + backoff).toISOString(),
+        releasedAt: new Date(now).toISOString()
       });
       if (!attempted) {
         this.usedIdleBoundaries.delete(sessionId);
@@ -839,15 +854,20 @@ export class FleetMonitor {
         if (current?.[0] && current[0].attemptCount >= this.pendingInputMaxAttempts) {
           this.failPendingInputBatch(current, message);
         } else {
-          this.schedulePendingInputCheck(sessionId, backoff);
+          this.schedulePendingInputRelease(sessionId, backoff);
         }
         return;
       }
 
       if (delivery) {
-        this.schedulePendingInputCheck(sessionId, this.pendingInputPollMs);
-      } else if (!this.pendingSessionInputs.removeBatch(batchIds)) {
-        throw new Error("released pending input batch was not removed from the durable queue");
+        const completed = this.promptDeliveries?.find(delivery.id);
+        if (completed?.state === "accepted") {
+          if (!this.pendingSessionInputs.markBatchConfirmed(batchIds, completed.confirmedAt ?? completed.acceptedAt)) {
+            throw new Error("accepted pending input batch was not marked confirmed");
+          }
+        }
+      } else if (!this.pendingSessionInputs.markBatchConfirmed(batchIds)) {
+        throw new Error("released pending input batch was not marked confirmed");
       }
     } finally {
       this.pendingInputReleases.delete(sessionId);
@@ -872,10 +892,13 @@ export class FleetMonitor {
     );
     // Failed rows remain durable for diagnosis, but no longer own the live
     // FIFO head. Give the next human batch the same idle safe opportunity.
-    this.schedulePendingInputCheck(head.perchSessionId, 0);
+    this.schedulePendingInputRelease(head.perchSessionId, 0);
   }
 
-  private schedulePendingInputCheck(sessionId: string, delayMs: number): void {
+  // Timers represent a known deadline only: the 50ms enqueue coalescer or a
+  // bounded retry backoff. They are never used to repeatedly ask if a mate is
+  // idle, which keeps the normal idle path event-driven.
+  private schedulePendingInputRelease(sessionId: string, delayMs: number): void {
     this.clearPendingInputTimer(sessionId);
     const timer = setTimeout(() => {
       this.pendingInputTimers.delete(sessionId);
@@ -907,7 +930,7 @@ export class FleetMonitor {
     previous: AgentSessionStatus | undefined,
     status: AgentSessionStatus
   ): void {
-    if (status === "idle" && previous && previous !== "idle") {
+    if (status === "idle" && previous !== "idle") {
       this.usedIdleBoundaries.delete(sessionId);
     }
     void this.releasePendingInputBatch(sessionId).catch(() => {});
@@ -1426,9 +1449,9 @@ export class FleetMonitor {
     }
 
     this.pruneSessionState(previousSessionIds);
-    for (const session of this.sessions) {
-      void this.releasePendingInputBatch(session.id, session).catch(() => {});
-    }
+    // Queue release intentionally does not happen from this recurring safety
+    // reconciliation. Startup recovery, provider turn boundaries, PTY-ready
+    // events, receipt callbacks, and explicit retry deadlines own release.
     this.scheduleBroadcast();
   }
 
@@ -1592,6 +1615,18 @@ export class FleetMonitor {
           (this.pendingSessionInputs?.count(session.id) ?? 0);
         if (queued > 0) {
           result.queuedCount = queued;
+        }
+        const queuedInput = this.pendingSessionInputs?.list(session.id)[0];
+        const latestInput = queuedInput ?? this.pendingSessionInputs?.latest(session.id);
+        if (latestInput) {
+          result.inputDelivery = {
+            state: latestInput.state === "pending"
+              ? latestInput.releasedAt ? "released" : "queued"
+              : latestInput.state,
+            enqueuedAt: latestInput.enqueuedAt,
+            ...(latestInput.releasedAt ? { releasedAt: latestInput.releasedAt } : {}),
+            ...(latestInput.confirmedAt ? { confirmedAt: latestInput.confirmedAt } : {})
+          };
         }
       }
       return result;

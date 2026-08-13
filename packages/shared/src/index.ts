@@ -107,6 +107,15 @@ export type AgentSession = {
   // Messages held server-side until the session can accept input. This
   // includes the durable boss-to-mate turn-boundary queue.
   queuedCount?: number;
+  // The latest durable mate-input delivery stage. This is intentionally
+  // content-free so a reconnecting client can distinguish queued, released,
+  // and confirmed input without reading the prompt text.
+  inputDelivery?: {
+    state: "queued" | "released" | "confirmed" | "failed";
+    enqueuedAt: string;
+    releasedAt?: string;
+    confirmedAt?: string;
+  };
   // Durable logical-worker/runtime identity. PTY sessions are replaceable
   // generations; this snapshot survives reconnects and is separate from the
   // task's semantic state.
