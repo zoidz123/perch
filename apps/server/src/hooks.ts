@@ -68,6 +68,18 @@ post_echo() {
   exit 0
 }
 
+post_stop() {
+  # Stop is a synchronous control hook for the mate's silent mailbox
+  # continuation. Keep it short and fail open: a slow or unavailable local
+  # server must never trap Claude in a turn.
+  curl -sf --max-time 2 -X POST "$PERCH_HOOK_URL" \\
+    -H "content-type: application/json" \\
+    -H "x-perch-session: $PERCH_SESSION_ID" \\
+    -H "x-perch-token: $PERCH_HOOK_TOKEN" \\
+    --data-binary @- 2>/dev/null
+  exit 0
+}
+
 post_observer() {
   curl -sf --max-time 3 -X POST "$PERCH_HOOK_URL" \\
     -H "content-type: application/json" \\
@@ -98,8 +110,11 @@ post_blocking() {
 }
 
 case "$event" in
-  session-start|stop)
+  session-start)
     post_echo
+    ;;
+  stop)
+    post_stop
     ;;
   pre-tool-observer)
     post_observer

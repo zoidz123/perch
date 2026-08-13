@@ -130,6 +130,7 @@ import { ClaudeQuestionCoordinator, publicQuestion } from "./claudeQuestions.js"
 import { ClaudeInteractionCoordinator, publicInteraction } from "./claudeInteractions.js";
 import type { PromptDeliveryTracker } from "./promptDeliveries.js";
 import { CodexHistorySyncCoordinator } from "./codexHistorySync.js";
+import type { MateMailboxNudger } from "./mateWake.js";
 
 export { markTaskWorkingFromActivity } from "./agentLauncher.js";
 
@@ -192,6 +193,10 @@ export type HttpServerOptions = {
   claudeQuestions?: ClaudeQuestionCoordinator;
   claudeInteractions?: ClaudeInteractionCoordinator;
   promptDeliveries?: PromptDeliveryTracker;
+  // The live mate's Stop hook asks this owner-local nudge coordinator whether
+  // it should continue silently at the boundary. Optional for isolated HTTP
+  // tests and older server compositions.
+  mailboxNudger?: MateMailboxNudger;
 };
 
 const CODEX_ON_PATH_TTL_MS = 30_000;
@@ -4092,6 +4097,16 @@ async function handleHookReport(
 
     const eventName = hookEventName(payload);
     const codexOwnedTurnBoundary = format === "codex" && options.codexOwned?.has(sessionId) === true;
+    // A mailbox continuation is deliberately restricted to the single live
+    // Claude mate. Workers and Codex's settled turn notifications retain their
+    // existing Stop behavior. Deciding before the status transition prevents
+    // the idle nudge tap from typing a visible control line into a turn that
+    // Claude is about to continue.
+    const continueMateMailboxStop =
+      format === "claude" &&
+      eventName === "Stop" &&
+      options.ownerManager?.liveMateSessionId() === sessionId &&
+      options.mailboxNudger?.continueMateStop(sessionId) === true;
 
     if (eventName === "UserPromptSubmit" && format === "claude" && typeof payload.prompt === "string") {
       options.promptDeliveries?.acknowledgeHook(
@@ -4145,7 +4160,7 @@ async function handleHookReport(
     }
 
     const codexPermissionTelemetry = format === "codex" && eventName === "PermissionRequest";
-    if (normalized.status) {
+    if (normalized.status && !continueMateMailboxStop) {
       // Codex emits PermissionRequest while its configured reviewer evaluates
       // policy. Only a server-initiated JSON-RPC request means a human is
       // actually needed; the hook is quiet liveness telemetry and must not
@@ -4330,6 +4345,19 @@ async function handleHookReport(
       return;
     }
     if (format === "claude" && eventName === "Stop") {
+      if (continueMateMailboxStop) {
+        writeJson(response, 200, {
+          hookSpecificOutput: {
+            hookEventName: "Stop",
+            // Claude renders this as transcript-only Stop hook feedback. In
+            // contrast, top-level decision: "block" is an error-style warning
+            // in the terminal, which would violate the silent-boundary contract.
+            additionalContext:
+              "Perch mailbox has unread worker messages. Drain the mailbox now with perch mailbox read, process the messages, and acknowledge each one before stopping."
+          }
+        });
+        return;
+      }
       // Valid empty structured output means "allow Stop" without exposing the
       // server's internal acknowledgement as hook feedback.
       writeJson(response, 200, {});

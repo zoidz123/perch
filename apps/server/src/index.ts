@@ -758,7 +758,8 @@ const server = createControlServer({
   settings,
   taskScheduler,
   runtimeManager,
-  ownerManager
+  ownerManager,
+  mailboxNudger
 });
 
 // Off-LAN reach: a relay is on by default (config.relayUrl resolves to the
