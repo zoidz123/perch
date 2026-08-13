@@ -493,11 +493,11 @@ codexOwned.wireEvents({
 const outboxWorker = new OutboxWorker({
   stateDb: tasks.stateDb,
   deliver: {
-    // Worker-authored events already committed their durable mailbox delivery
-    // with the event; the mate channel then carries only a disposable
-    // attention nudge for them. System notifications keep the legacy content
-    // wake line.
-    mate: ({ task, event }) => deliverMateAttention(task, event, adapter, monitor, mailboxNudger),
+    // Lifecycle wakes already committed their durable mailbox delivery with
+    // the event; the mate channel then carries only a disposable attention
+    // nudge. Pre-mailbox outbox rows fall back to the legacy content line.
+    mate: ({ task, event, taskEventId }) =>
+      deliverMateAttention(task, event, adapter, monitor, mailboxNudger, { taskEventId }),
     push: ({ task, event }) => pushRouter.deliverTaskEvent(task, event)
   }
 });

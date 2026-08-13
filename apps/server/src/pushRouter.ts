@@ -74,6 +74,8 @@ export type PushRouterOptions = {
   fallbackMs?: number;
 };
 
+const MATE_ONLY_TASK_EVENT_REASONS = new Set(["prompt_delivery_unknown"]);
+
 type ArmedFallback = {
   timer: ReturnType<typeof setTimeout>;
   kind: "needs_decision" | "blocked" | "runtime_interrupted";
@@ -234,6 +236,13 @@ export class PushRouter {
     task: Task,
     event: { kind: TaskEventKind; message?: string; data?: Record<string, unknown> }
   ): Promise<void> {
+    // Delivery-confirmation uncertainty is operational context for the mate,
+    // not a request for the boss's attention. Keep this explicit even though
+    // stalled events are not currently enqueued on the push outbox, so adding
+    // a broader push kind later cannot leak this known noise to mobile.
+    if (typeof event.data?.reason === "string" && MATE_ONLY_TASK_EVENT_REASONS.has(event.data.reason)) {
+      return;
+    }
     const crew = this.isCrewTask(task);
 
     // Live permission surfaces already send the dedicated role-aware approval

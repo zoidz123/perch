@@ -118,8 +118,9 @@ test("isMailboxRouted separates worker fan-in from system notifications", () => 
   assert.equal(isMailboxRouted({ kind: "needs_decision", source: "worker" }), true);
   assert.equal(isMailboxRouted({ kind: "note", source: "worker", data: { reason: "worker_report" } }), true);
   assert.equal(isMailboxRouted({ kind: "note", source: "worker" }), false);
-  assert.equal(isMailboxRouted({ kind: "stalled", source: "system" }), false);
-  assert.equal(isMailboxRouted({ kind: "chart_ready", source: "system" }), false);
+  assert.equal(isMailboxRouted({ kind: "stalled", source: "system" }), true);
+  assert.equal(isMailboxRouted({ kind: "chart_ready", source: "system" }), true);
+  assert.equal(isMailboxRouted({ kind: "merged", source: "poller" }), true);
   // Legacy outbox payloads without a source stay on the legacy wake path.
   assert.equal(isMailboxRouted({ kind: "completion_requested" }), false);
 });
@@ -164,17 +165,20 @@ test("a report arriving during an active mate turn does not interrupt or steer; 
   });
 });
 
-test("one nudge covers a burst; acknowledged mail never re-nudges", async () => {
+test("one pending nudge coalesces newer mail; acknowledged mail never re-nudges", async () => {
   await withNudger(async ({ tasks, adapter, monitor, nudger, task: routed }) => {
     monitor.applyExternalStatus("pty:mate", "idle", "claude");
     const first = { kind: "blocked" as const, source: "worker" as const, message: "one" };
     tasks.recordEvent(routed.id, first);
+    await deliverMateAttention(tasks.find(routed.id)!, first, adapter, monitor, nudger);
+
+    // Newer mail lands after the first nudge was submitted but before the mate
+    // has started processing it. It must not inject a second control line.
     tasks.recordEvent(routed.id, { kind: "working", source: "worker" });
     const second = { kind: "needs_decision" as const, source: "worker" as const, message: "two" };
     tasks.recordEvent(routed.id, second);
-    await deliverMateAttention(tasks.find(routed.id)!, first, adapter, monitor, nudger);
     await deliverMateAttention(tasks.find(routed.id)!, second, adapter, monitor, nudger);
-    assert.equal(adapter.submissions.length, 1, "the first nudge already covered the backlog");
+    assert.equal(adapter.submissions.length, 1, "the unprocessed first nudge covers the growing backlog");
 
     // Drain + ack everything; an idle transition afterwards stays silent.
     const now = new Date().toISOString();
@@ -194,10 +198,11 @@ test("one nudge covers a burst; acknowledged mail never re-nudges", async () => 
   });
 });
 
-test("system-sourced notifications keep the legacy content wake line", async () => {
+test("system and poller lifecycle events use the mailbox and never inject their raw wake line", async () => {
   await withNudger(async ({ tasks, adapter, monitor, nudger, task: routed }) => {
     monitor.applyExternalStatus("pty:mate", "idle", "claude");
-    const event = { kind: "merged" as const, source: "poller" as const, message: "PR #7 merged" };
+    const event = { kind: "checks_green" as const, source: "poller" as const, message: "PR #7 checks green" };
+    tasks.recordEvent(routed.id, event);
     await deliverMateAttention(
       { ...tasks.find(routed.id)!, sessionId: "pty:worker" },
       event,
@@ -206,7 +211,29 @@ test("system-sourced notifications keep the legacy content wake line", async () 
       nudger
     );
     assert.equal(adapter.submissions.length, 1);
-    assert.ok(adapter.submissions[0]!.text.startsWith("[perch] "));
-    assert.ok(adapter.submissions[0]!.text.includes("merged: PR #7 merged"));
+    assert.ok(adapter.submissions[0]!.text.startsWith(MAILBOX_CONTROL_PREFIX));
+    assert.ok(!adapter.submissions[0]!.text.includes("PR #7 checks green"));
+    const delivery = tasks.stateDb.mateMailbox.list()[0]!;
+    assert.equal(tasks.stateDb.tasks.eventById(delivery.taskEventId)?.kind, "checks_green");
+  });
+});
+
+test("an unavailable mailbox attention path falls back to the legacy raw wake line", async () => {
+  await withNudger(async ({ adapter, monitor, nudger, task: routed }) => {
+    monitor.applyExternalStatus("pty:mate", "idle", "claude");
+    const event = { kind: "runtime_interrupted" as const, source: "system" as const, message: "runtime exited" };
+    await deliverMateAttention(
+      { ...routed, sessionId: "pty:worker" },
+      event,
+      adapter,
+      monitor,
+      nudger,
+      { taskEventId: Number.MAX_SAFE_INTEGER }
+    );
+    assert.equal(adapter.submissions.length, 1);
+    assert.equal(
+      adapter.submissions[0]!.text,
+      `[perch] ${routed.id} · runtime_interrupted: runtime exited`
+    );
   });
 });

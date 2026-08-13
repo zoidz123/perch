@@ -30,7 +30,7 @@ import {
   type ChartEventKind
 } from "./charts.js";
 import { FleetMonitor } from "./fleetMonitor.js";
-import { MateMailboxNudger, wireChartWake, wireMateWake } from "./mateWake.js";
+import { mailboxNudgeLine, MateMailboxNudger, wireChartWake, wireMateWake } from "./mateWake.js";
 import { HookRegistry } from "./hooks.js";
 import { createControlServer, handleWebSocketRpcRequest } from "./http.js";
 import { OwnerManager } from "./ownerManager.js";
@@ -1158,7 +1158,7 @@ test("a crew chart wakes the supervising session with the review link", async ()
     assert.equal(adapter.submitted[0]?.sessionId, "pty:mate");
     assert.equal(
       adapter.submitted[0]?.text,
-      `[perch] ${task.id} · chart_ready: "roadmap" - review at http://mac:4711/charts/${chart.id}/review`
+      mailboxNudgeLine(1)
     );
     const chartEvents = tasks.events(task.id).filter((event) => event.kind === "chart_ready");
     assert.equal(chartEvents.length, 1);
@@ -1215,13 +1215,14 @@ test("a scout chart is persisted and wakes the current live mate", async () => {
     assert.equal(adapter.submitted[0]?.sessionId, "pty:mate");
     assert.equal(
       adapter.submitted[0]?.text,
-      `[perch] ${task.id} · chart_ready: "roadmap" - review at http://mac:4711/charts/${chart.id}/review`
+      mailboxNudgeLine(1)
     );
 
     tasks.recordEvent(task.id, { kind: "blocked", source: "worker", message: "need access" });
-    await waitFor(() => adapter.submitted.length === 2);
     tasks.recordEvent(task.id, { kind: "done", source: "worker", message: "scout complete" });
-    await waitFor(() => adapter.submitted.length === 3);
+    await waitFor(() => tasks.stateDb.mateMailbox.list().length === 3);
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    assert.equal(adapter.submitted.length, 1, "one unprocessed nudge covers the three-message backlog");
     assert.equal(tasks.events(task.id).filter((event) => event.kind === "chart_ready").length, 1);
   });
 });

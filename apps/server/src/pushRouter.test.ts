@@ -256,6 +256,23 @@ test("crew done/failed/checks_green/merge_ready/merged stay silent; solo task ev
   assert.equal(sent[2]?.body, "https://github.com/o/r/pull/52");
 });
 
+test("prompt delivery-confirmation uncertainty never reaches boss push", async () => {
+  const { router, sent } = harness({ findSession: (id) => (id === "pty:solo" ? soloSession : undefined) });
+  await router.deliverTaskEvent(task("t-noise", { sessionId: "pty:solo", state: "blocked" }), {
+    kind: "blocked",
+    message: "Claude prompt delivery is unknown; Perch did not resend it",
+    data: { reason: "prompt_delivery_unknown" }
+  });
+  assert.equal(sent.length, 0);
+
+  await router.deliverTaskEvent(task("t-real", { sessionId: "pty:solo", state: "blocked" }), {
+    kind: "blocked",
+    message: "Claude prompt was not submitted",
+    data: { reason: "prompt_not_submitted" }
+  });
+  assert.equal(sent.length, 1, "a real submission failure keeps the normal boss push");
+});
+
 test("solo needs_decision pushes immediately with the friendly copy", () => {
   const { router, sent } = harness({ findSession: (id) => (id === "pty:solo" ? soloSession : undefined) });
   router.taskEvent(task("t-2", { sessionId: "pty:solo", state: "needs_you" }), {

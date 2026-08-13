@@ -10,7 +10,7 @@ import { MAILBOX_CONTROL_PREFIX } from "./timeline.js";
 // reach the mate and the phone; working-heartbeats and bookkeeping notes stay
 // silent. "stalled" is watchdog-emitted (a worker went quiet) - it wakes the
 // mate but never pushes the phone.
-export const BOSS_EVENT_KINDS = new Set([
+export const BOSS_EVENT_KINDS = new Set<TaskEventKind>([
   "chart_ready",
   "pr_linked",
   "needs_decision",
@@ -25,20 +25,6 @@ export const BOSS_EVENT_KINDS = new Set([
   "runtime_interrupted"
 ]);
 
-// Worker-authored boss-relevant kinds: these fan in to the mate through the
-// durable mailbox (a delivery row committed with the event) instead of raw
-// composer injection. System/hook/poller notifications stay on the legacy
-// wake-line path below until the mailbox subsumes them - that legacy path is
-// the explicit compatibility boundary, not a second correctness layer.
-export const MATE_MAILBOX_EVENT_KINDS = new Set<TaskEventKind>([
-  "pr_linked",
-  "needs_decision",
-  "blocked",
-  "completion_requested",
-  "done",
-  "failed"
-]);
-
 export type MailboxRoutableEvent = {
   kind: TaskEventKind;
   message?: string;
@@ -46,14 +32,14 @@ export type MailboxRoutableEvent = {
   data?: Record<string, unknown>;
 };
 
-// A worker message never becomes a user message in the mate's chat. Either it
-// is a worker-sourced boss event or the pointer note of a submitted worker
-// report - both already have durable mailbox deliveries by the time the
-// outbox fans out.
+// A lifecycle wake never becomes a user message in the mate's chat. New
+// source-stamped boss events and worker-report pointers already have durable
+// mailbox deliveries by the time the outbox fans out. Source-less payloads
+// predate this mailbox route and stay on the compatibility wake-line path.
 export function isMailboxRouted(event: MailboxRoutableEvent): boolean {
-  if (event.source !== "worker") return false;
-  if (MATE_MAILBOX_EVENT_KINDS.has(event.kind)) return true;
-  return event.kind === "note" && event.data?.reason === "worker_report";
+  if (!event.source) return false;
+  if (BOSS_EVENT_KINDS.has(event.kind)) return true;
+  return event.source === "worker" && event.kind === "note" && event.data?.reason === "worker_report";
 }
 
 // The disposable attention nudge: single line (a newline would submit the
@@ -102,9 +88,10 @@ function approvalWakeBody(fallback: string, data: Record<string, unknown>): stri
 // Supervisor wake channel: boss-relevant events inject one line into a
 // running mate's composer (queue-gated, so an open permission prompt is never
 // typed into). The mate sleeps free and wakes on meaning; absorbed events cost
-// it zero tokens. Worker-authored events are diverted to the mailbox nudge
-// path in deliverMateAttention; this raw injection remains only for
-// system-sourced notifications.
+// it zero tokens. Source-stamped lifecycle events are diverted to the mailbox
+// nudge path in deliverMateAttention; this raw injection remains only as the
+// compatibility fallback for source-less old outbox payloads or an unavailable
+// mailbox attention path.
 export function wireMateWake(
   tasks: TaskStore,
   adapter: AgentAdapter,
@@ -118,16 +105,20 @@ export function wireMateWake(
 
 // The outbox 'mate' channel entrypoint. Mailbox-routed events already have
 // durable delivery rows; their only remaining need is disposable attention.
-// Everything else keeps the legacy content wake line.
+// An older server composition may not provide a nudger, so absence falls back
+// to the legacy content line instead of losing the wake.
 export async function deliverMateAttention(
   task: Task,
   event: MailboxRoutableEvent,
   adapter: AgentAdapter,
   monitor: FleetMonitor,
-  nudger?: MateMailboxNudger
+  nudger?: MateMailboxNudger,
+  delivery?: { taskEventId?: number }
 ): Promise<void> {
-  if (isMailboxRouted(event)) {
-    await nudger?.nudge({ excludeSessionId: task.sessionId });
+  const mailboxAvailable =
+    nudger && (delivery?.taskEventId === undefined || nudger.hasDelivery(delivery.taskEventId));
+  if (isMailboxRouted(event) && mailboxAvailable) {
+    await nudger.nudge({ excludeSessionId: task.sessionId });
     return;
   }
   await deliverMateWake(task, event, adapter, monitor);
@@ -160,6 +151,8 @@ export async function deliverMateWake(
 // between drain checkpoints).
 export class MateMailboxNudger {
   private lastNudgedOrderKey = 0;
+  private pendingNudgeTarget: string | undefined;
+  private nudgeInFlight: Promise<void> | undefined;
 
   constructor(
     private readonly options: {
@@ -169,9 +162,20 @@ export class MateMailboxNudger {
     }
   ) {}
 
+  hasDelivery(taskEventId: number): boolean {
+    try {
+      return this.options.mailbox.hasTaskEvent(taskEventId);
+    } catch {
+      return false;
+    }
+  }
+
   // Safe-checkpoint safety net: a mate turn just ended. If unacknowledged
   // messages arrived that no nudge has covered, raise attention now.
   onStatusChange(change: SessionStatusChange): void {
+    if (change.sessionId === this.pendingNudgeTarget && change.to === "running") {
+      this.pendingNudgeTarget = undefined;
+    }
     if (change.to !== "idle") return;
     void (async () => {
       const sessions = await this.options.adapter.listSessions();
@@ -182,6 +186,19 @@ export class MateMailboxNudger {
   }
 
   async nudge(input: { excludeSessionId?: string; target?: string } = {}): Promise<void> {
+    // Coalesce concurrent outbox deliveries and newer arrivals while the
+    // existing control prompt is still waiting for the mate to process it.
+    if (this.nudgeInFlight || this.pendingNudgeTarget) return;
+    const inFlight = this.performNudge(input);
+    this.nudgeInFlight = inFlight;
+    try {
+      await inFlight;
+    } finally {
+      if (this.nudgeInFlight === inFlight) this.nudgeInFlight = undefined;
+    }
+  }
+
+  private async performNudge(input: { excludeSessionId?: string; target?: string }): Promise<void> {
     const now = new Date().toISOString();
     const pending = this.options.mailbox.pendingCount(now);
     if (pending === 0) return;
@@ -197,11 +214,21 @@ export class MateMailboxNudger {
     if (!targetId || targetId === input.excludeSessionId) return;
     // Never steer an active turn; the idle transition re-invokes this.
     if (this.options.monitor.sessionStatus(targetId) === "running") return;
-    const result = await this.options.monitor.queueOrSubmit(targetId, mailboxNudgeLine(pending), {
-      queueIfGated: false,
-      silent: true
-    });
-    if (!result.gated) this.lastNudgedOrderKey = maxKey;
+    this.pendingNudgeTarget = targetId;
+    try {
+      const result = await this.options.monitor.queueOrSubmit(targetId, mailboxNudgeLine(pending), {
+        queueIfGated: false,
+        silent: true
+      });
+      if (result.gated) {
+        this.pendingNudgeTarget = undefined;
+        return;
+      }
+      this.lastNudgedOrderKey = maxKey;
+    } catch (error) {
+      this.pendingNudgeTarget = undefined;
+      throw error;
+    }
   }
 }
 

@@ -327,6 +327,31 @@ test("mailbox claim and acknowledgment are fenced to the live mate session; work
   });
 });
 
+test("system lifecycle mail has the same kind, task, worker, and summary projection as worker reports", async () => {
+  await withServer(async ({ port, tasks, hooks }) => {
+    const { task } = makeWorker(tasks, hooks, "system lifecycle", "pty:worker");
+    const named = tasks.claimWorkerName(task.id);
+    tasks.recordEvent(task.id, {
+      kind: "runtime_interrupted",
+      source: "system",
+      message: "worker runtime exited"
+    });
+
+    const response = await fetch(`http://127.0.0.1:${port}/mate/mailbox`, {
+      headers: { authorization: "Bearer test-token" }
+    });
+    assert.equal(response.status, 200);
+    const body = (await response.json()) as {
+      messages: Array<{ kind: string; taskId: string; workerName?: string; summary?: string }>;
+    };
+    assert.equal(body.messages.length, 1);
+    assert.equal(body.messages[0]!.kind, "runtime_interrupted");
+    assert.equal(body.messages[0]!.taskId, task.id);
+    assert.equal(body.messages[0]!.workerName, named.workerName);
+    assert.equal(body.messages[0]!.summary, "worker runtime exited");
+  });
+});
+
 test("wait_for_messages returns immediately when mail is pending and empty on timeout", async () => {
   await withServer(async ({ port, tasks, hooks, ownerManager }) => {
     const mate = registerLiveMate(ownerManager, hooks);
