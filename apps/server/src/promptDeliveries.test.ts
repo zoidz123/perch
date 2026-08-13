@@ -593,14 +593,12 @@ test("late acceptance retains durable evidence that an earlier unknown warning n
   }
 });
 
-test("a newer accepted delivery cannot hide an older unresolved warning", async () => {
+test("a newer accepted delivery expires an older unresolved warning", async () => {
   const f = fixture();
   try {
     const unresolved = f.tracker.create("pty:worker", "older uncertain prompt", "agent");
     f.tracker.markTyping(unresolved.id);
     f.tracker.markSubmitted(unresolved.id, null);
-    const unresolvedSubmittedAt = f.stateDb.promptDeliveries.find(unresolved.id)?.submittedAt;
-    assert.ok(unresolvedSubmittedAt);
     await new Promise((resolve) => setTimeout(resolve, 2));
     f.tracker.markUnknown(unresolved.id, "acceptance was not confirmed; not resent");
 
@@ -609,21 +607,9 @@ test("a newer accepted delivery cannot hide an older unresolved warning", async 
     f.tracker.markSubmitted(newer.id, null);
     f.tracker.acknowledgeHook("pty:worker", "newer confirmed prompt");
 
-    const unresolvedSurface = promptDeliverySurface(f.stateDb.promptDeliveries.list("pty:worker"));
-    assert.equal(unresolvedSurface.promptDeliveryWarning?.deliveryId, unresolved.id);
+    const unresolvedSurface = promptDeliverySurface(f.stateDb.promptDeliveries.surfaceCandidates("pty:worker"));
+    assert.equal(unresolvedSurface.promptDeliveryWarning, undefined);
     assert.equal(unresolvedSurface.promptDeliveryResolution, undefined);
-
-    f.tracker.acknowledgeTimeline({
-      seq: 18,
-      id: "older-authentic-row",
-      sessionId: "pty:worker",
-      kind: "user",
-      text: "older uncertain prompt",
-      at: unresolvedSubmittedAt!
-    });
-    const resolvedSurface = promptDeliverySurface(f.stateDb.promptDeliveries.list("pty:worker"));
-    assert.equal(resolvedSurface.promptDeliveryWarning, undefined);
-    assert.equal(resolvedSurface.promptDeliveryResolution?.deliveryId, unresolved.id);
   } finally {
     f.close();
   }
@@ -903,6 +889,9 @@ test("restart reconciles a backfilled transcript receipt without emitting a stal
       message: { content: "Recover this receipt" }
     })}\n`
   );
+  // The backfilled receipt must predate the restart's unknown marker. Keep
+  // that intended ordering deterministic across millisecond clock ties.
+  await new Promise((resolve) => setTimeout(resolve, 2));
 
   const secondDb = new StateDb({ PERCH_HOME: home } as NodeJS.ProcessEnv);
   const restartWarnings: string[] = [];

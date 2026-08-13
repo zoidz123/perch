@@ -9,9 +9,18 @@ export type PromptDeliverySource = "human" | "agent";
 export type PromptDeliverySurface = {
   promptDeliveryWarning?: AgentSession["promptDeliveryWarning"];
   promptDeliveryResolution?: AgentSession["promptDeliveryResolution"];
+  latestAcceptedAt?: string;
 };
 
 export function promptDeliverySurface(deliveries: PromptDeliverySurfaceRecord[]): PromptDeliverySurface {
+  const latestAccepted = deliveries
+    .filter((delivery) => delivery.state === "accepted" && delivery.acceptedNotifiedAt)
+    .sort((left, right) => {
+      const byTime = (left.acceptedAt ?? left.updatedAt).localeCompare(right.acceptedAt ?? right.updatedAt);
+      return byTime || (left.deliveryOrdinal ?? 0) - (right.deliveryOrdinal ?? 0);
+    })
+    .at(-1);
+  const latestAcceptedAt = latestAccepted?.acceptedAt ?? latestAccepted?.updatedAt;
   const unresolved = deliveries
     .filter(
       (delivery) =>
@@ -19,7 +28,17 @@ export function promptDeliverySurface(deliveries: PromptDeliverySurfaceRecord[])
         (delivery.state === "not_submitted" || delivery.state === "delivery_unknown")
     )
     .at(-1);
-  if (unresolved) {
+  const unresolvedAt = unresolved?.unknownAt ?? unresolved?.updatedAt;
+  const laterAccepted = Boolean(
+    unresolved &&
+    latestAcceptedAt &&
+    (latestAcceptedAt > unresolvedAt! ||
+      (latestAcceptedAt === unresolvedAt &&
+        latestAccepted?.deliveryOrdinal !== undefined &&
+        unresolved.deliveryOrdinal !== undefined &&
+        latestAccepted.deliveryOrdinal > unresolved.deliveryOrdinal))
+  );
+  if (unresolved && !laterAccepted) {
     return {
       promptDeliveryWarning: {
         deliveryId: unresolved.id,
@@ -27,26 +46,23 @@ export function promptDeliverySurface(deliveries: PromptDeliverySurfaceRecord[])
           ? unresolved.failureReason ?? "Claude prompt was not submitted; Perch did not send it"
           : "Claude prompt delivery is unknown; Perch did not resend it",
         at: unresolved.unknownAt ?? unresolved.updatedAt
-      }
+      },
+      ...(latestAcceptedAt ? { latestAcceptedAt } : {})
     };
   }
-  const resolved = deliveries
-    .filter(
-      (delivery) =>
-        delivery.state === "accepted" &&
-        delivery.unknownNotifiedAt &&
-        delivery.acceptedNotifiedAt
-    )
-    .at(-1);
+  const resolved = latestAccepted?.unknownNotifiedAt ? latestAccepted : undefined;
   return resolved
     ? {
         promptDeliveryResolution: {
           deliveryId: resolved.id,
           message: "Claude prompt delivery was confirmed after the earlier warning",
           at: resolved.acceptedAt ?? resolved.updatedAt
-        }
+        },
+        ...(latestAcceptedAt ? { latestAcceptedAt } : {})
       }
-    : {};
+    : latestAcceptedAt
+      ? { latestAcceptedAt }
+      : {};
 }
 
 type PromptDeliveryTrackerOptions = {

@@ -41,6 +41,7 @@ const SCREEN_CAPTURE_LINES = 60;
 const DEFAULT_PENDING_INPUT_RETRY_BACKOFF_MS = [1_000, 3_000, 10_000] as const;
 const DEFAULT_PENDING_INPUT_MAX_ATTEMPTS = 4;
 const DEFAULT_PENDING_INPUT_POLL_MS = 1_000;
+const DEFAULT_PENDING_INPUT_BATCH_WINDOW_MS = 50;
 
 // A session status change with its provenance, observable via
 // FleetMonitorOptions.onStatusChange (feeds the state metrics, G6).
@@ -146,7 +147,7 @@ export type FleetMonitorOptions = {
   promptDeliveries?: PromptDeliveryTracker;
   // Boss messages aimed at the mate are held here while a turn is active.
   // Unlike the permission-composer queue, this store is durable and releases
-  // only one record per observed turn boundary.
+  // the whole eligible backlog as one ordered prompt at a safe boundary.
   pendingSessionInputs?: PendingSessionInputRepository;
   // Human mate input is at-least-once. Unknown PTY outcomes reuse one durable
   // delivery id and retry with bounded backoff; options are injectable only so
@@ -154,6 +155,7 @@ export type FleetMonitorOptions = {
   pendingInputRetryBackoffMs?: readonly number[];
   pendingInputMaxAttempts?: number;
   pendingInputPollMs?: number;
+  pendingInputBatchWindowMs?: number;
   // Durable warning text derived from the prompt-delivery ledger. It is
   // recomputed for every fleet snapshot, so disconnected clients see it on
   // reconnect instead of depending on a one-shot WebSocket event.
@@ -227,6 +229,7 @@ export class FleetMonitor {
   private readonly pendingInputRetryBackoffMs: readonly number[];
   private readonly pendingInputMaxAttempts: number;
   private readonly pendingInputPollMs: number;
+  private readonly pendingInputBatchWindowMs: number;
   private readonly auditLog?: AuditLog;
   private pushRouter?: PushRouter;
   private readonly onPrune?: (activeSessionIds: Set<string>) => void;
@@ -264,6 +267,7 @@ export class FleetMonitor {
       : DEFAULT_PENDING_INPUT_RETRY_BACKOFF_MS;
     this.pendingInputMaxAttempts = options.pendingInputMaxAttempts ?? DEFAULT_PENDING_INPUT_MAX_ATTEMPTS;
     this.pendingInputPollMs = options.pendingInputPollMs ?? DEFAULT_PENDING_INPUT_POLL_MS;
+    this.pendingInputBatchWindowMs = options.pendingInputBatchWindowMs ?? DEFAULT_PENDING_INPUT_BATCH_WINDOW_MS;
     this.auditLog = options.auditLog;
     this.pushRouter = options.pushRouter;
     this.onPrune = options.onPrune;
@@ -495,7 +499,7 @@ export class FleetMonitor {
     const pending = this.pendingApprovals.get(canonical);
     if (pending && this.pendingApprovals.delete(canonical)) {
       this.onApprovalResolved?.(canonical, pending);
-      void this.releaseOnePendingInput(canonical).catch(() => {});
+      void this.releasePendingInputBatch(canonical).catch(() => {});
       this.scheduleBroadcast();
     }
   }
@@ -571,7 +575,7 @@ export class FleetMonitor {
     if (!open || !pending) return undefined;
     open.delete(key);
     if (open.size === 0) this.pendingServerRequests.delete(canonical);
-    void this.releaseOnePendingInput(canonical).catch(() => {});
+    void this.releasePendingInputBatch(canonical).catch(() => {});
     this.scheduleBroadcast();
     return pending;
   }
@@ -610,7 +614,7 @@ export class FleetMonitor {
   resolveQuestion(sessionId: string): void {
     const canonical = this.canonicalSessionId(sessionId);
     if (this.pendingQuestions.delete(canonical)) {
-      void this.releaseOnePendingInput(canonical).catch(() => {});
+      void this.releasePendingInputBatch(canonical).catch(() => {});
       this.scheduleBroadcast();
     }
   }
@@ -657,7 +661,7 @@ export class FleetMonitor {
       return;
     }
     if (!this.inputGated(canonical)) void this.flushQueuedInputs(canonical);
-    if (!this.inputGated(canonical)) void this.releaseOnePendingInput(canonical).catch(() => {});
+    if (!this.inputGated(canonical)) void this.releasePendingInputBatch(canonical).catch(() => {});
     if (removed) this.scheduleBroadcast();
   }
 
@@ -699,7 +703,7 @@ export class FleetMonitor {
         source
       });
       this.scheduleBroadcast();
-      void this.releaseOnePendingInput(canonical, session).catch(() => {});
+      this.schedulePendingInputCheck(canonical, this.pendingInputBatchWindowMs);
       return { queued: true };
     }
 
@@ -722,7 +726,7 @@ export class FleetMonitor {
     return { queued: false };
   }
 
-  private async releaseOnePendingInput(sessionId: string, knownSession?: AgentSession): Promise<void> {
+  private async releasePendingInputBatch(sessionId: string, knownSession?: AgentSession): Promise<void> {
     if (!this.pendingSessionInputs || this.pendingInputReleases.has(sessionId)) return;
     this.pendingInputReleases.add(sessionId);
     try {
@@ -731,18 +735,29 @@ export class FleetMonitor {
         this.sessions.find((candidate) => candidate.id === sessionId);
       if (session?.labels?.role !== "mate") return;
 
-      const pending = this.pendingSessionInputs.list(sessionId)[0];
+      const queued = this.pendingSessionInputs.list(sessionId);
+      const pending = queued[0];
       if (!pending) {
         this.clearPendingInputTimer(sessionId);
         return;
       }
+      const batch: PendingSessionInputRecord[] = [];
+      for (const input of queued) {
+        const belongsToBatch = pending.deliveryId
+          ? input.deliveryId === pending.deliveryId
+          : input.deliveryId === undefined;
+        if (!belongsToBatch) break;
+        batch.push(input);
+      }
+      const batchIds = batch.map((input) => input.id);
+      const promptText = batch.map((input) => input.promptText).join("\n");
 
       const tracked = pending.deliveryId
         ? this.promptDeliveries?.find(pending.deliveryId)
         : undefined;
       if (tracked?.state === "accepted") {
-        if (!this.pendingSessionInputs.remove(pending.id)) {
-          throw new Error("confirmed pending input was not removed from the durable queue");
+        if (!this.pendingSessionInputs.removeBatch(batchIds)) {
+          throw new Error("confirmed pending input batch was not removed from the durable queue");
         }
         this.clearPendingInputTimer(sessionId);
         return;
@@ -759,8 +774,8 @@ export class FleetMonitor {
         return;
       }
       if (pending.attemptCount >= this.pendingInputMaxAttempts) {
-        this.failPendingInput(
-          pending,
+        this.failPendingInputBatch(
+          batch,
           tracked?.failureReason ?? pending.lastError ?? "delivery could not be confirmed"
         );
         return;
@@ -795,7 +810,7 @@ export class FleetMonitor {
       const delivery = session.agent === "claude" && this.promptDeliveries
         ? pending.deliveryId
           ? this.promptDeliveries.retryUnknown(pending.deliveryId)
-          : this.promptDeliveries.create(sessionId, pending.promptText, pending.source)
+          : this.promptDeliveries.create(sessionId, promptText, pending.source)
         : undefined;
       if (pending.deliveryId && session.agent === "claude" && !delivery) {
         this.usedIdleBoundaries.delete(sessionId);
@@ -806,7 +821,7 @@ export class FleetMonitor {
       const backoff = this.pendingInputRetryBackoffMs[
         Math.min(attempt - 1, this.pendingInputRetryBackoffMs.length - 1)
       ]!;
-      const attempted = this.pendingSessionInputs.beginAttempt(pending.id, {
+      const attempted = this.pendingSessionInputs.beginBatchAttempt(batchIds, {
         ...(delivery ? { deliveryId: delivery.id } : {}),
         nextAttemptAt: new Date(now + backoff).toISOString()
       });
@@ -816,13 +831,13 @@ export class FleetMonitor {
       }
 
       try {
-        await this.submitToAdapter(sessionId, pending.promptText, delivery?.id);
+        await this.submitToAdapter(sessionId, promptText, delivery?.id);
       } catch (error) {
         this.usedIdleBoundaries.delete(sessionId);
         const message = error instanceof Error ? error.message : String(error);
-        const current = this.pendingSessionInputs.recordAttemptError(pending.id, message);
-        if (current && current.attemptCount >= this.pendingInputMaxAttempts) {
-          this.failPendingInput(current, message);
+        const current = this.pendingSessionInputs.recordBatchAttemptError(batchIds, message);
+        if (current?.[0] && current[0].attemptCount >= this.pendingInputMaxAttempts) {
+          this.failPendingInputBatch(current, message);
         } else {
           this.schedulePendingInputCheck(sessionId, backoff);
         }
@@ -831,8 +846,8 @@ export class FleetMonitor {
 
       if (delivery) {
         this.schedulePendingInputCheck(sessionId, this.pendingInputPollMs);
-      } else if (!this.pendingSessionInputs.remove(pending.id)) {
-        throw new Error("released pending input was not removed from the durable queue");
+      } else if (!this.pendingSessionInputs.removeBatch(batchIds)) {
+        throw new Error("released pending input batch was not removed from the durable queue");
       }
     } finally {
       this.pendingInputReleases.delete(sessionId);
@@ -840,27 +855,31 @@ export class FleetMonitor {
     }
   }
 
-  private failPendingInput(pending: PendingSessionInputRecord, error: string): void {
-    if (!this.pendingSessionInputs) return;
-    const failed = this.pendingSessionInputs.markFailed(pending.id, error);
-    if (!failed) return;
-    this.clearPendingInputTimer(pending.perchSessionId);
-    this.usedIdleBoundaries.delete(pending.perchSessionId);
-    this.pushRouter?.pendingInputDeliveryFailed(
-      pending.perchSessionId,
-      this.findSession(pending.perchSessionId),
-      failed.attemptCount
+  private failPendingInputBatch(pending: readonly PendingSessionInputRecord[], error: string): void {
+    if (!this.pendingSessionInputs || pending.length === 0) return;
+    const failed = this.pendingSessionInputs.markBatchFailed(
+      pending.map((input) => input.id),
+      error
     );
-    // The failed row remains durable for diagnosis, but it no longer owns the
-    // live FIFO head. Give the next human row the same idle safe opportunity.
-    this.schedulePendingInputCheck(pending.perchSessionId, 0);
+    if (!failed?.[0]) return;
+    const head = failed[0];
+    this.clearPendingInputTimer(head.perchSessionId);
+    this.usedIdleBoundaries.delete(head.perchSessionId);
+    this.pushRouter?.pendingInputDeliveryFailed(
+      head.perchSessionId,
+      this.findSession(head.perchSessionId),
+      head.attemptCount
+    );
+    // Failed rows remain durable for diagnosis, but no longer own the live
+    // FIFO head. Give the next human batch the same idle safe opportunity.
+    this.schedulePendingInputCheck(head.perchSessionId, 0);
   }
 
   private schedulePendingInputCheck(sessionId: string, delayMs: number): void {
     this.clearPendingInputTimer(sessionId);
     const timer = setTimeout(() => {
       this.pendingInputTimers.delete(sessionId);
-      void this.releaseOnePendingInput(sessionId).catch(() => {});
+      void this.releasePendingInputBatch(sessionId).catch(() => {});
     }, Math.max(0, delayMs));
     timer.unref?.();
     this.pendingInputTimers.set(sessionId, timer);
@@ -878,7 +897,7 @@ export class FleetMonitor {
     if (!this.running) this.sessions = sessions;
     for (const session of sessions) {
       if (session.labels?.role === "mate" && this.pendingSessionInputs.count(session.id) > 0) {
-        void this.releaseOnePendingInput(session.id, session).catch(() => {});
+        void this.releasePendingInputBatch(session.id, session).catch(() => {});
       }
     }
   }
@@ -891,7 +910,7 @@ export class FleetMonitor {
     if (status === "idle" && previous && previous !== "idle") {
       this.usedIdleBoundaries.delete(sessionId);
     }
-    void this.releaseOnePendingInput(sessionId).catch(() => {});
+    void this.releasePendingInputBatch(sessionId).catch(() => {});
   }
 
   // The live status a server-side sender should honor before submitting
@@ -910,12 +929,7 @@ export class FleetMonitor {
     session: AgentSession | undefined
   ): AgentSessionStatus | undefined {
     const live = this.sessionState.get(sessionId);
-    if (!live?.status) return session?.status;
-    const liveAt = Date.parse(live.at);
-    const adapterAt = Date.parse(session?.lastActivityAt ?? "");
-    return Number.isFinite(adapterAt) && (!Number.isFinite(liveAt) || adapterAt > liveAt)
-      ? session?.status
-      : live.status;
+    return live?.status ?? session?.status;
   }
 
   // Prompt provided at spawn time: hold it until the agent signals ready
@@ -1413,7 +1427,7 @@ export class FleetMonitor {
 
     this.pruneSessionState(previousSessionIds);
     for (const session of this.sessions) {
-      void this.releaseOnePendingInput(session.id, session).catch(() => {});
+      void this.releasePendingInputBatch(session.id, session).catch(() => {});
     }
     this.scheduleBroadcast();
   }
@@ -1516,8 +1530,14 @@ export class FleetMonitor {
         result.promptDeliveryResolution = deliverySurface.promptDeliveryResolution;
       }
       const failedInput = this.pendingSessionInputs?.latestFailed(session.id);
+      const failedInputSuperseded = Boolean(
+        failedInput?.failedAt &&
+        deliverySurface?.latestAcceptedAt &&
+        deliverySurface.latestAcceptedAt >= failedInput.failedAt
+      );
       if (
         failedInput?.failedAt &&
+        !failedInputSuperseded &&
         (!result.promptDeliveryWarning || failedInput.failedAt >= result.promptDeliveryWarning.at)
       ) {
         result.promptDeliveryWarning = {

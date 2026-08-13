@@ -116,6 +116,58 @@ test("pending session inputs preserve FIFO order across a database restart", () 
   rmSync(root, { recursive: true, force: true });
 });
 
+test("pending session input batches share attempt identity and mutate atomically", () => {
+  const root = home();
+  const state = new StateDb(env(root));
+  const one = state.pendingSessionInputs.enqueue({
+    perchSessionId: "pty:mate",
+    promptText: "first",
+    source: "human"
+  });
+  const two = state.pendingSessionInputs.enqueue({
+    perchSessionId: "pty:mate",
+    promptText: "second",
+    source: "human"
+  });
+  const later = state.pendingSessionInputs.enqueue({
+    perchSessionId: "pty:mate",
+    promptText: "later",
+    source: "human"
+  });
+  const delivery = state.promptDeliveries.create({
+    perchSessionId: "pty:mate",
+    promptText: "first\nsecond",
+    source: "human"
+  });
+
+  const attempted = state.pendingSessionInputs.beginBatchAttempt([one.id, two.id], {
+    deliveryId: delivery.id,
+    nextAttemptAt: "2026-08-13T04:00:00.000Z"
+  });
+  assert.deepEqual(
+    attempted?.map((input) => [input.promptText, input.deliveryId, input.attemptCount]),
+    [
+      ["first", delivery.id, 1],
+      ["second", delivery.id, 1]
+    ]
+  );
+  assert.equal(state.pendingSessionInputs.find(later.id)?.attemptCount, 0);
+
+  assert.equal(
+    state.pendingSessionInputs.beginBatchAttempt([one.id, "missing"], {
+      deliveryId: "delivery-2",
+      nextAttemptAt: "2026-08-13T04:01:00.000Z"
+    }),
+    undefined
+  );
+  assert.equal(state.pendingSessionInputs.find(one.id)?.attemptCount, 1);
+  assert.equal(state.pendingSessionInputs.removeBatch([one.id, two.id]), true);
+  assert.deepEqual(state.pendingSessionInputs.list("pty:mate").map((input) => input.id), [later.id]);
+
+  state.close();
+  rmSync(root, { recursive: true, force: true });
+});
+
 test("version 20 adopts the wedged head's unknown delivery for retry", () => {
   const root = home();
   const current = new StateDb(env(root));

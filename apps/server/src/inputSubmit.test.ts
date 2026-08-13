@@ -15,7 +15,7 @@ import { HookRegistry } from "./hooks.js";
 import { createControlServer } from "./http.js";
 import { DeviceRegistry } from "./pairing.js";
 import { PrPoller } from "./prPoller.js";
-import { PromptDeliveryTracker } from "./promptDeliveries.js";
+import { PromptDeliveryTracker, promptDeliverySurface } from "./promptDeliveries.js";
 import { ProjectRegistry } from "./projects.js";
 import type { PushNotification } from "./push.js";
 import { PushRouter } from "./pushRouter.js";
@@ -138,6 +138,8 @@ async function startServer(
     onApprovalNeeded: (sessionId, approval) => surfaceApprovalToTask(tasks, sessionId, approval),
     onApprovalResolved: (sessionId, approval) => resolveApprovalForTask(tasks, sessionId, approval),
     promptDeliveries,
+    promptDeliverySurface: (sessionId) =>
+      promptDeliverySurface(tasks.stateDb.promptDeliveries.surfaceCandidates(sessionId)),
     ...(options.pendingInputMaxAttempts !== undefined
       ? { pendingInputMaxAttempts: options.pendingInputMaxAttempts }
       : {}),
@@ -304,6 +306,83 @@ test("an idle mate durably queues and starts release near-immediately", async ()
   });
 });
 
+test("an idle mate receives a three-message burst as one ordered delivery", async (t) => {
+  for (const agent of ["claude", "codex"] as const) {
+    await t.test(agent, async () => {
+      await withServer(async ({ port, adapter, monitor, tasks, promptDeliveries }) => {
+        adapter.session.agent = agent;
+        monitor.applyExternalStatus(SESSION_ID, "idle", agent, "hook");
+
+        const responses = await Promise.all([
+          postInput(port, "first"),
+          postInput(port, "second"),
+          postInput(port, "third")
+        ]);
+        assert.deepEqual(
+          await Promise.all(responses.map((response) => response.json())),
+          Array.from({ length: 3 }, () => ({ ok: true, queued: true }))
+        );
+
+        const combined = "first\nsecond\nthird";
+        await waitForWrites(adapter, 2);
+        assert.deepEqual(adapter.writes, [combined, "\r"]);
+        assert.equal(await queuedCount(port), agent === "claude" ? 3 : undefined);
+        const pending = tasks.stateDb.pendingSessionInputs.list(SESSION_ID);
+        const deliveries = tasks.stateDb.promptDeliveries.list(SESSION_ID);
+        assert.deepEqual(deliveries.map((delivery) => delivery.promptText), agent === "claude" ? [combined] : []);
+        assert.deepEqual(
+          pending.map((input) => input.deliveryId),
+          agent === "claude" ? Array.from({ length: 3 }, () => deliveries[0]!.id) : []
+        );
+
+        if (agent === "claude") {
+          promptDeliveries.acknowledgeHook(SESSION_ID, combined);
+          monitor.applyExternalStatus(SESSION_ID, "running", agent, "hook");
+          await waitFor(async () => (await queuedCount(port)) === undefined);
+        }
+      });
+    });
+  }
+});
+
+test("an idle mate releases despite a newer PTY redraw retaining coarse running status", async () => {
+  await withServer(async ({ port, adapter, monitor, promptDeliveries }) => {
+    monitor.applyExternalStatus(SESSION_ID, "idle", "claude", "hook");
+    // PTY redraws update activity while the Claude process keeps its coarse
+    // launch-time status. That activity is not a newer status observation.
+    adapter.session.lastActivityAt = new Date(Date.now() + 1_000).toISOString();
+    assert.equal(adapter.session.status, "running");
+    assert.equal((await sessionSnapshot(port))?.status, "idle");
+
+    const response = await postInput(port, "deliver while genuinely idle");
+    assert.deepEqual(await response.json(), { ok: true, queued: true });
+    await waitForWrites(adapter, 2);
+    assert.deepEqual(adapter.writes, ["deliver while genuinely idle", "\r"]);
+
+    promptDeliveries.acknowledgeHook(SESSION_ID, "deliver while genuinely idle");
+    monitor.applyExternalStatus(SESSION_ID, "running", "claude", "hook");
+    await waitFor(async () => (await queuedCount(port)) === undefined);
+  });
+});
+
+test("a busy mate releases at turn end despite a newer PTY redraw retaining coarse running status", async () => {
+  await withServer(async ({ port, adapter, monitor, promptDeliveries }) => {
+    monitor.applyExternalStatus(SESSION_ID, "running", "claude", "hook");
+    const response = await postInput(port, "deliver at the next turn end");
+    assert.deepEqual(await response.json(), { ok: true, queued: true });
+    assert.deepEqual(adapter.writes, []);
+
+    adapter.session.lastActivityAt = new Date(Date.now() + 1_000).toISOString();
+    monitor.applyExternalStatus(SESSION_ID, "idle", "claude", "hook");
+    await waitForWrites(adapter, 2);
+    assert.deepEqual(adapter.writes, ["deliver at the next turn end", "\r"]);
+
+    promptDeliveries.acknowledgeHook(SESSION_ID, "deliver at the next turn end");
+    monitor.applyExternalStatus(SESSION_ID, "running", "claude", "hook");
+    await waitFor(async () => (await queuedCount(port)) === undefined);
+  });
+});
+
 test("an idle mate release waits for a shared PTY desktop draft to clear", async () => {
   const adapter = new RecordingAdapter();
   adapter.composerEmpty = false;
@@ -335,6 +414,7 @@ test("Claude PTY input stays submitted until its matching hook receipt accepts i
     const response = await postInput(port, prompt);
     assert.equal(response.status, 202);
 
+    await waitFor(() => tasks.stateDb.promptDeliveries.list(SESSION_ID)[0]?.state === "submitted");
     const [submitted] = tasks.stateDb.promptDeliveries.list(SESSION_ID);
     assert.equal(submitted?.state, "submitted");
     assert.deepEqual(adapter.writes, [prompt, "\r"]);
@@ -421,7 +501,7 @@ test("input queues while a permission prompt is open instead of typing into the 
   });
 });
 
-test("a busy mate receives a three-message burst on three separate turn boundaries in FIFO order", async (t) => {
+test("a busy mate receives a three-message burst as one ordered turn-boundary delivery", async (t) => {
   for (const agent of ["claude", "codex"] as const) {
     await t.test(agent, async () => {
       await withServer(async ({ port, adapter, monitor, tasks, promptDeliveries }) => {
@@ -448,34 +528,27 @@ test("a busy mate receives a three-message burst on three separate turn boundari
         monitor.applyExternalStatus(SESSION_ID, "idle", agent, "hook");
         monitor.applyExternalStatus(SESSION_ID, "idle", agent, "hook");
         await waitForWrites(adapter, 2);
-        assert.deepEqual(adapter.writes, ["first", "\r"]);
-        assert.equal(await queuedCount(port), agent === "claude" ? 3 : 2);
+        const combined = "first\nsecond\nthird";
+        assert.deepEqual(adapter.writes, [combined, "\r"]);
+        assert.equal(await queuedCount(port), agent === "claude" ? 3 : undefined);
         assert.deepEqual(
-          tasks.stateDb.promptDeliveries.list(SESSION_ID).map((delivery) => delivery.state),
-          agent === "claude" ? ["submitted"] : []
+          tasks.stateDb.promptDeliveries.list(SESSION_ID).map((delivery) => [delivery.state, delivery.promptText]),
+          agent === "claude" ? [["submitted", combined]] : []
         );
 
-        if (agent === "claude") promptDeliveries.acknowledgeHook(SESSION_ID, "first");
-        monitor.applyExternalStatus(SESSION_ID, "running", agent, "hook");
-        await waitFor(async () => (await queuedCount(port)) === 2);
-        monitor.applyExternalStatus(SESSION_ID, "idle", agent, "hook");
-        await waitForWrites(adapter, 4);
-        assert.deepEqual(adapter.writes, ["first", "\r", "second", "\r"]);
-        assert.equal(await queuedCount(port), agent === "claude" ? 2 : 1);
-
-        if (agent === "claude") promptDeliveries.acknowledgeHook(SESSION_ID, "second");
-        monitor.applyExternalStatus(SESSION_ID, "running", agent, "hook");
-        await waitFor(async () => (await queuedCount(port)) === 1);
-        monitor.applyExternalStatus(SESSION_ID, "idle", agent, "hook");
-        await waitForWrites(adapter, 6);
-        assert.deepEqual(adapter.writes, ["first", "\r", "second", "\r", "third", "\r"]);
-        assert.equal(await queuedCount(port), agent === "claude" ? 1 : undefined);
         if (agent === "claude") {
-          promptDeliveries.acknowledgeHook(SESSION_ID, "third");
+          const deliveryIds = tasks.stateDb.pendingSessionInputs
+            .list(SESSION_ID)
+            .map((input) => input.deliveryId);
+          assert.deepEqual(
+            deliveryIds,
+            Array.from({ length: 3 }, () => tasks.stateDb.promptDeliveries.list(SESSION_ID)[0]!.id)
+          );
+          promptDeliveries.acknowledgeHook(SESSION_ID, combined);
           monitor.applyExternalStatus(SESSION_ID, "running", agent, "hook");
           await waitFor(async () => (await queuedCount(port)) === undefined);
         }
-        assert.equal(tasks.stateDb.promptDeliveries.list(SESSION_ID).length, agent === "claude" ? 3 : 0);
+        assert.equal(tasks.stateDb.promptDeliveries.list(SESSION_ID).length, agent === "claude" ? 1 : 0);
       });
     });
   }
@@ -528,10 +601,20 @@ test("an unknown mate delivery retries the durable head instead of wedging later
 
     monitor.applyExternalStatus(SESSION_ID, "idle", "claude", "hook");
     await waitForWrites(adapter, 2);
-    assert.deepEqual(adapter.writes, ["Hello", "\r"]);
+    const combined = "Hello\nHello??";
+    assert.deepEqual(adapter.writes, [combined, "\r"]);
     assert.equal(tasks.stateDb.pendingSessionInputs.count(SESSION_ID), 2);
     const [unknown] = tasks.stateDb.promptDeliveries.list(SESSION_ID);
     assert.equal(unknown?.state, "delivery_unknown");
+    assert.equal(unknown?.promptText, combined);
+    assert.equal(
+      new Set(tasks.stateDb.pendingSessionInputs.list(SESSION_ID).map((input) => input.deliveryId)).size,
+      1
+    );
+
+    const later = await postInput(port, "later after unknown");
+    assert.deepEqual(await later.json(), { ok: true, queued: true });
+    assert.equal(tasks.stateDb.pendingSessionInputs.count(SESSION_ID), 3);
 
     // This is the production wedge: the release failed after Enter while the
     // only idle transition was already being consumed. Repeated idle reads
@@ -540,15 +623,18 @@ test("an unknown mate delivery retries the durable head instead of wedging later
     monitor.applyExternalStatus(SESSION_ID, "idle", "claude", "adapter");
     phone.emit("close");
     await waitForWrites(adapter, 4);
-    assert.deepEqual(adapter.writes, ["Hello", "\r", "Hello", "\r"]);
+    assert.deepEqual(adapter.writes, [combined, "\r", combined, "\r"]);
     const [retried] = tasks.stateDb.promptDeliveries.list(SESSION_ID);
     assert.equal(retried?.id, unknown?.id, "retry reuses one delivery identity");
-    assert.equal(tasks.stateDb.pendingSessionInputs.list(SESSION_ID)[0]?.attemptCount, 2);
+    assert.deepEqual(
+      tasks.stateDb.pendingSessionInputs.list(SESSION_ID).map((input) => input.attemptCount),
+      [2, 2, 0]
+    );
 
     const firstReceipt = await postHook(port, token, {
       hook_event_name: "UserPromptSubmit",
       session_id: "claude-session-1",
-      prompt: "Hello"
+      prompt: combined
     });
     assert.equal(firstReceipt.status, 200);
     await waitFor(async () => (await queuedCount(port)) === 1);
@@ -559,12 +645,12 @@ test("an unknown mate delivery retries the durable head instead of wedging later
     });
     assert.equal(boundary.status, 200);
     await waitForWrites(adapter, 6);
-    assert.deepEqual(adapter.writes, ["Hello", "\r", "Hello", "\r", "Hello??", "\r"]);
+    assert.deepEqual(adapter.writes, [combined, "\r", combined, "\r", "later after unknown", "\r"]);
 
     const secondReceipt = await postHook(port, token, {
       hook_event_name: "UserPromptSubmit",
       session_id: "claude-session-1",
-      prompt: "Hello??"
+      prompt: "later after unknown"
     });
     assert.equal(secondReceipt.status, 200);
     await waitFor(async () => (await queuedCount(port)) === undefined);
@@ -587,9 +673,10 @@ test("an exhausted mate head warns the session and boss, then releases later inp
   await withServer(async ({ port, monitor, tasks, promptDeliveries }) => {
     monitor.applyExternalStatus(SESSION_ID, "running", "claude", "hook");
     await postInput(port, "cannot deliver");
-    await postInput(port, "later message");
 
     monitor.applyExternalStatus(SESSION_ID, "idle", "claude", "hook");
+    await waitFor(() => tasks.stateDb.pendingSessionInputs.list(SESSION_ID)[0]?.attemptCount === 1);
+    await postInput(port, "later message");
     await waitFor(() => Boolean(tasks.stateDb.pendingSessionInputs.latestFailed(SESSION_ID)));
     await waitForWrites(adapter, 2);
     assert.deepEqual(adapter.writes, ["later message", "\r"]);
@@ -608,6 +695,7 @@ test("an exhausted mate head warns the session and boss, then releases later inp
     promptDeliveries.acknowledgeHook(SESSION_ID, "later message");
     monitor.applyExternalStatus(SESSION_ID, "running", "claude", "hook");
     await waitFor(async () => (await queuedCount(port)) === undefined);
+    assert.equal((await sessionSnapshot(port))?.promptDeliveryWarning, undefined);
   }, {
     pendingInputMaxAttempts: 2,
     pendingInputPollMs: 5,
