@@ -101,19 +101,8 @@ class MonitorSocket extends EventEmitter {
   terminate(): void {}
 }
 
-async function withServer(
-  run: (ctx: {
-    port: number;
-    adapter: RecordingAdapter;
-    monitor: FleetMonitor;
-    tasks: TaskStore;
-    hooks: HookRegistry;
-    promptDeliveries: PromptDeliveryTracker;
-  }) => Promise<void>
-): Promise<void> {
-  const home = mkdtempSync(join(tmpdir(), "perch-input-home-"));
+async function startServer(home: string, adapter = new RecordingAdapter()) {
   const env = { PERCH_HOME: home } as NodeJS.ProcessEnv;
-  const adapter = new RecordingAdapter();
   const tasks = new TaskStore(env);
   const promptDeliveries = new PromptDeliveryTracker(tasks.stateDb, { receiptTimeoutMs: 5_000 });
   const monitor = new FleetMonitor(adapter, {
@@ -146,30 +135,50 @@ async function withServer(
   });
   await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
   const port = (server.address() as AddressInfo).port;
+  return {
+    port,
+    adapter,
+    monitor,
+    tasks,
+    hooks,
+    promptDeliveries,
+    async close() {
+      promptDeliveries.stop();
+      timeline.stop();
+      monitor.stop();
+      server.closeAllConnections?.();
+      await new Promise<void>((resolve) => server.close(() => resolve()));
+      tasks.close();
+    }
+  };
+}
+
+async function withServer(
+  run: (ctx: Awaited<ReturnType<typeof startServer>>) => Promise<void>
+): Promise<void> {
+  const home = mkdtempSync(join(tmpdir(), "perch-input-home-"));
+  const context = await startServer(home);
   try {
-    await run({ port, adapter, monitor, tasks, hooks, promptDeliveries });
+    await run(context);
   } finally {
-    promptDeliveries.stop();
-    timeline.stop();
-    server.closeAllConnections?.();
-    await new Promise<void>((resolve) => server.close(() => resolve()));
+    await context.close();
     rmSync(home, { recursive: true, force: true });
   }
 }
 
-function postInput(port: number, text: string): Promise<Response> {
+function postInput(port: number, text: string, interrupt = false): Promise<Response> {
   return fetch(`http://127.0.0.1:${port}/sessions/${encodeURIComponent(SESSION_ID)}/input`, {
     method: "POST",
     headers: { authorization: "Bearer test-token", "content-type": "application/json" },
-    body: JSON.stringify({ text })
+    body: JSON.stringify({ text, ...(interrupt ? { interrupt: true } : {}) })
   });
 }
 
-function postSubmit(port: number, text: string): Promise<Response> {
+function postSubmit(port: number, text: string, interrupt = false): Promise<Response> {
   return fetch(`http://127.0.0.1:${port}/sessions/${encodeURIComponent(SESSION_ID)}/submit`, {
     method: "POST",
     headers: { authorization: "Bearer test-token", "content-type": "application/json" },
-    body: JSON.stringify({ text })
+    body: JSON.stringify({ text, ...(interrupt ? { interrupt: true } : {}) })
   });
 }
 
@@ -191,8 +200,26 @@ async function waitForMessage(socket: MonitorSocket, id: string): Promise<Record
   return undefined;
 }
 
+async function waitForWrites(adapter: RecordingAdapter, count: number): Promise<void> {
+  const deadline = Date.now() + 1_000;
+  while (adapter.writes.length < count && Date.now() < deadline) {
+    await new Promise((resolve) => setTimeout(resolve, 5));
+  }
+  assert.equal(adapter.writes.length, count);
+}
+
+async function queuedCount(port: number): Promise<number | undefined> {
+  const response = await fetch(`http://127.0.0.1:${port}/sessions`, {
+    headers: { authorization: "Bearer test-token" }
+  });
+  assert.equal(response.status, 200);
+  const body = await response.json() as { sessions: AgentSession[] };
+  return body.sessions.find((session) => session.id === SESSION_ID)?.queuedCount;
+}
+
 test("a single POST /sessions/:id/input submits: the text write, then a distinct Enter", async () => {
-  await withServer(async ({ port, adapter }) => {
+  await withServer(async ({ port, adapter, monitor }) => {
+    monitor.applyExternalStatus(SESSION_ID, "idle", "claude", "hook");
     const response = await postInput(port, "please also update the tests\n");
     assert.equal(response.status, 202);
     assert.deepEqual((await response.json()) as object, { ok: true, queued: false });
@@ -201,7 +228,8 @@ test("a single POST /sessions/:id/input submits: the text write, then a distinct
 });
 
 test("Claude PTY input stays submitted until its matching hook receipt accepts it", async () => {
-  await withServer(async ({ port, adapter, tasks, hooks }) => {
+  await withServer(async ({ port, adapter, tasks, hooks, monitor }) => {
+    monitor.applyExternalStatus(SESSION_ID, "idle", "claude", "hook");
     const prompt = "please report the exact test result";
     const response = await postInput(port, prompt);
     assert.equal(response.status, 202);
@@ -234,7 +262,8 @@ test("Claude PTY input stays submitted until its matching hook receipt accepts i
 });
 
 test("multi-line input stays one composer body and exactly one Enter", async () => {
-  await withServer(async ({ port, adapter }) => {
+  await withServer(async ({ port, adapter, monitor }) => {
+    monitor.applyExternalStatus(SESSION_ID, "idle", "claude", "hook");
     const text = "line one\nline two\nline three";
     await postInput(port, text);
     // Internal newlines ride inside the single text write (composer content);
@@ -245,7 +274,8 @@ test("multi-line input stays one composer body and exactly one Enter", async () 
 });
 
 test("home mate submit acks accepted delivery before slow PTY confirmation can trip the client timeout", async () => {
-  await withServer(async ({ port, adapter }) => {
+  await withServer(async ({ port, adapter, monitor }) => {
+    monitor.applyExternalStatus(SESSION_ID, "idle", "claude", "hook");
     adapter.submitDelayMs = 1500;
 
     const started = Date.now();
@@ -260,7 +290,8 @@ test("home mate submit acks accepted delivery before slow PTY confirmation can t
 });
 
 test("home mate submit still reports a real immediate delivery failure", async () => {
-  await withServer(async ({ port, adapter }) => {
+  await withServer(async ({ port, adapter, monitor }) => {
+    monitor.applyExternalStatus(SESSION_ID, "idle", "claude", "hook");
     adapter.failSubmit = true;
 
     const response = await postSubmit(port, "message the mate");
@@ -282,6 +313,108 @@ test("input queues while a permission prompt is open instead of typing into the 
     assert.deepEqual((await response.json()) as object, { ok: true, queued: true });
     assert.deepEqual(adapter.writes, []);
   });
+});
+
+test("a busy mate receives a three-message burst on three separate turn boundaries in FIFO order", async (t) => {
+  for (const agent of ["claude", "codex"] as const) {
+    await t.test(agent, async () => {
+      await withServer(async ({ port, adapter, monitor, tasks }) => {
+        adapter.session.agent = agent;
+        monitor.applyExternalStatus(SESSION_ID, "running", agent, "hook");
+
+        const responses = [
+          await postInput(port, "first"),
+          await postInput(port, "second"),
+          await postInput(port, "third")
+        ];
+        assert.deepEqual(
+          await Promise.all(responses.map((response) => response.json())),
+          Array.from({ length: 3 }, () => ({ ok: true, queued: true }))
+        );
+        assert.deepEqual(adapter.writes, []);
+        assert.equal(await queuedCount(port), 3);
+        assert.deepEqual(
+          tasks.stateDb.pendingSessionInputs.list(SESSION_ID).map((input) => input.promptText),
+          ["first", "second", "third"]
+        );
+        assert.equal(tasks.stateDb.promptDeliveries.list(SESSION_ID).length, 0);
+
+        monitor.applyExternalStatus(SESSION_ID, "idle", agent, "hook");
+        monitor.applyExternalStatus(SESSION_ID, "idle", agent, "hook");
+        await waitForWrites(adapter, 2);
+        assert.deepEqual(adapter.writes, ["first", "\r"]);
+        assert.equal(await queuedCount(port), 2);
+        assert.deepEqual(
+          tasks.stateDb.promptDeliveries.list(SESSION_ID).map((delivery) => delivery.state),
+          agent === "claude" ? ["submitted"] : []
+        );
+
+        monitor.applyExternalStatus(SESSION_ID, "running", agent, "hook");
+        monitor.applyExternalStatus(SESSION_ID, "idle", agent, "hook");
+        await waitForWrites(adapter, 4);
+        assert.deepEqual(adapter.writes, ["first", "\r", "second", "\r"]);
+        assert.equal(await queuedCount(port), 1);
+
+        monitor.applyExternalStatus(SESSION_ID, "running", agent, "hook");
+        monitor.applyExternalStatus(SESSION_ID, "idle", agent, "hook");
+        await waitForWrites(adapter, 6);
+        assert.deepEqual(adapter.writes, ["first", "\r", "second", "\r", "third", "\r"]);
+        assert.equal(await queuedCount(port), undefined);
+        assert.equal(tasks.stateDb.promptDeliveries.list(SESSION_ID).length, agent === "claude" ? 3 : 0);
+      });
+    });
+  }
+});
+
+test("interrupt input bypasses a busy mate's turn-boundary queue", async () => {
+  await withServer(async ({ port, adapter, tasks }) => {
+    const response = await postInput(port, "override now", true);
+
+    assert.equal(response.status, 202);
+    assert.deepEqual(await response.json(), { ok: true, queued: false });
+    assert.deepEqual(adapter.writes, ["override now", "\r"]);
+    assert.equal(tasks.stateDb.pendingSessionInputs.count(SESSION_ID), 0);
+  });
+});
+
+test("worker-session steering remains immediate while the worker turn is active", async () => {
+  await withServer(async ({ port, adapter, tasks }) => {
+    adapter.session.title = "worker";
+    adapter.session.labels = { task: "task-1", parent: "pty:mate" };
+    const response = await postInput(port, "worker override");
+
+    assert.equal(response.status, 202);
+    assert.deepEqual(await response.json(), { ok: true, queued: false });
+    assert.deepEqual(adapter.writes, ["worker override", "\r"]);
+    assert.equal(tasks.stateDb.pendingSessionInputs.count(SESSION_ID), 0);
+  });
+});
+
+test("a held mate message survives a server restart and releases at the next turn boundary", async () => {
+  const home = mkdtempSync(join(tmpdir(), "perch-input-restart-"));
+  const first = await startServer(home);
+  try {
+    const accepted = await postSubmit(first.port, "survive restart");
+    assert.deepEqual(await accepted.json(), { ok: true, queued: true });
+    assert.deepEqual(first.adapter.writes, []);
+    assert.equal(first.tasks.stateDb.pendingSessionInputs.count(SESSION_ID), 1);
+  } finally {
+    await first.close();
+  }
+
+  const second = await startServer(home);
+  try {
+    assert.equal(second.tasks.stateDb.pendingSessionInputs.count(SESSION_ID), 1);
+    assert.deepEqual(second.adapter.writes, []);
+
+    second.monitor.applyExternalStatus(SESSION_ID, "idle", "claude", "hook");
+    await waitForWrites(second.adapter, 2);
+    assert.deepEqual(second.adapter.writes, ["survive restart", "\r"]);
+    assert.equal(second.tasks.stateDb.pendingSessionInputs.count(SESSION_ID), 0);
+  } finally {
+    await second.close();
+    rmSync(home, { recursive: true, force: true });
+  }
 });
 
 test("a Codex prompt without a structured request cannot be answered with a guessed PTY key", async () => {
