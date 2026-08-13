@@ -15,6 +15,7 @@ perch codex [options] [codex args...]
 perch run [options] -- <command> [args...]
 perch ls
 perch tasks [--json]
+perch show [cmux] [--all] [--once]
 perch attach [options] <session-id>
 perch stop <session-id>
 perch recover task <task-id>
@@ -32,6 +33,21 @@ A fresh Codex `perch mate` is different: Perch withholds its attach command, sub
 `perch claude` and Claude mate launches keep the WebSocket terminal mirror.
 If any Codex launch unexpectedly returns without attach metadata, the CLI prints the started session record plus a hint to retry with `perch attach <session-id>` instead of showing an empty terminal.
 `perch codex --no-attach` starts the session and exits without attaching anything.
+
+## Fleet workspaces
+
+```text
+perch show [cmux] [--all] [--once]
+```
+
+`perch show cmux` creates one named cmux workspace per live worker in the caller's cmux window.
+Each workspace runs that worker's exact `perch attach <session-id>` command, so the workers are directly selectable from the cmux sidebar.
+Workspace titles include the worker name and task title.
+The command identifies its own workspaces by a content-free session marker, so rerunning it adds only workers that are not already shown.
+`--all` includes the Mate.
+`--once` prints the attach commands without creating workspaces, which is useful for scripts.
+An explicit `perch show cmux` outside cmux prints the same commands as a graceful fallback.
+Bare `perch show` selects cmux only when it is the unambiguous active backend; otherwise it names the supported backend instead of guessing.
 
 ## Task status
 
