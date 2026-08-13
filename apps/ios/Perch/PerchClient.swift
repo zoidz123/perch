@@ -168,6 +168,7 @@ final class PerchStore: ObservableObject {
 
     private func applyUsableFleetSnapshot(_ snapshot: [AgentSession]) {
         sessions = snapshot
+        settleConfirmedSendStates(in: snapshot)
         hasUsableFleetSnapshot = true
     }
 
@@ -351,7 +352,7 @@ final class PerchStore: ObservableObject {
         optimisticBySession = [:]
         modelSwitchHintBySession = [:]
         draft = ""
-        lastSubmitQueued = false
+        sendStateBySession = [:]
         pendingAttachmentsBySession = SessionScopedValues()
         pendingModelBySession = [:]
         pendingEffortBySession = [:]
@@ -553,20 +554,28 @@ final class PerchStore: ObservableObject {
     // replaces every optimistic message whose ordered newline join equals the
     // row. A normal multi-line submission matches itself first and consumes
     // one; a server-drained batch consumes all of its constituent messages.
-    // Unmatched rows preserve the established one-row ordinal fallback, which
-    // covers old servers and a canonical row that arrived after its timeout.
+    // A server retry can append the batch's final input once more; that echo is
+    // one delivery, not a second local message. Unmatched rows preserve the
+    // established one-row ordinal fallback, which covers old servers and a
+    // canonical row that arrived after its timeout.
     func reconcileOptimistic(_ sessionId: String, _ fresh: [TimelineItem]) {
         var pending = optimisticBySession[sessionId, default: []]
         guard !pending.isEmpty else {
             return
         }
+        var didAbsorb = false
         for item in fresh where item.kind == .user {
             let absorb = optimisticMessagesMatched(by: item.text, in: pending)
             for _ in 0..<absorb where !pending.isEmpty {
                 pending.remove(at: pending.firstIndex { !$0.failed } ?? 0)
+                didAbsorb = true
             }
         }
         optimisticBySession[sessionId] = pending
+        if didAbsorb,
+           !pending.contains(where: { !$0.failed && !$0.acknowledged }) {
+            settleSendState(for: sessionId)
+        }
     }
 
     private func optimisticMessagesMatched(by canonicalText: String?, in pending: [OptimisticMessage]) -> Int {
@@ -578,6 +587,7 @@ final class PerchStore: ObservableObject {
         }
 
         var joined = ""
+        var retryEchoAbsorb: Int?
         for (offset, message) in pending[firstPending...].enumerated() {
             guard !message.failed, let text = message.item.text else {
                 break
@@ -586,11 +596,17 @@ final class PerchStore: ObservableObject {
             if joined == canonicalText {
                 return offset + 1
             }
+            // A retry after delivery_unknown can repeat the final batch line
+            // in the canonical row. Keep looking for an exact longer match so
+            // a genuine pair of identical user sends still consumes both.
+            if canonicalText == "\(joined)\n\(text)" {
+                retryEchoAbsorb = offset + 1
+            }
             if joined.count > canonicalText.count {
                 break
             }
         }
-        return 1
+        return retryEchoAbsorb ?? 1
     }
 
     // How long an optimistic message waits for its canonical row before it is
@@ -635,6 +651,7 @@ final class PerchStore: ObservableObject {
                 let remaining = message.deadline.timeIntervalSinceNow
                 guard remaining > 0 else {
                     self.setOptimistic(sessionId, itemId) { $0.failed = true }
+                    self.clearSendStateIfNothingIsInFlight(for: sessionId)
                     return
                 }
                 do {
@@ -678,30 +695,90 @@ final class PerchStore: ObservableObject {
             // A retry has no draft to restore (the composer moved on), so the
             // bubble simply returns to its failed state, retryable again.
             setOptimistic(sessionId, itemId) { $0.failed = true }
+            clearSendStateIfNothingIsInFlight(for: sessionId)
             connectionState = error.localizedDescription
             errorMessage = error.localizedDescription
         }
     }
 
-    // The server accepted and injected the input (202). That is the
-    // authoritative delivery signal, so mark the row acknowledged - the
-    // canonical timeline row now only confirms it and can never turn a
-    // delivered message into a false "Not delivered". A server-queued send
-    // additionally waits behind a permission prompt, so it keeps the longer
-    // leash rather than expiring while the boss decides.
+    // A direct submission settles at its 202 boundary. A queued submission has
+    // only been accepted for delivery, so it stays neutral until the server's
+    // confirmed timestamp or canonical timeline row proves it reached Mate.
     private func noteSubmitResult(_ result: SubmitResult, sessionId: String, itemId: String) {
-        setOptimistic(sessionId, itemId) { $0.acknowledged = true }
+        sendStateBySession[sessionId] = .sending
         guard result.queued ?? false else {
+            setOptimistic(sessionId, itemId) { $0.acknowledged = true }
+            settleSendState(for: sessionId)
             return
         }
-        lastSubmitQueued = true
         setOptimistic(sessionId, itemId) {
             $0.deadline = Date().addingTimeInterval(Self.optimisticQueuedTimeout)
         }
         Task { [weak self] in
-            try? await Task.sleep(for: .seconds(4))
-            self?.lastSubmitQueued = false
+            await self?.refreshSendDelivery(sessionId)
         }
+    }
+
+    func sendState(for sessionId: String) -> ComposerSendState? {
+        guard let localState = sendStateBySession[sessionId] else {
+            return nil
+        }
+        guard localState != .settled else {
+            return .settled
+        }
+        guard let session = session(for: sessionId) else {
+            return .sending
+        }
+        return ComposerSendState.resolve(
+            delivery: session.inputDelivery,
+            queuedCount: session.queuedCount,
+            agentStatus: session.status
+        )
+    }
+
+    private func refreshSendDelivery(_ sessionId: String) async {
+        guard let response: SessionsResponse = try? await request(path: "/sessions") else {
+            return
+        }
+        acceptDirectFleetSnapshot(response.sessions)
+        guard response.sessions.contains(where: { $0.id == sessionId }) else {
+            return
+        }
+    }
+
+    private func settleConfirmedSendStates(in sessions: [AgentSession]) {
+        for session in sessions where session.inputDelivery?.confirmedAt != nil {
+            guard let sendState = sendStateBySession[session.id], sendState != .settled else {
+                continue
+            }
+            acknowledgeOldestUnsettledOptimistic(in: session.id)
+            settleSendState(for: session.id)
+        }
+    }
+
+    private func acknowledgeOldestUnsettledOptimistic(in sessionId: String) {
+        guard let itemId = optimisticBySession[sessionId]?.first(where: { !$0.failed && !$0.acknowledged })?.id else {
+            return
+        }
+        setOptimistic(sessionId, itemId) { $0.acknowledged = true }
+    }
+
+    private func settleSendState(for sessionId: String) {
+        sendStateBySession[sessionId] = .settled
+        Task { [weak self] in
+            try? await Task.sleep(for: .seconds(1.5))
+            guard self?.sendStateBySession[sessionId] == .settled else {
+                return
+            }
+            self?.sendStateBySession.removeValue(forKey: sessionId)
+        }
+    }
+
+    private func clearSendStateIfNothingIsInFlight(for sessionId: String) {
+        guard !(optimisticBySession[sessionId]?.contains { !$0.failed && !$0.acknowledged } ?? false) else {
+            return
+        }
+        sendStateBySession.removeValue(forKey: sessionId)
     }
 
     // Navigate straight to a session's detail view (deep links, push taps,
@@ -926,9 +1003,10 @@ final class PerchStore: ObservableObject {
     }
 
 
-    // Set briefly after a submit that the server queued (session was blocked
-    // on a permission prompt); drives the "queued" chip on the composer.
-    @Published var lastSubmitQueued = false
+    // A local send state fills the gap before the next authoritative fleet
+    // snapshot. Snapshot delivery stages and queuedCount refine it when the
+    // server supports them; older servers remain honestly neutral.
+    @Published private var sendStateBySession: [String: ComposerSendState] = [:]
 
     // Images staged in the composer, already uploaded to the server (so send
     // just references their stored paths). Foundation-only so this store stays
