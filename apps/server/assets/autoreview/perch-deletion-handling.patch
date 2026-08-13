@@ -1,18 +1,31 @@
 diff --git a/skills/autoreview/scripts/autoreview b/skills/autoreview/scripts/autoreview
-index fbef8125c418c9d4f620fe022cd8ccde590bed2a..1d20cdd6ae77553eb65fc11e2dd330d0c10670f7 100755
 --- a/skills/autoreview/scripts/autoreview
 +++ b/skills/autoreview/scripts/autoreview
-@@ -7879,7 +7879,6 @@ def redact_deletion_only_secret_values(
-             continue
-         if new_risk:
+@@ -28,2 +28,3 @@
+ import urllib.parse
++import zlib
+ from pathlib import Path, PurePosixPath
+@@ -55,2 +56,15 @@
+ LOCAL_DIFF_VALIDATION_BOUNDARY = "\n[autoreview local diff validation boundary]\n"
++DOCUMENTATION_IMAGE_PATH_PREFIXES = ("apps/ios/Screenshots/",)
++MAX_DOCUMENTATION_PNG_BYTES = 2 * 1024 * 1024
++MAX_DOCUMENTATION_PNG_DIMENSION = 4096
++MAX_DOCUMENTATION_PNG_PIXELS = 8_000_000
++MAX_DOCUMENTATION_PNG_METADATA_BYTES = 256 * 1024
++MAX_DOCUMENTATION_PNG_DECOMPRESSED_METADATA_BYTES = 512 * 1024
++DOCUMENTATION_PNG_ANCILLARY_CHUNKS = frozenset({
++    b"cICP",
++    b"eXIf",
++    b"iCCP",
++    b"iTXt",
++    b"pHYs",
++})
+ ENGINE_GIT_CONFIG_OVERRIDES = (
+@@ -7881,3 +7895,2 @@
              refuse_secret_like_review_patch(label)
 -        fragments: set[str] = set()
          if old_risk:
-             try:
-                 fragments = review_secret_fragments(
-@@ -7888,10 +7887,8 @@ def redact_deletion_only_secret_values(
-                 )
-             except SystemExit:
+@@ -7890,6 +7903,4 @@
                  refuse_secret_like_review_patch(label)
 -            if not fragments:
 -                refuse_secret_like_review_patch(label)
@@ -21,45 +34,392 @@ index fbef8125c418c9d4f620fe022cd8ccde590bed2a..1d20cdd6ae77553eb65fc11e2dd330d0
 +            deletion_sections[index] = (old_dialect, old_content, fragments)
 +            all_fragments.update(fragments)
  
-     if len(all_fragments) > MAX_DELETION_SECRET_FRAGMENTS:
-         raise SystemExit(
-@@ -7930,8 +7927,6 @@ def redact_deletion_only_secret_values(
-                 refuse_secret_like_review_patch(label)
- 
+@@ -7932,4 +7943,2 @@
      for index, (dialect, _old_content, fragments) in deletion_sections.items():
 -        if not fragments:
 -            continue
          try:
-             redacted = redact_deleted_file_secret_lines(
-                 units[index],
-@@ -7944,6 +7939,12 @@ def redact_deletion_only_secret_values(
-         residual_pattern = known_secret_fragment_pattern(
-             sorted(fragments, key=lambda fragment: (-len(fragment), fragment))
-         )
-+        if (
-+            secret_text_risk(old_content, javascript_dialect=dialect)
+@@ -7948,2 +7957,8 @@
+             secret_text_risk(old_content, javascript_dialect=dialect)
 +            or (residual_pattern is not None and residual_pattern.search(old_content))
 +        ):
 +            redacted = diff_section_without_deleted_line_contents(redacted)
 +            old_content, new_content = unified_diff_contents(redacted)
-         if (
-             secret_text_risk(old_content, javascript_dialect=dialect)
++        if (
++            secret_text_risk(old_content, javascript_dialect=dialect)
              or secret_text_risk(new_content)
-@@ -8320,13 +8321,23 @@ def validate_review_patch(
-     return patch
- 
+@@ -8322,4 +8337,369 @@
  
 -def require_no_binary_diff(label: str, numstat: str) -> None:
++def documentation_image_path(path: str) -> bool:
++    return (
++        path.endswith(".png")
++        and any(path.startswith(prefix) for prefix in DOCUMENTATION_IMAGE_PATH_PREFIXES)
++    )
++
++
++def read_git_blob(repo: Path, object_id: str) -> bytes:
++    if re.fullmatch(r"[0-9a-f]{40,64}", object_id) is None:
++        raise SystemExit("refusing documentation image with an invalid Git object id")
++    blob_size_text = git(repo, "cat-file", "-s", object_id).strip()
++    if re.fullmatch(r"\d+", blob_size_text) is None:
++        raise SystemExit("unable to determine documentation image size from the reviewed Git object")
++    blob_size = int(blob_size_text)
++    if blob_size > MAX_DOCUMENTATION_PNG_BYTES:
++        raise SystemExit(
++            "refusing documentation image addition because it exceeds "
++            f"{MAX_DOCUMENTATION_PNG_BYTES} byte limit: {blob_size} bytes"
++        )
++    result = subprocess.run(
++        [
++            resolve_command("git", repo),
++            "--no-optional-locks",
++            *SAFE_GIT_CONFIG_ARGS,
++            "cat-file",
++            "blob",
++            object_id,
++        ],
++        cwd=repo,
++        stdout=subprocess.PIPE,
++        stderr=subprocess.PIPE,
++        env=safe_git_env(repo),
++    )
++    if result.returncode != 0:
++        raise SystemExit(
++            "unable to read documentation image from the reviewed Git object: "
++            f"{display_escape(result.stderr.decode('utf-8', 'replace'), 500)}"
++        )
++    if len(result.stdout) != blob_size:
++        raise SystemExit("unable to read the expected documentation image bytes from the reviewed Git object")
++    return result.stdout
++
++
++def tree_documentation_image_blob(
++    repo: Path,
++    treeish: str,
++    path: str,
++) -> tuple[str, bytes]:
++    entries = [
++        entry
++        for entry in git(
++            repo,
++            "ls-tree",
++            "-z",
++            "--full-tree",
++            treeish,
++            "--",
++            path,
++        ).split("\0")
++        if entry
++    ]
++    if len(entries) != 1 or "\t" not in entries[0]:
++        raise SystemExit(
++            "unable to resolve documentation image from the reviewed Git tree: "
++            f"{display_escape(path, 500)}"
++        )
++    metadata, entry_path = entries[0].split("\t", 1)
++    fields = metadata.split()
++    if len(fields) != 3 or entry_path != path or fields[1] != "blob":
++        raise SystemExit(
++            "unable to validate documentation image metadata from the reviewed Git tree: "
++            f"{display_escape(path, 500)}"
++        )
++    return fields[0], read_git_blob(repo, fields[2])
++
++
++def index_documentation_image_blob(repo: Path, path: str) -> tuple[str, bytes]:
++    entries = [
++        entry
++        for entry in git(
++            repo,
++            "ls-files",
++            "--stage",
++            "-z",
++            "--",
++            path,
++        ).split("\0")
++        if entry
++    ]
++    if len(entries) != 1 or "\t" not in entries[0]:
++        raise SystemExit(
++            "unable to resolve documentation image from the staged Git index: "
++            f"{display_escape(path, 500)}"
++        )
++    metadata, entry_path = entries[0].split("\t", 1)
++    fields = metadata.split()
++    if (
++        len(fields) != 3
++        or entry_path != path
++        or fields[2] != "0"
++    ):
++        raise SystemExit(
++            "unable to validate documentation image metadata from the staged Git index: "
++            f"{display_escape(path, 500)}"
++        )
++    return fields[0], read_git_blob(repo, fields[1])
++
++
++def worktree_documentation_image_blob(repo: Path, path: str) -> tuple[str, bytes]:
++    relative = PurePosixPath(path)
++    if relative.is_absolute() or ".." in relative.parts or not relative.parts:
++        raise SystemExit(
++            f"refusing documentation image with an unsafe path: {display_escape(path, 500)}"
++        )
++    relative_path = Path(*relative.parts)
++    if raw_repo_path_has_symlink_component(repo, relative_path.parent):
++        raise SystemExit(
++            "refusing documentation image through a symlinked parent directory: "
++            f"{display_escape(path, 500)}"
++        )
++    image_path = repo / relative_path
++    try:
++        before = os.lstat(image_path)
++    except OSError as exc:
++        raise SystemExit(
++            "unable to read documentation image from the working tree: "
++            f"{display_escape(path, 500)}"
++        ) from exc
++    if not stat.S_ISREG(before.st_mode):
++        return "non-regular", b""
++    if before.st_mode & 0o111:
++        return "executable", b""
++    if before.st_size > MAX_DOCUMENTATION_PNG_BYTES:
++        raise SystemExit(
++            "refusing documentation image addition because it exceeds "
++            f"{MAX_DOCUMENTATION_PNG_BYTES} byte limit: {before.st_size} bytes"
++        )
++
++    descriptor: int | None = None
++    try:
++        descriptor = os.open(
++            image_path,
++            os.O_RDONLY
++            | getattr(os, "O_BINARY", 0)
++            | getattr(os, "O_CLOEXEC", 0)
++            | getattr(os, "O_NOFOLLOW", 0),
++        )
++        opened = os.fstat(descriptor)
++        if (
++            not stat.S_ISREG(opened.st_mode)
++            or (before.st_dev, before.st_ino) != (opened.st_dev, opened.st_ino)
++        ):
++            raise OSError("file changed while opening")
++        data = bytearray()
++        while len(data) <= MAX_DOCUMENTATION_PNG_BYTES:
++            chunk = os.read(
++                descriptor,
++                min(64 * 1024, MAX_DOCUMENTATION_PNG_BYTES + 1 - len(data)),
++            )
++            if not chunk:
++                break
++            data.extend(chunk)
++        after = os.fstat(descriptor)
++        if (
++            opened.st_mode,
++            opened.st_size,
++            opened.st_mtime_ns,
++        ) != (
++            after.st_mode,
++            after.st_size,
++            after.st_mtime_ns,
++        ):
++            raise OSError("file changed while reading")
++    except OSError as exc:
++        raise SystemExit(
++            "unable to read documentation image from the working tree: "
++            f"{display_escape(path, 500)}"
++        ) from exc
++    finally:
++        if descriptor is not None:
++            os.close(descriptor)
++    return "100644", bytes(data)
++
++
++def bounded_zlib_payload(data: bytes, limit: int) -> bytes | None:
++    try:
++        inflater = zlib.decompressobj()
++        payload = inflater.decompress(data, limit + 1)
++        if len(payload) > limit or inflater.unconsumed_tail:
++            return None
++        payload += inflater.flush(limit - len(payload) + 1)
++    except zlib.error:
++        return None
++    if len(payload) > limit or not inflater.eof or inflater.unused_data:
++        return None
++    return payload
++
++
++def documentation_png_error(data: bytes) -> str | None:
++    if len(data) > MAX_DOCUMENTATION_PNG_BYTES:
++        return f"exceeds {MAX_DOCUMENTATION_PNG_BYTES} byte limit"
++    if not data.startswith(b"\x89PNG\r\n\x1a\n"):
++        return "does not have a PNG signature"
++
++    offset = 8
++    width = height = bit_depth = color_type = -1
++    saw_ihdr = saw_idat = saw_iend = saw_plte = False
++    idat_finished = False
++    metadata_bytes = 0
++    image_data = bytearray()
++    while offset < len(data):
++        if len(data) - offset < 12:
++            return "has a truncated PNG chunk"
++        length = int.from_bytes(data[offset:offset + 4], "big")
++        chunk_type = data[offset + 4:offset + 8]
++        chunk_start = offset + 8
++        chunk_end = chunk_start + length
++        checksum_end = chunk_end + 4
++        if chunk_end > len(data) - 4:
++            return "has a truncated PNG chunk"
++        if re.fullmatch(rb"[A-Za-z]{4}", chunk_type) is None:
++            return "has an invalid PNG chunk type"
++        if chunk_type[2] & 0x20:
++            return "uses a PNG chunk with an invalid reserved bit"
++        chunk_data = data[chunk_start:chunk_end]
++        expected_checksum = int.from_bytes(data[chunk_end:checksum_end], "big")
++        if binascii.crc32(chunk_type + chunk_data) & 0xFFFFFFFF != expected_checksum:
++            return "has an invalid PNG chunk checksum"
++
++        if chunk_type == b"IHDR":
++            if saw_ihdr or offset != 8 or length != 13:
++                return "has an invalid PNG header"
++            saw_ihdr = True
++            width = int.from_bytes(chunk_data[0:4], "big")
++            height = int.from_bytes(chunk_data[4:8], "big")
++            bit_depth = chunk_data[8]
++            color_type = chunk_data[9]
++            compression_method = chunk_data[10]
++            filter_method = chunk_data[11]
++            interlace_method = chunk_data[12]
++            valid_bit_depths = {
++                0: {1, 2, 4, 8},
++                2: {8},
++                3: {1, 2, 4, 8},
++                4: {8},
++                6: {8},
++            }
++            if (
++                width < 1
++                or height < 1
++                or width > MAX_DOCUMENTATION_PNG_DIMENSION
++                or height > MAX_DOCUMENTATION_PNG_DIMENSION
++                or width * height > MAX_DOCUMENTATION_PNG_PIXELS
++                or bit_depth not in valid_bit_depths.get(color_type, set())
++                or compression_method != 0
++                or filter_method != 0
++                or interlace_method != 0
++            ):
++                return "exceeds PNG dimension or pixel limits"
++        elif chunk_type == b"PLTE":
++            if not saw_ihdr or saw_idat or saw_plte or length == 0 or length % 3:
++                return "has an invalid PNG palette"
++            if color_type in {0, 4} or length > 768:
++                return "has an invalid PNG palette"
++            saw_plte = True
++        elif chunk_type == b"IDAT":
++            if not saw_ihdr or saw_iend or idat_finished:
++                return "has non-contiguous PNG image data"
++            if length == 0:
++                return "has empty PNG image data"
++            saw_idat = True
++            image_data.extend(chunk_data)
++        elif chunk_type == b"IEND":
++            if not saw_ihdr or not saw_idat or length != 0 or checksum_end != len(data):
++                return "has an invalid PNG end marker or trailing data"
++            saw_iend = True
++            break
++        else:
++            if not saw_ihdr or saw_iend:
++                return "has an invalid PNG chunk order"
++            if not chunk_type[0] & 0x20:
++                return "uses an unknown critical PNG chunk"
++            if chunk_type not in DOCUMENTATION_PNG_ANCILLARY_CHUNKS:
++                return "uses an unapproved PNG metadata chunk"
++            metadata_bytes += length
++            if metadata_bytes > MAX_DOCUMENTATION_PNG_METADATA_BYTES:
++                return "exceeds PNG metadata limit"
++            if chunk_type == b"cICP" and length != 4:
++                return "has invalid PNG color metadata"
++            if chunk_type == b"pHYs" and length != 9:
++                return "has invalid PNG physical-size metadata"
++            if chunk_type == b"iCCP":
++                profile_name, separator, compressed_profile = chunk_data.partition(b"\0")
++                if (
++                    not separator
++                    or not 1 <= len(profile_name) <= 79
++                    or not compressed_profile
++                    or compressed_profile[0] != 0
++                    or bounded_zlib_payload(
++                        compressed_profile[1:],
++                        MAX_DOCUMENTATION_PNG_DECOMPRESSED_METADATA_BYTES,
++                    ) is None
++                ):
++                    return "has invalid or oversized PNG color metadata"
++            if chunk_type == b"iTXt":
++                keyword, separator, text_metadata = chunk_data.partition(b"\0")
++                if (
++                    not separator
++                    or not 1 <= len(keyword) <= 79
++                    or len(text_metadata) < 2
++                    or text_metadata[0] != 0
++                    or text_metadata[1] != 0
++                ):
++                    return "has unsupported compressed PNG text metadata"
++            if saw_idat:
++                idat_finished = True
++        offset = checksum_end
++
++    if not saw_ihdr or not saw_idat or not saw_iend:
++        return "is not a complete PNG image"
++    if color_type == 3 and not saw_plte:
++        return "is missing its indexed PNG palette"
++
++    channels = {0: 1, 2: 3, 3: 1, 4: 2, 6: 4}[color_type]
++    expected_raw_bytes = height * (1 + (width * channels * bit_depth + 7) // 8)
++    raw = bounded_zlib_payload(bytes(image_data), expected_raw_bytes)
++    if raw is None:
++        return "has invalid compressed PNG image data"
++    if len(raw) != expected_raw_bytes:
++        return "expands beyond its declared PNG dimensions"
++    return None
++
++
++def review_documentation_image_additions(
++    repo: Path,
++    added_paths: set[str],
++    read_image: Callable[[str], tuple[str, bytes]],
++) -> set[str]:
++    approved: set[str] = set()
++    for path in added_paths:
++        if not documentation_image_path(path):
++            continue
++        mode, data = read_image(path)
++        if mode != "100644":
++            raise SystemExit(
++                "refusing documentation image addition because it is not a "
++                f"non-executable regular file: {display_escape(path, 500)}"
++            )
++        error = documentation_png_error(data)
++        if error is not None:
++            raise SystemExit(
++                "refusing documentation image addition because it is not a "
++                f"safe PNG: {display_escape(path, 500)} ({error})"
++            )
++        approved.add(path)
++    return approved
++
++
 +def require_no_binary_diff(
 +    label: str,
 +    numstat: str,
 +    deletion_only_paths: set[str] | None = None,
++    approved_documentation_images: set[str] | None = None,
 +) -> None:
      binary_paths: list[str] = []
 +    allowed_deletions = deletion_only_paths or set()
++    allowed_images = approved_documentation_images or set()
      for record in numstat.split("\0"):
-         if not record:
-             continue
+@@ -8328,3 +8708,9 @@
          fields = record.split("\t", 2)
 -        if len(fields) == 3 and fields[0] == "-" and fields[1] == "-":
 +        if (
@@ -67,13 +427,10 @@ index fbef8125c418c9d4f620fe022cd8ccde590bed2a..1d20cdd6ae77553eb65fc11e2dd330d0
 +            and fields[0] == "-"
 +            and fields[1] == "-"
 +            and fields[2] not in allowed_deletions
++            and fields[2] not in allowed_images
 +        ):
              binary_paths.append(fields[2])
-     if binary_paths:
-         details = "\n".join(
-@@ -8497,14 +8508,6 @@ def local_bundle(
- ) -> tuple[str, bool]:
-     staged_patch = git(repo, "diff", *SAFE_DIFF_FLAGS, "--cached", "--patch")
+@@ -8499,10 +8885,2 @@
      unstaged_patch = git(repo, "diff", *SAFE_DIFF_FLAGS, "--patch")
 -    require_no_binary_diff(
 -        "local staged diff",
@@ -84,49 +441,81 @@ index fbef8125c418c9d4f620fe022cd8ccde590bed2a..1d20cdd6ae77553eb65fc11e2dd330d0
 -        git(repo, "diff", *SAFE_DIFF_FLAGS, "--numstat", "-z"),
 -    )
      require_no_gitlink_diff(
-         "local staged diff",
-         git(repo, "diff", *SAFE_DIFF_FLAGS, "--cached", "--raw", "-z"),
-@@ -8546,6 +8549,16 @@ def local_bundle(
-         None,
-         "HEAD",
+@@ -8548,2 +8926,43 @@
      )
++    staged_documentation_images = review_documentation_image_additions(
++        repo,
++        set(
++            git_path_list(
++                repo,
++                "diff",
++                *SAFE_DIFF_FLAGS,
++                "--diff-filter=A",
++                "--name-only",
++                "--cached",
++                "-z",
++            )
++        ),
++        lambda path: index_documentation_image_blob(repo, path),
++    )
++    unstaged_documentation_images = review_documentation_image_additions(
++        repo,
++        set(
++            git_path_list(
++                repo,
++                "diff",
++                *SAFE_DIFF_FLAGS,
++                "--diff-filter=A",
++                "--name-only",
++                "-z",
++            )
++        ),
++        lambda path: worktree_documentation_image_blob(repo, path),
++    )
 +    require_no_binary_diff(
 +        "local staged diff",
 +        git(repo, "diff", *SAFE_DIFF_FLAGS, "--cached", "--numstat", "-z"),
 +        deletion_only_paths,
++        staged_documentation_images,
 +    )
 +    require_no_binary_diff(
 +        "local unstaged diff",
 +        git(repo, "diff", *SAFE_DIFF_FLAGS, "--numstat", "-z"),
 +        deletion_only_paths,
++        unstaged_documentation_images,
 +    )
      deleted_paths = set(
-         git_path_list(
-             repo,
-@@ -8839,6 +8852,12 @@ def branch_bundle(
-         "--end-of-options",
+@@ -8840,2 +9259,24 @@
          diff_range,
-     )
++    )
 +    deletion_only_paths = review_deletion_only_paths(
 +        repo,
 +        "branch",
 +        base_ref,
 +        "HEAD",
 +    )
-     require_no_binary_diff(
-         "branch diff",
-         git(
-@@ -8850,6 +8869,7 @@ def branch_bundle(
-             "--end-of-options",
-             diff_range,
++    documentation_images = review_documentation_image_additions(
++        repo,
++        set(
++            git_path_list(
++                repo,
++                "diff",
++                *SAFE_DIFF_FLAGS,
++                "--diff-filter=A",
++                "--name-only",
++                "-z",
++                "--end-of-options",
++                diff_range,
++            )
++        ),
++        lambda path: tree_documentation_image_blob(repo, "HEAD", path),
+     )
+@@ -8852,2 +9293,4 @@
          ),
 +        deletion_only_paths,
++        documentation_images,
      )
-     require_no_gitlink_diff(
-         "branch diff",
-@@ -8864,12 +8884,6 @@ def branch_bundle(
-         ),
-     )
+@@ -8866,8 +9309,2 @@
      omitted_tracked = bool(tracked_sensitive_paths(branch_paths))
 -    deletion_only_paths = review_deletion_only_paths(
 -        repo,
@@ -135,11 +524,7 @@ index fbef8125c418c9d4f620fe022cd8ccde590bed2a..1d20cdd6ae77553eb65fc11e2dd330d0
 -        "HEAD",
 -    )
      branch_patch = validate_review_patch(
-         "branch diff",
-         branch_paths,
-@@ -8935,6 +8949,12 @@ def commit_bundle(
-         "--end-of-options",
-         commit_ref,
+@@ -8937,2 +9374,25 @@
      )
 +    deletion_only_paths = review_deletion_only_paths(
 +        repo,
@@ -147,20 +532,30 @@ index fbef8125c418c9d4f620fe022cd8ccde590bed2a..1d20cdd6ae77553eb65fc11e2dd330d0
 +        None,
 +        commit_ref,
 +    )
++    documentation_images = review_documentation_image_additions(
++        repo,
++        set(
++            git_path_list(
++                repo,
++                "show",
++                *SAFE_DIFF_FLAGS,
++                "--diff-filter=A",
++                "--name-only",
++                "--format=",
++                "-z",
++                "--end-of-options",
++                commit_ref,
++            )
++        ),
++        lambda path: tree_documentation_image_blob(repo, commit_ref, path),
++    )
      require_no_binary_diff(
-         "commit diff",
-         git(
-@@ -8947,6 +8967,7 @@ def commit_bundle(
-             "--end-of-options",
-             commit_ref,
+@@ -8949,2 +9409,4 @@
          ),
 +        deletion_only_paths,
++        documentation_images,
      )
-     require_no_gitlink_diff(
-         "commit diff",
-@@ -8971,12 +8992,6 @@ def commit_bundle(
-         "--end-of-options",
-         commit_ref,
+@@ -8973,8 +9435,2 @@
      )
 -    deletion_only_paths = review_deletion_only_paths(
 -        repo,
@@ -169,5 +564,3 @@ index fbef8125c418c9d4f620fe022cd8ccde590bed2a..1d20cdd6ae77553eb65fc11e2dd330d0
 -        commit_ref,
 -    )
      commit_patch = validate_review_patch(
-         "commit diff",
-         commit_paths,

@@ -20,7 +20,10 @@ The bundled AutoReview tree comes from `openclaw/agent-skills` commit `2a409d348
 
 The manifest records the exact runtime bytes, source blobs, modes, and SHA-256 hashes in `apps/server/assets/autoreview/manifest.json`.
 
-Perch carries one audited helper deviation on that base commit: deletion-only secret-like lines are redacted and pure binary deletions are allowed, while additions and modifications remain fail-closed.
+Perch carries one audited helper deviation on that base commit: deletion-only secret-like lines are redacted and pure binary deletions are allowed.
+New PNGs are accepted only when Git adds a non-executable regular file under `apps/ios/Screenshots/` that passes strict signature, structure, checksum, size, dimension, pixel, and decompression-bound validation.
+The limit is 2 MiB, 4096 pixels on either edge, and 8 million pixels total.
+All other binary additions and every binary modification remain fail-closed.
 The exact upstreamable delta and its hash are recorded in `apps/server/assets/autoreview/perch-deletion-handling.patch` and the manifest.
 
 The pinned upstream test suite and fixture files are not packaged.

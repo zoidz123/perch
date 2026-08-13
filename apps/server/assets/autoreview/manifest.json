@@ -6,21 +6,22 @@
     "canonicalPath": "skills/autoreview",
     "licensePath": "LICENSE"
   },
-  "version": "2a409d348a4bcf6f15e41e9a20efd0b298a32528+perch-deletion-handling.1",
+  "version": "2a409d348a4bcf6f15e41e9a20efd0b298a32528+perch-documentation-images.1",
   "deviations": [
     {
       "baseUpstreamCommit": "2a409d348a4bcf6f15e41e9a20efd0b298a32528",
       "sourcePath": "skills/autoreview/scripts/autoreview",
       "baseSourceBlob": "fbef8125c418c9d4f620fe022cd8ccde590bed2a",
       "baseSha256": "711accc0dfe2f642b44c9401f05966996087659ec2e17d67b0654aa663d4b51d",
-      "patchedSha256": "436abe24d6347d761646bbcaa620645d248d84beb8d81ca30465b7539372f60a",
+      "patchedSha256": "1c1124d4d24f86198d8480ae3b97e329aa885088638f89f3058b4d994ad944dd",
       "patchPath": "perch-deletion-handling.patch",
-      "patchSha256": "606694552a517f0466c98c11c2734418c7277d7ff0a6f6e8b705f3558ed73155",
+      "patchSha256": "2a01375c02c828d5454f6010faba78bf4cbc4f107538f0eacc76ff310f73e16c",
       "patched": [
         "Deletion-only secret-like values are redacted from review bundles, with a deleted-line-content fallback when placeholder-only risk has no redactable fragment.",
-        "Pure binary deletions are allowed only when the same diff classifies the path as deletion-only; binary additions and modifications remain refused."
+        "Pure binary deletions are allowed only when the same diff classifies the path as deletion-only; binary additions and modifications remain refused.",
+        "New non-executable PNG files under apps/ios/Screenshots are allowed only after strict signature, structure, checksum, size, dimension, pixel, and decompression-bound validation."
       ],
-      "reason": "Perch ship reviews must be able to remove secret-like test placeholders and obsolete binary artifacts without weakening review of any added or modified content."
+      "reason": "Perch ship reviews must be able to remove secret-like test placeholders and obsolete binary artifacts while allowing small, safe public presentation screenshots without accepting arbitrary binary additions or modified content."
     }
   ],
   "files": [
@@ -28,7 +29,7 @@
     { "path": "skill/AGENTS.md", "sourcePath": "skills/autoreview/AGENTS.md", "sourceBlob": "5a0173d73d39a8b1e2e66ae1d54b47f960b25e43", "mode": "100644", "bytes": 437, "sha256": "d413df783f69b238904fb2b2428f313c99bcfaae7f5992412506bf09aac9ee2f" },
     { "path": "skill/CLAUDE.md", "sourcePath": "skills/autoreview/CLAUDE.md", "sourceBlob": "47dc3e3d863cfb5727b87d785d09abf9743c0a72", "mode": "120000", "bytes": 9, "sha256": "a54ff182c7e8acf56acfd6e4b9c3ff41e2c41a31c9b211b2deb9df75d9a478f9", "linkTarget": "AGENTS.md", "npmMaterialization": { "bytes": 437, "sha256": "d413df783f69b238904fb2b2428f313c99bcfaae7f5992412506bf09aac9ee2f" } },
     { "path": "skill/SKILL.md", "sourcePath": "skills/autoreview/SKILL.md", "sourceBlob": "2690ee3f6bb54a5630e8d2ba19139ce08ca07707", "mode": "100644", "bytes": 37913, "sha256": "53d9676e35ce0a13ac3b9ff6e33f83d9998c24e08ab2fe626521425c65d12986" },
-    { "path": "skill/scripts/autoreview", "sourcePath": "skills/autoreview/scripts/autoreview", "sourceBlob": "fbef8125c418c9d4f620fe022cd8ccde590bed2a", "mode": "100755", "bytes": 461431, "sha256": "436abe24d6347d761646bbcaa620645d248d84beb8d81ca30465b7539372f60a" },
+    { "path": "skill/scripts/autoreview", "sourcePath": "skills/autoreview/scripts/autoreview", "sourceBlob": "fbef8125c418c9d4f620fe022cd8ccde590bed2a", "mode": "100755", "bytes": 477350, "sha256": "1c1124d4d24f86198d8480ae3b97e329aa885088638f89f3058b4d994ad944dd" },
     { "path": "skill/scripts/test-review-harness", "sourcePath": "skills/autoreview/scripts/test-review-harness", "sourceBlob": "ab98338a891a69423beee3f21247dc215066f392", "mode": "100755", "bytes": 367, "sha256": "d58e158818a634b291893b74d1e21b0027e187ef6ee28a1cb84361345e1d5308" },
     { "path": "skill/scripts/test-review-harness.ps1", "sourcePath": "skills/autoreview/scripts/test-review-harness.ps1", "sourceBlob": "f2012afdccb5047bab32a6fa8040bf1314b569fd", "mode": "100644", "bytes": 1016, "sha256": "55e95ac5f8a209acb8e31f2abbcae3ddad3d3d90b59daa907065673950e1418b" },
     { "path": "skill/scripts/test-review-harness.py", "sourcePath": "skills/autoreview/scripts/test-review-harness.py", "sourceBlob": "f8cfa16a70cfb1a6d6821dc1bd9b408639208817", "mode": "100644", "bytes": 7073, "sha256": "8d029dd505346afdbdd7797839850daa684a5fefe0e2157054caea8d10436186" }
