@@ -139,6 +139,67 @@ class ScriptedMatePty implements PtyProcess {
   }
 }
 
+class TranscriptMatePty implements PtyProcess {
+  pid = process.pid;
+  readonly writes: Array<{ data: string; at: number }> = [];
+  readonly submissions: string[] = [];
+  private composer = "";
+  private receipt = 0;
+  private readonly dataListeners = new Set<(data: string) => void>();
+  private readonly exitListeners = new Set<(event: { exitCode: number; signal?: number }) => void>();
+
+  constructor(private readonly transcript: string) {}
+
+  write(data: string): void {
+    this.writes.push({ data, at: Date.now() });
+    if (data === "\x15") {
+      this.composer = "";
+      this.emitData(data);
+      return;
+    }
+    if (data !== "\r") {
+      this.composer += data;
+      this.emitData(data);
+      return;
+    }
+
+    const submitted = this.composer;
+    this.composer = "";
+    if (submitted) {
+      this.submissions.push(submitted);
+      this.receipt += 1;
+      appendFileSync(
+        this.transcript,
+        `${JSON.stringify({
+          type: "user",
+          uuid: `interleaved-receipt-${this.receipt}`,
+          timestamp: new Date().toISOString(),
+          message: { role: "user", content: submitted }
+        })}\n`
+      );
+    }
+    this.emitData("\r\n❯ ");
+  }
+
+  kill(): void {
+    for (const listener of this.exitListeners) listener({ exitCode: 0 });
+  }
+
+  onData(listener: (data: string) => void) {
+    this.dataListeners.add(listener);
+    return { dispose: () => this.dataListeners.delete(listener) };
+  }
+
+  onExit(listener: (event: { exitCode: number; signal?: number }) => void) {
+    this.exitListeners.add(listener);
+    return { dispose: () => this.exitListeners.delete(listener) };
+  }
+
+  emitData(data: string): void {
+    for (const listener of this.dataListeners) listener(data);
+  }
+}
+
 class MonitorSocket extends EventEmitter {
   readonly OPEN = 1;
   readyState = 1;
@@ -453,6 +514,78 @@ test("mate-like PTY transcript confirms literal and transformed input exactly on
         rmSync(transcriptHome, { recursive: true, force: true });
       }
     });
+  }
+});
+
+test("interleaved boss and mailbox deliveries reach one mate PTY exactly once", async () => {
+  const transcriptHome = mkdtempSync(join(tmpdir(), "perch-input-interleave-"));
+  const transcript = join(transcriptHome, "mate.jsonl");
+  writeFileSync(transcript, "");
+  let child: TranscriptMatePty | undefined;
+  const adapter = new PtyAgentAdapter(() => {
+    child = new TranscriptMatePty(transcript);
+    return child;
+  });
+  await adapter.startAgent({
+    command: "claude",
+    sessionId: SESSION_ID,
+    title: "mate",
+    labels: { role: "mate" }
+  });
+
+  const firstNudge = "[perch mailbox] 1 unread item - use mailbox tools";
+  const secondNudge = "[perch mailbox] 2 unread items - use mailbox tools";
+  const bossText = "Add dark mode to my gym app";
+
+  try {
+    await withServer(async ({ port, monitor, tasks, timeline }) => {
+      timeline.attach(SESSION_ID, transcript);
+      child!.emitData("❯ ");
+      monitor.applyExternalStatus(SESSION_ID, "idle", "claude", "hook");
+
+      const response = await postInput(port, bossText);
+      assert.equal(response.status, 202);
+      const nudges = [
+        monitor.queueOrSubmit(SESSION_ID, firstNudge, { silent: true }),
+        monitor.queueOrSubmit(SESSION_ID, secondNudge, { silent: true })
+      ];
+      await Promise.all(nudges);
+
+      await waitFor(
+        () => {
+          const deliveries = tasks.stateDb.promptDeliveries.list(SESSION_ID);
+          return deliveries.length === 3 && deliveries.every((delivery) => delivery.state === "accepted");
+        },
+        10_000
+      );
+      await new Promise((resolve) => setTimeout(resolve, 100));
+
+      assert.deepEqual(child!.submissions, [firstNudge, secondNudge, bossText]);
+      assert.equal(child!.writes.filter((write) => write.data === "\r").length, 3);
+      assert.equal(tasks.stateDb.pendingSessionInputs.count(SESSION_ID), 0);
+      const deliveries = tasks.stateDb.promptDeliveries.list(SESSION_ID);
+      assert.deepEqual(
+        [firstNudge, secondNudge, bossText].map((promptText) => {
+          const delivery = deliveries.find((candidate) => candidate.promptText === promptText);
+          return {
+            promptText: delivery?.promptText,
+            state: delivery?.state,
+            receiptKind: delivery?.receiptKind
+          };
+        }),
+        [firstNudge, secondNudge, bossText].map((promptText) => ({
+          promptText,
+          state: "accepted",
+          receiptKind: "transcript"
+        }))
+      );
+    }, {
+      receiptTimeoutMs: 2_500,
+      pendingInputRetryBackoffMs: [10]
+    }, adapter as unknown as RecordingAdapter);
+  } finally {
+    adapter.stop();
+    rmSync(transcriptHome, { recursive: true, force: true });
   }
 });
 

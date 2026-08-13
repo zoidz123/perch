@@ -3705,6 +3705,40 @@ export class PromptDeliveryRepository {
     return row ? promptDeliveryFromRow(row) : undefined;
   }
 
+  hasEarlierInFlight(id: string): boolean {
+    return Boolean(
+      this.db.prepare(
+        `SELECT 1
+         FROM prompt_deliveries current
+         JOIN prompt_deliveries earlier
+           ON earlier.perch_session_id = current.perch_session_id
+          AND earlier.rowid < current.rowid
+         WHERE current.id = ?
+           AND (
+             earlier.state IN ('queued', 'typing', 'submitted')
+             OR (
+               earlier.state IN ('not_submitted', 'delivery_unknown')
+               AND EXISTS (
+                 SELECT 1 FROM pending_session_inputs pending
+                 WHERE pending.delivery_id = earlier.id AND pending.state = 'pending'
+               )
+             )
+           )
+         LIMIT 1`
+      ).pluck().get(id)
+    );
+  }
+
+  hasPendingInput(id: string): boolean {
+    return Boolean(
+      this.db.prepare(
+        `SELECT 1 FROM pending_session_inputs
+         WHERE delivery_id = ? AND state = 'pending'
+         LIMIT 1`
+      ).pluck().get(id)
+    );
+  }
+
   list(sessionId?: string): PromptDeliveryRecord[] {
     const rows = sessionId
       ? this.db.prepare("SELECT * FROM prompt_deliveries WHERE perch_session_id = ? ORDER BY created_at, id").all(sessionId)

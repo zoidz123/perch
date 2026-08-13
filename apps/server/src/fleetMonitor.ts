@@ -909,6 +909,7 @@ export class FleetMonitor {
     );
     if (!failed?.[0]) return;
     const head = failed[0];
+    if (head.deliveryId) this.promptDeliveries?.settleSubmissionChain(head.deliveryId);
     this.clearPendingInputTimer(head.perchSessionId);
     this.usedIdleBoundaries.delete(head.perchSessionId);
     this.pushRouter?.pendingInputDeliveryFailed(
@@ -1069,7 +1070,13 @@ export class FleetMonitor {
   }
 
   private async submitToAdapter(sessionId: string, text: string, deliveryId?: string, silent?: boolean): Promise<void> {
-    if (deliveryId) this.promptDeliveries?.markTyping(deliveryId);
+    if (deliveryId) {
+      // A PTY has one shared composer. Let the preceding tracked delivery
+      // reach accepted/unknown before typing this one, otherwise concurrent
+      // boss and mailbox submissions can concatenate before either Enter.
+      await this.promptDeliveries?.waitForSubmissionTurn(deliveryId);
+      this.promptDeliveries?.markTyping(deliveryId);
+    }
     try {
       if (this.adapter.submitInput) {
         await this.adapter.submitInput(sessionId, text);

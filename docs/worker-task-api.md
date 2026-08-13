@@ -292,6 +292,7 @@ Process argv is readable across users for the life of the session (world-readabl
 
 Every server-originated Claude text prompt is journaled in SQLite before submission, including the positional kickoff and later composer or Mate follow-ups.
 Follow-ups still use Claude's native PTY TUI: Perch types the prompt, verifies that distinctive text reached the input line when possible, and sends exactly one Enter.
+Per Claude session, tracked PTY follow-ups form one submission chain: Perch does not type the next boss message or mailbox nudge until the preceding delivery is accepted or its retry chain has settled, and each line is matched to its own receipt.
 The delivery becomes accepted only from a matching verified `UserPromptSubmit` hook or a matching transcript user row with an authentic provider timestamp.
 Receipt IDs, durable ordering, timestamp boundaries, and conservative same-text matching prevent transcript replay or an older identical prompt from accepting a newer delivery.
 A receipt timeout, process loss, or server restart records either `prompt_not_submitted` or `prompt_delivery_unknown`; Perch never blindly resends uncertain input.
