@@ -15,7 +15,7 @@ import { HookRegistry } from "./hooks.js";
 import { createControlServer } from "./http.js";
 import { DeviceRegistry } from "./pairing.js";
 import { PrPoller } from "./prPoller.js";
-import { PromptDeliveryTracker } from "./promptDeliveries.js";
+import { PromptDeliveryTracker, promptDeliverySurface } from "./promptDeliveries.js";
 import { ProjectRegistry } from "./projects.js";
 import type { PushNotification } from "./push.js";
 import { PushRouter } from "./pushRouter.js";
@@ -138,6 +138,8 @@ async function startServer(
     onApprovalNeeded: (sessionId, approval) => surfaceApprovalToTask(tasks, sessionId, approval),
     onApprovalResolved: (sessionId, approval) => resolveApprovalForTask(tasks, sessionId, approval),
     promptDeliveries,
+    promptDeliverySurface: (sessionId) =>
+      promptDeliverySurface(tasks.stateDb.promptDeliveries.surfaceCandidates(sessionId)),
     ...(options.pendingInputMaxAttempts !== undefined
       ? { pendingInputMaxAttempts: options.pendingInputMaxAttempts }
       : {}),
@@ -299,6 +301,44 @@ test("an idle mate durably queues and starts release near-immediately", async ()
     assert.equal(await queuedCount(port), 1);
 
     promptDeliveries.acknowledgeHook(SESSION_ID, "please also update the tests\n");
+    monitor.applyExternalStatus(SESSION_ID, "running", "claude", "hook");
+    await waitFor(async () => (await queuedCount(port)) === undefined);
+  });
+});
+
+test("an idle mate releases despite a newer PTY redraw retaining coarse running status", async () => {
+  await withServer(async ({ port, adapter, monitor, promptDeliveries }) => {
+    monitor.applyExternalStatus(SESSION_ID, "idle", "claude", "hook");
+    // PTY redraws update activity while the Claude process keeps its coarse
+    // launch-time status. That activity is not a newer status observation.
+    adapter.session.lastActivityAt = new Date(Date.now() + 1_000).toISOString();
+    assert.equal(adapter.session.status, "running");
+    assert.equal((await sessionSnapshot(port))?.status, "idle");
+
+    const response = await postInput(port, "deliver while genuinely idle");
+    assert.deepEqual(await response.json(), { ok: true, queued: true });
+    await waitForWrites(adapter, 2);
+    assert.deepEqual(adapter.writes, ["deliver while genuinely idle", "\r"]);
+
+    promptDeliveries.acknowledgeHook(SESSION_ID, "deliver while genuinely idle");
+    monitor.applyExternalStatus(SESSION_ID, "running", "claude", "hook");
+    await waitFor(async () => (await queuedCount(port)) === undefined);
+  });
+});
+
+test("a busy mate releases at turn end despite a newer PTY redraw retaining coarse running status", async () => {
+  await withServer(async ({ port, adapter, monitor, promptDeliveries }) => {
+    monitor.applyExternalStatus(SESSION_ID, "running", "claude", "hook");
+    const response = await postInput(port, "deliver at the next turn end");
+    assert.deepEqual(await response.json(), { ok: true, queued: true });
+    assert.deepEqual(adapter.writes, []);
+
+    adapter.session.lastActivityAt = new Date(Date.now() + 1_000).toISOString();
+    monitor.applyExternalStatus(SESSION_ID, "idle", "claude", "hook");
+    await waitForWrites(adapter, 2);
+    assert.deepEqual(adapter.writes, ["deliver at the next turn end", "\r"]);
+
+    promptDeliveries.acknowledgeHook(SESSION_ID, "deliver at the next turn end");
     monitor.applyExternalStatus(SESSION_ID, "running", "claude", "hook");
     await waitFor(async () => (await queuedCount(port)) === undefined);
   });
@@ -608,6 +648,7 @@ test("an exhausted mate head warns the session and boss, then releases later inp
     promptDeliveries.acknowledgeHook(SESSION_ID, "later message");
     monitor.applyExternalStatus(SESSION_ID, "running", "claude", "hook");
     await waitFor(async () => (await queuedCount(port)) === undefined);
+    assert.equal((await sessionSnapshot(port))?.promptDeliveryWarning, undefined);
   }, {
     pendingInputMaxAttempts: 2,
     pendingInputPollMs: 5,

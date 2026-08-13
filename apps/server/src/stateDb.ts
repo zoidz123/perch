@@ -1196,7 +1196,7 @@ export type PromptDeliverySurfaceRecord = Pick<
   | "acceptedAt"
   | "acceptedNotifiedAt"
   | "updatedAt"
->;
+> & { deliveryOrdinal?: number };
 
 export type PendingSessionInputRecord = {
   id: string;
@@ -3530,21 +3530,22 @@ export class PromptDeliveryRepository {
     const rows = this.db.prepare(
       `WITH scoped AS (
          SELECT pd.id, pd.state, pd.failure_reason, pd.unknown_at, pd.unknown_notified_at,
-                pd.accepted_at, pd.accepted_notified_at, pd.updated_at, pd.created_at
+                pd.accepted_at, pd.accepted_notified_at, pd.updated_at, pd.created_at,
+                pd.rowid AS delivery_ordinal
          FROM prompt_deliveries pd
          WHERE ${PROMPT_DELIVERY_LINEAGE_SCOPE_SQL}
        ), unresolved AS (
          SELECT * FROM scoped
          WHERE state IN ('not_submitted', 'delivery_unknown') AND unknown_notified_at IS NOT NULL
          ORDER BY created_at DESC, id DESC LIMIT 1
-       ), resolved AS (
+       ), latest_accepted AS (
          SELECT * FROM scoped
-         WHERE state = 'accepted' AND unknown_notified_at IS NOT NULL AND accepted_notified_at IS NOT NULL
-         ORDER BY created_at DESC, id DESC LIMIT 1
+         WHERE state = 'accepted' AND accepted_notified_at IS NOT NULL
+         ORDER BY accepted_at DESC, created_at DESC, id DESC LIMIT 1
        )
        SELECT * FROM unresolved
        UNION ALL
-       SELECT * FROM resolved`
+       SELECT * FROM latest_accepted`
     ).all({ sessionId }) as PromptDeliverySurfaceRow[];
     return rows.map(promptDeliverySurfaceFromRow);
   }
@@ -4025,7 +4026,7 @@ type PromptDeliverySurfaceRow = Pick<
   | "accepted_at"
   | "accepted_notified_at"
   | "updated_at"
->;
+> & { delivery_ordinal: number };
 
 type CodexHistorySyncRow = {
   id: string;
@@ -4383,6 +4384,7 @@ function promptDeliverySurfaceFromRow(row: PromptDeliverySurfaceRow): PromptDeli
     ...(row.unknown_notified_at ? { unknownNotifiedAt: row.unknown_notified_at } : {}),
     ...(row.accepted_at ? { acceptedAt: row.accepted_at } : {}),
     ...(row.accepted_notified_at ? { acceptedNotifiedAt: row.accepted_notified_at } : {}),
+    deliveryOrdinal: row.delivery_ordinal,
     updatedAt: row.updated_at
   };
 }

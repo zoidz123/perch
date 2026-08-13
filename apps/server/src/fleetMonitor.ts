@@ -910,12 +910,7 @@ export class FleetMonitor {
     session: AgentSession | undefined
   ): AgentSessionStatus | undefined {
     const live = this.sessionState.get(sessionId);
-    if (!live?.status) return session?.status;
-    const liveAt = Date.parse(live.at);
-    const adapterAt = Date.parse(session?.lastActivityAt ?? "");
-    return Number.isFinite(adapterAt) && (!Number.isFinite(liveAt) || adapterAt > liveAt)
-      ? session?.status
-      : live.status;
+    return live?.status ?? session?.status;
   }
 
   // Prompt provided at spawn time: hold it until the agent signals ready
@@ -1516,8 +1511,14 @@ export class FleetMonitor {
         result.promptDeliveryResolution = deliverySurface.promptDeliveryResolution;
       }
       const failedInput = this.pendingSessionInputs?.latestFailed(session.id);
+      const failedInputSuperseded = Boolean(
+        failedInput?.failedAt &&
+        deliverySurface?.latestAcceptedAt &&
+        deliverySurface.latestAcceptedAt >= failedInput.failedAt
+      );
       if (
         failedInput?.failedAt &&
+        !failedInputSuperseded &&
         (!result.promptDeliveryWarning || failedInput.failedAt >= result.promptDeliveryWarning.at)
       ) {
         result.promptDeliveryWarning = {
