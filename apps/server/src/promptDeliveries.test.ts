@@ -280,6 +280,59 @@ test("a late receipt from an earlier copy settles the active retry chain", () =>
   }
 });
 
+test("a later prompt waits while an earlier durable delivery chain retries", async () => {
+  const f = fixture();
+  try {
+    const pending = f.stateDb.pendingSessionInputs.enqueue({
+      perchSessionId: "pty:worker",
+      promptText: "retry this first",
+      source: "human"
+    });
+    const first = f.tracker.create("pty:worker", pending.promptText, "human", {
+      enqueuedAt: pending.enqueuedAt
+    });
+    assert.ok(f.stateDb.pendingSessionInputs.beginAttempt(pending.id, {
+      deliveryId: first.id,
+      releasedAt: new Date().toISOString(),
+      nextAttemptAt: new Date().toISOString()
+    }));
+    f.tracker.markTyping(first.id);
+    f.tracker.markSubmitted(first.id, null);
+
+    const second = f.tracker.create("pty:worker", "mailbox nudge waits", "agent");
+    let secondReady = false;
+    const secondTurn = f.tracker.waitForSubmissionTurn(second.id).then(() => {
+      secondReady = true;
+    });
+    await new Promise((resolve) => setTimeout(resolve, 5));
+    assert.equal(secondReady, false);
+
+    f.tracker.markUnknown(first.id, "first copy was not confirmed");
+    await new Promise((resolve) => setTimeout(resolve, 5));
+    assert.equal(secondReady, false, "unknown does not release a still-retriable human chain");
+
+    assert.ok(f.tracker.retryUnknown(first.id));
+    f.tracker.markTyping(first.id);
+    f.tracker.markSubmitted(first.id, null);
+    assert.equal(
+      f.tracker.acknowledgeTimeline({
+        seq: 9,
+        id: "retried-first-copy",
+        sessionId: "pty:worker",
+        kind: "user",
+        text: pending.promptText,
+        at: new Date().toISOString()
+      })?.id,
+      first.id
+    );
+
+    await secondTurn;
+    assert.equal(secondReady, true);
+  } finally {
+    f.close();
+  }
+});
+
 test("a no-timeout kickoff becomes unknown when its Claude session ends", () => {
   const f = fixture(10);
   try {

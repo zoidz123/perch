@@ -82,6 +82,8 @@ export class PromptDeliveryTracker {
   private readonly onAccepted?: (delivery: PromptDeliveryRecord) => void;
   private readonly onUnknown?: (delivery: PromptDeliveryRecord) => void;
   private readonly timers = new Map<string, ReturnType<typeof setTimeout>>();
+  private readonly submissionWaiters = new Map<string, Set<() => void>>();
+  private stopped = false;
 
   constructor(
     private readonly stateDb: StateDb,
@@ -154,6 +156,35 @@ export class PromptDeliveryTracker {
     this.stateDb.promptDeliveries.markTyping(id);
   }
 
+  async waitForSubmissionTurn(id: string): Promise<void> {
+    const delivery = this.stateDb.promptDeliveries.find(id);
+    if (!delivery) throw new Error(`prompt delivery not found: ${id}`);
+    while (!this.stopped && this.stateDb.promptDeliveries.hasEarlierInFlight(id)) {
+      await new Promise<void>((resolve) => {
+        const waiters = this.submissionWaiters.get(delivery.perchSessionId) ?? new Set();
+        waiters.add(resolve);
+        this.submissionWaiters.set(delivery.perchSessionId, waiters);
+        // Close the check/register race if the earlier delivery settled just
+        // before this waiter became visible.
+        if (!this.stateDb.promptDeliveries.hasEarlierInFlight(id)) {
+          waiters.delete(resolve);
+          if (waiters.size === 0) this.submissionWaiters.delete(delivery.perchSessionId);
+          resolve();
+        }
+      });
+    }
+    if (this.stopped) throw new Error("prompt delivery tracker stopped");
+    if (this.stateDb.promptDeliveries.find(id)?.state !== "queued") {
+      throw new Error(`prompt delivery is no longer queued: ${id}`);
+    }
+  }
+
+  settleSubmissionChain(id: string): void {
+    const delivery = this.stateDb.promptDeliveries.find(id);
+    if (!delivery || this.stateDb.promptDeliveries.hasPendingInput(id)) return;
+    this.wakeSubmissionWaiters(delivery.perchSessionId);
+  }
+
   markSubmitted(id: string, receiptTimeoutMs: number | null = this.receiptTimeoutMs): void {
     const delivery = this.stateDb.promptDeliveries.markSubmitted(id);
     if (!delivery || delivery.state === "accepted") return;
@@ -165,7 +196,10 @@ export class PromptDeliveryTracker {
         id,
         "Claude did not acknowledge the submitted prompt before the receipt timeout; not resent"
       );
-      if (unknown?.state === "delivery_unknown") this.notifyUnknown(unknown);
+      if (unknown?.state === "delivery_unknown") {
+        this.settleSubmissionChain(unknown.id);
+        this.notifyUnknown(unknown);
+      }
     }, receiptTimeoutMs);
     timer.unref?.();
     this.timers.set(id, timer);
@@ -178,6 +212,7 @@ export class PromptDeliveryTracker {
       ? this.stateDb.promptDeliveries.markNotSubmitted(id, reason)
       : this.stateDb.promptDeliveries.markUnknown(id, reason);
     if (delivery?.state === "not_submitted" || delivery?.state === "delivery_unknown") {
+      this.settleSubmissionChain(delivery.id);
       this.notifyUnknown(delivery);
     }
   }
@@ -250,14 +285,22 @@ export class PromptDeliveryTracker {
   }
 
   stop(): void {
+    this.stopped = true;
     for (const timer of this.timers.values()) clearTimeout(timer);
     this.timers.clear();
+    for (const waiters of this.submissionWaiters.values()) {
+      for (const resolve of waiters) resolve();
+    }
+    this.submissionWaiters.clear();
   }
 
   private accept(input: Parameters<StateDb["promptDeliveries"]["acceptMatch"]>[0]): PromptDeliveryRecord | undefined {
     const acceptance = this.stateDb.promptDeliveries.acceptMatch(input);
     if (!acceptance) return undefined;
     this.clearTimer(acceptance.delivery.id);
+    if (acceptance.newlyAccepted) {
+      this.settleSubmissionChain(acceptance.delivery.id);
+    }
     if (!acceptance.delivery.acceptedNotifiedAt) this.notifyAccepted(acceptance.delivery);
     return acceptance.delivery;
   }
@@ -297,5 +340,12 @@ export class PromptDeliveryTracker {
     const timer = this.timers.get(id);
     if (timer) clearTimeout(timer);
     this.timers.delete(id);
+  }
+
+  private wakeSubmissionWaiters(sessionId: string): void {
+    const waiters = this.submissionWaiters.get(sessionId);
+    if (!waiters) return;
+    this.submissionWaiters.delete(sessionId);
+    for (const resolve of waiters) resolve();
   }
 }
