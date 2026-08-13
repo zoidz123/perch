@@ -1,3 +1,4 @@
+import Foundation
 import SwiftUI
 import PhotosUI
 import PerchMatePresentation
@@ -5,7 +6,7 @@ import PerchSessionNavigation
 
 // Design language (reference: minimal dark chat apps): near-black canvas,
 // plain rows with hairline separators instead of heavy cards, one big bold
-// title, round icon buttons, and a pill composer. The phone is chat-only:
+// title, round icon buttons, and a two-tier composer card. The phone is chat-only:
 // the real terminal stays on the desktop.
 //
 // "Oro Nero" palette: warm near-black surfaces, cream text, one sparing gold
@@ -27,9 +28,9 @@ enum Style {
     static let textSecondary = Color(red: 0.659, green: 0.624, blue: 0.549)   // #A89F8C
     static let textFaint = Color(red: 0.435, green: 0.408, blue: 0.353)       // #6F685A
 
-    // Composer chrome: a softer rounded-rect (not a full pill) with a hairline
-    // border that brightens on focus. Shared by both composers so they read
-    // as the same control.
+    // Composer chrome: a generous rounded card with a hairline border that
+    // brightens on focus. Shared by both composers so they read as the same
+    // control.
     static let composerRadius: CGFloat = 20
     static let composerFill = panel
     static let composerBorder = hairline
@@ -70,6 +71,24 @@ enum Style {
     // so it reads as distinct-but-quiet in running prose.
     static let inlineCodeFill = Color(red: 0.149, green: 0.125, blue: 0.098)  // #262019
     static let inlineCodeText = textPrimary
+}
+
+// Debug-only screenshot controls let simulator automation cover empty, filled,
+// multiline, and keyboard-up composer states without driving the GUI. They do
+// not compile into release builds and do nothing without explicit launch args.
+private enum ComposerScreenshotPreview {
+    #if DEBUG
+    static var text: String? {
+        UserDefaults.standard.string(forKey: "PerchComposerPreviewText")
+    }
+
+    static var showsKeyboard: Bool {
+        UserDefaults.standard.bool(forKey: "PerchComposerPreviewKeyboard")
+    }
+    #else
+    static let text: String? = nil
+    static let showsKeyboard = false
+    #endif
 }
 
 struct ContentView: View {
@@ -1020,25 +1039,31 @@ struct HomeComposer: View {
     @StateObject private var dictation = VoiceDictation()
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 8) {
-            HStack(spacing: 10) {
-                if let mate = store.mateSession {
-                    ModelChip(sessionId: mate.id, agent: mate.agent)
-                        .padding(.leading, 8)
-                }
-                Spacer(minLength: 8)
-            }
+        VStack(spacing: 0) {
+            if dictation.isActive {
+                DictationRecordingRow(dictation: dictation)
+                    .padding(.horizontal, 12)
+                    .padding(.vertical, 12)
+            } else {
+                TextField("Message the mate…", text: $text, axis: .vertical)
+                    .textFieldStyle(.plain)
+                    .lineLimit(1...5)
+                    .font(.body)
+                    .tint(Style.accent)
+                    .focused(focused)
+                    .padding(.horizontal, 16)
+                    .padding(.vertical, 13)
 
-            HStack(spacing: 10) {
-                if dictation.isActive {
-                    DictationRecordingRow(dictation: dictation)
-                } else {
-                    TextField("Message the mate…", text: $text, axis: .vertical)
-                        .textFieldStyle(.plain)
-                        .lineLimit(1...7)
-                        .font(.system(size: 17))
-                        .tint(Style.accent)
-                        .focused(focused)
+                Rectangle()
+                    .fill(Style.hairline)
+                    .frame(height: 1)
+
+                HStack(spacing: 8) {
+                    if let mate = store.mateSession {
+                        ModelChip(sessionId: mate.id, agent: mate.agent)
+                    }
+
+                    Spacer(minLength: 8)
 
                     if focused.wrappedValue {
                         Button {
@@ -1051,7 +1076,7 @@ struct HomeComposer: View {
                                     .font(.system(size: 15, weight: .semibold))
                                     .foregroundStyle(Style.textSecondary)
                             }
-                            .frame(width: 38, height: 38)
+                            .frame(width: 40, height: 40)
                         }
                         .accessibilityLabel("Dismiss keyboard")
                     } else {
@@ -1063,24 +1088,25 @@ struct HomeComposer: View {
                     Button(action: send) {
                         ZStack {
                             Circle()
-                                .fill(canSend ? Style.textPrimary : Style.secondaryFill)
+                                .fill(canSend ? Style.accent : Style.secondaryFill)
                             if sending {
                                 ProgressView()
                                     .controlSize(.small)
+                                    .tint(.black)
                             } else {
                                 Image(systemName: "arrow.up")
                                     .font(.system(size: 16, weight: .bold))
                                     .foregroundStyle(canSend ? Color.black : Style.textSecondary)
                             }
                         }
-                        .frame(width: 38, height: 38)
+                        .frame(width: 40, height: 40)
                     }
                     .disabled(!canSend || sending)
                 }
+                .padding(.horizontal, 10)
+                .padding(.vertical, 8)
             }
-            .padding(.leading, 18)
-            .padding(.trailing, 7)
-            .padding(.vertical, 8)
+        }
             .background(Style.composerFill, in: RoundedRectangle(cornerRadius: Style.composerRadius, style: .continuous))
             .overlay(
                 RoundedRectangle(cornerRadius: Style.composerRadius, style: .continuous)
@@ -1090,7 +1116,14 @@ struct HomeComposer: View {
             .animation(.snappy(duration: 0.22, extraBounce: 0.02), value: dictation.isActive)
             .animation(.easeOut(duration: 0.16), value: focused.wrappedValue)
             .dictationLifecycle(dictation)
-        }
+            .task {
+                if let previewText = ComposerScreenshotPreview.text, text.isEmpty {
+                    text = previewText
+                }
+                if ComposerScreenshotPreview.showsKeyboard {
+                    focused.wrappedValue = true
+                }
+            }
     }
 
     private var canSend: Bool {
@@ -1809,38 +1842,45 @@ struct SessionDetailView: View {
     }
 
     private var composer: some View {
-        VStack(alignment: .leading, spacing: 8) {
-            AttachmentBar(picked: $pickedPhotos, uploading: $uploadingPhoto)
-
-            // Controls row: the model picker remains available for provider
-            // sessions.
-            if session?.agent == .claude || session?.agent == .codex {
-                HStack(spacing: 10) {
-                    if let agent = session?.agent, agent == .claude || agent == .codex {
-                        ModelChip(sessionId: sessionId, agent: agent)
-                            .padding(.leading, 8)
-                    }
-                }
+        VStack(spacing: 0) {
+            if !store.pendingAttachments.isEmpty {
+                AttachmentBar(picked: $pickedPhotos, uploading: $uploadingPhoto)
+                    .padding(.horizontal, 12)
+                    .padding(.top, 10)
             }
 
-            HStack(spacing: 10) {
-                if dictation.isActive {
-                    DictationRecordingRow(dictation: dictation)
-                } else {
+            if dictation.isActive {
+                DictationRecordingRow(dictation: dictation)
+                    .padding(.horizontal, 12)
+                    .padding(.vertical, 12)
+            } else {
+                TextField("Follow up…", text: $store.draft, axis: .vertical)
+                    .textFieldStyle(.plain)
+                    .lineLimit(1...5)
+                    .font(.body)
+                    .tint(Style.accent)
+                    .focused($composerFocused)
+                    .onChange(of: composerFocused) { _, focused in
+                        if focused {
+                            store.markSeen(sessionId)
+                        }
+                    }
+                    .onSubmit(sendDraft)
+                    .padding(.horizontal, 16)
+                    .padding(.vertical, 13)
+
+                Rectangle()
+                    .fill(Style.hairline)
+                    .frame(height: 1)
+
+                HStack(spacing: 8) {
                     AttachmentPickerButton(picked: $pickedPhotos, uploading: $uploadingPhoto)
 
-                    TextField("Follow up…", text: $store.draft, axis: .vertical)
-                        .textFieldStyle(.plain)
-                        .lineLimit(1...7)
-                        .font(.system(size: 17))
-                        .tint(Style.accent)
-                        .focused($composerFocused)
-                        .onChange(of: composerFocused) { _, focused in
-                            if focused {
-                                store.markSeen(sessionId)
-                            }
-                        }
-                        .onSubmit(sendDraft)
+                    if let agent = session?.agent, agent == .claude || agent == .codex {
+                        ModelChip(sessionId: sessionId, agent: agent)
+                    }
+
+                    Spacer(minLength: 8)
 
                     VoiceDictationButton(dictation: dictation, text: $store.draft) {
                         composerFocused = true
@@ -1849,19 +1889,19 @@ struct SessionDetailView: View {
                     Button(action: sendDraft) {
                         ZStack {
                             Circle()
-                                .fill(canSend ? Style.textPrimary : Style.secondaryFill)
+                                .fill(canSend ? Style.accent : Style.secondaryFill)
                             Image(systemName: "arrow.up")
                                 .font(.system(size: 15, weight: .bold))
                                 .foregroundStyle(canSend ? Color.black : Style.textSecondary)
                         }
-                        .frame(width: 38, height: 38)
+                        .frame(width: 40, height: 40)
                     }
                     .disabled(!canSend)
                 }
+                .padding(.horizontal, 10)
+                .padding(.vertical, 8)
             }
-            .padding(.leading, 18)
-            .padding(.trailing, 7)
-            .padding(.vertical, 8)
+        }
             .background(Style.composerFill, in: RoundedRectangle(cornerRadius: Style.composerRadius, style: .continuous))
             .overlay(
                 RoundedRectangle(cornerRadius: Style.composerRadius, style: .continuous)
@@ -1871,7 +1911,14 @@ struct SessionDetailView: View {
             .animation(.snappy(duration: 0.22, extraBounce: 0.02), value: dictation.isActive)
             .animation(.easeOut(duration: 0.16), value: composerFocused)
             .dictationLifecycle(dictation)
-        }
+            .task {
+                if let previewText = ComposerScreenshotPreview.text, store.draft.isEmpty {
+                    store.draft = previewText
+                }
+                if ComposerScreenshotPreview.showsKeyboard {
+                    composerFocused = true
+                }
+            }
     }
 
     private var hasDraft: Bool {
