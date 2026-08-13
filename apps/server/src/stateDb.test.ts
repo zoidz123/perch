@@ -22,7 +22,7 @@ test("fresh startup creates the versioned WAL database with foreign keys enabled
 
   assert.equal(state.path, join(root, "state.sqlite"));
   assert.equal(existsSync(state.path), true);
-  assert.equal(state.schemaVersion(), 18);
+  assert.equal(state.schemaVersion(), 19);
   assert.equal(state.journalMode(), "wal");
   assert.equal(state.foreignKeysEnabled(), true);
 
@@ -45,7 +45,8 @@ test("fresh startup creates the versioned WAL database with foreign keys enabled
     { version: 15, name: "native-codex-child-run-observations" },
     { version: 16, name: "worker-reports-and-mate-mailbox" },
     { version: 17, name: "durable-autoreview-receipts" },
-    { version: 18, name: "delivery-redelivery-force-with-lease" }
+    { version: 18, name: "delivery-redelivery-force-with-lease" },
+    { version: 19, name: "durable-pending-session-inputs" }
   ]);
   assert.deepEqual(
     inspect
@@ -69,6 +70,7 @@ test("fresh startup creates the versioned WAL database with foreign keys enabled
       "operations",
       "owner_operations",
       "owner_runtimes",
+      "pending_session_inputs",
       "prompt_deliveries",
       "runtimes",
       "schema_migrations",
@@ -83,6 +85,33 @@ test("fresh startup creates the versioned WAL database with foreign keys enabled
 
   inspect.close();
   state.close();
+  rmSync(root, { recursive: true, force: true });
+});
+
+test("pending session inputs preserve FIFO order across a database restart", () => {
+  const root = home();
+  const first = new StateDb(env(root));
+  const one = first.pendingSessionInputs.enqueue({
+    perchSessionId: "pty:mate",
+    promptText: "first",
+    source: "human"
+  });
+  const two = first.pendingSessionInputs.enqueue({
+    perchSessionId: "pty:mate",
+    promptText: "second",
+    source: "human"
+  });
+  first.close();
+
+  const restarted = new StateDb(env(root));
+  assert.deepEqual(
+    restarted.pendingSessionInputs.list("pty:mate").map((input) => input.promptText),
+    ["first", "second"]
+  );
+  assert.equal(restarted.pendingSessionInputs.count("pty:mate"), 2);
+  assert.equal(restarted.pendingSessionInputs.remove(one.id), true);
+  assert.deepEqual(restarted.pendingSessionInputs.list("pty:mate").map((input) => input.id), [two.id]);
+  restarted.close();
   rmSync(root, { recursive: true, force: true });
 });
 
@@ -139,13 +168,14 @@ test("version 13 migrates an earlier prompt delivery schema without losing rows"
     DROP TABLE worker_reports;
     DROP TABLE delivery_pr_attempts;
     DROP TABLE autoreview_attempts;
-    DELETE FROM schema_migrations WHERE version IN (13, 14, 15, 16, 17, 18);
+    DROP TABLE pending_session_inputs;
+    DELETE FROM schema_migrations WHERE version IN (13, 14, 15, 16, 17, 18, 19);
     PRAGMA user_version = 12;
   `);
   legacy.close();
 
   const migrated = new StateDb(env(root));
-  assert.equal(migrated.schemaVersion(), 18);
+  assert.equal(migrated.schemaVersion(), 19);
   assert.deepEqual(migrated.promptDeliveries.find("legacy-delivery"), {
     id: "legacy-delivery",
     perchSessionId: "pty:legacy",
