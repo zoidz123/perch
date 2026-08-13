@@ -77,24 +77,63 @@ private enum TestError: Error {
 }
 
 final class WorkspaceGroupingTests: XCTestCase {
-    func testTaskRefreshFailureRetainsSnapshotAndSurfacesActionableError() {
+    func testFirstTaskRefreshFailureRetainsSnapshotWithoutBanner() {
         let stale = [FixtureTask(id: "closed", project: "/tmp/repo", state: "closed", updatedAt: "t", sessionId: nil)]
         let result: Result<[FixtureTask], Error> = .failure(TestError.offline)
 
-        let refresh = WorkspaceGrouping.taskRefreshResult(current: stale, result: result)
+        let refresh = WorkspaceGrouping.taskRefreshResult(
+            current: stale,
+            state: WorkspaceTaskRefreshState(),
+            result: result
+        )
 
         XCTAssertEqual(refresh.tasks.map(\.id), ["closed"])
-        XCTAssertEqual(refresh.errorMessage, "Couldn’t refresh tasks. Pull to refresh or reconnect.")
+        XCTAssertEqual(refresh.state.consecutiveFailures, 1)
+        XCTAssertNil(refresh.state.errorMessage)
     }
 
-    func testSuccessfulTaskRefreshReplacesSnapshotAndRemovesStaleClosedTasks() {
+    func testSecondConsecutiveTaskRefreshFailureShowsBanner() {
+        let current = [FixtureTask(id: "current", project: "/tmp/repo", state: "working", updatedAt: "t", sessionId: nil)]
+        let first = WorkspaceGrouping.taskRefreshResult(
+            current: current,
+            state: WorkspaceTaskRefreshState(),
+            result: Result<[FixtureTask], Error>.failure(TestError.offline)
+        )
+
+        let second = WorkspaceGrouping.taskRefreshResult(
+            current: first.tasks,
+            state: first.state,
+            result: Result<[FixtureTask], Error>.failure(TestError.offline)
+        )
+
+        XCTAssertEqual(second.tasks.map(\.id), ["current"])
+        XCTAssertEqual(second.state.consecutiveFailures, 2)
+        XCTAssertEqual(second.state.errorMessage, "Couldn’t refresh tasks. Pull to refresh or reconnect.")
+    }
+
+    func testSuccessfulTaskRefreshReplacesSnapshotAndClearsFailureBannerImmediately() {
         let stale = [FixtureTask(id: "closed", project: "/tmp/repo", state: "closed", updatedAt: "t", sessionId: nil)]
         let live = FixtureTask(id: "live", project: "/tmp/repo", state: "working", updatedAt: "t", sessionId: nil)
+        let firstFailure = WorkspaceGrouping.taskRefreshResult(
+            current: stale,
+            state: WorkspaceTaskRefreshState(),
+            result: Result<[FixtureTask], Error>.failure(TestError.offline)
+        )
+        let secondFailure = WorkspaceGrouping.taskRefreshResult(
+            current: firstFailure.tasks,
+            state: firstFailure.state,
+            result: Result<[FixtureTask], Error>.failure(TestError.offline)
+        )
 
-        let refresh = WorkspaceGrouping.taskRefreshResult(current: stale, result: .success([live]))
+        let refresh = WorkspaceGrouping.taskRefreshResult(
+            current: secondFailure.tasks,
+            state: secondFailure.state,
+            result: .success([live])
+        )
 
         XCTAssertEqual(refresh.tasks.map(\.id), ["live"])
-        XCTAssertNil(refresh.errorMessage)
+        XCTAssertEqual(refresh.state.consecutiveFailures, 0)
+        XCTAssertNil(refresh.state.errorMessage)
     }
 
     func testWorkerIdentityDecodesNewAndHistoricalTaskRecords() throws {

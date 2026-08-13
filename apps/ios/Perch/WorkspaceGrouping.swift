@@ -80,16 +80,39 @@ struct WorkspaceTerminalTaskLink: Equatable {
     let sessionIds: Set<String>
 }
 
+struct WorkspaceTaskRefreshState: Equatable {
+    static let failureThreshold = 2
+
+    private(set) var consecutiveFailures = 0
+
+    var errorMessage: String? {
+        guard consecutiveFailures >= Self.failureThreshold else { return nil }
+        return "Couldn’t refresh tasks. Pull to refresh or reconnect."
+    }
+
+    mutating func recordSuccess() {
+        consecutiveFailures = 0
+    }
+
+    mutating func recordFailure() {
+        consecutiveFailures += 1
+    }
+}
+
 enum WorkspaceGrouping {
     static func taskRefreshResult<Task>(
         current: [Task],
+        state: WorkspaceTaskRefreshState,
         result: Result<[Task], Error>
-    ) -> (tasks: [Task], errorMessage: String?) {
+    ) -> (tasks: [Task], state: WorkspaceTaskRefreshState) {
+        var state = state
         switch result {
         case let .success(tasks):
-            return (tasks, nil)
+            state.recordSuccess()
+            return (tasks, state)
         case .failure:
-            return (current, "Couldn’t refresh tasks. Pull to refresh or reconnect.")
+            state.recordFailure()
+            return (current, state)
         }
     }
 
