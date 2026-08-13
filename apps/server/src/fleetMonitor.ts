@@ -45,6 +45,7 @@ const SCREEN_CAPTURE_LINES = 60;
 const DEFAULT_PENDING_INPUT_RETRY_BACKOFF_MS = [250, 500, 1_000] as const;
 const DEFAULT_PENDING_INPUT_MAX_ATTEMPTS = 4;
 const DEFAULT_PENDING_INPUT_BATCH_WINDOW_MS = 50;
+const STALE_UNLINKED_PENDING_INPUT_MAX_AGE_MS = 2 * 60 * 1_000;
 
 // A session status change with its provenance, observable via
 // FleetMonitorOptions.onStatusChange (feeds the state metrics, G6).
@@ -291,6 +292,14 @@ export class FleetMonitor {
 
   setPendingSessionInputs(repository: PendingSessionInputRepository): void {
     this.pendingSessionInputs = repository;
+    const cleared = repository.clearUnlinkedReleasedBefore(
+      new Date(Date.now() - STALE_UNLINKED_PENDING_INPUT_MAX_AGE_MS).toISOString()
+    );
+    if (cleared > 0) {
+      console.warn(
+        `pending input: cleared ${cleared} stale unlinked released row${cleared === 1 ? "" : "s"} instead of replaying`
+      );
+    }
     void this.resumePendingSessionInputs().catch((error) => {
       console.warn(`pending input: startup resume failed: ${error instanceof Error ? error.message : error}`);
     });
@@ -769,8 +778,8 @@ export class FleetMonitor {
         ? this.promptDeliveries?.find(pending.deliveryId)
         : undefined;
       if (tracked?.state === "accepted") {
-        if (!this.pendingSessionInputs.markBatchConfirmed(batchIds, tracked.confirmedAt ?? tracked.acceptedAt)) {
-          throw new Error("confirmed pending input batch was not marked in the durable queue");
+        if (!this.pendingSessionInputs.removeBatch(batchIds)) {
+          throw new Error("accepted pending input batch was not deleted");
         }
         this.clearPendingInputTimer(sessionId);
         return;
@@ -860,14 +869,11 @@ export class FleetMonitor {
       }
 
       if (delivery) {
-        const completed = this.promptDeliveries?.find(delivery.id);
-        if (completed?.state === "accepted") {
-          if (!this.pendingSessionInputs.markBatchConfirmed(batchIds, completed.confirmedAt ?? completed.acceptedAt)) {
-            throw new Error("accepted pending input batch was not marked confirmed");
-          }
-        }
-      } else if (!this.pendingSessionInputs.markBatchConfirmed(batchIds)) {
-        throw new Error("released pending input batch was not marked confirmed");
+        // Prompt-delivery acceptance deletes its linked queue rows in the
+        // same database transaction. An unknown receipt leaves them pending
+        // for retry instead.
+      } else if (!this.pendingSessionInputs.removeBatch(batchIds)) {
+        throw new Error("released pending input batch was not deleted");
       }
     } finally {
       this.pendingInputReleases.delete(sessionId);
@@ -1624,8 +1630,7 @@ export class FleetMonitor {
               ? latestInput.releasedAt ? "released" : "queued"
               : latestInput.state,
             enqueuedAt: latestInput.enqueuedAt,
-            ...(latestInput.releasedAt ? { releasedAt: latestInput.releasedAt } : {}),
-            ...(latestInput.confirmedAt ? { confirmedAt: latestInput.confirmedAt } : {})
+            ...(latestInput.releasedAt ? { releasedAt: latestInput.releasedAt } : {})
           };
         }
       }
