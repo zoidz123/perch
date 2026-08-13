@@ -3740,7 +3740,8 @@ export class PromptDeliveryRepository {
     const now = this.nextTimestamp(at);
     const order = this.nextMutationOrder();
     this.db.prepare(
-      `UPDATE prompt_deliveries SET state = 'typing', typing_at = ?, typing_order = ?, updated_at = ?
+      `UPDATE prompt_deliveries SET state = 'typing', typing_at = coalesce(typing_at, ?),
+       typing_order = ?, updated_at = ?
        WHERE id = ? AND state = 'queued'`
     ).run(now, order, now, id);
     return this.find(id);
