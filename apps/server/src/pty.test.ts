@@ -164,6 +164,30 @@ test("PTY adapter starts sessions and streams coalesced raw deltas", async () =>
   adapter.stop();
 });
 
+test("PTY composer inspection distinguishes an empty prompt from a human draft", async () => {
+  let child: FakePtyProcess | undefined;
+  const adapter = new PtyAgentAdapter(() => {
+    child = new FakePtyProcess();
+    return child;
+  });
+  const session = await adapter.startAgent({ command: "claude", title: "Claude" });
+
+  child!.emitData("❯ ");
+  assert.equal(await adapter.composerIsEmpty(session.id), true);
+
+  child!.emitData("desktop draft");
+  assert.equal(await adapter.composerIsEmpty(session.id), false);
+
+  // Moving the cursor back to the prompt does not hide text to its right.
+  child!.emitData("\x1b[13D");
+  assert.equal(await adapter.composerIsEmpty(session.id), false);
+
+  child!.emitData("\r\x1b[2K❯ ");
+  assert.equal(await adapter.composerIsEmpty(session.id), true);
+
+  adapter.stop();
+});
+
 test("PTY adapter drops inherited NO_COLOR but preserves a Claude session override", async () => {
   const spawnEnvs: NodeJS.ProcessEnv[] = [];
   const adapter = new PtyAgentAdapter(

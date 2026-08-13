@@ -26,7 +26,7 @@ export type SessionModel = {
 import type { RawData } from "ws";
 import type { AgentAdapter } from "./adapters/types.js";
 import type { PromptDeliverySource, PromptDeliverySurface, PromptDeliveryTracker } from "./promptDeliveries.js";
-import type { PendingSessionInputRepository } from "./stateDb.js";
+import type { PendingSessionInputRecord, PendingSessionInputRepository } from "./stateDb.js";
 import type { AuditLog } from "./audit.js";
 import { detectPrompt, type DetectedPrompt } from "./promptDetect.js";
 import type { PushRouter } from "./pushRouter.js";
@@ -38,6 +38,9 @@ import { detectUsageLimit, type UsageLimit } from "./usageLimitDetect.js";
 // bottom-anchored boxes, so a dialog a handful of content lines up sits far more
 // raw lines from the bottom.
 const SCREEN_CAPTURE_LINES = 60;
+const DEFAULT_PENDING_INPUT_RETRY_BACKOFF_MS = [1_000, 3_000, 10_000] as const;
+const DEFAULT_PENDING_INPUT_MAX_ATTEMPTS = 4;
+const DEFAULT_PENDING_INPUT_POLL_MS = 1_000;
 
 // A session status change with its provenance, observable via
 // FleetMonitorOptions.onStatusChange (feeds the state metrics, G6).
@@ -145,6 +148,12 @@ export type FleetMonitorOptions = {
   // Unlike the permission-composer queue, this store is durable and releases
   // only one record per observed turn boundary.
   pendingSessionInputs?: PendingSessionInputRepository;
+  // Human mate input is at-least-once. Unknown PTY outcomes reuse one durable
+  // delivery id and retry with bounded backoff; options are injectable only so
+  // the E2E suite does not spend production seconds waiting on each attempt.
+  pendingInputRetryBackoffMs?: readonly number[];
+  pendingInputMaxAttempts?: number;
+  pendingInputPollMs?: number;
   // Durable warning text derived from the prompt-delivery ledger. It is
   // recomputed for every fleet snapshot, so disconnected clients see it on
   // reconnect instead of depending on a one-shot WebSocket event.
@@ -183,6 +192,7 @@ export class FleetMonitor {
   private pendingSessionInputs?: PendingSessionInputRepository;
   private readonly usedIdleBoundaries = new Set<string>();
   private readonly pendingInputReleases = new Set<string>();
+  private readonly pendingInputTimers = new Map<string, ReturnType<typeof setTimeout>>();
   // Prompts raised off the rendered screen rather than a hook, by session ->
   // prompt id. No hook will ever resolve one, so the detector retracts it when
   // the dialog leaves the screen; the id also keeps a redraw from re-raising it.
@@ -214,6 +224,9 @@ export class FleetMonitor {
   private readonly tailThrottleMs: number;
   private readonly detailThrottleMs: number;
   private readonly broadcastMs: number;
+  private readonly pendingInputRetryBackoffMs: readonly number[];
+  private readonly pendingInputMaxAttempts: number;
+  private readonly pendingInputPollMs: number;
   private readonly auditLog?: AuditLog;
   private pushRouter?: PushRouter;
   private readonly onPrune?: (activeSessionIds: Set<string>) => void;
@@ -246,6 +259,11 @@ export class FleetMonitor {
     this.tailThrottleMs = options.tailThrottleMs ?? 750;
     this.detailThrottleMs = options.detailThrottleMs ?? 250;
     this.broadcastMs = options.broadcastMs ?? 120;
+    this.pendingInputRetryBackoffMs = options.pendingInputRetryBackoffMs?.length
+      ? options.pendingInputRetryBackoffMs
+      : DEFAULT_PENDING_INPUT_RETRY_BACKOFF_MS;
+    this.pendingInputMaxAttempts = options.pendingInputMaxAttempts ?? DEFAULT_PENDING_INPUT_MAX_ATTEMPTS;
+    this.pendingInputPollMs = options.pendingInputPollMs ?? DEFAULT_PENDING_INPUT_POLL_MS;
     this.auditLog = options.auditLog;
     this.pushRouter = options.pushRouter;
     this.onPrune = options.onPrune;
@@ -269,6 +287,9 @@ export class FleetMonitor {
 
   setPendingSessionInputs(repository: PendingSessionInputRepository): void {
     this.pendingSessionInputs = repository;
+    void this.resumePendingSessionInputs().catch((error) => {
+      console.warn(`pending input: startup resume failed: ${error instanceof Error ? error.message : error}`);
+    });
   }
 
   setClaudeManualGateHandler(handler: (sessionId: string, approval: PendingApproval) => void): void {
@@ -328,7 +349,7 @@ export class FleetMonitor {
     socket.on("close", () => {
       this.clients.delete(client);
       if (this.clients.size === 0) {
-        this.stop();
+        this.stopClientMonitoring();
       }
     });
   }
@@ -658,9 +679,7 @@ export class FleetMonitor {
     const session =
       this.sessions.find((candidate) => candidate.id === canonical) ??
       (await this.adapter.listSessions()).find((candidate) => candidate.id === canonical);
-    const status =
-      this.sessionState.get(canonical)?.status ??
-      session?.status;
+    const status = this.effectiveSessionStatus(canonical, session);
     if (status === "done" || status === "error") {
       throw new Error("worker session has ended; follow-up input was not accepted");
     }
@@ -674,35 +693,14 @@ export class FleetMonitor {
       if (!this.pendingSessionInputs) {
         throw new Error("durable pending-input queue is unavailable");
       }
-      const hasPending = this.pendingSessionInputs.count(canonical) > 0;
-      const idleBoundaryAvailable =
-        status === "idle" &&
-        !this.usedIdleBoundaries.has(canonical) &&
-        !this.inputGated(canonical);
-      if (hasPending || !idleBoundaryAvailable) {
-        this.pendingSessionInputs.enqueue({
-          perchSessionId: canonical,
-          promptText: text,
-          source
-        });
-        this.scheduleBroadcast();
-        if (idleBoundaryAvailable) {
-          await this.releaseOnePendingInput(canonical, session);
-        }
-        return { queued: true };
-      }
-
-      this.usedIdleBoundaries.add(canonical);
-      const delivery = session.agent === "claude"
-        ? this.promptDeliveries?.create(canonical, text, source)
-        : undefined;
-      try {
-        await this.submitToAdapter(canonical, text, delivery?.id, options.silent);
-      } catch (error) {
-        this.usedIdleBoundaries.delete(canonical);
-        throw error;
-      }
-      return { queued: false };
+      this.pendingSessionInputs.enqueue({
+        perchSessionId: canonical,
+        promptText: text,
+        source
+      });
+      this.scheduleBroadcast();
+      void this.releaseOnePendingInput(canonical, session).catch(() => {});
+      return { queued: true };
     }
 
     if (this.inputGated(canonical)) {
@@ -728,28 +726,112 @@ export class FleetMonitor {
     if (!this.pendingSessionInputs || this.pendingInputReleases.has(sessionId)) return;
     this.pendingInputReleases.add(sessionId);
     try {
-      if (this.usedIdleBoundaries.has(sessionId) || this.inputGated(sessionId)) return;
       const session = knownSession ??
-        this.sessions.find((candidate) => candidate.id === sessionId) ??
-        (await this.adapter.listSessions()).find((candidate) => candidate.id === sessionId);
-      const status = this.sessionState.get(sessionId)?.status ?? session?.status;
-      if (
-        session?.labels?.role !== "mate" ||
-        status !== "idle" ||
-        this.usedIdleBoundaries.has(sessionId) ||
-        this.inputGated(sessionId)
-      ) {
+        (await this.adapter.listSessions()).find((candidate) => candidate.id === sessionId) ??
+        this.sessions.find((candidate) => candidate.id === sessionId);
+      if (session?.labels?.role !== "mate") return;
+
+      const pending = this.pendingSessionInputs.list(sessionId)[0];
+      if (!pending) {
+        this.clearPendingInputTimer(sessionId);
         return;
       }
-      const pending = this.pendingSessionInputs.list(sessionId)[0];
-      if (!pending) return;
+
+      const tracked = pending.deliveryId
+        ? this.promptDeliveries?.find(pending.deliveryId)
+        : undefined;
+      if (tracked?.state === "accepted") {
+        if (!this.pendingSessionInputs.remove(pending.id)) {
+          throw new Error("confirmed pending input was not removed from the durable queue");
+        }
+        this.clearPendingInputTimer(sessionId);
+        return;
+      }
+      if (tracked && ["queued", "typing", "submitted"].includes(tracked.state)) {
+        this.schedulePendingInputCheck(sessionId, this.pendingInputPollMs);
+        return;
+      }
+
+      const now = Date.now();
+      const nextAttemptAt = Date.parse(pending.nextAttemptAt ?? "");
+      if (Number.isFinite(nextAttemptAt) && nextAttemptAt > now) {
+        this.schedulePendingInputCheck(sessionId, nextAttemptAt - now);
+        return;
+      }
+      if (pending.attemptCount >= this.pendingInputMaxAttempts) {
+        this.failPendingInput(
+          pending,
+          tracked?.failureReason ?? pending.lastError ?? "delivery could not be confirmed"
+        );
+        return;
+      }
+
+      if (tracked?.state === "not_submitted" || tracked?.state === "delivery_unknown") {
+        this.usedIdleBoundaries.delete(sessionId);
+      }
+
+      const status = this.effectiveSessionStatus(sessionId, session);
+      let composerEmpty: boolean | undefined;
+      if (session.agent === "claude" && this.adapter.composerIsEmpty) {
+        composerEmpty = await this.adapter.composerIsEmpty(sessionId).catch(() => false);
+      }
+      const unknownDelivery =
+        tracked?.state === "not_submitted" || tracked?.state === "delivery_unknown";
+      const safeStatus =
+        status === "idle" ||
+        status === "waiting" ||
+        (unknownDelivery && composerEmpty === true);
+      if (
+        !safeStatus ||
+        this.usedIdleBoundaries.has(sessionId) ||
+        this.inputGated(sessionId) ||
+        composerEmpty === false
+      ) {
+        this.schedulePendingInputCheck(sessionId, this.pendingInputPollMs);
+        return;
+      }
 
       this.usedIdleBoundaries.add(sessionId);
-      const delivery = session.agent === "claude"
-        ? this.promptDeliveries?.create(sessionId, pending.promptText, pending.source)
+      const delivery = session.agent === "claude" && this.promptDeliveries
+        ? pending.deliveryId
+          ? this.promptDeliveries.retryUnknown(pending.deliveryId)
+          : this.promptDeliveries.create(sessionId, pending.promptText, pending.source)
         : undefined;
-      await this.submitToAdapter(sessionId, pending.promptText, delivery?.id);
-      if (!this.pendingSessionInputs.remove(pending.id)) {
+      if (pending.deliveryId && session.agent === "claude" && !delivery) {
+        this.usedIdleBoundaries.delete(sessionId);
+        this.schedulePendingInputCheck(sessionId, this.pendingInputPollMs);
+        return;
+      }
+      const attempt = pending.attemptCount + 1;
+      const backoff = this.pendingInputRetryBackoffMs[
+        Math.min(attempt - 1, this.pendingInputRetryBackoffMs.length - 1)
+      ]!;
+      const attempted = this.pendingSessionInputs.beginAttempt(pending.id, {
+        ...(delivery ? { deliveryId: delivery.id } : {}),
+        nextAttemptAt: new Date(now + backoff).toISOString()
+      });
+      if (!attempted) {
+        this.usedIdleBoundaries.delete(sessionId);
+        return;
+      }
+
+      try {
+        await this.submitToAdapter(sessionId, pending.promptText, delivery?.id);
+      } catch (error) {
+        this.usedIdleBoundaries.delete(sessionId);
+        const message = error instanceof Error ? error.message : String(error);
+        const current = this.pendingSessionInputs.recordAttemptError(pending.id, message);
+        if (current && current.attemptCount >= this.pendingInputMaxAttempts) {
+          this.failPendingInput(current, message);
+        } else {
+          this.schedulePendingInputCheck(sessionId, backoff);
+        }
+        return;
+      }
+
+      if (delivery) {
+        this.schedulePendingInputCheck(sessionId, this.pendingInputPollMs);
+      } else if (!this.pendingSessionInputs.remove(pending.id)) {
         throw new Error("released pending input was not removed from the durable queue");
       }
     } finally {
@@ -758,13 +840,55 @@ export class FleetMonitor {
     }
   }
 
+  private failPendingInput(pending: PendingSessionInputRecord, error: string): void {
+    if (!this.pendingSessionInputs) return;
+    const failed = this.pendingSessionInputs.markFailed(pending.id, error);
+    if (!failed) return;
+    this.clearPendingInputTimer(pending.perchSessionId);
+    this.usedIdleBoundaries.delete(pending.perchSessionId);
+    this.pushRouter?.pendingInputDeliveryFailed(
+      pending.perchSessionId,
+      this.findSession(pending.perchSessionId),
+      failed.attemptCount
+    );
+    // The failed row remains durable for diagnosis, but it no longer owns the
+    // live FIFO head. Give the next human row the same idle safe opportunity.
+    this.schedulePendingInputCheck(pending.perchSessionId, 0);
+  }
+
+  private schedulePendingInputCheck(sessionId: string, delayMs: number): void {
+    this.clearPendingInputTimer(sessionId);
+    const timer = setTimeout(() => {
+      this.pendingInputTimers.delete(sessionId);
+      void this.releaseOnePendingInput(sessionId).catch(() => {});
+    }, Math.max(0, delayMs));
+    timer.unref?.();
+    this.pendingInputTimers.set(sessionId, timer);
+  }
+
+  private clearPendingInputTimer(sessionId: string): void {
+    const timer = this.pendingInputTimers.get(sessionId);
+    if (timer) clearTimeout(timer);
+    this.pendingInputTimers.delete(sessionId);
+  }
+
+  private async resumePendingSessionInputs(): Promise<void> {
+    if (!this.pendingSessionInputs) return;
+    const sessions = await this.adapter.listSessions();
+    if (!this.running) this.sessions = sessions;
+    for (const session of sessions) {
+      if (session.labels?.role === "mate" && this.pendingSessionInputs.count(session.id) > 0) {
+        void this.releaseOnePendingInput(session.id, session).catch(() => {});
+      }
+    }
+  }
+
   private observeTurnStatus(
     sessionId: string,
     previous: AgentSessionStatus | undefined,
     status: AgentSessionStatus
   ): void {
-    if (status !== "idle") return;
-    if (previous && previous !== "idle") {
+    if (status === "idle" && previous && previous !== "idle") {
       this.usedIdleBoundaries.delete(sessionId);
     }
     void this.releaseOnePendingInput(sessionId).catch(() => {});
@@ -775,10 +899,23 @@ export class FleetMonitor {
   // adapter snapshot.
   sessionStatus(sessionId: string): AgentSessionStatus | undefined {
     const canonical = this.canonicalSessionId(sessionId);
-    return (
-      this.sessionState.get(canonical)?.status ??
-      this.sessions.find((session) => session.id === canonical)?.status
+    return this.effectiveSessionStatus(
+      canonical,
+      this.sessions.find((session) => session.id === canonical)
     );
+  }
+
+  private effectiveSessionStatus(
+    sessionId: string,
+    session: AgentSession | undefined
+  ): AgentSessionStatus | undefined {
+    const live = this.sessionState.get(sessionId);
+    if (!live?.status) return session?.status;
+    const liveAt = Date.parse(live.at);
+    const adapterAt = Date.parse(session?.lastActivityAt ?? "");
+    return Number.isFinite(adapterAt) && (!Number.isFinite(liveAt) || adapterAt > liveAt)
+      ? session?.status
+      : live.status;
   }
 
   // Prompt provided at spawn time: hold it until the agent signals ready
@@ -937,7 +1074,7 @@ export class FleetMonitor {
     }
     this.onDisconnectDevice?.(deviceId);
     if (this.clients.size === 0) {
-      this.stop();
+      this.stopClientMonitoring();
     }
   }
 
@@ -978,6 +1115,14 @@ export class FleetMonitor {
   }
 
   stop(): void {
+    this.stopClientMonitoring();
+    for (const timer of this.pendingInputTimers.values()) {
+      clearTimeout(timer);
+    }
+    this.pendingInputTimers.clear();
+  }
+
+  private stopClientMonitoring(): void {
     this.running = false;
 
     this.unsubscribeEvents?.();
@@ -1268,9 +1413,7 @@ export class FleetMonitor {
 
     this.pruneSessionState(previousSessionIds);
     for (const session of this.sessions) {
-      if (session.status === "idle") {
-        void this.releaseOnePendingInput(session.id, session).catch(() => {});
-      }
+      void this.releaseOnePendingInput(session.id, session).catch(() => {});
     }
     this.scheduleBroadcast();
   }
@@ -1371,6 +1514,18 @@ export class FleetMonitor {
       }
       if (deliverySurface?.promptDeliveryResolution) {
         result.promptDeliveryResolution = deliverySurface.promptDeliveryResolution;
+      }
+      const failedInput = this.pendingSessionInputs?.latestFailed(session.id);
+      if (
+        failedInput?.failedAt &&
+        (!result.promptDeliveryWarning || failedInput.failedAt >= result.promptDeliveryWarning.at)
+      ) {
+        result.promptDeliveryWarning = {
+          deliveryId: failedInput.id,
+          message: pendingInputFailureMessage(failedInput.attemptCount),
+          at: failedInput.failedAt
+        };
+        delete result.promptDeliveryResolution;
       }
       const modelInfo = this.sessionModels.get(session.id);
       if (modelInfo) {
@@ -1673,6 +1828,10 @@ function isActionableClaudeInteraction(
   interaction: PendingClaudeInteraction | undefined
 ): interaction is PendingClaudeInteraction {
   return interaction?.state === "waiting" || interaction?.state === "response_sent";
+}
+
+function pendingInputFailureMessage(attempts: number): string {
+  return `Mate input was not delivered after ${attempts} attempts; Perch released later queued messages`;
 }
 
 function lastLines(text: string, count: number): string {

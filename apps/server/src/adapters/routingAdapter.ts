@@ -77,6 +77,10 @@ export class RoutingAgentAdapter implements AgentAdapter {
     return this.pty.promptAnswerInFlight?.(sessionId) ?? false;
   }
 
+  composerIsEmpty(sessionId: string): Promise<boolean> {
+    return this.ownerOf(sessionId).composerIsEmpty?.(sessionId) ?? Promise.resolve(false);
+  }
+
   sendEnter(sessionId: string): Promise<void> {
     return this.ownerOf(sessionId).sendEnter(sessionId);
   }

@@ -14,7 +14,7 @@ import type {
 import Database from "better-sqlite3";
 import type { TaskDeliverable, TaskVerificationFacts } from "./taskPresentation.js";
 
-const LATEST_SCHEMA_VERSION = 19;
+const LATEST_SCHEMA_VERSION = 20;
 const LEGACY_TASK_IMPORT = "tasks-json-v1";
 
 const MIGRATIONS = [
@@ -728,6 +728,46 @@ const MIGRATIONS = [
       CREATE INDEX pending_session_inputs_session_idx
         ON pending_session_inputs(perch_session_id, created_at);
     `
+  },
+  {
+    version: 20,
+    name: "retryable-pending-session-inputs",
+    sql: `
+      ALTER TABLE pending_session_inputs
+        ADD COLUMN state TEXT NOT NULL DEFAULT 'pending'
+        CHECK (state IN ('pending', 'failed'));
+      ALTER TABLE pending_session_inputs
+        ADD COLUMN attempt_count INTEGER NOT NULL DEFAULT 0 CHECK (attempt_count >= 0);
+      ALTER TABLE pending_session_inputs
+        ADD COLUMN delivery_id TEXT REFERENCES prompt_deliveries(id) ON DELETE RESTRICT;
+      ALTER TABLE pending_session_inputs ADD COLUMN next_attempt_at TEXT;
+      ALTER TABLE pending_session_inputs ADD COLUMN last_error TEXT;
+      ALTER TABLE pending_session_inputs ADD COLUMN failed_at TEXT;
+      CREATE INDEX pending_session_inputs_release_idx
+        ON pending_session_inputs(perch_session_id, state, created_at);
+
+      UPDATE pending_session_inputs AS pending
+      SET delivery_id = (
+        SELECT delivery.id
+        FROM prompt_deliveries AS delivery
+        WHERE delivery.perch_session_id = pending.perch_session_id
+          AND delivery.source = pending.source
+          AND delivery.prompt_text = pending.prompt_text
+          AND delivery.state IN ('not_submitted', 'delivery_unknown')
+          AND delivery.created_at >= pending.created_at
+        ORDER BY delivery.created_at, delivery.id
+        LIMIT 1
+      )
+      WHERE pending.rowid = (
+        SELECT min(head.rowid)
+        FROM pending_session_inputs AS head
+        WHERE head.perch_session_id = pending.perch_session_id
+      );
+      UPDATE pending_session_inputs
+      SET attempt_count = 1,
+          next_attempt_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+      WHERE delivery_id IS NOT NULL;
+    `
   }
 ] as const;
 
@@ -1162,7 +1202,13 @@ export type PendingSessionInputRecord = {
   id: string;
   perchSessionId: string;
   source: "human" | "agent";
+  state: "pending" | "failed";
   promptText: string;
+  attemptCount: number;
+  deliveryId?: string;
+  nextAttemptAt?: string;
+  lastError?: string;
+  failedAt?: string;
   createdAt: string;
 };
 
@@ -3325,7 +3371,9 @@ export class PendingSessionInputRepository {
       id: randomUUID(),
       perchSessionId: input.perchSessionId,
       source: input.source,
+      state: "pending",
       promptText: input.promptText,
+      attemptCount: 0,
       createdAt: new Date().toISOString()
     };
     this.db.prepare(
@@ -3338,17 +3386,65 @@ export class PendingSessionInputRepository {
   list(sessionId: string): PendingSessionInputRecord[] {
     return (this.db.prepare(
       `SELECT * FROM pending_session_inputs
-       WHERE perch_session_id = ?
+       WHERE perch_session_id = ? AND state = 'pending'
        ORDER BY rowid`
     ).all(sessionId) as PendingSessionInputRow[]).map(pendingSessionInputFromRow);
   }
 
+  find(id: string): PendingSessionInputRecord | undefined {
+    const row = this.db.prepare("SELECT * FROM pending_session_inputs WHERE id = ?")
+      .get(id) as PendingSessionInputRow | undefined;
+    return row ? pendingSessionInputFromRow(row) : undefined;
+  }
+
+  latestFailed(sessionId: string): PendingSessionInputRecord | undefined {
+    const row = this.db.prepare(
+      `SELECT * FROM pending_session_inputs
+       WHERE perch_session_id = ? AND state = 'failed'
+       ORDER BY failed_at DESC, rowid DESC LIMIT 1`
+    ).get(sessionId) as PendingSessionInputRow | undefined;
+    return row ? pendingSessionInputFromRow(row) : undefined;
+  }
+
   count(sessionId: string): number {
     return Number(
-      this.db.prepare("SELECT count(*) FROM pending_session_inputs WHERE perch_session_id = ?")
+      this.db.prepare(
+        "SELECT count(*) FROM pending_session_inputs WHERE perch_session_id = ? AND state = 'pending'"
+      )
         .pluck()
         .get(sessionId)
     );
+  }
+
+  beginAttempt(
+    id: string,
+    input: { deliveryId?: string; nextAttemptAt: string }
+  ): PendingSessionInputRecord | undefined {
+    const result = this.db.prepare(
+      `UPDATE pending_session_inputs
+       SET attempt_count = attempt_count + 1,
+           delivery_id = coalesce(?, delivery_id),
+           next_attempt_at = ?,
+           last_error = NULL
+       WHERE id = ? AND state = 'pending'`
+    ).run(input.deliveryId ?? null, input.nextAttemptAt, id);
+    return result.changes === 1 ? this.find(id) : undefined;
+  }
+
+  recordAttemptError(id: string, error: string): PendingSessionInputRecord | undefined {
+    const result = this.db.prepare(
+      "UPDATE pending_session_inputs SET last_error = ? WHERE id = ? AND state = 'pending'"
+    ).run(error, id);
+    return result.changes === 1 ? this.find(id) : undefined;
+  }
+
+  markFailed(id: string, error: string, at = new Date().toISOString()): PendingSessionInputRecord | undefined {
+    const result = this.db.prepare(
+      `UPDATE pending_session_inputs
+       SET state = 'failed', last_error = ?, failed_at = ?
+       WHERE id = ? AND state = 'pending'`
+    ).run(error, at, id);
+    return result.changes === 1 ? this.find(id) : undefined;
   }
 
   remove(id: string): boolean {
@@ -3489,6 +3585,16 @@ export class PromptDeliveryRepository {
        failure_reason = ?, unknown_at = ?, updated_at = ?
        WHERE id = ? AND state = 'queued'`
     ).run(reason, now, now, id);
+    return result.changes === 1 ? this.find(id) : undefined;
+  }
+
+  retryUnknown(id: string, at?: string): PromptDeliveryRecord | undefined {
+    const now = this.nextTimestamp(at);
+    const result = this.db.prepare(
+      `UPDATE prompt_deliveries
+       SET state = 'queued', failure_reason = NULL, updated_at = ?
+       WHERE id = ? AND state IN ('not_submitted', 'delivery_unknown')`
+    ).run(now, id);
     return result.changes === 1 ? this.find(id) : undefined;
   }
 
@@ -3899,7 +4005,13 @@ type PendingSessionInputRow = {
   id: string;
   perch_session_id: string;
   source: "human" | "agent";
+  state: "pending" | "failed";
   prompt_text: string;
+  attempt_count: number;
+  delivery_id: string | null;
+  next_attempt_at: string | null;
+  last_error: string | null;
+  failed_at: string | null;
   created_at: string;
 };
 
@@ -4251,7 +4363,13 @@ function pendingSessionInputFromRow(row: PendingSessionInputRow): PendingSession
     id: row.id,
     perchSessionId: row.perch_session_id,
     source: row.source,
+    state: row.state,
     promptText: row.prompt_text,
+    attemptCount: row.attempt_count,
+    ...(row.delivery_id ? { deliveryId: row.delivery_id } : {}),
+    ...(row.next_attempt_at ? { nextAttemptAt: row.next_attempt_at } : {}),
+    ...(row.last_error ? { lastError: row.last_error } : {}),
+    ...(row.failed_at ? { failedAt: row.failed_at } : {}),
     createdAt: row.created_at
   };
 }

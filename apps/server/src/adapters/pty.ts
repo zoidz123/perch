@@ -371,6 +371,12 @@ export class PtyAgentAdapter implements AgentAdapter {
     return this.answeringSessions.has(sessionId);
   }
 
+  async composerIsEmpty(sessionId: string): Promise<boolean> {
+    const state = this.requireLiveSession(sessionId);
+    await state.writeQueue;
+    return cursorComposerIsEmpty(state.terminal);
+  }
+
   async submitInput(sessionId: string, text: string, confirm?: SubmitBarrier): Promise<boolean> {
     if (!confirm) {
       return await this.submitAndConfirm(sessionId, text);
@@ -973,6 +979,27 @@ function terminalText(terminal: HeadlessTerminal): string {
   }
 
   return normalizeLines(stripTerminalControls(lines.join("\n")));
+}
+
+function cursorComposerIsEmpty(terminal: HeadlessTerminal): boolean {
+  const buffer = terminal.buffer.active;
+  const line = buffer.getLine(buffer.baseY + buffer.cursorY);
+  if (!line) return false;
+
+  const prefix = line.translateToString(false, 0, buffer.cursorX);
+  if (!/(?:^|[│┃|])\s*[❯›>]\s*$/.test(prefix)) return false;
+
+  // A human can move the cursor to the beginning of an existing draft. Check
+  // the suffix too. Dim ghost text is a TUI placeholder, while ordinary cells
+  // after the cursor are real draft content. Box borders are presentation.
+  for (let column = buffer.cursorX; column < terminal.cols; column += 1) {
+    const cell = line.getCell(column);
+    if (!cell) continue;
+    const chars = cell.getChars();
+    if (!chars || /^\s$/.test(chars) || /^[│┃|]$/.test(chars)) continue;
+    if (!cell.isDim()) return false;
+  }
+  return true;
 }
 
 function lastLines(text: string, count: number): string {

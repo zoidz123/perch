@@ -58,7 +58,8 @@ type PromptDeliveryTrackerOptions = {
 
 // Durable boundary around PTY prompt submission. It records intent before any
 // keystrokes, then waits for Claude's UserPromptSubmit hook or the matching
-// transcript user row. A timeout records uncertainty but never retries input.
+// transcript user row. Callers that own durable human input may explicitly
+// re-arm the same delivery id after an unknown outcome for at-least-once retry.
 export class PromptDeliveryTracker {
   private readonly receiptTimeoutMs: number;
   private readonly restartRecoveryTimeoutMs: number;
@@ -128,6 +129,10 @@ export class PromptDeliveryTracker {
     });
   }
 
+  find(id: string): PromptDeliveryRecord | undefined {
+    return this.stateDb.promptDeliveries.find(id);
+  }
+
   markTyping(id: string): void {
     this.stateDb.promptDeliveries.markTyping(id);
   }
@@ -158,6 +163,12 @@ export class PromptDeliveryTracker {
     if (delivery?.state === "not_submitted" || delivery?.state === "delivery_unknown") {
       this.notifyUnknown(delivery);
     }
+  }
+
+  retryUnknown(id: string): PromptDeliveryRecord | undefined {
+    const delivery = this.stateDb.promptDeliveries.retryUnknown(id);
+    if (delivery) this.clearTimer(id);
+    return delivery;
   }
 
   acknowledgeHook(sessionId: string, prompt: string, receiptId?: string): PromptDeliveryRecord | undefined {
