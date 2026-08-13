@@ -1,10 +1,11 @@
 import assert from "node:assert/strict";
 import { execFileSync, spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
-import { cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, unlinkSync, writeFileSync } from "node:fs";
+import { chmodSync, cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, unlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { test } from "node:test";
+import { deflateSync } from "node:zlib";
 import {
   AutoReviewService,
   createFocusedTestEnvironment,
@@ -125,6 +126,76 @@ function helperReviewFixture(base: string | Buffer | undefined, reviewed: string
   return repo;
 }
 
+type HelperFixtureFile = {
+  path: string;
+  content?: string | Buffer;
+  symlink?: string;
+  executable?: boolean;
+};
+
+function writeHelperFixtureFiles(repo: string, files: HelperFixtureFile[]): void {
+  for (const file of files) {
+    const path = join(repo, ...file.path.split("/"));
+    mkdirSync(dirname(path), { recursive: true });
+    if (file.symlink !== undefined) {
+      symlinkSync(file.symlink, path);
+    } else {
+      writeFileSync(path, file.content ?? "");
+      if (file.executable) chmodSync(path, 0o755);
+    }
+  }
+}
+
+function helperPathReviewFixture(base: HelperFixtureFile[], reviewed: HelperFixtureFile[]): string {
+  const repo = mkdtempSync(join(tmpdir(), "perch-autoreview-helper-path-"));
+  const git = (args: string[]) => execFileSync("git", ["-C", repo, ...args], { stdio: "pipe" });
+  git(["init", "-q"]);
+  git(["config", "user.email", "review@example.test"]);
+  git(["config", "user.name", "AutoReview test"]);
+  writeFileSync(join(repo, "baseline.txt"), "base\n");
+  writeHelperFixtureFiles(repo, base);
+  git(["add", "-A"]);
+  git(["commit", "-qm", "base"]);
+  writeHelperFixtureFiles(repo, reviewed);
+  git(["add", "-A"]);
+  git(["commit", "-qm", "reviewed"]);
+  return repo;
+}
+
+function crc32(value: Buffer): number {
+  let crc = 0xFFFFFFFF;
+  for (const byte of value) {
+    crc ^= byte;
+    for (let bit = 0; bit < 8; bit += 1) {
+      crc = (crc >>> 1) ^ ((crc & 1) ? 0xEDB88320 : 0);
+    }
+  }
+  return (crc ^ 0xFFFFFFFF) >>> 0;
+}
+
+function pngChunk(type: string, content: Buffer): Buffer {
+  const name = Buffer.from(type, "ascii");
+  const length = Buffer.alloc(4);
+  length.writeUInt32BE(content.length);
+  const checksum = Buffer.alloc(4);
+  checksum.writeUInt32BE(crc32(Buffer.concat([name, content])));
+  return Buffer.concat([length, name, content, checksum]);
+}
+
+function png(width = 1, height = 1): Buffer {
+  const header = Buffer.alloc(13);
+  header.writeUInt32BE(width, 0);
+  header.writeUInt32BE(height, 4);
+  header[8] = 8;
+  header[9] = 6;
+  return Buffer.concat([
+    Buffer.from([0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A]),
+    pngChunk("IHDR", header),
+    pngChunk("IDAT", deflateSync(Buffer.alloc(height * (1 + width * 4)))),
+    pngChunk("IEND", Buffer.alloc(0))
+  ]);
+}
+
 function runHelperDriver(repo: string, mode: "bundle" | "detected-secret") {
   return spawnSync("python3", [
     "-c",
@@ -163,13 +234,13 @@ test("bundled AutoReview verifies package-owned bytes and rejects tampering", ()
       reason: string;
     }>;
   };
-  assert.equal(manifest.version, "2a409d348a4bcf6f15e41e9a20efd0b298a32528+perch-deletion-handling.1");
+  assert.equal(manifest.version, "2a409d348a4bcf6f15e41e9a20efd0b298a32528+perch-documentation-images.1");
   assert.equal(manifest.deviations.length, 1);
   const deviation = manifest.deviations[0];
   assert.equal(deviation.baseUpstreamCommit, bundled.manifest.source.commit);
   assert.equal(deviation.patchedSha256, bundled.helperSha256);
-  assert.equal(deviation.patched.length, 2);
-  assert.match(deviation.reason, /without weakening review of any added or modified content/);
+  assert.equal(deviation.patched.length, 3);
+  assert.match(deviation.reason, /without accepting arbitrary binary additions or modified content/);
 
   const patchPath = join(bundled.root, deviation.patchPath);
   const patch = readFileSync(patchPath, "utf8");
@@ -239,6 +310,89 @@ test("bundled helper allows deletion-only risks without loosening additions", ()
     const secretAddition = runHelperDriver(repos[3], "detected-secret");
     assert.notEqual(secretAddition.status, 0, "detected added secrets must remain refused");
     assert.match(secretAddition.stderr, /TruffleHog found verified or unknown credentials/);
+  } finally {
+    for (const repo of repos) rmSync(repo, { recursive: true, force: true });
+  }
+});
+
+test("bundled helper permits only new safe documentation PNGs", () => {
+  const image = png();
+  const allowed = helperPathReviewFixture([], [{
+    path: "apps/ios/Screenshots/readme-fleet.png",
+    content: image
+  }]);
+  const extensionSpoof = helperPathReviewFixture([], [{
+    path: "apps/ios/Screenshots/archive-disguised-as-image.png",
+    content: Buffer.from([0x50, 0x4b, 0x03, 0x04])
+  }]);
+  const outOfScope = helperPathReviewFixture([], [{
+    path: "docs/assets/out-of-scope.png",
+    content: image
+  }]);
+  const executable = helperPathReviewFixture([], [{
+    path: "apps/ios/Screenshots/executable.png",
+    content: image,
+    executable: true
+  }]);
+  const symlink = helperPathReviewFixture([], [{
+    path: "apps/ios/Screenshots/linked.png",
+    symlink: "../../../../baseline.txt"
+  }]);
+  const modified = helperPathReviewFixture([{
+    path: "apps/ios/Screenshots/modified.png",
+    content: image
+  }], [{
+    path: "apps/ios/Screenshots/modified.png",
+    content: Buffer.concat([image, Buffer.from([0])])
+  }]);
+  const polyglot = helperPathReviewFixture([], [{
+    path: "apps/ios/Screenshots/png-zip-polyglot.png",
+    content: Buffer.concat([image, Buffer.from([0x50, 0x4B, 0x03, 0x04])])
+  }]);
+  const oversized = helperPathReviewFixture([], [{
+    path: "apps/ios/Screenshots/oversized.png",
+    content: Buffer.concat([image, Buffer.alloc(2 * 1024 * 1024)])
+  }]);
+  const tooWide = helperPathReviewFixture([], [{
+    path: "apps/ios/Screenshots/too-wide.png",
+    content: png(4097, 1)
+  }]);
+  const repos = [allowed, extensionSpoof, outOfScope, executable, symlink, modified, polyglot, oversized, tooWide];
+  try {
+    const accepted = runHelperDriver(allowed, "bundle");
+    assert.equal(accepted.status, 0, accepted.stderr);
+
+    const spoofed = runHelperDriver(extensionSpoof, "bundle");
+    assert.notEqual(spoofed.status, 0, "PNG extension spoofing must remain refused");
+    assert.match(spoofed.stderr, /not a safe PNG/);
+
+    const scopeViolation = runHelperDriver(outOfScope, "bundle");
+    assert.notEqual(scopeViolation.status, 0, "out-of-scope images must remain refused");
+    assert.match(scopeViolation.stderr, /refusing binary changes in branch diff/);
+
+    const executableImage = runHelperDriver(executable, "bundle");
+    assert.notEqual(executableImage.status, 0, "executable images must remain refused");
+    assert.match(executableImage.stderr, /non-executable regular file/);
+
+    const linkedImage = runHelperDriver(symlink, "bundle");
+    assert.notEqual(linkedImage.status, 0, "symlinked images must remain refused");
+    assert.match(linkedImage.stderr, /non-executable regular file/);
+
+    const modifiedImage = runHelperDriver(modified, "bundle");
+    assert.notEqual(modifiedImage.status, 0, "modified binary images must remain refused");
+    assert.match(modifiedImage.stderr, /refusing binary changes in branch diff/);
+
+    const disguisedArchive = runHelperDriver(polyglot, "bundle");
+    assert.notEqual(disguisedArchive.status, 0, "PNG polyglots must remain refused");
+    assert.match(disguisedArchive.stderr, /not a safe PNG/);
+
+    const tooLarge = runHelperDriver(oversized, "bundle");
+    assert.notEqual(tooLarge.status, 0, "oversized images must remain refused");
+    assert.match(tooLarge.stderr, /exceeds 2097152 byte limit/);
+
+    const excessiveDimensions = runHelperDriver(tooWide, "bundle");
+    assert.notEqual(excessiveDimensions.status, 0, "oversized dimensions must remain refused");
+    assert.match(excessiveDimensions.stderr, /not a safe PNG/);
   } finally {
     for (const repo of repos) rmSync(repo, { recursive: true, force: true });
   }
