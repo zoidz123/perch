@@ -74,6 +74,7 @@ final class PerchStore: ObservableObject {
     @Published private(set) var presentedServerAvailability: PresentedServerAvailability = .connecting
     @Published var errorMessage: String?
     @Published private(set) var taskRefreshErrorMessage: String?
+    private var taskRefreshState = WorkspaceTaskRefreshState()
     @Published var isLoading = false
     // Local usage/credit snapshot (Claude + Codex), read on the Mac.
     @Published private(set) var usage: UsageResponse?
@@ -359,6 +360,7 @@ final class PerchStore: ObservableObject {
         timelineCatchUps = []
         errorMessage = nil
         taskRefreshErrorMessage = nil
+        taskRefreshState = WorkspaceTaskRefreshState()
         isLoading = false
         usageRefresh.reset()
         applyUsageState()
@@ -1393,24 +1395,29 @@ final class PerchStore: ObservableObject {
             )
             let refresh = WorkspaceGrouping.taskRefreshResult(
                 current: tasks,
+                state: taskRefreshState,
                 result: Result<[AgentTask], Error>.success(response.tasks)
             )
             tasks = refresh.tasks
-            taskRefreshErrorMessage = refresh.errorMessage
+            taskRefreshState = refresh.state
+            taskRefreshErrorMessage = refresh.state.errorMessage
         } catch {
             if isCancellation(error) {
                 return
             }
             if (error as? PerchClientError)?.httpStatusCode == 404 {
+                taskRefreshState = WorkspaceTaskRefreshState()
                 taskRefreshErrorMessage = nil
                 return
             }
             let refresh = WorkspaceGrouping.taskRefreshResult(
                 current: tasks,
+                state: taskRefreshState,
                 result: Result<[AgentTask], Error>.failure(error)
             )
             tasks = refresh.tasks
-            taskRefreshErrorMessage = refresh.errorMessage
+            taskRefreshState = refresh.state
+            taskRefreshErrorMessage = refresh.state.errorMessage
         }
     }
 

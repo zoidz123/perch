@@ -109,7 +109,7 @@ final class TaskPayloadDecodingTests: XCTestCase {
 
     // The user-visible failure: a thrown snapshot decode becomes the refresh
     // banner, which is exactly what a required `mode` produced on build 10.
-    func testDecodeFailureProducesTheRefreshBanner() {
+    func testDecodeFailureCountsTowardTheRefreshBanner() {
         let json = "{\"tasks\": [\(Self.modelessTask)]}"
         var decodeError: Error?
         do {
@@ -121,12 +121,14 @@ final class TaskPayloadDecodingTests: XCTestCase {
 
         let refresh = WorkspaceGrouping.taskRefreshResult(
             current: [AgentTask](),
+            state: WorkspaceTaskRefreshState(),
             result: Result<[AgentTask], Error>.failure(
                 decodeError ?? NSError(domain: "decode", code: 1)
             )
         )
 
-        XCTAssertEqual(refresh.errorMessage, "Couldn’t refresh tasks. Pull to refresh or reconnect.")
+        XCTAssertEqual(refresh.state.consecutiveFailures, 1)
+        XCTAssertNil(refresh.state.errorMessage)
     }
 }
 
