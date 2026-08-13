@@ -1,0 +1,173 @@
+diff --git a/skills/autoreview/scripts/autoreview b/skills/autoreview/scripts/autoreview
+index fbef8125c418c9d4f620fe022cd8ccde590bed2a..1d20cdd6ae77553eb65fc11e2dd330d0c10670f7 100755
+--- a/skills/autoreview/scripts/autoreview
++++ b/skills/autoreview/scripts/autoreview
+@@ -7879,7 +7879,6 @@ def redact_deletion_only_secret_values(
+             continue
+         if new_risk:
+             refuse_secret_like_review_patch(label)
+-        fragments: set[str] = set()
+         if old_risk:
+             try:
+                 fragments = review_secret_fragments(
+@@ -7888,10 +7887,8 @@ def redact_deletion_only_secret_values(
+                 )
+             except SystemExit:
+                 refuse_secret_like_review_patch(label)
+-            if not fragments:
+-                refuse_secret_like_review_patch(label)
+-        deletion_sections[index] = (old_dialect, old_content, fragments)
+-        all_fragments.update(fragments)
++            deletion_sections[index] = (old_dialect, old_content, fragments)
++            all_fragments.update(fragments)
+ 
+     if len(all_fragments) > MAX_DELETION_SECRET_FRAGMENTS:
+         raise SystemExit(
+@@ -7930,8 +7927,6 @@ def redact_deletion_only_secret_values(
+                 refuse_secret_like_review_patch(label)
+ 
+     for index, (dialect, _old_content, fragments) in deletion_sections.items():
+-        if not fragments:
+-            continue
+         try:
+             redacted = redact_deleted_file_secret_lines(
+                 units[index],
+@@ -7944,6 +7939,12 @@ def redact_deletion_only_secret_values(
+         residual_pattern = known_secret_fragment_pattern(
+             sorted(fragments, key=lambda fragment: (-len(fragment), fragment))
+         )
++        if (
++            secret_text_risk(old_content, javascript_dialect=dialect)
++            or (residual_pattern is not None and residual_pattern.search(old_content))
++        ):
++            redacted = diff_section_without_deleted_line_contents(redacted)
++            old_content, new_content = unified_diff_contents(redacted)
+         if (
+             secret_text_risk(old_content, javascript_dialect=dialect)
+             or secret_text_risk(new_content)
+@@ -8320,13 +8321,23 @@ def validate_review_patch(
+     return patch
+ 
+ 
+-def require_no_binary_diff(label: str, numstat: str) -> None:
++def require_no_binary_diff(
++    label: str,
++    numstat: str,
++    deletion_only_paths: set[str] | None = None,
++) -> None:
+     binary_paths: list[str] = []
++    allowed_deletions = deletion_only_paths or set()
+     for record in numstat.split("\0"):
+         if not record:
+             continue
+         fields = record.split("\t", 2)
+-        if len(fields) == 3 and fields[0] == "-" and fields[1] == "-":
++        if (
++            len(fields) == 3
++            and fields[0] == "-"
++            and fields[1] == "-"
++            and fields[2] not in allowed_deletions
++        ):
+             binary_paths.append(fields[2])
+     if binary_paths:
+         details = "\n".join(
+@@ -8497,14 +8508,6 @@ def local_bundle(
+ ) -> tuple[str, bool]:
+     staged_patch = git(repo, "diff", *SAFE_DIFF_FLAGS, "--cached", "--patch")
+     unstaged_patch = git(repo, "diff", *SAFE_DIFF_FLAGS, "--patch")
+-    require_no_binary_diff(
+-        "local staged diff",
+-        git(repo, "diff", *SAFE_DIFF_FLAGS, "--cached", "--numstat", "-z"),
+-    )
+-    require_no_binary_diff(
+-        "local unstaged diff",
+-        git(repo, "diff", *SAFE_DIFF_FLAGS, "--numstat", "-z"),
+-    )
+     require_no_gitlink_diff(
+         "local staged diff",
+         git(repo, "diff", *SAFE_DIFF_FLAGS, "--cached", "--raw", "-z"),
+@@ -8546,6 +8549,16 @@ def local_bundle(
+         None,
+         "HEAD",
+     )
++    require_no_binary_diff(
++        "local staged diff",
++        git(repo, "diff", *SAFE_DIFF_FLAGS, "--cached", "--numstat", "-z"),
++        deletion_only_paths,
++    )
++    require_no_binary_diff(
++        "local unstaged diff",
++        git(repo, "diff", *SAFE_DIFF_FLAGS, "--numstat", "-z"),
++        deletion_only_paths,
++    )
+     deleted_paths = set(
+         git_path_list(
+             repo,
+@@ -8839,6 +8852,12 @@ def branch_bundle(
+         "--end-of-options",
+         diff_range,
+     )
++    deletion_only_paths = review_deletion_only_paths(
++        repo,
++        "branch",
++        base_ref,
++        "HEAD",
++    )
+     require_no_binary_diff(
+         "branch diff",
+         git(
+@@ -8850,6 +8869,7 @@ def branch_bundle(
+             "--end-of-options",
+             diff_range,
+         ),
++        deletion_only_paths,
+     )
+     require_no_gitlink_diff(
+         "branch diff",
+@@ -8864,12 +8884,6 @@ def branch_bundle(
+         ),
+     )
+     omitted_tracked = bool(tracked_sensitive_paths(branch_paths))
+-    deletion_only_paths = review_deletion_only_paths(
+-        repo,
+-        "branch",
+-        base_ref,
+-        "HEAD",
+-    )
+     branch_patch = validate_review_patch(
+         "branch diff",
+         branch_paths,
+@@ -8935,6 +8949,12 @@ def commit_bundle(
+         "--end-of-options",
+         commit_ref,
+     )
++    deletion_only_paths = review_deletion_only_paths(
++        repo,
++        "commit",
++        None,
++        commit_ref,
++    )
+     require_no_binary_diff(
+         "commit diff",
+         git(
+@@ -8947,6 +8967,7 @@ def commit_bundle(
+             "--end-of-options",
+             commit_ref,
+         ),
++        deletion_only_paths,
+     )
+     require_no_gitlink_diff(
+         "commit diff",
+@@ -8971,12 +8992,6 @@ def commit_bundle(
+         "--end-of-options",
+         commit_ref,
+     )
+-    deletion_only_paths = review_deletion_only_paths(
+-        repo,
+-        "commit",
+-        None,
+-        commit_ref,
+-    )
+     commit_patch = validate_review_patch(
+         "commit diff",
+         commit_paths,

@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
-import { execFileSync } from "node:child_process";
-import { cpSync, existsSync, mkdtempSync, readFileSync, rmSync, unlinkSync, writeFileSync } from "node:fs";
+import { execFileSync, spawnSync } from "node:child_process";
+import { createHash } from "node:crypto";
+import { cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, unlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
@@ -70,6 +71,70 @@ function cleanup(value: Fixture): void {
   rmSync(value.repo, { recursive: true, force: true });
 }
 
+const HELPER_DRIVER = [
+  "import importlib.machinery",
+  "import importlib.util",
+  "import pathlib",
+  "import subprocess",
+  "import sys",
+  "sys.dont_write_bytecode = True",
+  "loader = importlib.machinery.SourceFileLoader('perch_autoreview_helper', sys.argv[1])",
+  "spec = importlib.util.spec_from_loader(loader.name, loader)",
+  "helper = importlib.util.module_from_spec(spec)",
+  "loader.exec_module(helper)",
+  "repo = pathlib.Path(sys.argv[2])",
+  "if sys.argv[3] == 'bundle':",
+  "    bundle, _truncated = helper.branch_bundle(repo, 'HEAD~1')",
+  "    sys.stdout.write(bundle)",
+  "elif sys.argv[3] == 'detected-secret':",
+  "    needle = 'gh' + 'p_'",
+  "    real_find_command = helper.find_command",
+  "    helper.find_command = lambda name, target: '/fixture/trufflehog' if name == 'trufflehog' else real_find_command(name, target)",
+  "    real_run = helper.run",
+  "    def detected(command, *_args, **_kwargs):",
+  "        if command[0] != '/fixture/trufflehog':",
+  "            return real_run(command, *_args, **_kwargs)",
+  "        scan_repo = pathlib.Path(command[2].removeprefix('file://'))",
+  "        history = helper.git(scan_repo, 'log', '-p', '--all')",
+  "        if needle not in history:",
+  "            raise AssertionError('fixture secret was not materialized for scanning')",
+  "        return subprocess.CompletedProcess(command, helper.TRUFFLEHOG_FINDINGS_EXIT_CODE, '', '')",
+  "    helper.run = detected",
+  "    helper.run_trufflehog_preflight(repo, 'branch', 'HEAD~1', 'HEAD')",
+  "else:",
+  "    raise AssertionError('unknown driver mode')"
+].join("\n");
+
+function helperReviewFixture(base: string | Buffer | undefined, reviewed: string | Buffer | undefined): string {
+  const repo = mkdtempSync(join(tmpdir(), "perch-autoreview-helper-"));
+  const git = (args: string[]) => execFileSync("git", ["-C", repo, ...args], { stdio: "pipe" });
+  git(["init", "-q"]);
+  git(["config", "user.email", "review@example.test"]);
+  git(["config", "user.name", "AutoReview test"]);
+  writeFileSync(join(repo, "baseline.txt"), "base\n");
+  if (base !== undefined) writeFileSync(join(repo, "fixture.ts"), base);
+  git(["add", "-A"]);
+  git(["commit", "-qm", "base"]);
+  if (reviewed === undefined) {
+    git(["rm", "-q", "fixture.ts"]);
+  } else {
+    writeFileSync(join(repo, "fixture.ts"), reviewed);
+    git(["add", "fixture.ts"]);
+  }
+  git(["commit", "-qm", "reviewed"]);
+  return repo;
+}
+
+function runHelperDriver(repo: string, mode: "bundle" | "detected-secret") {
+  return spawnSync("python3", [
+    "-c",
+    HELPER_DRIVER,
+    join(autoReviewAssetRoot(), "skill", "scripts", "autoreview"),
+    repo,
+    mode
+  ], { encoding: "utf8" });
+}
+
 test("bundled AutoReview verifies package-owned bytes and rejects tampering", () => {
   const bundled = resolveBundledAutoReview();
   assert.match(bundled.root, /assets[\\/]autoreview$/);
@@ -86,6 +151,46 @@ test("bundled AutoReview verifies package-owned bytes and rejects tampering", ()
     assert.equal(existsSync(join(bundled.root, excluded.path)), false, `${excluded.path} must never ship`);
   }
 
+  const manifest = JSON.parse(readFileSync(join(bundled.root, "manifest.json"), "utf8")) as {
+    version: string;
+    deviations: Array<{
+      baseUpstreamCommit: string;
+      baseSha256: string;
+      patchedSha256: string;
+      patchPath: string;
+      patchSha256: string;
+      patched: string[];
+      reason: string;
+    }>;
+  };
+  assert.equal(manifest.version, "2a409d348a4bcf6f15e41e9a20efd0b298a32528+perch-deletion-handling.1");
+  assert.equal(manifest.deviations.length, 1);
+  const deviation = manifest.deviations[0];
+  assert.equal(deviation.baseUpstreamCommit, bundled.manifest.source.commit);
+  assert.equal(deviation.patchedSha256, bundled.helperSha256);
+  assert.equal(deviation.patched.length, 2);
+  assert.match(deviation.reason, /without weakening review of any added or modified content/);
+
+  const patchPath = join(bundled.root, deviation.patchPath);
+  const patch = readFileSync(patchPath, "utf8");
+  assert.equal(createHash("sha256").update(patch).digest("hex"), deviation.patchSha256);
+  assert.deepEqual(patch.match(/^diff --git .+$/gm), [
+    "diff --git a/skills/autoreview/scripts/autoreview b/skills/autoreview/scripts/autoreview"
+  ]);
+
+  const patchScratch = mkdtempSync(join(tmpdir(), "perch-autoreview-patch-"));
+  try {
+    const canonicalHelper = join(patchScratch, "skills", "autoreview", "scripts", "autoreview");
+    mkdirSync(join(patchScratch, "skills", "autoreview", "scripts"), { recursive: true });
+    writeFileSync(canonicalHelper, readFileSync(bundled.helperPath));
+    execFileSync("git", ["apply", "--reverse", patchPath], { cwd: patchScratch, stdio: "pipe" });
+    assert.equal(createHash("sha256").update(readFileSync(canonicalHelper)).digest("hex"), deviation.baseSha256);
+    execFileSync("git", ["apply", patchPath], { cwd: patchScratch, stdio: "pipe" });
+    assert.equal(createHash("sha256").update(readFileSync(canonicalHelper)).digest("hex"), deviation.patchedSha256);
+  } finally {
+    rmSync(patchScratch, { recursive: true, force: true });
+  }
+
   const scratch = mkdtempSync(join(tmpdir(), "perch-autoreview-assets-"));
   try {
     const copy = join(scratch, "autoreview");
@@ -98,6 +203,44 @@ test("bundled AutoReview verifies package-owned bytes and rejects tampering", ()
     assert.throws(() => resolveBundledAutoReview(copy), /integrity mismatch/);
   } finally {
     rmSync(scratch, { recursive: true, force: true });
+  }
+});
+
+test("bundled helper allows deletion-only risks without loosening additions", () => {
+  const placeholder = ["test", "token"].join("-");
+  const placeholderOnlyRisk = [
+    `    assert.ok(!html.includes("token=${placeholder}"));`,
+    'test("chartReviewHtml escapes chart names and the session JSON", () => {',
+    `    name: 'road<map> "v1"',`,
+    ""
+  ].join("\n");
+  const binaryMarker = "DELETED_BINARY_CONTENT_MUST_NOT_ENTER_THE_BUNDLE";
+  const binary = Buffer.concat([Buffer.from([0, 1, 2, 3]), Buffer.from(binaryMarker)]);
+  const liveLookingSecret = ["gh", "p_", "A".repeat(32)].join("");
+  const repos = [
+    helperReviewFixture(placeholderOnlyRisk, undefined),
+    helperReviewFixture(binary, undefined),
+    helperReviewFixture(undefined, binary),
+    helperReviewFixture(undefined, `export const token = "${liveLookingSecret}";\n`)
+  ];
+  try {
+    const secretDeletion = runHelperDriver(repos[0], "bundle");
+    assert.equal(secretDeletion.status, 0, secretDeletion.stderr);
+    assert.doesNotMatch(secretDeletion.stdout, new RegExp(placeholder));
+
+    const binaryDeletion = runHelperDriver(repos[1], "bundle");
+    assert.equal(binaryDeletion.status, 0, binaryDeletion.stderr);
+    assert.doesNotMatch(binaryDeletion.stdout, new RegExp(binaryMarker));
+
+    const binaryAddition = runHelperDriver(repos[2], "bundle");
+    assert.notEqual(binaryAddition.status, 0, "binary additions must remain refused");
+    assert.match(binaryAddition.stderr, /refusing binary changes in branch diff/);
+
+    const secretAddition = runHelperDriver(repos[3], "detected-secret");
+    assert.notEqual(secretAddition.status, 0, "detected added secrets must remain refused");
+    assert.match(secretAddition.stderr, /TruffleHog found verified or unknown credentials/);
+  } finally {
+    for (const repo of repos) rmSync(repo, { recursive: true, force: true });
   }
 });
 
