@@ -31,6 +31,7 @@
 import { spawn as childSpawn } from "node:child_process";
 import { createInterface, type Interface as ReadlineInterface } from "node:readline";
 import type { Readable, Writable } from "node:stream";
+import { isDeepStrictEqual } from "node:util";
 import type {
   AgentSessionStatus,
   PendingServerRequest,
@@ -190,23 +191,37 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
-function decisionList(value: unknown, fallback: string[]): PendingServerRequest["decisions"] {
-  const ids = Array.isArray(value) ? value.filter((entry): entry is string => typeof entry === "string") : fallback;
+function decisionList(value: unknown, fallback: unknown[]): PendingServerRequest["decisions"] {
+  const values = Array.isArray(value) ? value : fallback;
   const labels: Record<string, string> = {
     accept: "Allow",
     acceptForSession: "Allow for session",
+    acceptWithExecpolicyAmendment: "Allow and remember rule",
+    applyNetworkPolicyAmendment: "Apply network policy",
     decline: "Deny",
     cancel: "Cancel",
     allow_turn: "Allow this turn",
     allow_session: "Allow for session",
     deny: "Deny"
   };
-  return ids.map((id) => ({
-    id,
-    label: labels[id] ?? id,
-    ...(id === "decline" || id === "deny" || id === "cancel" ? { destructive: true } : {}),
-    ...(id === "acceptForSession" || id === "allow_session" ? { persistence: "session" as const } : {})
-  }));
+  return values.flatMap((value) => {
+    const id = typeof value === "string"
+      ? value
+      : isRecord(value) && Object.keys(value).length === 1
+        ? Object.keys(value)[0]
+        : undefined;
+    if (!id) return [];
+    return [{
+      id,
+      label: labels[id] ?? id,
+      ...(typeof value === "object" ? { wireValue: value as Record<string, unknown> } : {}),
+      ...(id === "decline" || id === "deny" || id === "cancel" || /deny/i.test(id) ? { destructive: true } : {}),
+      ...(id === "acceptForSession" || id === "allow_session" ? { persistence: "session" as const } : {}),
+      ...(id === "acceptWithExecpolicyAmendment" || id === "applyNetworkPolicyAmendment"
+        ? { persistence: "always" as const }
+        : {})
+    }];
+  });
 }
 
 function persistenceAdvertises(value: unknown, choice: "session" | "always"): boolean {
@@ -285,6 +300,7 @@ export class CodexAppServerClient {
   private nextId = 1;
   private pending = new Map<number, PendingRequest>();
   private readonly pendingServerRequests = new Map<string, PendingServerRequest>();
+  private readonly submittedServerRequestResults = new Map<string, Record<string, unknown>>();
   private readonly pendingUserSources = new Map<string, "human" | "agent">();
   private processEpoch = 0;
   private connected = false;
@@ -1115,12 +1131,17 @@ export class CodexAppServerClient {
   respondToServerRequest(
     requestId: string | number,
     decision?: string,
-    content?: Record<string, unknown>
+    content?: Record<string, unknown>,
+    threadId?: string
   ): boolean {
-    const pending = this.pendingServerRequests.get(requestKey(requestId));
-    if (!pending) return false;
+    const key = requestKey(requestId);
+    const pending = this.pendingServerRequests.get(key);
+    if (!pending || (threadId !== undefined && pending.threadId !== threadId)) return false;
     const result = this.serverRequestResult(pending, decision, content);
     if (!result) return false;
+    const submitted = this.submittedServerRequestResults.get(key);
+    if (submitted) return isDeepStrictEqual(submitted, result);
+    this.submittedServerRequestResults.set(key, result);
     this.respond(requestId, result);
     return true;
   }
@@ -1139,12 +1160,25 @@ export class CodexAppServerClient {
 
     if (method === "item/commandExecution/requestApproval") {
       const command = this.stringifyCommand(params.command);
+      const proposedExecpolicyAmendment = Array.isArray(params.proposedExecpolicyAmendment)
+        ? params.proposedExecpolicyAmendment.filter((entry): entry is string => typeof entry === "string")
+        : [];
       return {
         ...base,
         ...(typeof params.approvalId === "string" ? { callId: params.approvalId } : itemId ? { callId: itemId } : {}),
         family: "command_execution",
         summary: typeof params.reason === "string" ? params.reason : command ? `Run: ${command}` : "Run a command",
-        decisions: decisionList(params.availableDecisions, ["accept", "acceptForSession", "decline", "cancel"]),
+        decisions: decisionList(params.availableDecisions, [
+          "accept",
+          "acceptForSession",
+          "decline",
+          "cancel",
+          {
+            acceptWithExecpolicyAmendment: {
+              execpolicy_amendment: proposedExecpolicyAmendment
+            }
+          }
+        ]),
         persistence: { source: Array.isArray(params.availableDecisions) ? "advertised" : "schema", session: true }
       };
     }
@@ -1220,7 +1254,8 @@ export class CodexAppServerClient {
         _meta: null
       };
     }
-    return { decision };
+    const selected = pending.decisions.find((entry) => entry.id === decision)!;
+    return { decision: selected.wireValue ?? selected.id };
   }
 
   private resolveStructuredServerRequest(requestId: string | number, threadId?: string): void {
@@ -1228,6 +1263,7 @@ export class CodexAppServerClient {
     const pending = this.pendingServerRequests.get(key);
     if (!pending || (threadId && pending.threadId !== threadId)) return;
     this.pendingServerRequests.delete(key);
+    this.submittedServerRequestResults.delete(key);
     this.onServerRequestResolved?.(pending);
     if (this.pendingServerRequests.size === 0) {
       this.setStatus(this._turnId ? "running" : "idle");
@@ -1239,6 +1275,7 @@ export class CodexAppServerClient {
       this.onServerRequestResolved?.(pending);
     }
     this.pendingServerRequests.clear();
+    this.submittedServerRequestResults.clear();
   }
 
   private async dispatchApproval(request: CodexApprovalRequest): Promise<ReviewDecision> {

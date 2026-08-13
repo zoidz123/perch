@@ -130,6 +130,50 @@ final class TaskPayloadDecodingTests: XCTestCase {
         XCTAssertEqual(refresh.state.consecutiveFailures, 1)
         XCTAssertNil(refresh.state.errorMessage)
     }
+
+    func testCodexApprovalDecodesExactChoicesAndRuntimeFence() throws {
+        let json = """
+        {
+          "id": "pty:codex-1",
+          "title": "Alder",
+          "agent": "codex",
+          "cwd": "/repo",
+          "kind": "terminal",
+          "status": "needs_approval",
+          "lastActivityAt": "2026-08-13T16:00:00.000Z",
+          "pendingServerRequest": {
+            "requestId": 47,
+            "threadId": "thr-1",
+            "turnId": "turn-1",
+            "runtimeGeneration": 3,
+            "itemId": "item-1",
+            "family": "command_execution",
+            "summary": "Run the command?",
+            "content": {
+              "reason": "Needed for release verification",
+              "command": "npm test",
+              "cwd": "/repo"
+            },
+            "decisions": [
+              { "id": "accept", "label": "Allow" },
+              { "id": "acceptForSession", "label": "Allow for session", "persistence": "session" },
+              { "id": "decline", "label": "Deny", "destructive": true },
+              { "id": "cancel", "label": "Cancel", "destructive": true }
+            ],
+            "at": "2026-08-13T16:00:00.000Z"
+          }
+        }
+        """
+        let session = try JSONDecoder().decode(AgentSession.self, from: Data(json.utf8))
+
+        XCTAssertEqual(session.pendingServerRequest?.requestId, .number(47))
+        XCTAssertEqual(session.pendingServerRequest?.threadId, "thr-1")
+        XCTAssertEqual(session.pendingServerRequest?.runtimeGeneration, 3)
+        XCTAssertEqual(
+            session.pendingServerRequest?.decisions.map(\.id),
+            ["accept", "acceptForSession", "decline", "cancel"]
+        )
+    }
 }
 
 // The build-10 (0.2.1/10, ffcd65c) shape of the decoded task record, kept only

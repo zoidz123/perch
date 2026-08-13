@@ -836,6 +836,8 @@ export function surfaceApprovalToTask(
       context: approval.context,
       command: approval.command,
       cwd: approval.cwd,
+      interactionKind: approval.interactionKind,
+      sessionId: approval.interactionKind === "pty_manual_gate" ? sessionId : undefined,
       requestVersion: approval.requestVersion,
       runtimeGeneration: approval.runtimeGeneration,
       decisionPolicy: approval.decisionPolicy
@@ -870,11 +872,15 @@ function codexServerRequestEventData(request: PendingServerRequest): Record<stri
     requestId: request.requestId,
     threadId: request.threadId,
     turnId: request.turnId,
+    runtimeGeneration: request.runtimeGeneration,
     itemId: request.itemId,
     callId: request.callId,
     family: request.family,
     decisions: request.decisions,
-    persistence: request.persistence
+    persistence: request.persistence,
+    command: request.content.command,
+    cwd: request.content.cwd,
+    requestReason: request.content.reason
   };
 }
 
@@ -883,14 +889,19 @@ export function surfaceCodexServerRequest(
   sessionId: string,
   request: PendingServerRequest
 ): void {
-  if (!options.monitor.setPendingServerRequest(sessionId, request)) return;
+  const runtime = options.tasks.stateDb.runtimes.findBySession(sessionId) ??
+    options.tasks.stateDb.ownerRuntimes.findBySession(sessionId);
+  const projected = request.runtimeGeneration === undefined && runtime
+    ? { ...request, runtimeGeneration: runtime.generation }
+    : request;
+  if (!options.monitor.setPendingServerRequest(sessionId, projected)) return;
   const task = taskForSession(options, sessionId);
   if (!task || !["queued", "working", "needs_you", "blocked"].includes(task.state)) return;
   options.tasks.recordEvent(task.id, {
     kind: "needs_decision",
     source: "system",
-    message: request.summary,
-    data: codexServerRequestEventData(request)
+    message: projected.summary,
+    data: codexServerRequestEventData(projected)
   });
 }
 

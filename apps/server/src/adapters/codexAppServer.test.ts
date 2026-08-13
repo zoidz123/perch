@@ -611,6 +611,70 @@ test("structured requests preserve identity, cover every 0.144.1 family, and cle
   assert.equal(opened[3]?.persistence?.always, true);
 });
 
+test("approval normalization preserves default and advertised Codex decisions including execpolicy objects", async () => {
+  const opened: PendingServerRequest[] = [];
+  const { client, server } = await connectedClient({ onServerRequest: (request) => opened.push(request) });
+  await client.startThread();
+
+  server.requestToClient("default-command", "item/commandExecution/requestApproval", {
+    threadId: "thr_1",
+    turnId: "turn_1",
+    itemId: "item-default",
+    command: "npm test",
+    proposedExecpolicyAmendment: ["npm", "test"]
+  });
+  await tick();
+  const command = opened.at(-1)!;
+  assert.deepEqual(command.decisions.map((decision) => decision.id), [
+    "accept",
+    "acceptForSession",
+    "decline",
+    "cancel",
+    "acceptWithExecpolicyAmendment"
+  ]);
+  assert.equal(client.respondToServerRequest(command.requestId, "acceptWithExecpolicyAmendment", undefined, "thr_1"), true);
+  assert.equal(client.respondToServerRequest(command.requestId, "acceptWithExecpolicyAmendment", undefined, "thr_1"), true);
+  assert.equal(client.respondToServerRequest(command.requestId, "decline", undefined, "thr_1"), false);
+  await tick();
+  const commandResponses = server.requests.filter((request) => request.id === command.requestId && request.result);
+  assert.equal(commandResponses.length, 1, "an idempotent retry never writes a second JSON-RPC response");
+  assert.deepEqual(commandResponses[0]?.result, {
+    decision: {
+      acceptWithExecpolicyAmendment: {
+        execpolicy_amendment: ["npm", "test"]
+      }
+    }
+  });
+  server.push("serverRequest/resolved", { threadId: "thr_1", requestId: command.requestId });
+  await tick();
+
+  server.requestToClient("advertised-command", "item/commandExecution/requestApproval", {
+    threadId: "thr_1",
+    turnId: "turn_2",
+    itemId: "item-advertised",
+    command: "git status",
+    availableDecisions: ["accept", "decline"]
+  });
+  await tick();
+  const constrained = opened.at(-1)!;
+  assert.deepEqual(constrained.decisions.map((decision) => decision.id), ["accept", "decline"]);
+  assert.equal(client.respondToServerRequest(constrained.requestId, "acceptForSession", undefined, "thr_1"), false);
+  assert.equal(client.respondToServerRequest(constrained.requestId, "accept", undefined, "wrong-thread"), false);
+  assert.equal(client.respondToServerRequest(constrained.requestId, "accept", undefined, "thr_1"), true);
+  server.push("serverRequest/resolved", { threadId: "thr_1", requestId: constrained.requestId });
+  await tick();
+
+  server.requestToClient("default-file", "item/fileChange/requestApproval", {
+    threadId: "thr_1",
+    turnId: "turn_3",
+    itemId: "item-file"
+  });
+  await tick();
+  assert.deepEqual(opened.at(-1)?.decisions.map((decision) => decision.id), [
+    "accept", "acceptForSession", "decline", "cancel"
+  ]);
+});
+
 test("child-thread server requests cannot enter root approval or input state", async () => {
   const opened: PendingServerRequest[] = [];
   const statuses: AgentSessionStatus[] = [];

@@ -107,24 +107,23 @@ struct ContentView: View {
     private var screenshotRun: Bool {
         UserDefaults.standard.bool(forKey: "PerchScreenshots")
             || UserDefaults.standard.bool(forKey: "PerchOpenUsage")
+            || UserDefaults.standard.bool(forKey: "PerchApprovalPreview")
     }
     private var openUsageOnLaunch: Bool {
         UserDefaults.standard.bool(forKey: "PerchOpenUsage")
     }
 
     var body: some View {
-        NavigationStack {
-            HomeView(showPairSheet: $showPairSheet, showUsageSheet: $showUsageSheet)
-                .environmentObject(store)
-                // Item-based: at most ONE session view can ever exist, so
-                // duplicate/raced pushes (the navigation-wedge class of bugs:
-                // rapid back -> open-other, repeated deep links) are
-                // impossible by construction. Row taps and deep links both
-                // just set store.openSessionRef.
-                .navigationDestination(item: $store.openSessionRef) { ref in
-                    SessionDetailView(sessionId: ref.id)
-                        .environmentObject(store)
-                }
+        Group {
+            #if DEBUG
+            if UserDefaults.standard.bool(forKey: "PerchApprovalPreview") {
+                ApprovalScreenshotPreview()
+            } else {
+                navigationContent
+            }
+            #else
+            navigationContent
+            #endif
         }
         .tint(Style.accent)
         .sheet(isPresented: $showPairSheet) {
@@ -215,6 +214,22 @@ struct ContentView: View {
             if openUsageOnLaunch {
                 showUsageSheet = true
             }
+        }
+    }
+
+    private var navigationContent: some View {
+        NavigationStack {
+            HomeView(showPairSheet: $showPairSheet, showUsageSheet: $showUsageSheet)
+                .environmentObject(store)
+                // Item-based: at most ONE session view can ever exist, so
+                // duplicate/raced pushes (the navigation-wedge class of bugs:
+                // rapid back -> open-other, repeated deep links) are
+                // impossible by construction. Row taps and deep links both
+                // just set store.openSessionRef.
+                .navigationDestination(item: $store.openSessionRef) { ref in
+                    SessionDetailView(sessionId: ref.id)
+                        .environmentObject(store)
+                }
         }
     }
 }
@@ -1766,7 +1781,7 @@ struct SessionDetailView: View {
                     }
                     .padding(.horizontal, 12)
                 } else if let approval = session?.pendingApproval {
-                    ApprovalCard(approval: approval) { decision in
+                    ApprovalCard(approval: approval, sessionId: sessionId) { decision in
                         await store.approve(sessionId, decision: decision, approvalId: approval.id)
                     }
                     .padding(.horizontal, 12)

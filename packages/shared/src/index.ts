@@ -184,6 +184,10 @@ export type ServerRequestDecision = {
   label: string;
   destructive?: boolean;
   persistence?: "turn" | "session" | "always";
+  // Exact protocol decision advertised by Codex. Object-shaped decisions
+  // (for example an execpolicy amendment) remain server-owned; clients submit
+  // only `id`, and the server replies with this preserved wire value.
+  wireValue?: string | Record<string, unknown>;
 };
 
 export type PendingServerRequest = {
@@ -192,6 +196,10 @@ export type PendingServerRequest = {
   requestId: string | number;
   threadId: string;
   turnId?: string | null;
+  // Durable Perch runtime generation that owned this request when it surfaced.
+  // A response must match it so a recycled worker session cannot receive a
+  // stale approval intended for an earlier generation.
+  runtimeGeneration?: number;
   itemId?: string;
   callId?: string;
   family: ServerRequestFamily;
@@ -976,12 +984,19 @@ export type ApproveRequest = {
   // exact decision ids on PendingApproval and reject every other value.
   decision: string;
   id?: string;
+  // Genuine Codex app-server approvals use the exact JSON-RPC identity and
+  // thread fence. `id` remains the durable Claude / terminal approval id.
+  requestId?: string | number;
+  threadId?: string;
+  content?: Record<string, unknown>;
   requestVersion?: 1;
   runtimeGeneration?: number | null;
 };
 
 export type ServerRequestResponse = {
   requestId: string | number;
+  threadId?: string;
+  runtimeGeneration?: number | null;
   decision?: string;
   // Family-specific structured content. Used by MCP form elicitation,
   // permissions grants, and request_user_input answers.

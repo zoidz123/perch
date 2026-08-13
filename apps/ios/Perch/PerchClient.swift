@@ -1283,11 +1283,18 @@ final class PerchStore: ObservableObject {
         decision: String?,
         content: [String: Any]?
     ) async {
-        var body: [String: Any] = ["requestId": request.requestId.jsonObject]
+        var body: [String: Any] = [
+            "requestId": request.requestId.jsonObject,
+            "threadId": request.threadId,
+            "runtimeGeneration": request.runtimeGeneration ?? NSNull()
+        ]
         if let decision { body["decision"] = decision }
         if let content { body["content"] = content }
         do {
-            try await postAny(path: "/sessions/\(escapePath(sessionId))/server-request", body: body)
+            let path = decision == nil
+                ? "/sessions/\(escapePath(sessionId))/server-request"
+                : "/sessions/\(escapePath(sessionId))/approve"
+            try await postAny(path: path, body: body)
             errorMessage = nil
         } catch {
             errorMessage = error.localizedDescription

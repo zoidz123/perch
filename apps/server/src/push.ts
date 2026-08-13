@@ -6,6 +6,8 @@
 // (skip the device actively viewing the session) but must never GATE
 // delivery - stale presence from a backgrounded app cannot suppress a push.
 
+import type { ServerRequestDecision } from "@perch/shared";
+
 export type PushNotification = {
   title: string;
   // Where the agent works ("branch · path"), rendered under the title.
@@ -17,6 +19,16 @@ export type PushNotification = {
   // session, approvals threaded per session); the mate conversation pins a
   // stable "mate" thread across mate restarts.
   threadId?: string;
+  // Genuine Codex approvals preserve their exact request and offered choices
+  // in the push payload. Notification actions stay disabled because iOS
+  // cannot declare a dynamic action set, but a tap can hydrate the real card
+  // without inventing generic Approve / Deny choices.
+  codexApproval?: {
+    requestId: string | number;
+    threadId: string;
+    runtimeGeneration?: number;
+    decisions: Array<Omit<ServerRequestDecision, "wireValue">>;
+  };
 };
 
 export type PushSender = {
@@ -119,7 +131,8 @@ export class ApnsPushSender implements PushSender {
         category: apnsCategory(notification.category),
         "thread-id": notification.threadId ?? notification.sessionId
       },
-      sessionId: notification.sessionId
+      sessionId: notification.sessionId,
+      ...(notification.codexApproval ? { codexApproval: notification.codexApproval } : {})
     });
     // Per-device delivery is independent: one stale token (APNs 410 is
     // routine) must not fail the whole send, or the durable outbox would

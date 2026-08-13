@@ -9,12 +9,14 @@ import type {
   PendingClaudeInteraction,
   PendingQuestion,
   PendingServerRequest,
+  ServerRequestResponse,
   StartAgentRequest,
   WebSocketClientEvent,
   WebSocketRpcRequest,
   WebSocketRpcResponse,
   WebSocketServerEvent
 } from "@perch/shared";
+import { isDeepStrictEqual } from "node:util";
 
 // The live model + reasoning effort a session is running, tracked so the fleet
 // overview and GET /sessions report exactly what an agent is using right now.
@@ -189,6 +191,7 @@ export class FleetMonitor {
   // deterministic queue the overview presents, oldest first. A session's entry
   // exists only while at least one request is open, so `has()` is the gate.
   private readonly pendingServerRequests = new Map<string, Map<string, PendingServerRequest>>();
+  private readonly submittedServerRequestResponses = new Map<string, Map<string, ServerRequestResponse>>();
   // Open AskUserQuestion prompts, alongside approvals in the overview. Both
   // gate the composer so typed text never lands in the focused widget.
   private readonly pendingQuestions = new Map<string, PendingQuestion>();
@@ -552,12 +555,7 @@ export class FleetMonitor {
     open.set(key, request);
     this.pendingServerRequests.set(canonical, open);
     this.applyExternalStatus(canonical, "needs_approval", "codex", "adapter");
-    this.pushRouter?.approvalNeeded(canonical, this.findSession(canonical), {
-      id: key,
-      summary: request.summary,
-      command: typeof request.content.command === "string" ? request.content.command : undefined,
-      at: request.at
-    });
+    this.pushRouter?.serverRequestNeeded(canonical, this.findSession(canonical), request);
     this.scheduleBroadcast();
     return true;
   }
@@ -576,6 +574,27 @@ export class FleetMonitor {
     return open?.get(serverRequestKey(requestId));
   }
 
+  prepareServerRequestResponse(
+    sessionId: string,
+    response: ServerRequestResponse
+  ): "send" | "idempotent" | "conflict" {
+    const canonical = this.canonicalSessionId(sessionId);
+    const key = serverRequestKey(response.requestId);
+    const submitted = this.submittedServerRequestResponses.get(canonical) ?? new Map<string, ServerRequestResponse>();
+    const existing = submitted.get(key);
+    if (existing) return isDeepStrictEqual(existing, response) ? "idempotent" : "conflict";
+    submitted.set(key, response);
+    this.submittedServerRequestResponses.set(canonical, submitted);
+    return "send";
+  }
+
+  resetServerRequestResponse(sessionId: string, requestId: string | number): void {
+    const canonical = this.canonicalSessionId(sessionId);
+    const submitted = this.submittedServerRequestResponses.get(canonical);
+    submitted?.delete(serverRequestKey(requestId));
+    if (submitted?.size === 0) this.submittedServerRequestResponses.delete(canonical);
+  }
+
   resolveServerRequest(sessionId: string, requestId: string | number): PendingServerRequest | undefined {
     const canonical = this.canonicalSessionId(sessionId);
     const open = this.pendingServerRequests.get(canonical);
@@ -584,6 +603,7 @@ export class FleetMonitor {
     if (!open || !pending) return undefined;
     open.delete(key);
     if (open.size === 0) this.pendingServerRequests.delete(canonical);
+    this.resetServerRequestResponse(canonical, requestId);
     void this.releasePendingInputBatch(canonical).catch(() => {});
     this.scheduleBroadcast();
     return pending;
@@ -1470,6 +1490,7 @@ export class FleetMonitor {
       this.sessionState,
       this.pendingApprovals,
       this.pendingServerRequests,
+      this.submittedServerRequestResponses,
       this.pendingQuestions,
       this.pendingClaudeInteractions,
       this.screenPrompts,

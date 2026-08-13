@@ -77,10 +77,13 @@ function approvalWakeBody(fallback: string, data: Record<string, unknown>): stri
   const context = data.context && typeof data.context === "object"
     ? data.context as Record<string, unknown>
     : {};
-  const tool = typeof context.tool === "string" ? context.tool : "Claude tool";
+  const tool = typeof context.tool === "string" ? context.tool : "Permission request";
   const command = typeof data.command === "string" ? data.command.replace(/\s+/g, " ").trim().slice(0, 180) : undefined;
   const cwd = typeof data.cwd === "string" ? data.cwd.slice(0, 180) : undefined;
-  return [fallback, tool, command, cwd ? `cwd ${cwd}` : undefined].filter(Boolean).join(" - ");
+  const attach = data.interactionKind === "pty_manual_gate" && typeof data.sessionId === "string"
+    ? `answer with perch attach ${data.sessionId}`
+    : undefined;
+  return [fallback, tool, command, cwd ? `cwd ${cwd}` : undefined, attach].filter(Boolean).join(" - ");
 }
 
 // Supervisor wake channel: boss-relevant events inject one line into a

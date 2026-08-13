@@ -36,6 +36,10 @@ type JsonRpc = {
   error?: { code: number; message: string };
 };
 
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
 type FakeTurnItem = Record<string, unknown> & { id: string; type: string };
 
 export type FakeTurn = {
@@ -55,6 +59,7 @@ type FakeThread = {
 type PendingApproval = {
   requestId: number;
   threadId: string;
+  itemId: string;
   askedOf: Set<WebSocket>;
   resolve: (answer: { result: unknown; socket: WebSocket }) => void;
 };
@@ -71,6 +76,7 @@ export type TurnStartBehavior = "ok" | "reject" | "accept-no-response" | "lose-b
 export class FakeCodexAppServer {
   readonly threads = new Map<string, FakeThread>();
   readonly requestLog: Array<{ method: string; params: Record<string, unknown> }> = [];
+  readonly approvalCompletions: Array<{ requestId: number; itemId: string; status: "completed" | "declined" }> = [];
   nextTurnStartBehavior: TurnStartBehavior = "ok";
   rejectionError = { code: -32000, message: "turn refused by fake policy" };
   // Thread ids whose rollout "was never written": thread/resume fails with
@@ -191,16 +197,28 @@ export class FakeCodexAppServer {
   ): { requestId: number; answer: Promise<{ result: unknown }> } {
     const thread = this.thread(threadId);
     const requestId = ++this.approvalCounter;
+    const itemId = typeof params.itemId === "string" ? params.itemId : `item_${requestId}`;
     const askedOf = new Set(thread.subscribers);
     const answer = new Promise<{ result: unknown; socket: WebSocket }>((resolve) => {
-      this.approvals.set(requestId, { requestId, threadId, askedOf, resolve });
+      this.approvals.set(requestId, { requestId, threadId, itemId, askedOf, resolve });
+    });
+    this.notifySubscribers(thread, "item/started", {
+      threadId,
+      turnId: thread.activeTurnId,
+      item: {
+        id: itemId,
+        type: "commandExecution",
+        status: "inProgress",
+        command: params.command,
+        cwd: params.cwd
+      }
     });
     for (const socket of askedOf) {
       this.send(socket, {
         jsonrpc: "2.0",
         id: requestId,
         method: "item/commandExecution/requestApproval",
-        params: { threadId, turnId: thread.activeTurnId, itemId: `item_${requestId}`, ...params }
+        params: { threadId, turnId: thread.activeTurnId, itemId, ...params }
       });
     }
     return { requestId, answer: answer.then(({ result }) => ({ result })) };
@@ -235,14 +253,26 @@ export class FakeCodexAppServer {
     approval.resolve({ result: msg.result, socket: ws });
     const thread = this.threads.get(approval.threadId);
     if (!thread) return;
-    for (const other of approval.askedOf) {
-      if (other === ws || other.readyState !== other.OPEN) continue;
-      this.send(other, {
+    for (const subscriber of approval.askedOf) {
+      if (subscriber.readyState !== subscriber.OPEN) continue;
+      this.send(subscriber, {
         jsonrpc: "2.0",
         method: "serverRequest/resolved",
         params: { requestId: approval.requestId, threadId: approval.threadId }
       });
     }
+    const decision = isRecord(msg.result) ? msg.result.decision : undefined;
+    const status = decision === "decline" || decision === "cancel" ? "declined" : "completed";
+    this.approvalCompletions.push({ requestId: approval.requestId, itemId: approval.itemId, status });
+    this.notifySubscribers(thread, "item/completed", {
+      threadId: approval.threadId,
+      turnId: thread.activeTurnId,
+      item: {
+        id: approval.itemId,
+        type: "commandExecution",
+        status
+      }
+    });
   }
 
   private handleRequest(ws: WebSocket, msg: JsonRpc): void {

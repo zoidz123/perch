@@ -897,6 +897,23 @@ async function dispatchWebSocketRpc(
     const canonicalSessionId = canonicalSessionIdFor(options.adapter, sessionId);
     const decision = body.decision;
     if (typeof decision !== "string" || decision.length === 0) return rpcError(400, "decision must be a non-empty string");
+    if (options.monitor.pendingServerRequest(canonicalSessionId)) {
+      const result = submitCodexServerRequestResponse(
+        options,
+        canonicalSessionId,
+        body as unknown as ServerRequestResponse
+      );
+      if (result.status < 400) {
+        await audit(options.auditLog, {
+          action: isNegativeDecision(decision) ? "deny" : "approve",
+          sessionId: canonicalSessionId,
+          requestId: auditValue(body.requestId),
+          decision,
+          ...auditPeer
+        });
+      }
+      return result;
+    }
     const pending = options.monitor.pendingApproval(canonicalSessionId);
     if (!pending) return rpcError(409, "No pending approval for this session");
     if (typeof body.id === "string" && body.id.length > 0 && body.id !== pending.id) {
@@ -920,7 +937,7 @@ async function dispatchWebSocketRpc(
       );
       if (result.status >= 400) return { status: result.status, body: result.body };
       await audit(options.auditLog, {
-        action: decision === "allow" ? "approve" : "deny",
+        action: decision === "allow" || decision.startsWith("allow_always:") ? "approve" : "deny",
         sessionId: canonicalSessionId,
         approvalId: body.id,
         decision,
@@ -998,6 +1015,29 @@ async function dispatchWebSocketRpc(
       at: new Date().toISOString()
     });
     return rpcOk(202, { ok: true, pending: true });
+  }
+
+  const serverRequestMatch = pathname.match(/^\/sessions\/([^/]+)\/server-request$/);
+  if (method === "POST" && serverRequestMatch) {
+    const canonicalSessionId = canonicalSessionIdFor(
+      options.adapter,
+      decodeURIComponent(serverRequestMatch[1] ?? "")
+    );
+    const result = submitCodexServerRequestResponse(
+      options,
+      canonicalSessionId,
+      body as unknown as ServerRequestResponse
+    );
+    if (result.status < 400) {
+      await audit(options.auditLog, {
+        action: isNegativeDecision(body.decision) ? "deny" : "approve",
+        sessionId: canonicalSessionId,
+        requestId: auditValue(body.requestId),
+        decision: auditValue(body.decision),
+        ...auditPeer
+      });
+    }
+    return result;
   }
 
   const answerMatch = pathname.match(/^\/sessions\/([^/]+)\/answer$/);
@@ -1759,37 +1799,17 @@ async function route(
       const sessionId = decodeURIComponent(serverRequestMatch[1] ?? "");
       const canonicalSessionId = canonicalSessionIdFor(options.adapter, sessionId);
       const body = await readJson<ServerRequestResponse>(request);
-      if (typeof body.requestId !== "string" && typeof body.requestId !== "number") {
-        throw new Error("requestId must be a string or number");
+      const result = submitCodexServerRequestResponse(options, canonicalSessionId, body);
+      if (result.status < 400) {
+        await audit(options.auditLog, {
+          action: isNegativeDecision(body.decision) ? "deny" : "approve",
+          sessionId: canonicalSessionId,
+          requestId: auditValue(body.requestId),
+          decision: body.decision,
+          remoteAddress: request.socket.remoteAddress
+        });
       }
-      // Several requests can be open at once; answer exactly the id named,
-      // whether or not it is the queue head the overview currently shows.
-      const pending = options.monitor.pendingServerRequestById(canonicalSessionId, body.requestId);
-      if (!pending) {
-        if (options.monitor.pendingServerRequest(canonicalSessionId)) {
-          writeJson(response, 409, { error: "The structured server request has changed" });
-        } else {
-          writeJson(response, 409, { error: "No structured server request for this session" });
-        }
-        return;
-      }
-      if (!options.codexOwned?.respondToServerRequest(canonicalSessionId, body)) {
-        writeJson(response, 409, { error: "The response is stale or invalid for this request" });
-        return;
-      }
-      await audit(options.auditLog, {
-        action: body.decision === "decline" || body.decision === "deny" || body.decision === "cancel" ? "deny" : "approve",
-        sessionId: canonicalSessionId,
-        remoteAddress: request.socket.remoteAddress
-      });
-      options.monitor.publish({
-        type: "message",
-        sessionId: canonicalSessionId,
-        role: "system",
-        text: "Response sent; waiting for Codex confirmation",
-        at: new Date().toISOString()
-      });
-      writeJson(response, 202, { ok: true, pending: true });
+      writeJson(response, result.status, result.body);
       return;
     }
 
@@ -1803,7 +1823,21 @@ async function route(
       }
 
       if (options.monitor.pendingServerRequest(canonicalSessionId)) {
-        writeJson(response, 409, { error: "This approval requires a structured app-server response" });
+        const result = submitCodexServerRequestResponse(
+          options,
+          canonicalSessionId,
+          body as unknown as ServerRequestResponse
+        );
+        if (result.status < 400) {
+          await audit(options.auditLog, {
+            action: isNegativeDecision(body.decision) ? "deny" : "approve",
+            sessionId: canonicalSessionId,
+            requestId: auditValue(body.requestId),
+            decision: body.decision,
+            remoteAddress: request.socket.remoteAddress
+          });
+        }
+        writeJson(response, result.status, result.body);
         return;
       }
 
@@ -1841,7 +1875,7 @@ async function route(
         );
         if (result.status < 400) {
           await audit(options.auditLog, {
-            action: body.decision === "allow" ? "approve" : "deny",
+            action: body.decision === "allow" || body.decision.startsWith("allow_always:") ? "approve" : "deny",
             sessionId: canonicalSessionId,
             approvalId: body.id,
             decision: body.decision,
@@ -4020,7 +4054,9 @@ async function handleHookReport(
     // payload shape: codex emits Claude-compatible flat payloads, so shape
     // detection cannot distinguish them.
     const sessions = await options.adapter.listSessions();
-    const agent = sessions.find((session) => session.id === sessionId)?.agent;
+    const runtime = options.tasks.stateDb.runtimes.findBySession(sessionId) ??
+      options.tasks.stateDb.ownerRuntimes.findBySession(sessionId);
+    const agent = sessions.find((session) => session.id === sessionId)?.agent ?? runtime?.agent;
     const format = agent === "codex" ? ("codex" as const) : ("claude" as const);
     const usageLimit = agent === "claude" ? usageLimitFromClaudeHook(payload) : undefined;
     if (hookEventName(payload) === "SessionStart" && normalized.correlation?.agentSessionId) {
@@ -4108,8 +4144,16 @@ async function handleHookReport(
       }
     }
 
+    const codexPermissionTelemetry = format === "codex" && eventName === "PermissionRequest";
     if (normalized.status) {
-      options.monitor.applyExternalStatus(sessionId, normalized.status);
+      // Codex emits PermissionRequest while its configured reviewer evaluates
+      // policy. Only a server-initiated JSON-RPC request means a human is
+      // actually needed; the hook is quiet liveness telemetry and must not
+      // gate input or overwrite the app-server's authoritative status.
+      options.monitor.applyExternalStatus(
+        sessionId,
+        codexPermissionTelemetry ? "running" : normalized.status
+      );
     }
     if (usageLimit) {
       options.monitor.reportUsageLimit(sessionId, "claude", usageLimit);
@@ -4136,7 +4180,7 @@ async function handleHookReport(
     }
     if (normalized.approval && format === "claude" && eventName === "PermissionRequest") {
       structuredClaudeApprovalId = options.claudeApprovals!.register(sessionId, payload).record.id;
-    } else if (normalized.approval) {
+    } else if (normalized.approval && !codexPermissionTelemetry) {
       const at = new Date().toISOString();
       options.monitor.setPendingApproval(sessionId, {
         id: normalized.approval.id,
@@ -4144,7 +4188,6 @@ async function handleHookReport(
         command: normalized.approval.command,
         at,
         source: "hook",
-        ...(format === "codex" ? { remoteResolutionUnavailable: true } : {})
       });
       options.monitor.publish({
         type: "approval_request",
@@ -4366,6 +4409,72 @@ function canonicalSessionIdFor(adapter: AgentAdapter, sessionId: string): string
 
 function withCanonicalSessionId(event: AgentEvent, sessionId: string): AgentEvent {
   return event.sessionId === sessionId ? event : ({ ...event, sessionId } as AgentEvent);
+}
+
+function submitCodexServerRequestResponse(
+  options: HttpServerOptions,
+  canonicalSessionId: string,
+  body: ServerRequestResponse
+): RpcResult {
+  if (typeof body.requestId !== "string" && typeof body.requestId !== "number") {
+    return rpcError(400, "requestId must be a string or number");
+  }
+  const pending = options.monitor.pendingServerRequestById(canonicalSessionId, body.requestId);
+  if (!pending) {
+    return options.monitor.pendingServerRequest(canonicalSessionId)
+      ? rpcError(409, "The structured server request has changed")
+      : rpcError(409, "No structured server request for this session");
+  }
+  if (body.threadId !== pending.threadId) {
+    return rpcError(409, "The Codex approval thread has changed");
+  }
+  if (body.runtimeGeneration !== (pending.runtimeGeneration ?? null)) {
+    return rpcError(409, "The Codex approval runtime generation has changed");
+  }
+  if (pending.family === "request_user_input") {
+    if (!body.content || typeof body.content !== "object" || Array.isArray(body.content)) {
+      return rpcError(400, "content is required for this Codex input request");
+    }
+  } else if (
+    typeof body.decision !== "string" ||
+    !pending.decisions.some((decision) => decision.id === body.decision)
+  ) {
+    return rpcError(400, "decision is not offered for this Codex approval");
+  }
+
+  const response: ServerRequestResponse = {
+    requestId: pending.requestId,
+    threadId: pending.threadId,
+    runtimeGeneration: pending.runtimeGeneration ?? null,
+    ...(body.decision !== undefined ? { decision: body.decision } : {}),
+    ...(body.content !== undefined ? { content: body.content } : {})
+  };
+  const state = options.monitor.prepareServerRequestResponse(canonicalSessionId, response);
+  if (state === "conflict") {
+    return rpcError(409, "The response conflicts with the decision already sent for this Codex approval");
+  }
+  if (state === "send" && !options.codexOwned?.respondToServerRequest(canonicalSessionId, response)) {
+    options.monitor.resetServerRequestResponse(canonicalSessionId, pending.requestId);
+    return rpcError(409, "The response is stale or invalid for this request");
+  }
+  if (state === "send") {
+    options.monitor.publish({
+      type: "message",
+      sessionId: canonicalSessionId,
+      role: "system",
+      text: "Response sent; waiting for Codex confirmation",
+      at: new Date().toISOString()
+    });
+  }
+  return rpcOk(202, { ok: true, pending: true, idempotent: state === "idempotent" });
+}
+
+function isNegativeDecision(decision: unknown): boolean {
+  return decision === "decline" || decision === "deny" || decision === "cancel";
+}
+
+function auditValue(value: unknown): string | undefined {
+  return typeof value === "string" ? value : typeof value === "number" ? String(value) : undefined;
 }
 
 function rpcOk(status: number, body: unknown): RpcResult {
