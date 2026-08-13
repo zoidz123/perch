@@ -139,6 +139,19 @@ test("the observed 14:43:56 PermissionDenied remains evidence without gating inp
   }
 });
 
+test("PermissionDenied without tool context never invents a Claude tool label", () => {
+  const f = fixture();
+  try {
+    const record = f.coordinator.observePermissionDenied(SESSION_ID, {
+      hook_event_name: "PermissionDenied",
+      session_id: "claude-session"
+    });
+    assert.equal(record.summary, "Permission was denied");
+  } finally {
+    f.close();
+  }
+});
+
 test("startup replay demotes a legacy observed pending and flushes queued input", async () => {
   const f = fixture();
   try {

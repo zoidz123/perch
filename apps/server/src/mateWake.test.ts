@@ -63,6 +63,29 @@ test("wakeLine renders a needs_decision from the worker's own message", () => {
   assert.equal(line, "[perch] fix-the-auth-a1b2 · needs_decision: which branch?");
 });
 
+test("approval wake copy never invents Claude and names the attach command only for Claude PTY gates", () => {
+  assert.equal(
+    wakeLine(task(), {
+      kind: "needs_decision",
+      message: "Allow this action?",
+      data: { reason: "approval_request", command: "npm test" }
+    }),
+    "[perch] fix-the-auth-a1b2 · needs_decision: Allow this action? - Permission request - npm test"
+  );
+  assert.equal(
+    wakeLine(task(), {
+      kind: "needs_decision",
+      message: "Trust this directory?",
+      data: {
+        reason: "approval_request",
+        interactionKind: "pty_manual_gate",
+        sessionId: "pty:claude-1"
+      }
+    }),
+    "[perch] fix-the-auth-a1b2 · needs_decision: Trust this directory? - Permission request - answer with perch attach pty:claude-1"
+  );
+});
+
 // ---------------------------------------------------------------------------
 // Mailbox routing and the disposable nudge
 // ---------------------------------------------------------------------------

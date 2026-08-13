@@ -5,6 +5,7 @@ import SwiftUI
 // answered through the waiting hook; only degraded prompts use local UI.
 struct ApprovalCard: View {
     let approval: PendingApproval
+    let sessionId: String
     let onDecision: (String) async -> Void
 
     @State private var deciding = false
@@ -43,9 +44,9 @@ struct ApprovalCard: View {
             }
 
             if approval.remoteResolutionUnavailable == true {
-                Text(approval.requestVersion == 1
-                    ? "Remote approval expired or disconnected. Answer Claude's native dialog on the desktop."
-                    : "Structured remote resolution is unavailable. Answer this prompt in the desktop Codex session.")
+                Text(approval.interactionKind == "pty_manual_gate"
+                    ? "Answer on your Mac: run `perch attach \(sessionId)`, then choose in Claude's dialog."
+                    : "Remote resolution is unavailable for this prompt.")
                     .font(.system(size: 12, weight: .medium))
                     .foregroundStyle(Style.warningText)
                     .fixedSize(horizontal: false, vertical: true)
@@ -160,9 +161,15 @@ struct StructuredRequestCard: View {
                 .tracking(1.1)
                 .foregroundStyle(Style.warningText)
 
-            Text(request.summary)
-                .font(.system(size: 13.5, weight: .medium))
-                .foregroundStyle(Style.textPrimary)
+            if case let .string(reason) = request.content["reason"] {
+                Text("Reason: \(reason)")
+                    .font(.system(size: 13.5, weight: .medium))
+                    .foregroundStyle(Style.textPrimary)
+            } else {
+                Text(request.summary)
+                    .font(.system(size: 13.5, weight: .medium))
+                    .foregroundStyle(Style.textPrimary)
+            }
 
             if case let .string(command) = request.content["command"] {
                 Text(command)
@@ -173,6 +180,13 @@ struct StructuredRequestCard: View {
                     .frame(maxWidth: .infinity, alignment: .leading)
                     .background(Color.black.opacity(0.4))
                     .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
+            }
+
+            if case let .string(cwd) = request.content["cwd"] {
+                Text("cwd: \(cwd)")
+                    .font(.system(size: 11.5, weight: .medium, design: .monospaced))
+                    .foregroundStyle(Style.textSecondary)
+                    .lineLimit(2)
             }
 
             if request.family == "request_user_input" {
@@ -282,3 +296,63 @@ private struct StructuredQuestion: Identifiable {
         }
     }
 }
+
+#if DEBUG
+// Deterministic simulator-only fixture for the required approval-card visual
+// check. Its three choices match the option set observed from the isolated
+// Codex 0.146.0 app-server escalation probe.
+struct ApprovalScreenshotPreview: View {
+    private let request = PendingServerRequest(
+        requestId: .number(0),
+        threadId: "019ffbfb-probe",
+        turnId: "turn-probe",
+        runtimeGeneration: 1,
+        itemId: "item-probe",
+        callId: nil,
+        family: "command_execution",
+        summary: "Codex needs permission to run a command",
+        content: [
+            "reason": .string("This command writes outside the workspace sandbox."),
+            "command": .string("touch /tmp/perch-real-approval-probe"),
+            "cwd": .string("/Users/kevin/Projects/perch")
+        ],
+        decisions: [
+            ServerRequestDecision(id: "accept", label: "Allow", destructive: nil, persistence: nil),
+            ServerRequestDecision(
+                id: "acceptWithExecpolicyAmendment",
+                label: "Allow and remember rule",
+                destructive: nil,
+                persistence: "always"
+            ),
+            ServerRequestDecision(id: "cancel", label: "Cancel", destructive: true, persistence: nil)
+        ],
+        persistence: nil,
+        at: "2026-08-13T16:00:00.000Z"
+    )
+
+    var body: some View {
+        NavigationStack {
+            ScrollView {
+                VStack(alignment: .leading, spacing: 16) {
+                    Text("Codex worker")
+                        .font(.system(size: 30, weight: .bold))
+                        .foregroundStyle(Style.textPrimary)
+                    Text("A real app-server request is waiting for your decision.")
+                        .font(.system(size: 14))
+                        .foregroundStyle(Style.textSecondary)
+                    StructuredRequestCard(request: request) { _, _ in }
+                }
+                .padding(Style.pageInset)
+            }
+            .background(Style.canvas.ignoresSafeArea())
+            .toolbar {
+                ToolbarItem(placement: .topBarLeading) {
+                    Image(systemName: "bird.fill")
+                        .foregroundStyle(Style.accent)
+                }
+            }
+        }
+        .preferredColorScheme(.dark)
+    }
+}
+#endif

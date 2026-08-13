@@ -13,7 +13,7 @@ import { resolveApprovalForTask, surfaceApprovalToTask } from "./agentLauncher.j
 import { AuditLog } from "./audit.js";
 import { FleetMonitor, type FleetMonitorOptions } from "./fleetMonitor.js";
 import { HookRegistry } from "./hooks.js";
-import { createControlServer } from "./http.js";
+import { createControlServer, handleWebSocketRpcRequest } from "./http.js";
 import { DeviceRegistry } from "./pairing.js";
 import { PrPoller } from "./prPoller.js";
 import { PromptDeliveryTracker, promptDeliverySurface } from "./promptDeliveries.js";
@@ -192,7 +192,7 @@ async function startServer(
   const hooks = new HookRegistry();
   const timeline = new TimelineStore();
   timeline.observe((item) => promptDeliveries.acknowledgeTimeline(item));
-  const server = createControlServer({
+  const serverOptions = {
     adapter,
     auditLog: new AuditLog(join(home, "audit.jsonl")),
     authToken: "test-token",
@@ -209,7 +209,8 @@ async function startServer(
       throw new Error("gh disabled in tests");
     }),
     promptDeliveries
-  });
+  };
+  const server = createControlServer(serverOptions);
   await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
   const port = (server.address() as AddressInfo).port;
   return {
@@ -219,6 +220,7 @@ async function startServer(
     tasks,
     hooks,
     promptDeliveries,
+    options: serverOptions,
     async close() {
       promptDeliveries.stop();
       timeline.stop();
@@ -971,6 +973,51 @@ test("a Codex prompt without a structured request cannot be answered with a gues
   });
 });
 
+test("Codex PermissionRequest hook telemetry creates no approval, push, or needs_decision", async () => {
+  const pushes: PushNotification[] = [];
+  const adapter = new RecordingAdapter();
+  adapter.session.agent = undefined;
+  const pushRouter = new PushRouter({
+    push: { send: (notification) => pushes.push(notification) },
+    projectName: () => "perch",
+    findSession: () => adapter.session
+  });
+
+  await withServer(async ({ port, monitor, tasks, hooks }) => {
+    const task = tasks.update(tasks.create({ title: "auto-reviewed command", project: "/repo" }).id, {
+      sessionId: SESSION_ID
+    });
+    tasks.stateDb.runtimes.create({
+      taskId: task.id,
+      generation: 0,
+      state: "live",
+      agent: "codex",
+      provider: "codex",
+      providerSessionId: "codex-thread-1",
+      ptySessionId: SESSION_ID
+    });
+    tasks.recordEvent(task.id, { kind: "working", source: "system" });
+    const { token } = hooks.register(SESSION_ID);
+
+    const response = await postHook(port, token, {
+      hook_event_name: "PermissionRequest",
+      session_id: "codex-thread-1",
+      cwd: "/repo",
+      tool_name: "Bash",
+      tool_input: { command: "npm test" }
+    });
+    assert.equal(response.status, 200);
+
+    assert.equal(monitor.pendingApproval(SESSION_ID), undefined);
+    assert.equal(pushes.length, 0);
+    assert.equal(
+      tasks.events(task.id).filter((event) => event.kind === "needs_decision").length,
+      0
+    );
+    assert.equal(monitor.withLiveState([adapter.session])[0]?.status, "running");
+  }, { pushRouter }, adapter);
+});
+
 test("generic Claude approvals wait for a provider status barrier and reject duplicate responses", async () => {
   await withServer(async ({ port, adapter, monitor, tasks }) => {
     const task = tasks.update(tasks.create({ title: "run tests", project: "/repo" }).id, { sessionId: SESSION_ID });
@@ -1037,6 +1084,133 @@ test("Claude PermissionRequest hook blocks on durable CAS and returns exact stru
     });
     assert.deepEqual(adapter.writes, []);
     assert.equal(monitor.pendingApproval(SESSION_ID)?.state, "decision_sent");
+  });
+});
+
+test("Claude PermissionRequest exact durable rule option round-trips through the phone API", async () => {
+  await withServer(async ({ port, adapter, monitor, hooks }) => {
+    const { token } = hooks.register(SESSION_ID);
+    const hookResponse = postHook(port, token, {
+      hook_event_name: "PermissionRequest",
+      session_id: "claude-session-rule",
+      cwd: "/tmp",
+      tool_name: "Bash",
+      tool_input: { command: "git status --short" },
+      permission_suggestions: [{ type: "addRules", destination: "userSettings", rules: ["Bash(git status:*)"] }]
+    });
+    let pending = monitor.pendingApproval(SESSION_ID);
+    for (let index = 0; !pending && index < 100; index += 1) {
+      await new Promise((resolve) => setTimeout(resolve, 5));
+      pending = monitor.pendingApproval(SESSION_ID);
+    }
+    const ruleDecision = pending?.decisions?.find((decision) => decision.id.startsWith("allow_always:"));
+    assert.ok(ruleDecision, "the phone surface receives the exact durable rule choice");
+
+    const decision = await fetch(`http://127.0.0.1:${port}/sessions/${encodeURIComponent(SESSION_ID)}/approve`, {
+      method: "POST",
+      headers: { authorization: "Bearer test-token", "content-type": "application/json" },
+      body: JSON.stringify({
+        id: pending!.id,
+        decision: ruleDecision.id,
+        requestVersion: 1,
+        runtimeGeneration: pending!.runtimeGeneration ?? null
+      })
+    });
+    assert.equal(decision.status, 202);
+    const response = await hookResponse;
+    assert.equal(response.status, 200);
+    assert.deepEqual(await response.json(), {
+      hookSpecificOutput: {
+        hookEventName: "PermissionRequest",
+        decision: {
+          behavior: "allow",
+          updatedPermissions: [{ type: "addRules", destination: "userSettings", rules: ["Bash(git status:*)"] }]
+        }
+      }
+    });
+    assert.deepEqual(adapter.writes, []);
+  });
+});
+
+test("Claude PermissionRequest is answerable through relay RPC with exact id and generation", async () => {
+  await withServer(async ({ port, adapter, monitor, hooks, options }) => {
+    const { token } = hooks.register(SESSION_ID);
+    const hookResponse = postHook(port, token, {
+      hook_event_name: "PermissionRequest",
+      session_id: "claude-session-relay",
+      cwd: "/tmp",
+      tool_name: "Bash",
+      tool_input: { command: "git status --short" }
+    });
+    let pending = monitor.pendingApproval(SESSION_ID);
+    for (let index = 0; !pending && index < 100; index += 1) {
+      await new Promise((resolve) => setTimeout(resolve, 5));
+      pending = monitor.pendingApproval(SESSION_ID);
+    }
+    assert.equal(pending?.requestVersion, 1);
+
+    const stale = await handleWebSocketRpcRequest(
+      {
+        type: "rpc",
+        id: "claude-stale",
+        method: "POST",
+        path: `/sessions/${encodeURIComponent(SESSION_ID)}/approve`,
+        body: {
+          id: pending!.id,
+          decision: "deny",
+          requestVersion: 1,
+          runtimeGeneration: (pending!.runtimeGeneration ?? 0) + 1
+        }
+      },
+      { kind: "device", deviceId: "phone" },
+      options
+    );
+    assert.equal(stale.status, 409);
+
+    const decision = await handleWebSocketRpcRequest(
+      {
+        type: "rpc",
+        id: "claude-deny",
+        method: "POST",
+        path: `/sessions/${encodeURIComponent(SESSION_ID)}/approve`,
+        body: {
+          id: pending!.id,
+          decision: "deny",
+          requestVersion: 1,
+          runtimeGeneration: pending!.runtimeGeneration ?? null
+        }
+      },
+      { kind: "device", deviceId: "phone" },
+      options
+    );
+    assert.equal(decision.status, 202);
+    const duplicate = await handleWebSocketRpcRequest(
+      {
+        type: "rpc",
+        id: "claude-deny-retry",
+        method: "POST",
+        path: `/sessions/${encodeURIComponent(SESSION_ID)}/approve`,
+        body: {
+          id: pending!.id,
+          decision: "deny",
+          requestVersion: 1,
+          runtimeGeneration: pending!.runtimeGeneration ?? null
+        }
+      },
+      { kind: "device", deviceId: "phone" },
+      options
+    );
+    assert.equal(duplicate.status, 202);
+
+    const response = await hookResponse;
+    assert.equal(response.status, 200);
+    assert.deepEqual(await response.json(), {
+      hookSpecificOutput: {
+        hookEventName: "PermissionRequest",
+        decision: { behavior: "deny", message: "Denied by the boss in Perch" }
+      }
+    });
+    assert.deepEqual(adapter.writes, []);
   });
 });
 

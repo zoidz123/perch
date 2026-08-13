@@ -65,6 +65,7 @@ export class ClaudeInteractionCoordinator {
     if (prior) return prior;
     const task = this.tasks.list().find((candidate) => candidate.sessionId === sessionId);
     const runtime = this.tasks.stateDb.runtimes.findBySession(sessionId) ?? this.tasks.stateDb.ownerRuntimes.findBySession(sessionId);
+    const toolName = typeof body.tool_name === "string" && body.tool_name.trim() ? body.tool_name.trim() : undefined;
     const record = this.tasks.stateDb.claudeInteractions.create({
       kind: "permission_denied",
       state: "observed",
@@ -73,7 +74,7 @@ export class ClaudeInteractionCoordinator {
       providerRequestId,
       payload: pick(body, ["session_id", "tool_use_id", "tool_name", "permission_mode", "cwd"]),
       payloadHash: hash(stableStringify(body)),
-      summary: `${String(body.tool_name ?? "Claude tool")} permission was denied`,
+      summary: toolName ? `${toolName} permission was denied` : "Permission was denied",
       ...(runtime ? { runtimeGeneration: runtime.generation } : {}),
       ...(task ? { taskId: task.id } : {})
     });

@@ -558,7 +558,12 @@ export class CodexAppServerAdapter implements AgentAdapter {
   respondToServerRequest(sessionId: string, response: ServerRequestResponse): boolean {
     const session = this.sessions.get(sessionId);
     if (!session || !session.client.isConnected()) return false;
-    return session.client.respondToServerRequest(response.requestId, response.decision, response.content);
+    return session.client.respondToServerRequest(
+      response.requestId,
+      response.decision,
+      response.content,
+      response.threadId
+    );
   }
 
   // Read authoritative thread history for a turn containing the given

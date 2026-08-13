@@ -3,6 +3,7 @@ import type {
   AgentSessionStatus,
   PendingApproval,
   PendingQuestion,
+  PendingServerRequest,
   Task,
   TaskEventKind
 } from "@perch/shared";
@@ -188,6 +189,34 @@ export class PushRouter {
       category: approval.decisions?.length || approval.remoteResolutionUnavailable
         ? "approval_choices"
         : "approval"
+    });
+  }
+
+  serverRequestNeeded(
+    sessionId: string,
+    session: AgentSession | undefined,
+    request: PendingServerRequest
+  ): void {
+    const role = this.classify(sessionId, session);
+    const project = this.projectOf(session);
+    const actor = session?.workerName ?? (role === "mate" ? "Mate" : role === "crew" ? "Worker" : undefined);
+    const command = typeof request.content.command === "string" ? request.content.command : undefined;
+    const cwd = typeof request.content.cwd === "string" ? request.content.cwd : undefined;
+    const detail = [command ? truncateAtWord(command, 100) : undefined, cwd ? `in ${cwd}` : undefined]
+      .filter(Boolean)
+      .join(" ");
+    this.sendDetached({
+      title: actor ? `${actor} needs permission` : "Your OK needed",
+      subtitle: pushContext(session),
+      body: `${project}: ${truncateAtWord(request.summary, 100)}${detail ? ` - ${detail}` : ""}`,
+      sessionId,
+      category: "approval_choices",
+      codexApproval: {
+        requestId: request.requestId,
+        threadId: request.threadId,
+        ...(request.runtimeGeneration !== undefined ? { runtimeGeneration: request.runtimeGeneration } : {}),
+        decisions: request.decisions.map(({ wireValue: _, ...decision }) => decision)
+      }
     });
   }
 

@@ -466,6 +466,7 @@ struct PendingServerRequest: Codable, Equatable {
     let requestId: JSONRPCID
     let threadId: String
     let turnId: String?
+    let runtimeGeneration: Int?
     let itemId: String?
     let callId: String?
     let family: String

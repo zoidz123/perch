@@ -627,6 +627,7 @@ test("E2E structured approval reaches API, gates input, resolves by request id, 
       requestId: "rpc-47",
       threadId: "thr-1",
       turnId: "turn-1",
+      runtimeGeneration: 0,
       itemId: "item-1",
       callId: "call-1",
       family: "mcp_elicitation",
@@ -656,7 +657,7 @@ test("E2E structured approval reaches API, gates input, resolves by request id, 
     const response = await fetch(`${baseUrl}/sessions/${encodeURIComponent(task.sessionId)}/server-request`, {
       ...authed,
       method: "POST",
-      body: JSON.stringify({ requestId: "rpc-47", decision: "accept" })
+      body: JSON.stringify({ requestId: "rpc-47", threadId: "thr-1", runtimeGeneration: 0, decision: "accept" })
     });
     assert.equal(response.status, 202, await response.text());
     assert.equal(fx.options.tasks.find(task.id)?.state, "needs_you", "wire response waits for serverRequest/resolved");
@@ -672,9 +673,125 @@ test("E2E structured approval reaches API, gates input, resolves by request id, 
     const stale = await fetch(`${baseUrl}/sessions/${encodeURIComponent(task.sessionId)}/server-request`, {
       ...authed,
       method: "POST",
-      body: JSON.stringify({ requestId: "rpc-47", decision: "accept" })
+      body: JSON.stringify({ requestId: "rpc-47", threadId: "thr-1", runtimeGeneration: 0, decision: "accept" })
     });
     assert.equal(stale.status, 409);
+  } finally {
+    await fx.cleanup(repo);
+  }
+});
+
+test("E2E Codex approval choices round-trip through direct and relay approve paths with exact fences", async () => {
+  const fx = fixture();
+  const repo = makeRepo();
+  const baseUrl = await listen(fx.server, fx.options);
+  try {
+    const dispatched = await fetch(`${baseUrl}/tasks`, {
+      ...authed,
+      method: "POST",
+      body: JSON.stringify({ title: "all Codex decisions", project: repo, dispatch: true, agent: "codex", prompt: "go" })
+    });
+    const { task } = (await dispatched.json()) as { task: { id: string; sessionId: string } };
+    const callback = ownedCallbacks(fx, task.sessionId);
+    const decisions = ["accept", "acceptForSession", "decline", "cancel", "acceptWithExecpolicyAmendment"];
+
+    for (const [index, decision] of decisions.entries()) {
+      const request: PendingServerRequest = {
+        requestId: `choice-${index}`,
+        threadId: "thr-choices",
+        turnId: `turn-${index}`,
+        runtimeGeneration: 0,
+        itemId: `item-${index}`,
+        family: "command_execution",
+        summary: "Allow the test command?",
+        content: { reason: "Needed for the E2E proof", command: "npm test", cwd: repo },
+        decisions: decisions.map((id) => ({
+          id,
+          label: id,
+          ...(id === "decline" || id === "cancel" ? { destructive: true } : {})
+        })),
+        at: new Date().toISOString()
+      };
+      callback.onServerRequest(request);
+
+      const sessions = (await (await fetch(`${baseUrl}/sessions`, authed)).json()) as { sessions: AgentSession[] };
+      assert.deepEqual(
+        sessions.sessions[0]?.pendingServerRequest?.decisions.map((entry) => entry.id),
+        decisions,
+        "GET preserves the real ordered option set"
+      );
+      const event = fx.options.tasks.events(task.id).at(-1);
+      assert.deepEqual(
+        (event?.data?.decisions as Array<{ id: string }>).map((entry) => entry.id),
+        decisions,
+        "task event preserves the real ordered option set"
+      );
+
+      const responseBody = {
+        requestId: request.requestId,
+        threadId: request.threadId,
+        runtimeGeneration: request.runtimeGeneration,
+        decision
+      };
+      const response = index % 2 === 0
+        ? await fetch(`${baseUrl}/sessions/${encodeURIComponent(task.sessionId)}/approve`, {
+            ...authed,
+            method: "POST",
+            body: JSON.stringify(responseBody)
+          })
+        : await handleWebSocketRpcRequest(
+            {
+              type: "rpc",
+              id: `relay-${index}`,
+              method: "POST",
+              path: `/sessions/${encodeURIComponent(task.sessionId)}/approve`,
+              body: responseBody
+            },
+            { kind: "device", deviceId: "phone" },
+            fx.options
+          );
+      const status = response instanceof Response ? response.status : response.status;
+      assert.equal(status, 202);
+      assert.equal(fx.codexOwned.serverResponses.at(-1)?.response.decision, decision);
+      const sentCount = fx.codexOwned.serverResponses.length;
+
+      const duplicate = await fetch(`${baseUrl}/sessions/${encodeURIComponent(task.sessionId)}/approve`, {
+        ...authed,
+        method: "POST",
+        body: JSON.stringify(responseBody)
+      });
+      assert.equal(duplicate.status, 202, await duplicate.text());
+      assert.equal(fx.codexOwned.serverResponses.length, sentCount, "same answer is idempotent before resolution");
+
+      const conflict = await fetch(`${baseUrl}/sessions/${encodeURIComponent(task.sessionId)}/approve`, {
+        ...authed,
+        method: "POST",
+        body: JSON.stringify({ ...responseBody, decision: decision === "decline" ? "accept" : "decline" })
+      });
+      assert.equal(conflict.status, 409);
+
+      callback.onServerRequestResolved(request);
+      assert.equal(fx.options.tasks.find(task.id)?.state, "working");
+    }
+
+    const fenced: PendingServerRequest = {
+      ...structuredRequest("fenced", "Run: npm test"),
+      threadId: "thr-current",
+      runtimeGeneration: 0
+    };
+    callback.onServerRequest(fenced);
+    for (const stale of [
+      { threadId: "thr-stale", runtimeGeneration: 0 },
+      { threadId: "thr-current", runtimeGeneration: 1 }
+    ]) {
+      const response = await fetch(`${baseUrl}/sessions/${encodeURIComponent(task.sessionId)}/approve`, {
+        ...authed,
+        method: "POST",
+        body: JSON.stringify({ requestId: "fenced", decision: "accept", ...stale })
+      });
+      assert.equal(response.status, 409);
+    }
+    assert.equal(fx.codexOwned.serverResponses.length, decisions.length);
   } finally {
     await fx.cleanup(repo);
   }
@@ -699,6 +816,7 @@ function structuredRequest(requestId: string | number, summary: string): Pending
     requestId,
     threadId: "thr-1",
     turnId: "turn-1",
+    runtimeGeneration: 0,
     family: "command_execution",
     summary,
     content: { command: summary },
@@ -756,7 +874,7 @@ test("E2E overlapping Codex approvals: resolving B first keeps A pending, gated,
     const answer = await fetch(`${baseUrl}/sessions/${encodeURIComponent(task.sessionId)}/server-request`, {
       ...authed,
       method: "POST",
-      body: JSON.stringify({ requestId: "rpc-a", decision: "accept" })
+      body: JSON.stringify({ requestId: "rpc-a", threadId: "thr-1", runtimeGeneration: 0, decision: "accept" })
     });
     assert.equal(answer.status, 202, await answer.text());
     assert.equal(fx.codexOwned.serverResponses.at(-1)?.response.requestId, "rpc-a");
@@ -780,7 +898,7 @@ test("E2E overlapping Codex approvals: resolving B first keeps A pending, gated,
     const stale = await fetch(`${baseUrl}/sessions/${encodeURIComponent(task.sessionId)}/server-request`, {
       ...authed,
       method: "POST",
-      body: JSON.stringify({ requestId: "rpc-a", decision: "accept" })
+      body: JSON.stringify({ requestId: "rpc-a", threadId: "thr-1", runtimeGeneration: 0, decision: "accept" })
     });
     assert.equal(stale.status, 409);
   } finally {
@@ -812,7 +930,7 @@ test("E2E overlapping Codex approvals resolve in order and the queued request is
     const answerB = await fetch(`${baseUrl}/sessions/${encodeURIComponent(task.sessionId)}/server-request`, {
       ...authed,
       method: "POST",
-      body: JSON.stringify({ requestId: 48, decision: "accept" })
+      body: JSON.stringify({ requestId: 48, threadId: "thr-1", runtimeGeneration: 0, decision: "accept" })
     });
     assert.equal(answerB.status, 202, await answerB.text());
     assert.equal(fx.codexOwned.serverResponses.at(-1)?.response.requestId, 48);

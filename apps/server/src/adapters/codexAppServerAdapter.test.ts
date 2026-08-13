@@ -549,6 +549,51 @@ test("approvals fan out to the native TUI peer and a first answer dismisses the 
   }
 });
 
+test("isolated app-server thread completes every command approval decision after serverRequest/resolved", async () => {
+  const f = await fixture("pxa-all-approvals-");
+  try {
+    await f.adapter.startOwned({ command: "codex", agent: "codex", cwd: f.dir, sessionId: "pty:s1" });
+    await f.adapter.submitInput("pty:s1", "run the approval matrix");
+    const decisions = ["accept", "acceptForSession", "decline", "cancel", "acceptWithExecpolicyAmendment"];
+
+    for (const [index, decision] of decisions.entries()) {
+      const { requestId, answer } = f.fake.requestApproval("thr_1", {
+        command: `echo ${index}`,
+        cwd: f.dir,
+        reason: `decision ${decision}`,
+        proposedExecpolicyAmendment: ["echo"]
+      });
+      assert.ok(await until(2_000, () => f.events.serverRequests.some((request) => request.requestId === requestId)));
+      const request = f.events.serverRequests.find((candidate) => candidate.requestId === requestId)!;
+      assert.deepEqual(request.decisions.map((entry) => entry.id), decisions);
+      assert.equal(
+        f.adapter.respondToServerRequest("pty:s1", {
+          requestId,
+          threadId: "thr_1",
+          decision
+        }),
+        true
+      );
+      const wire = await answer;
+      assert.deepEqual(
+        wire.result,
+        decision === "acceptWithExecpolicyAmendment"
+          ? { decision: { acceptWithExecpolicyAmendment: { execpolicy_amendment: ["echo"] } } }
+          : { decision }
+      );
+      assert.ok(await until(2_000, () => f.events.serverRequestsResolved.some((entry) => entry.requestId === requestId)));
+      assert.deepEqual(f.fake.approvalCompletions.at(-1), {
+        requestId,
+        itemId: `item_${requestId}`,
+        status: decision === "decline" || decision === "cancel" ? "declined" : "completed"
+      });
+      assert.equal((await f.adapter.listSessions())[0]?.status, "running");
+    }
+  } finally {
+    await f.close();
+  }
+});
+
 test("an approval answered on the attached TUI resolves Perch's pending copy (mobile dismissal)", async () => {
   const f = await fixture("pxa-approval-tui-");
   let peer: CodexAppServerClient | null = null;

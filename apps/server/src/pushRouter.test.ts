@@ -148,6 +148,44 @@ test("Computer Use push names the worker, tool, app, and exact session deep link
   assert.equal(sent[0]?.category, "approval_choices");
 });
 
+test("Codex server-request push carries exact identity and ordered choices without generic actions", () => {
+  const { router, sent } = harness();
+  router.serverRequestNeeded("pty:crew", crewSession, {
+    requestId: 47,
+    threadId: "thr-1",
+    turnId: "turn-1",
+    runtimeGeneration: 3,
+    family: "command_execution",
+    summary: "Run the release check?",
+    content: { command: "npm test", cwd: "/Users/dev/projects/perch" },
+    decisions: [
+      {
+        id: "acceptWithExecpolicyAmendment",
+        label: "Allow and remember rule",
+        wireValue: { acceptWithExecpolicyAmendment: { execpolicy_amendment: ["npm", "test"] } }
+      },
+      { id: "acceptForSession", label: "Allow for session", persistence: "session" },
+      { id: "decline", label: "Deny", destructive: true },
+      { id: "cancel", label: "Cancel", destructive: true }
+    ],
+    at: new Date().toISOString()
+  });
+
+  assert.equal(sent.length, 1);
+  assert.equal(sent[0]?.category, "approval_choices");
+  assert.deepEqual(sent[0]?.codexApproval, {
+    requestId: 47,
+    threadId: "thr-1",
+    runtimeGeneration: 3,
+    decisions: [
+      { id: "acceptWithExecpolicyAmendment", label: "Allow and remember rule" },
+      { id: "acceptForSession", label: "Allow for session", persistence: "session" },
+      { id: "decline", label: "Deny", destructive: true },
+      { id: "cancel", label: "Cancel", destructive: true }
+    ]
+  });
+});
+
 test("mirrored approval task evidence does not schedule a duplicate fallback push", async () => {
   const { router, sent } = harness({ findSession: (id) => (id === "pty:crew" ? crewSession : undefined) });
   await router.deliverTaskEvent(task("t-1", { sessionId: "pty:crew", state: "needs_you" }), {
