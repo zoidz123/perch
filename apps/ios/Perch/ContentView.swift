@@ -1759,14 +1759,14 @@ struct SessionDetailView: View {
                     .padding(.horizontal, 12)
                 }
 
-                if store.lastSubmitQueued || (session?.queuedCount ?? 0) > 0 {
+                if let sendState = store.sendState(for: sessionId) {
                     HStack(spacing: 6) {
-                        Image(systemName: "clock")
+                        Image(systemName: sendState.systemImage)
                             .font(.system(size: 11, weight: .semibold))
-                        Text("Queued - sends when the agent is free")
+                        Text(sendState.label)
                             .font(.system(size: 12, weight: .medium))
                     }
-                    .foregroundStyle(Style.warningText)
+                    .foregroundStyle(sendState == .queuedWhileBusy ? Style.warningText : Style.textSecondary)
                     .frame(maxWidth: .infinity, alignment: .leading)
                     .padding(.horizontal, Style.pageInset)
                 }

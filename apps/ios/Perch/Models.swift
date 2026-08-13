@@ -289,9 +289,60 @@ struct AgentSession: Identifiable, Codable, Equatable {
     let pendingClaudeInteraction: PendingClaudeInteraction?
     // Composer messages held server-side until the session can accept input.
     let queuedCount: Int?
+    // The most recent server-owned composer delivery. Older servers omit this
+    // entirely, in which case the client keeps its presentation neutral.
+    let inputDelivery: InputDeliveryState?
     // Durable logical-worker identity. This remains meaningful when its PTY
     // session is absent and is never inferred from WebSocket connectivity.
     let runtime: RuntimeSnapshotModel?
+}
+
+struct InputDeliveryState: Codable, Equatable {
+    let enqueuedAt: String?
+    let releasedAt: String?
+    let confirmedAt: String?
+}
+
+enum ComposerSendState: Equatable {
+    case sending
+    case queuedWhileBusy
+    case settled
+
+    static func resolve(
+        delivery: InputDeliveryState?,
+        queuedCount: Int?,
+        agentStatus: AgentSessionStatus
+    ) -> ComposerSendState {
+        if delivery?.confirmedAt != nil {
+            return .settled
+        }
+        if (queuedCount ?? 0) > 0, agentStatus == .running {
+            return .queuedWhileBusy
+        }
+        return .sending
+    }
+
+    var label: String {
+        switch self {
+        case .sending:
+            return "Sending..."
+        case .queuedWhileBusy:
+            return "Queued - agent is busy"
+        case .settled:
+            return "Delivered"
+        }
+    }
+
+    var systemImage: String {
+        switch self {
+        case .sending:
+            return "arrow.up.circle"
+        case .queuedWhileBusy:
+            return "clock"
+        case .settled:
+            return "checkmark.circle"
+        }
+    }
 }
 
 struct PromptDeliveryWarning: Codable, Equatable {
