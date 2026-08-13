@@ -317,3 +317,57 @@ test("attach fails clearly for a Codex session with no attachCommand", async () 
     await harness.close();
   }
 });
+
+// Codex hands every dynamic tool call to all clients attached to the thread and
+// keeps the first answer; the native TUI answers "Dynamic tool calls are not
+// available in TUI yet". Attaching it therefore suspends that session's Perch
+// reporting, review, and delivery tools until it detaches, so the native attach
+// path says so before it hands over the terminal. Claude sessions mirror the
+// Perch-owned PTY and are unaffected.
+test("attaching the native Codex TUI warns that it suspends the worker's custom tools", async () => {
+  const harness = await startHarness([
+    {
+      id: "pty:codex-owned-1",
+      agent: "codex",
+      status: "working",
+      title: "codex worker",
+      attachCommand: "codex resume thr-777 --remote unix:///tmp/perch-test/codex.sock",
+      lastActivityAt: new Date().toISOString()
+    }
+  ]);
+  try {
+    const result = await harness.run(["attach", "codex-ow"]);
+    assert.equal(result.code, 0);
+    assert.match(result.stderr, /suspends this worker's custom tool calls \(reporting, review, delivery\)/);
+    assert.match(result.stderr, /until you detach/);
+    assert.match(result.stderr, /Codex TUI limitation/);
+    // The warning precedes the handover, never trails it.
+    assert.ok(
+      result.stderr.indexOf("suspends this worker's custom tool calls") <
+        result.stderr.indexOf("Attaching native Codex TUI"),
+      "the warning must print before the attach line"
+    );
+  } finally {
+    await harness.close();
+  }
+});
+
+test("attaching a Claude session never warns about suspended custom tools", async () => {
+  const harness = await startHarness([
+    {
+      id: "pty:claude-1",
+      agent: "claude",
+      status: "working",
+      title: "claude worker",
+      lastActivityAt: new Date().toISOString()
+    }
+  ]);
+  try {
+    const result = await harness.run(["attach", "claude-1"]);
+    assert.equal(result.code, 0);
+    assert.doesNotMatch(result.stderr, /custom tool calls/);
+    assert.doesNotMatch(result.stderr, /Codex TUI limitation/);
+  } finally {
+    await harness.close();
+  }
+});

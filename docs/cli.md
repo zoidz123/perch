@@ -1,6 +1,6 @@
 # Perch CLI
 
-This guide describes `perchctl@0.1.17`.
+This guide describes `perchctl@0.1.18`.
 `perch --help` prints the canonical command list, and `perch --version` prints the version from the root package manifest.
 Every command supports `--help` or `-h` without starting a server or provider session.
 Use `perch help <command>` as an equivalent form.
@@ -15,7 +15,6 @@ perch codex [options] [codex args...]
 perch run [options] -- <command> [args...]
 perch ls
 perch tasks [--json]
-perch show [cmux] [--all] [--once]
 perch attach [options] <session-id>
 perch stop <session-id>
 perch recover task <task-id>
@@ -28,26 +27,14 @@ Press `Ctrl+]` to detach from an attached terminal without stopping its process.
 `perch attach` routes by how the session is owned.
 Claude and `perch run` sessions mirror the Perch-owned terminal as a thin client; `Ctrl+]` detaches.
 Codex sessions are app-server-owned with no mirrored terminal: `perch attach` launches the native Codex TUI using the session record's attach command (`codex resume <threadId> --remote unix://<socket>`), and exiting the TUI detaches while the session keeps running.
+Attaching that TUI suspends the session's custom tool calls (reporting, review, delivery) until you detach, so the CLI prints a warning first.
+Codex delivers each dynamic tool call to every client attached to the thread and keeps the first answer, and its TUI answers with "Dynamic tool calls are not available in TUI yet" (codex-cli 0.146.0); detaching restores the tools.
+Claude sessions mirror the Perch-owned terminal and are unaffected.
 The same routing applies at launch time: `perch codex` starts the session over HTTP and immediately opens the native Codex TUI from the started record's attach command.
 A fresh Codex `perch mate` is different: Perch withholds its attach command, submits the visible readiness turn, waits for that turn to complete and materialize rollout history, and only then opens the TUI.
 `perch claude` and Claude mate launches keep the WebSocket terminal mirror.
 If any Codex launch unexpectedly returns without attach metadata, the CLI prints the started session record plus a hint to retry with `perch attach <session-id>` instead of showing an empty terminal.
 `perch codex --no-attach` starts the session and exits without attaching anything.
-
-## Fleet workspaces
-
-```text
-perch show [cmux] [--all] [--once]
-```
-
-`perch show cmux` creates one named cmux workspace per live worker in the caller's cmux window.
-Each workspace runs that worker's exact `perch attach <session-id>` command, so the workers are directly selectable from the cmux sidebar.
-Workspace titles include the worker name and task title.
-The command identifies its own workspaces by a content-free session marker, so rerunning it adds only workers that are not already shown.
-`--all` includes the Mate.
-`--once` prints the attach commands without creating workspaces, which is useful for scripts.
-An explicit `perch show cmux` outside cmux prints the same commands as a graceful fallback.
-Bare `perch show` selects cmux only when it is the unambiguous active backend; otherwise it names the supported backend instead of guessing.
 
 ## Task status
 
