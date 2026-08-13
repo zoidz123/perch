@@ -53,12 +53,19 @@ struct AttachmentPickerButton: View {
     @Binding var uploading: Bool
 
     var body: some View {
+        let isUploading = uploading
         PhotosPicker(selection: $picked, maxSelectionCount: 4, matching: .images) {
-            Image(systemName: "photo")
-                .font(.system(size: 17))
-                .foregroundStyle(uploading ? Style.textSecondary : Style.textPrimary)
+            ZStack {
+                Circle()
+                    .fill(Style.secondaryFill)
+                Image(systemName: "plus")
+                    .font(.system(size: 17, weight: .semibold))
+                    .foregroundStyle(isUploading ? Style.textSecondary : Style.textPrimary)
+            }
+            .frame(width: 40, height: 40)
         }
         .disabled(uploading)
+        .accessibilityLabel("Add photo attachment")
         .onChange(of: picked) { _, items in
             guard !items.isEmpty else { return }
             Task { await upload(items) }
@@ -200,12 +207,15 @@ struct ModelChip: View {
     }
 
     private var chipLabelView: some View {
-        HStack(spacing: 4) {
-            Image(systemName: "cpu")
-            Text(chipLabel)
-        }
-        .font(.system(size: 13, weight: .medium))
-        .foregroundStyle(Style.textSecondary)
+        Text(chipLabel)
+            .lineLimit(1)
+            .truncationMode(.tail)
+            .font(.subheadline.weight(.medium))
+            .foregroundStyle(Style.textSecondary)
+            .padding(.horizontal, 10)
+            .padding(.vertical, 7)
+            .background(Style.secondaryFill, in: Capsule())
+            .overlay(Capsule().strokeBorder(Style.hairline, lineWidth: 1))
     }
 
     // The model/effort the chip reflects: a queued change when present, else the
