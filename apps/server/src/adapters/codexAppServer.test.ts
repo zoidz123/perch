@@ -90,6 +90,7 @@ async function connectedClient(overrides: Partial<{
   onTurnComplete: (ev: { message: string }) => void;
   onTurnStarted: () => void;
   onTaskEvent: (event: any) => Promise<{ success: boolean; text: string }>;
+  onWorkerReport: (report: any) => Promise<{ success: boolean; text: string }>;
   onAutoReviewRun: (input: Record<string, unknown>) => Promise<{ success: boolean; text: string }>;
   onDeliveryCreatePr: (input: Record<string, unknown>) => Promise<{ success: boolean; text: string }>;
   onUsageLimit: (ev: { provider: string; retryAt?: string; source?: string }) => void;
@@ -793,6 +794,90 @@ test("only the root thread can invoke typed AutoReview and delivery tools", asyn
   assert.equal(server.requests.find((request) => request.id === 92)?.result?.success, true);
   assert.equal(server.requests.find((request) => request.id === 93)?.result?.success, true);
   assert.equal(server.requests.find((request) => request.id === 94)?.error?.code, -32601);
+});
+
+// A routing rework must never break a SUBSET of the dynamic tools: send_report
+// broke in production while report_task_event still worked, and nothing failed
+// until a live worker tried to deliver. Drive every advertised tool through the
+// full item/tool/call -> handler -> JSON-RPC response cycle, and fail when a
+// newly registered tool has no case here.
+test("every registered dynamic tool completes its full request/response cycle", async () => {
+  const calls: Array<{ tool: string; arguments: unknown }> = [];
+  const handler = (tool: string) => async (input: unknown) => {
+    calls.push({ tool, arguments: input });
+    return { success: true, text: `${tool} accepted` };
+  };
+  const { client, server } = await connectedClient({
+    onTaskEvent: handler("report_task_event"),
+    onWorkerReport: handler("send_report"),
+    onAutoReviewRun: handler("autoreview_run"),
+    onDeliveryCreatePr: handler("delivery_create_pr")
+  });
+  await client.startThread();
+
+  const namespaces: Array<{ name: string; tools?: Array<{ name: string }> }> =
+    server.find("thread/start")?.params?.dynamicTools ?? [];
+  const advertised = namespaces.flatMap((namespace) =>
+    (namespace.tools ?? []).map((tool) => ({ namespace: namespace.name, tool: tool.name }))
+  );
+  const argumentsByTool: Record<string, Record<string, unknown>> = {
+    report_task_event: { kind: "working", message: "on it" },
+    send_report: { summary: "routing summary", report: "# full report", evidence: { ok: true } },
+    autoreview_run: { idempotencyKey: "review-1", testArgv: ["npm", "test"] },
+    delivery_create_pr: { idempotencyKey: "delivery-1" }
+  };
+  assert.deepEqual(
+    advertised.map((entry) => entry.tool).sort(),
+    Object.keys(argumentsByTool).sort(),
+    "a registered dynamic tool has no request/response coverage here"
+  );
+
+  let id = 700;
+  for (const { namespace, tool } of advertised) {
+    server.requestToClient((id += 1), "item/tool/call", {
+      threadId: "thr_1",
+      turnId: "turn_1",
+      callId: `call-${tool}`,
+      namespace,
+      tool,
+      arguments: argumentsByTool[tool]
+    });
+    await tick();
+    assert.deepEqual(
+      server.requests.find((request) => request.id === id)?.result,
+      { contentItems: [{ type: "inputText", text: `${tool} accepted` }], success: true },
+      `${tool} did not answer its dynamic tool request`
+    );
+  }
+  assert.deepEqual(
+    calls,
+    advertised.map(({ tool }) => ({ tool, arguments: argumentsByTool[tool] })),
+    "a dynamic tool reached the wrong handler, or reached it with mangled arguments"
+  );
+});
+
+// A handler that throws must still answer the request - an unanswered
+// item/tool/call hangs the worker's turn instead of failing one tool call.
+test("a failing dynamic tool handler still answers with a truthful failure", async () => {
+  const { client, server } = await connectedClient({
+    onWorkerReport: async () => {
+      throw new Error("mailbox is unavailable");
+    }
+  });
+  await client.startThread();
+
+  server.requestToClient(760, "item/tool/call", {
+    threadId: "thr_1",
+    namespace: "perch",
+    tool: "send_report",
+    arguments: { summary: "s", report: "r" }
+  });
+  await tick();
+
+  assert.deepEqual(server.requests.find((request) => request.id === 760)?.result, {
+    contentItems: [{ type: "inputText", text: "mailbox is unavailable" }],
+    success: false
+  });
 });
 
 // The Responses API rejects thread/start outright when any dynamic tool name falls
