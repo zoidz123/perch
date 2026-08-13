@@ -22,6 +22,8 @@ import { ProjectRegistry } from "./projects.js";
 import { TaskStore } from "./tasks.js";
 import { TimelineStore } from "./timeline.js";
 import { WorktreePool } from "./worktrees.js";
+import { MateMailboxNudger, MAX_MATE_MAILBOX_STOP_CONTINUATIONS } from "./mateWake.js";
+import { MAILBOX_CONTROL_PREFIX } from "./timeline.js";
 
 // HTTP contract for the lossless worker report channel and the mate mailbox
 // tools: identity ladders, explicit bounds, claim/ack fencing, bounded wait,
@@ -29,16 +31,20 @@ import { WorktreePool } from "./worktrees.js";
 
 class NoopAdapter implements AgentAdapter {
   readonly name = "fake-pty";
+  readonly sessions: AgentSession[] = [];
+  readonly submissions: Array<{ sessionId: string; text: string }> = [];
   async getTopology() {
     return { windows: [], generatedAt: "" };
   }
   async listSessions(): Promise<AgentSession[]> {
-    return [];
+    return this.sessions;
   }
   async readRecentEvents(): Promise<RecentEventsResult> {
     return { events: [], terminal: true };
   }
-  async sendInput(): Promise<void> {}
+  async sendInput(sessionId: string, text: string): Promise<void> {
+    this.submissions.push({ sessionId, text });
+  }
   async sendEnter(): Promise<void> {}
   async interrupt(): Promise<void> {}
 }
@@ -46,6 +52,9 @@ class NoopAdapter implements AgentAdapter {
 type Fixture = {
   home: string;
   port: number;
+  adapter: NoopAdapter;
+  monitor: FleetMonitor;
+  nudger: MateMailboxNudger;
   tasks: TaskStore;
   hooks: HookRegistry;
   ownerManager: OwnerManager;
@@ -55,11 +64,16 @@ async function withServer(run: (ctx: Fixture) => Promise<void>): Promise<void> {
   const home = mkdtempSync(join(tmpdir(), "perch-mailbox-http-"));
   const env = { PERCH_HOME: home } as NodeJS.ProcessEnv;
   const adapter = new NoopAdapter();
-  const monitor = new FleetMonitor(adapter, { broadcastMs: 5 });
+  let nudger: MateMailboxNudger | undefined;
+  const monitor = new FleetMonitor(adapter, {
+    broadcastMs: 5,
+    onStatusChange: (change) => nudger?.onStatusChange(change)
+  });
   const tasks = new TaskStore(env);
   const timeline = new TimelineStore();
   const hooks = new HookRegistry();
   const ownerManager = new OwnerManager(tasks);
+  nudger = new MateMailboxNudger({ mailbox: tasks.stateDb.mateMailbox, adapter, monitor });
   const options = {
     adapter,
     auditLog: new AuditLog(join(home, "audit.jsonl")),
@@ -74,6 +88,7 @@ async function withServer(run: (ctx: Fixture) => Promise<void>): Promise<void> {
     worktrees: new WorktreePool({ env }),
     tasks,
     ownerManager,
+    mailboxNudger: nudger,
     prPoller: new PrPoller(tasks, async () => {
       throw new Error("gh disabled in tests");
     })
@@ -82,7 +97,7 @@ async function withServer(run: (ctx: Fixture) => Promise<void>): Promise<void> {
   await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
   const port = (server.address() as AddressInfo).port;
   try {
-    await run({ home, port, tasks, hooks, ownerManager });
+    await run({ home, port, adapter, monitor, nudger, tasks, hooks, ownerManager });
   } finally {
     timeline.stop();
     server.closeAllConnections?.();
@@ -324,6 +339,66 @@ test("mailbox claim and acknowledgment are fenced to the live mate session; work
     const listed = (await list.json()) as { messages: Array<{ state: string }>; pending: number };
     assert.equal(listed.messages[0]!.state, "acknowledged");
     assert.equal(listed.pending, 0);
+  });
+});
+
+test("a live Claude mate drains mid-turn mail through a silent Stop continuation, then the loop guard permits one idle nudge", async () => {
+  await withServer(async ({ port, adapter, monitor, nudger, tasks, hooks, ownerManager }) => {
+    const { task } = makeWorker(tasks, hooks, "boundary mailbox", "pty:worker");
+    const mate = registerLiveMate(ownerManager, hooks);
+    adapter.sessions.push({
+      id: mate.sessionId,
+      title: "mate",
+      agent: "claude",
+      status: "running",
+      labels: { role: "mate" }
+    } as AgentSession);
+    monitor.applyExternalStatus(mate.sessionId, "running", "claude");
+    tasks.recordEvent(task.id, { kind: "blocked", source: "worker", message: "arrived during mate turn" });
+
+    for (let attempt = 0; attempt < MAX_MATE_MAILBOX_STOP_CONTINUATIONS; attempt += 1) {
+      const response = await fetch(`http://127.0.0.1:${port}/hooks`, {
+        method: "POST",
+        headers: mailboxHeaders(mate.sessionId, mate.token),
+        body: JSON.stringify({ hook_event_name: "Stop", session_id: `claude-mate-${attempt}`, stop_hook_active: attempt > 0 })
+      });
+      assert.equal(response.status, 200);
+      assert.deepEqual(await response.json(), {
+        hookSpecificOutput: {
+          hookEventName: "Stop",
+          additionalContext:
+            "Perch mailbox has unread worker messages. Drain the mailbox now with perch mailbox read, process the messages, and acknowledge each one before stopping."
+        }
+      });
+      assert.equal(monitor.sessionStatus(mate.sessionId), "running", "continued Stop never reaches the idle nudge path");
+      assert.deepEqual(adapter.submissions, [], "the continuation is hook feedback, not composer input");
+    }
+
+    const guarded = await fetch(`http://127.0.0.1:${port}/hooks`, {
+      method: "POST",
+      headers: mailboxHeaders(mate.sessionId, mate.token),
+      body: JSON.stringify({ hook_event_name: "Stop", session_id: "claude-mate-guarded", stop_hook_active: true })
+    });
+    assert.equal(guarded.status, 200);
+    assert.deepEqual(await guarded.json(), {});
+    await new Promise((resolve) => setTimeout(resolve, 25));
+    assert.equal(adapter.submissions.length, 1, "loop guard falls back to exactly one visible idle nudge");
+    assert.ok(adapter.submissions[0]!.text.startsWith(MAILBOX_CONTROL_PREFIX));
+
+    // A successful drain resets the continuation state and leaves the next
+    // normal Stop silent.
+    const now = new Date().toISOString();
+    for (const delivery of tasks.stateDb.mateMailbox.claim({ generation: mate.generation, limit: 10, ttlMs: 60_000, now })) {
+      tasks.stateDb.mateMailbox.ack({
+        id: delivery.id,
+        claimToken: delivery.claimToken!,
+        generation: mate.generation,
+        idempotencyKey: `ack-${delivery.id}`,
+        sessionId: mate.sessionId,
+        now
+      });
+    }
+    assert.equal(nudger.continueMateStop(mate.sessionId), false);
   });
 });
 

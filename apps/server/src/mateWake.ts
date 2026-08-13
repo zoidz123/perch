@@ -23,6 +23,12 @@ export const BOSS_EVENT_KINDS = new Set<TaskEventKind>([
   "runtime_interrupted"
 ]);
 
+// A Stop hook continuation gives the mate its current turn back without
+// injecting a chat message. Keep this finite even if a malformed mate keeps
+// reaching Stop without draining its mailbox; the normal idle nudge is the
+// durable fallback after the final allowed Stop.
+export const MAX_MATE_MAILBOX_STOP_CONTINUATIONS = 3;
+
 export type MailboxRoutableEvent = {
   kind: TaskEventKind;
   message?: string;
@@ -150,6 +156,7 @@ export class MateMailboxNudger {
   private pendingNudgeTarget: string | undefined;
   private nudgeInFlight: Promise<void> | undefined;
   private sweepTimer: ReturnType<typeof setInterval> | undefined;
+  private readonly stopContinuations = new Map<string, { pending: number; count: number }>();
   private readonly sweepMs: number;
 
   constructor(
@@ -181,6 +188,36 @@ export class MateMailboxNudger {
     try {
       return this.options.mailbox.hasTaskEvent(taskEventId);
     } catch {
+      return false;
+    }
+  }
+
+  // Called only for an authenticated live Claude mate's Stop hook. A positive
+  // result means the HTTP hook response should continue Stop silently and give
+  // the mate same-turn context to drain its durable mailbox. It intentionally holds no
+  // database state: restart safety remains with the existing idle nudge and
+  // janitor sweep, while this in-memory counter is only an infinite-loop fuse.
+  continueMateStop(sessionId: string): boolean {
+    try {
+      const pending = this.options.mailbox.pendingCount(new Date().toISOString());
+      if (pending === 0) {
+        this.stopContinuations.delete(sessionId);
+        return false;
+      }
+
+      const prior = this.stopContinuations.get(sessionId);
+      const count = !prior || pending < prior.pending ? 1 : prior.count + 1;
+      if (count > MAX_MATE_MAILBOX_STOP_CONTINUATIONS) {
+        this.stopContinuations.delete(sessionId);
+        return false;
+      }
+
+      this.stopContinuations.set(sessionId, { pending, count });
+      return true;
+    } catch {
+      // A hook must always fail open. The regular idle nudge and janitor sweep
+      // remain available once Claude stops normally.
+      this.stopContinuations.delete(sessionId);
       return false;
     }
   }

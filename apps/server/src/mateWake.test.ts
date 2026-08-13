@@ -6,7 +6,13 @@ import { test } from "node:test";
 import type { AgentSession, RecentEventsResult, Task } from "@perch/shared";
 import type { AgentAdapter } from "./adapters/types.js";
 import { FleetMonitor } from "./fleetMonitor.js";
-import { deliverMateAttention, isMailboxRouted, MateMailboxNudger, wakeLine } from "./mateWake.js";
+import {
+  deliverMateAttention,
+  isMailboxRouted,
+  MateMailboxNudger,
+  MAX_MATE_MAILBOX_STOP_CONTINUATIONS,
+  wakeLine
+} from "./mateWake.js";
 import { TaskStore } from "./tasks.js";
 import { MAILBOX_CONTROL_PREFIX } from "./timeline.js";
 
@@ -189,6 +195,26 @@ test("a report arriving during an active mate turn does not interrupt or steer; 
     nudger.onStatusChange({ sessionId: "pty:mate", from: "running", to: "idle", source: "adapter" });
     await new Promise((resolve) => setTimeout(resolve, 25));
     assert.equal(adapter.submissions.length, 1);
+  });
+});
+
+test("a bounded Stop continuation stays silent, then hands the unchanged backlog to the idle nudge fallback", async () => {
+  await withNudger(async ({ tasks, adapter, monitor, nudger, task: routed }) => {
+    monitor.applyExternalStatus("pty:mate", "running", "claude");
+    tasks.recordEvent(routed.id, { kind: "blocked", source: "worker", message: "drain me at the boundary" });
+
+    for (let attempt = 0; attempt < MAX_MATE_MAILBOX_STOP_CONTINUATIONS; attempt += 1) {
+      assert.equal(nudger.continueMateStop("pty:mate"), true, `continuation ${attempt + 1}`);
+      assert.equal(adapter.submissions.length, 0, "a continued turn receives no visible nudge");
+    }
+
+    assert.equal(nudger.continueMateStop("pty:mate"), false, "the loop guard permits a normal Stop");
+    monitor.applyExternalStatus("pty:mate", "idle", "claude");
+    nudger.onStatusChange({ sessionId: "pty:mate", from: "running", to: "idle", source: "hook" });
+    await delay(25);
+
+    assert.equal(adapter.submissions.length, 1, "the first genuinely idle boundary gets one fallback nudge");
+    assert.ok(adapter.submissions[0]!.text.startsWith(MAILBOX_CONTROL_PREFIX));
   });
 });
 

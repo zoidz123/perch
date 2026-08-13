@@ -1,6 +1,9 @@
 import assert from "node:assert/strict";
-import { spawnSync } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
+import { once } from "node:events";
 import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
+import { createServer } from "node:http";
+import type { AddressInfo } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
@@ -194,7 +197,9 @@ test("migrates inline commands to a shim that preserves event semantics", () => 
   assert.match(shim, /--max-time 3/);
   assert.match(shim, /--max-time 570/);
   assert.match(shim, /x-perch-observe-only: 1/);
-  assert.match(shim, /session-start\|stop/);
+  assert.match(shim, /session-start\)\n    post_echo/);
+  assert.match(shim, /stop\)\n    post_stop/);
+  assert.match(shim, /post_stop\(\)[\s\S]*--max-time 2/);
   assert.match(shim, /Perch remote approval unavailable/);
   assert.match(shim, /Perch remote question expired/);
   assert.match(shim, /Perch remote MCP interaction unavailable/);
@@ -205,6 +210,42 @@ test("migrates inline commands to a shim that preserves event semantics", () => 
   assert.deepEqual(JSON.parse(readFileSync(claudeSettingsPath(env), "utf8")), settings);
 
   rmSync(env.CLAUDE_CONFIG_DIR as string, { recursive: true, force: true });
+});
+
+test("the Stop shim fails open after its bounded local-hook timeout", async () => {
+  const env = makeEnv();
+  const server = createServer((_request, _response) => {
+    // Deliberately leave the response open to exercise curl's Stop timeout.
+  });
+  try {
+    assert.equal(installClaudeHooks(env), true);
+    await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+    const port = (server.address() as AddressInfo).port;
+    const child = spawn("sh", [perchHookPath(env), "stop"], {
+      env: {
+        ...process.env,
+        ...env,
+        PERCH_SESSION_ID: "pty:mate",
+        PERCH_HOOK_TOKEN: "test-token",
+        PERCH_HOOK_URL: `http://127.0.0.1:${port}/hooks`
+      },
+      stdio: ["pipe", "pipe", "pipe"]
+    });
+    let stdout = "";
+    let stderr = "";
+    child.stdout.on("data", (chunk: Buffer) => { stdout += chunk.toString(); });
+    child.stderr.on("data", (chunk: Buffer) => { stderr += chunk.toString(); });
+    child.stdin.end('{"hook_event_name":"Stop"}');
+
+    const [code] = await once(child, "close") as [number | null];
+    assert.equal(code, 0, "a timed-out local hook cannot trap Claude's turn");
+    assert.equal(stdout, "");
+    assert.equal(stderr, "");
+  } finally {
+    server.closeAllConnections?.();
+    await new Promise<void>((resolve) => server.close(() => resolve()));
+    rmSync(env.CLAUDE_CONFIG_DIR as string, { recursive: true, force: true });
+  }
 });
 
 test("rewriting settings preserves the original file mode", () => {
