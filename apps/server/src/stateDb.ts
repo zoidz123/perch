@@ -2035,6 +2035,22 @@ export class MateMailboxRepository {
     return row.max_key ?? undefined;
   }
 
+  // The sweep only retries a nudge when the mate has not started mailbox
+  // work since the prior attempt. Both values are durable, so a fresh server
+  // instance can safely treat an unacknowledged mailbox as needing attention.
+  latestClaimOrAckAt(): string | undefined {
+    const row = this.db
+      .prepare(
+        `SELECT max(activity_at) AS activity_at FROM (
+           SELECT claimed_at AS activity_at FROM mate_mailbox_deliveries WHERE recipient = 'mate'
+           UNION ALL
+           SELECT acked_at AS activity_at FROM mate_mailbox_deliveries WHERE recipient = 'mate'
+         ) WHERE activity_at IS NOT NULL`
+      )
+      .get() as { activity_at: string | null };
+    return row.activity_at ?? undefined;
+  }
+
   // Non-mutating snapshot in deterministic mailbox order. Listing never
   // claims and never acknowledges.
   list(options: { includeAcknowledged?: boolean; limit?: number } = {}): MateMailboxDeliveryRecord[] {

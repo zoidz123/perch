@@ -249,6 +249,7 @@ const monitor = new FleetMonitor(adapter, {
 });
 monitor.setRuntimeSnapshot((sessionId) => runtimeManager.snapshotForSession(sessionId));
 mailboxNudger = new MateMailboxNudger({ mailbox: tasks.stateDb.mateMailbox, adapter, monitor });
+mailboxNudger.start();
 void adapter
   .listSessions()
   .then((sessions) => {
@@ -852,6 +853,7 @@ async function shutdown(): Promise<void> {
     promptDeliveries.stop();
     prPoller.stop();
     reconciler.stop();
+    mailboxNudger?.stop();
     taskWatchdog?.stop();
     pushRouter.stop();
     relayClient?.stop();
