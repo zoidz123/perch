@@ -3420,35 +3420,92 @@ export class PendingSessionInputRepository {
     id: string,
     input: { deliveryId?: string; nextAttemptAt: string }
   ): PendingSessionInputRecord | undefined {
-    const result = this.db.prepare(
+    return this.beginBatchAttempt([id], input)?.[0];
+  }
+
+  beginBatchAttempt(
+    ids: readonly string[],
+    input: { deliveryId?: string; nextAttemptAt: string }
+  ): PendingSessionInputRecord[] | undefined {
+    const update = this.db.prepare(
       `UPDATE pending_session_inputs
        SET attempt_count = attempt_count + 1,
            delivery_id = coalesce(?, delivery_id),
            next_attempt_at = ?,
            last_error = NULL
        WHERE id = ? AND state = 'pending'`
-    ).run(input.deliveryId ?? null, input.nextAttemptAt, id);
-    return result.changes === 1 ? this.find(id) : undefined;
+    );
+    return this.mutatePendingBatch(
+      ids,
+      (id) => update.run(input.deliveryId ?? null, input.nextAttemptAt, id).changes
+    );
   }
 
   recordAttemptError(id: string, error: string): PendingSessionInputRecord | undefined {
-    const result = this.db.prepare(
+    return this.recordBatchAttemptError([id], error)?.[0];
+  }
+
+  recordBatchAttemptError(
+    ids: readonly string[],
+    error: string
+  ): PendingSessionInputRecord[] | undefined {
+    const update = this.db.prepare(
       "UPDATE pending_session_inputs SET last_error = ? WHERE id = ? AND state = 'pending'"
-    ).run(error, id);
-    return result.changes === 1 ? this.find(id) : undefined;
+    );
+    return this.mutatePendingBatch(ids, (id) => update.run(error, id).changes);
   }
 
   markFailed(id: string, error: string, at = new Date().toISOString()): PendingSessionInputRecord | undefined {
-    const result = this.db.prepare(
+    return this.markBatchFailed([id], error, at)?.[0];
+  }
+
+  markBatchFailed(
+    ids: readonly string[],
+    error: string,
+    at = new Date().toISOString()
+  ): PendingSessionInputRecord[] | undefined {
+    const update = this.db.prepare(
       `UPDATE pending_session_inputs
        SET state = 'failed', last_error = ?, failed_at = ?
        WHERE id = ? AND state = 'pending'`
-    ).run(error, at, id);
-    return result.changes === 1 ? this.find(id) : undefined;
+    );
+    return this.mutatePendingBatch(ids, (id) => update.run(error, at, id).changes);
   }
 
   remove(id: string): boolean {
-    return this.db.prepare("DELETE FROM pending_session_inputs WHERE id = ?").run(id).changes === 1;
+    return this.removeBatch([id]);
+  }
+
+  removeBatch(ids: readonly string[]): boolean {
+    if (ids.length === 0 || new Set(ids).size !== ids.length) return false;
+    const remove = this.db.prepare(
+      "DELETE FROM pending_session_inputs WHERE id = ? AND state = 'pending'"
+    );
+    return this.db.transaction(() => {
+      if (ids.some((id) => this.find(id)?.state !== "pending")) return false;
+      for (const id of ids) {
+        if (remove.run(id).changes !== 1) {
+          throw new Error("pending input batch changed during removal");
+        }
+      }
+      return true;
+    }).immediate();
+  }
+
+  private mutatePendingBatch(
+    ids: readonly string[],
+    mutate: (id: string) => number
+  ): PendingSessionInputRecord[] | undefined {
+    if (ids.length === 0 || new Set(ids).size !== ids.length) return undefined;
+    return this.db.transaction(() => {
+      if (ids.some((id) => this.find(id)?.state !== "pending")) return undefined;
+      for (const id of ids) {
+        if (mutate(id) !== 1) {
+          throw new Error("pending input batch changed during mutation");
+        }
+      }
+      return ids.map((id) => this.find(id)!);
+    }).immediate();
   }
 }
 
