@@ -162,6 +162,7 @@ function auditPack(pack) {
     "apps/server/assets/charts/chart.css",
     "apps/server/assets/autoreview/manifest.json",
     "apps/server/assets/autoreview/LICENSE.upstream",
+    "apps/server/assets/autoreview/perch-deletion-handling.patch",
     "apps/server/assets/autoreview/skill/SKILL.md",
     "apps/server/assets/autoreview/skill/scripts/autoreview",
     "apps/server/assets/autoreview/skill/scripts/test-review-harness",
@@ -203,6 +204,14 @@ function assertBundledAutoReview(packageRoot) {
   const manifest = JSON.parse(readFileSync(join(root, "manifest.json"), "utf8"));
   assert.equal(manifest.source.repository, "openclaw/agent-skills");
   assert.equal(manifest.source.commit, "2a409d348a4bcf6f15e41e9a20efd0b298a32528");
+  assert.equal(manifest.deviations.length, 1, "AutoReview deviation manifest must be complete");
+  const deviation = manifest.deviations[0];
+  assert.equal(deviation.baseUpstreamCommit, manifest.source.commit);
+  assert.equal(
+    createHash("sha256").update(readFileSync(join(root, deviation.patchPath))).digest("hex"),
+    deviation.patchSha256,
+    "AutoReview deviation patch hash mismatch"
+  );
   assert.equal(manifest.excludedFiles.length, 5, "AutoReview exclusion manifest must be complete");
   for (const entry of manifest.excludedFiles) {
     assert(!existsSync(join(root, entry.path)), `${entry.path} must not enter the npm package`);
