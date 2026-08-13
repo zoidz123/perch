@@ -1067,11 +1067,12 @@ export function normalizeClaudeRow(
 
   // String content: plain user prompt.
   if (typeof content === "string") {
-    if (rowType !== "user" || content.trim().length === 0 || isSyntheticUserText(content)) {
+    const userText = rowType === "user" ? normalizeClaudeUserText(content) : undefined;
+    if (!userText) {
       return [];
     }
     return [
-      makeItem(sessionId, uuid, "user", truncate(content), undefined, at, nextSeq, resolveSource?.(content))
+      makeItem(sessionId, uuid, "user", truncate(userText), undefined, at, nextSeq, resolveSource?.(userText))
     ];
   }
 
@@ -1085,9 +1086,10 @@ export function normalizeClaudeRow(
     const id = `${uuid}-${index}`;
 
     if (rowType === "user" && block.type === "text" && typeof block.text === "string") {
-      if (block.text.trim().length > 0 && !isSyntheticUserText(block.text)) {
+      const userText = normalizeClaudeUserText(block.text);
+      if (userText) {
         items.push(
-          makeItem(sessionId, id, "user", truncate(block.text), undefined, at, nextSeq, resolveSource?.(block.text))
+          makeItem(sessionId, id, "user", truncate(userText), undefined, at, nextSeq, resolveSource?.(userText))
         );
       }
     } else if (rowType === "user" && block.type === "tool_result") {
@@ -1140,9 +1142,30 @@ function makeItem(
 
 // Claude injects synthetic user rows (command output wrappers, reminders);
 // they would read as messages the human never typed.
+function normalizeClaudeUserText(text: string): string | undefined {
+  const command = unwrapClaudeSlashCommand(text);
+  if (command) return command;
+  return text.trim().length > 0 && !isSyntheticUserText(text) ? text : undefined;
+}
+
+// Claude rewrites a slash command before recording it. Reconstruct the canonical
+// composer shape so receipt matching and the boss-facing timeline both retain
+// what the human submitted instead of the provider's XML-like transport.
+function unwrapClaudeSlashCommand(text: string): string | undefined {
+  if (!text.startsWith("<command-message>") && !text.startsWith("<command-name>")) {
+    return undefined;
+  }
+  const name = text.match(/<command-name>([\s\S]*?)<\/command-name>/)?.[1]?.trim();
+  if (!name?.startsWith("/")) return undefined;
+  const args = text.match(/<command-args>([\s\S]*?)<\/command-args>/)?.[1]?.trim();
+  return args ? `${name} ${args}` : name;
+}
+
 function isSyntheticUserText(text: string): boolean {
   return (
+    text.startsWith("<command-message>") ||
     text.startsWith("<command-name>") ||
+    text.startsWith("<command-args>") ||
     text.startsWith("<local-command-stdout>") ||
     text.startsWith("<system-reminder>") ||
     text.startsWith("Caveat: ")

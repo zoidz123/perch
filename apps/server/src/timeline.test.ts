@@ -80,6 +80,35 @@ test("normalizes user prompts, assistant text, tool calls, and tool results", ()
   assert.deepEqual(seqs, [1, 2, 3, 4]);
 });
 
+test("normalizes Claude slash-command wrappers back to the submitted command", () => {
+  const resolved: string[] = [];
+  const [command] = normalizeClaudeRow(
+    "pty:mate",
+    {
+      type: "user",
+      uuid: "command-1",
+      timestamp: "2026-08-13T17:52:38.601Z",
+      message: {
+        role: "user",
+        content:
+          "<command-message>eli5</command-message>\n" +
+          "<command-name>/eli5</command-name>\n" +
+          "<command-args>how we implemented this</command-args>"
+      }
+    },
+    seqCounter(),
+    (text) => {
+      resolved.push(text);
+      return "human";
+    }
+  );
+
+  assert.equal(command?.kind, "user");
+  assert.equal(command?.text, "/eli5 how we implemented this");
+  assert.equal(command?.source, "human");
+  assert.deepEqual(resolved, ["/eli5 how we implemented this"]);
+});
+
 test("skips synthetic user rows, meta rows, and unknown shapes", () => {
   const next = seqCounter();
   const rows: Array<Record<string, unknown>> = [

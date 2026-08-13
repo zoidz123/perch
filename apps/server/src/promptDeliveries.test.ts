@@ -229,6 +229,57 @@ test("a transcript observed after timeout resolves only when its authentic times
   }
 });
 
+test("a late receipt from an earlier copy settles the active retry chain", () => {
+  const f = fixture();
+  try {
+    const pending = f.stateDb.pendingSessionInputs.enqueue({
+      perchSessionId: "pty:worker",
+      promptText: "settle the retry chain",
+      source: "human"
+    });
+    const delivery = f.tracker.create("pty:worker", pending.promptText, "human", {
+      enqueuedAt: pending.enqueuedAt
+    });
+    const firstTypingAt = new Date(Date.parse(delivery.createdAt) + 10).toISOString();
+    const firstReceiptAt = new Date(Date.parse(delivery.createdAt) + 20).toISOString();
+    const firstUnknownAt = new Date(Date.parse(delivery.createdAt) + 30).toISOString();
+    const retryTypingAt = new Date(Date.parse(delivery.createdAt) + 40).toISOString();
+
+    f.stateDb.pendingSessionInputs.beginAttempt(pending.id, {
+      deliveryId: delivery.id,
+      releasedAt: firstTypingAt,
+      nextAttemptAt: firstUnknownAt
+    });
+    f.stateDb.promptDeliveries.markTyping(delivery.id, firstTypingAt);
+    f.stateDb.promptDeliveries.markSubmitted(delivery.id, firstReceiptAt);
+    f.stateDb.promptDeliveries.markUnknown(delivery.id, "first copy was not confirmed", firstUnknownAt);
+    f.stateDb.promptDeliveries.retryUnknown(delivery.id, retryTypingAt);
+    f.stateDb.pendingSessionInputs.beginAttempt(pending.id, {
+      deliveryId: delivery.id,
+      releasedAt: retryTypingAt,
+      nextAttemptAt: retryTypingAt
+    });
+    f.stateDb.promptDeliveries.markTyping(delivery.id, retryTypingAt);
+    f.stateDb.promptDeliveries.markSubmitted(delivery.id, retryTypingAt);
+
+    const accepted = f.tracker.acknowledgeTimeline({
+      seq: 8,
+      id: "late-first-copy",
+      sessionId: "pty:worker",
+      kind: "user",
+      text: "settle the retry chain",
+      at: firstReceiptAt
+    });
+
+    assert.equal(accepted?.state, "accepted");
+    assert.equal(f.stateDb.promptDeliveries.find(delivery.id)?.state, "accepted");
+    assert.equal(f.stateDb.pendingSessionInputs.find(pending.id), undefined);
+    assert.deepEqual(f.accepted, [delivery.id]);
+  } finally {
+    f.close();
+  }
+});
+
 test("a no-timeout kickoff becomes unknown when its Claude session ends", () => {
   const f = fixture(10);
   try {

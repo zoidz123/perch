@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { EventEmitter } from "node:events";
-import { mkdtempSync, rmSync } from "node:fs";
+import { appendFileSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import type { AddressInfo } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -111,10 +111,13 @@ class ScriptedMatePty implements PtyProcess {
   private readonly dataListeners = new Set<(data: string) => void>();
   private readonly exitListeners = new Set<(event: { exitCode: number; signal?: number }) => void>();
 
+  constructor(private readonly onWrite?: (data: string) => void) {}
+
   write(data: string): void {
     this.writes.push({ data, at: Date.now() });
     // A real terminal echoes composed input before Claude processes Enter.
     this.emitData(data);
+    this.onWrite?.(data);
   }
 
   kill(): void {
@@ -219,6 +222,7 @@ async function startServer(
     monitor,
     tasks,
     hooks,
+    timeline,
     promptDeliveries,
     options: serverOptions,
     async close() {
@@ -311,8 +315,8 @@ async function waitForPtyWrite(child: ScriptedMatePty, data: string, after: numb
   assert.fail(`PTY did not receive ${JSON.stringify(data)} within one second`);
 }
 
-async function waitFor(predicate: () => boolean | Promise<boolean>): Promise<void> {
-  const deadline = Date.now() + 1_000;
+async function waitFor(predicate: () => boolean | Promise<boolean>, timeoutMs = 1_000): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
   while (!(await predicate()) && Date.now() < deadline) {
     await new Promise((resolve) => setTimeout(resolve, 5));
   }
@@ -360,6 +364,96 @@ test("an idle mate durably queues and starts release near-immediately", async ()
     const confirmed = await sessionSnapshot(port);
     assert.equal(confirmed?.inputDelivery, undefined);
   });
+});
+
+test("mate-like PTY transcript confirms literal and transformed input exactly once", async (t) => {
+  const cases = [
+    { name: "plain text", text: "please verify the delivery receipt" },
+    { name: "multiline batch", text: "first queued message\nsecond queued message" },
+    { name: "textual attachment reference", text: "review @docs/delivery-notes.md before replying" },
+    {
+      name: "slash command",
+      text: "/eli5 how we implemented this",
+      transcriptText:
+        "<command-message>eli5</command-message>\n" +
+        "<command-name>/eli5</command-name>\n" +
+        "<command-args>how we implemented this</command-args>"
+    }
+  ];
+
+  for (const input of cases) {
+    await t.test(input.name, async () => {
+      const transcriptHome = mkdtempSync(join(tmpdir(), "perch-input-transcript-"));
+      const transcript = join(transcriptHome, "mate.jsonl");
+      writeFileSync(transcript, "");
+      let child: ScriptedMatePty | undefined;
+      const adapter = new PtyAgentAdapter(() => {
+        child = new ScriptedMatePty((data) => {
+          if (data !== "\r") return;
+          appendFileSync(
+            transcript,
+            `${JSON.stringify({
+              type: "user",
+              uuid: `receipt-${input.name}`,
+              timestamp: new Date().toISOString(),
+              message: { role: "user", content: input.transcriptText ?? input.text }
+            })}\n`
+          );
+          child!.emitData("\r\n❯ ");
+        });
+        return child;
+      });
+      await adapter.startAgent({
+        command: "claude",
+        sessionId: SESSION_ID,
+        title: "mate",
+        labels: { role: "mate" }
+      });
+
+      try {
+        await withServer(async ({ port, monitor, tasks, timeline }) => {
+          timeline.attach(SESSION_ID, transcript);
+          child!.emitData("❯ ");
+          monitor.applyExternalStatus(SESSION_ID, "idle", "claude", "hook");
+
+          const response = await postInput(port, input.text);
+          assert.equal(response.status, 202);
+          assert.deepEqual(await response.json(), { ok: true, queued: true });
+          await waitFor(
+            () => tasks.stateDb.promptDeliveries.list(SESSION_ID)[0]?.state === "accepted",
+            5_000
+          );
+          await new Promise((resolve) => setTimeout(resolve, 100));
+
+          assert.equal(
+            child!.writes.filter((write) => write.data === input.text).length,
+            1,
+            "confirmed input must not be typed again"
+          );
+          assert.equal(
+            child!.writes.filter((write) => write.data === "\r").length,
+            1,
+            "confirmed input must have exactly one submission"
+          );
+          assert.equal(tasks.stateDb.pendingSessionInputs.count(SESSION_ID), 0);
+          assert.deepEqual(
+            tasks.stateDb.promptDeliveries.list(SESSION_ID).map((delivery) => ({
+              promptText: delivery.promptText,
+              state: delivery.state,
+              receiptKind: delivery.receiptKind
+            })),
+            [{ promptText: input.text, state: "accepted", receiptKind: "transcript" }]
+          );
+        }, {
+          receiptTimeoutMs: 2_500,
+          pendingInputRetryBackoffMs: [10]
+        }, adapter as unknown as RecordingAdapter);
+      } finally {
+        adapter.stop();
+        rmSync(transcriptHome, { recursive: true, force: true });
+      }
+    });
+  }
 });
 
 test("idle mate PTY tap-to-terminal p95 stays below five seconds", async () => {
