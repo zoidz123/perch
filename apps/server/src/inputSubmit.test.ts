@@ -356,8 +356,7 @@ test("an idle mate durably queues and starts release near-immediately", async ()
     monitor.applyExternalStatus(SESSION_ID, "running", "claude", "hook");
     await waitFor(async () => (await queuedCount(port)) === undefined);
     const confirmed = await sessionSnapshot(port);
-    assert.equal(confirmed?.inputDelivery?.state, "confirmed");
-    assert.ok(confirmed?.inputDelivery?.confirmedAt);
+    assert.equal(confirmed?.inputDelivery, undefined);
   });
 });
 
@@ -623,6 +622,7 @@ test("a busy mate receives a three-message burst as one ordered turn-boundary de
           tasks.stateDb.pendingSessionInputs.list(SESSION_ID).map((input) => input.promptText),
           ["first", "second", "third"]
         );
+        const pendingIds = tasks.stateDb.pendingSessionInputs.list(SESSION_ID).map((input) => input.id);
         assert.equal(tasks.stateDb.promptDeliveries.list(SESSION_ID).length, 0);
 
         monitor.applyExternalStatus(SESSION_ID, "idle", agent, "hook");
@@ -646,12 +646,42 @@ test("a busy mate receives a three-message burst as one ordered turn-boundary de
           );
           promptDeliveries.acknowledgeHook(SESSION_ID, combined);
           monitor.applyExternalStatus(SESSION_ID, "running", agent, "hook");
-          await waitFor(async () => (await queuedCount(port)) === undefined);
         }
+        await waitFor(async () => (await queuedCount(port)) === undefined);
+        assert.deepEqual(
+          pendingIds.map((id) => tasks.stateDb.pendingSessionInputs.find(id)),
+          Array.from({ length: 3 }, () => undefined),
+          "confirmed queue rows are deleted instead of retained as delivery history"
+        );
         assert.equal(tasks.stateDb.promptDeliveries.list(SESSION_ID).length, agent === "claude" ? 1 : 0);
       });
     });
   }
+});
+
+test("seven released mate inputs are removed after their shared delivery is confirmed", async () => {
+  await withServer(async ({ port, adapter, monitor, tasks, promptDeliveries }) => {
+    const prompts = Array.from({ length: 7 }, (_, index) => `production row ${index + 1}`);
+    monitor.applyExternalStatus(SESSION_ID, "running", "claude", "hook");
+    const responses = await Promise.all(prompts.map((prompt) => postInput(port, prompt)));
+    assert.deepEqual(
+      await Promise.all(responses.map((response) => response.json())),
+      Array.from({ length: 7 }, () => ({ ok: true, queued: true }))
+    );
+    const pendingIds = tasks.stateDb.pendingSessionInputs.list(SESSION_ID).map((input) => input.id);
+    assert.equal(pendingIds.length, 7);
+
+    monitor.applyExternalStatus(SESSION_ID, "idle", "claude", "hook");
+    const combined = prompts.join("\n");
+    await waitForWrites(adapter, 2);
+    assert.deepEqual(adapter.writes, [combined, "\r"]);
+
+    promptDeliveries.acknowledgeHook(SESSION_ID, combined);
+    monitor.applyExternalStatus(SESSION_ID, "running", "claude", "hook");
+    await waitFor(async () => (await queuedCount(port)) === undefined);
+    assert.deepEqual(pendingIds.map((id) => tasks.stateDb.pendingSessionInputs.find(id)), Array(7).fill(undefined));
+    assert.deepEqual(adapter.writes, [combined, "\r"], "confirmation never delivers the batch a second time");
+  });
 });
 
 test("a receipt timeout retries through stale running status when the shared composer is empty", async () => {
@@ -736,6 +766,7 @@ test("an unknown mate delivery retries the durable head instead of wedging later
     const later = await postInput(port, "later after unknown");
     assert.deepEqual(await later.json(), { ok: true, queued: true });
     assert.equal(tasks.stateDb.pendingSessionInputs.count(SESSION_ID), 3);
+    const pendingIds = tasks.stateDb.pendingSessionInputs.list(SESSION_ID).map((input) => input.id);
 
     // This is the production wedge: the release failed after Enter while the
     // only idle transition was already being consumed. Repeated idle reads
@@ -776,6 +807,7 @@ test("an unknown mate delivery retries the durable head instead of wedging later
     assert.equal(secondReceipt.status, 200);
     await waitFor(async () => (await queuedCount(port)) === undefined);
     assert.deepEqual(tasks.stateDb.pendingSessionInputs.list(SESSION_ID), []);
+    assert.deepEqual(pendingIds.map((id) => tasks.stateDb.pendingSessionInputs.find(id)), Array(3).fill(undefined));
   }, {
     pendingInputRetryBackoffMs: [20]
   });
@@ -857,12 +889,14 @@ test("server start retries a wedged in-flight mate delivery for an idle live ses
   } as const;
   const first = await startServer(home, firstAdapter, retryOptions);
   let deliveryId: string | undefined;
+  let pendingId: string | undefined;
   try {
     const accepted = await postSubmit(first.port, "survive restart");
     assert.deepEqual(await accepted.json(), { ok: true, queued: true });
     await waitForWrites(first.adapter, 2);
     assert.deepEqual(first.adapter.writes, ["survive restart", "\r"]);
     assert.equal(first.tasks.stateDb.pendingSessionInputs.count(SESSION_ID), 1);
+    pendingId = first.tasks.stateDb.pendingSessionInputs.list(SESSION_ID)[0]?.id;
     deliveryId = first.tasks.stateDb.pendingSessionInputs.list(SESSION_ID)[0]?.deliveryId;
     assert.equal(first.tasks.stateDb.promptDeliveries.find(deliveryId!)?.state, "submitted");
   } finally {
@@ -883,6 +917,38 @@ test("server start retries a wedged in-flight mate delivery for an idle live ses
     second.promptDeliveries.acknowledgeHook(SESSION_ID, "survive restart");
     second.monitor.applyExternalStatus(SESSION_ID, "running", "claude", "hook");
     await waitFor(() => second.tasks.stateDb.pendingSessionInputs.count(SESSION_ID) === 0);
+    assert.equal(second.tasks.stateDb.pendingSessionInputs.find(pendingId!), undefined);
+  } finally {
+    await second.close();
+    rmSync(home, { recursive: true, force: true });
+  }
+});
+
+test("server start clears stale unlinked released mate input instead of replaying it", async () => {
+  const home = mkdtempSync(join(tmpdir(), "perch-input-stale-orphan-"));
+  const env = { PERCH_HOME: home } as NodeJS.ProcessEnv;
+  const first = new TaskStore(env);
+  try {
+    const staleAt = new Date(Date.now() - 3 * 60 * 1_000).toISOString();
+    const orphan = first.stateDb.pendingSessionInputs.enqueue({
+      perchSessionId: SESSION_ID,
+      promptText: "already delivered before linkage existed",
+      source: "human"
+    });
+    assert.ok(first.stateDb.pendingSessionInputs.beginBatchAttempt([orphan.id], {
+      nextAttemptAt: staleAt,
+      releasedAt: staleAt
+    }));
+  } finally {
+    first.close();
+  }
+
+  const adapter = new RecordingAdapter();
+  adapter.session.status = "idle";
+  const second = await startServer(home, adapter);
+  try {
+    assert.equal(second.tasks.stateDb.pendingSessionInputs.count(SESSION_ID), 0);
+    assert.deepEqual(adapter.writes, []);
   } finally {
     await second.close();
     rmSync(home, { recursive: true, force: true });

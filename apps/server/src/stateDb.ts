@@ -14,7 +14,7 @@ import type {
 import Database from "better-sqlite3";
 import type { TaskDeliverable, TaskVerificationFacts } from "./taskPresentation.js";
 
-const LATEST_SCHEMA_VERSION = 21;
+const LATEST_SCHEMA_VERSION = 22;
 const LEGACY_TASK_IMPORT = "tasks-json-v1";
 
 const MIGRATIONS = [
@@ -775,6 +775,17 @@ const MIGRATIONS = [
     // StateDb checks existing columns before rebuilding the strict table.
     // That makes an interrupted or manually repaired schema recoverable.
     sql: ""
+  },
+  {
+    version: 22,
+    name: "delete-confirmed-pending-session-inputs",
+    sql: `
+      DELETE FROM pending_session_inputs
+      WHERE state = 'confirmed'
+         OR delivery_id IN (
+           SELECT id FROM prompt_deliveries WHERE state = 'accepted'
+         );
+    `
   }
 ] as const;
 
@@ -1214,7 +1225,7 @@ export type PendingSessionInputRecord = {
   id: string;
   perchSessionId: string;
   source: "human" | "agent";
-  state: "pending" | "confirmed" | "failed";
+  state: "pending" | "failed";
   promptText: string;
   attemptCount: number;
   deliveryId?: string;
@@ -1223,7 +1234,6 @@ export type PendingSessionInputRecord = {
   failedAt?: string;
   enqueuedAt: string;
   releasedAt?: string;
-  confirmedAt?: string;
   createdAt: string;
 };
 
@@ -3575,18 +3585,6 @@ export class PendingSessionInputRepository {
     return this.mutatePendingBatch(ids, (id) => update.run(error, at, id).changes);
   }
 
-  markBatchConfirmed(
-    ids: readonly string[],
-    at = new Date().toISOString()
-  ): PendingSessionInputRecord[] | undefined {
-    const update = this.db.prepare(
-      `UPDATE pending_session_inputs
-       SET state = 'confirmed', confirmed_at = ?, next_attempt_at = NULL, last_error = NULL
-       WHERE id = ? AND state = 'pending'`
-    );
-    return this.mutatePendingBatch(ids, (id) => update.run(at, id).changes);
-  }
-
   remove(id: string): boolean {
     return this.removeBatch([id]);
   }
@@ -3605,6 +3603,17 @@ export class PendingSessionInputRepository {
       }
       return true;
     }).immediate();
+  }
+
+  clearUnlinkedReleasedBefore(before: string): number {
+    return this.db.prepare(
+      `DELETE FROM pending_session_inputs
+       WHERE state = 'pending'
+         AND delivery_id IS NULL
+         AND attempt_count > 0
+         AND released_at IS NOT NULL
+         AND released_at <= ?`
+    ).run(before).changes;
   }
 
   private mutatePendingBatch(
@@ -3917,29 +3926,35 @@ export class PromptDeliveryRepository {
     const hookReceiptId = input.receiptKind === "user_prompt_submit" ? input.receiptId ?? null : null;
     const transcriptReceiptAt = input.receiptKind === "transcript" ? now : null;
     const transcriptReceiptId = input.receiptKind === "transcript" ? input.receiptId ?? null : null;
-    const result = this.db.prepare(
-      `UPDATE prompt_deliveries SET state = 'accepted', receipt_kind = ?, receipt_id = ?,
-       hook_receipt_at = coalesce(hook_receipt_at, ?),
-       hook_receipt_id = coalesce(hook_receipt_id, ?),
-       transcript_receipt_at = coalesce(transcript_receipt_at, ?),
-       transcript_receipt_id = coalesce(transcript_receipt_id, ?),
-       accepted_at = ?, confirmed_at = ?, accepted_order = ?, failure_reason = NULL, updated_at = ?
-       WHERE id = ? AND state IN ('typing', 'submitted', 'delivery_unknown')`
-    ).run(
-      input.receiptKind,
-      input.receiptId ?? null,
-      hookReceiptAt,
-      hookReceiptId,
-      transcriptReceiptAt,
-      transcriptReceiptId,
-      now,
-      now,
-      acceptedOrder,
-      now,
-      matched.id
-    );
-    const delivery = result.changes === 1 ? this.find(matched.id) : undefined;
-    return delivery ? { delivery, newlyAccepted: true } : undefined;
+    return this.db.transaction(() => {
+      const result = this.db.prepare(
+        `UPDATE prompt_deliveries SET state = 'accepted', receipt_kind = ?, receipt_id = ?,
+         hook_receipt_at = coalesce(hook_receipt_at, ?),
+         hook_receipt_id = coalesce(hook_receipt_id, ?),
+         transcript_receipt_at = coalesce(transcript_receipt_at, ?),
+         transcript_receipt_id = coalesce(transcript_receipt_id, ?),
+         accepted_at = ?, confirmed_at = ?, accepted_order = ?, failure_reason = NULL, updated_at = ?
+         WHERE id = ? AND state IN ('typing', 'submitted', 'delivery_unknown')`
+      ).run(
+        input.receiptKind,
+        input.receiptId ?? null,
+        hookReceiptAt,
+        hookReceiptId,
+        transcriptReceiptAt,
+        transcriptReceiptId,
+        now,
+        now,
+        acceptedOrder,
+        now,
+        matched.id
+      );
+      if (result.changes !== 1) return undefined;
+      this.db.prepare(
+        "DELETE FROM pending_session_inputs WHERE delivery_id = ? AND state = 'pending'"
+      ).run(matched.id);
+      const delivery = this.find(matched.id);
+      return delivery ? { delivery, newlyAccepted: true } : undefined;
+    }).immediate();
   }
 
   private recordCounterpartReceipt(
@@ -4187,7 +4202,7 @@ type PendingSessionInputRow = {
   id: string;
   perch_session_id: string;
   source: "human" | "agent";
-  state: "pending" | "confirmed" | "failed";
+  state: "pending" | "failed";
   prompt_text: string;
   attempt_count: number;
   delivery_id: string | null;
@@ -4560,7 +4575,6 @@ function pendingSessionInputFromRow(row: PendingSessionInputRow): PendingSession
     ...(row.failed_at ? { failedAt: row.failed_at } : {}),
     enqueuedAt: row.enqueued_at,
     ...(row.released_at ? { releasedAt: row.released_at } : {}),
-    ...(row.confirmed_at ? { confirmedAt: row.confirmed_at } : {}),
     createdAt: row.created_at
   };
 }
