@@ -8,6 +8,10 @@ Perch gives that job to one orchestrator, called Mate. Mate organizes real Claud
 
 Perch keeps this delegation durable with explicit task lifecycles, immutable evidence, provider-aware recovery, and remote monitoring and control from iPhone.
 
+![Mate's desktop terminal beside the Perch iPhone fleet view, showing Mate and active worker tasks across projects.](apps/ios/Screenshots/mate-terminal-and-iphone-fleet.png)
+
+_Mate on the desktop alongside the synchronized iPhone fleet view._
+
 **Get Perch:** [iPhone beta](https://testflight.apple.com/join/m2ApgjJF) · [npm package](https://www.npmjs.com/package/perchctl)
 
 ```
