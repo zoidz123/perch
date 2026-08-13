@@ -30,9 +30,8 @@ export type SessionRole = "mate" | "crew" | "solo";
 
 // Task-event kinds the durable push channel must deliver: the kinds that push
 // (or arm the escalation fallback), plus the state-moving kinds whose arrival
-// disarms a now-stale fallback. Everything else (notes, created, chart_ready -
-// which pushes via chartReady - and the mate-only stalled) is inert here and
-// never enqueued for this channel.
+// disarms a now-stale fallback. Everything else (notes, created, and the
+// mate-only stalled) is inert here and never enqueued for this channel.
 export const PUSH_EVENT_KINDS = new Set<TaskEventKind>([
   "pr_linked",
   "needs_decision",
@@ -204,22 +203,6 @@ export class PushRouter {
       body: first ? `${project}: ${truncateAtWord(first)}` : `The ${project} agent needs you to choose how to proceed.`,
       sessionId,
       category: "approval"
-    });
-  }
-
-  // A chart was registered for review. Charts exist to be reviewed by the
-  // boss, so - like approvals - this is boss-facing for EVERY role: a crew
-  // worker's chart pushes directly and is never absorbed as crew noise behind
-  // the mate relay.
-  chartReady(sessionId: string, session: AgentSession | undefined, chartName: string): void {
-    this.classify(sessionId, session);
-    const project = this.projectOf(session);
-    this.sendDetached({
-      title: `${project}: a chart is ready for review`,
-      subtitle: pushContext(session),
-      body: `"${chartName}" is up - take a look and mark it up when you have a minute.`,
-      sessionId,
-      category: "chart_ready"
     });
   }
 

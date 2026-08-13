@@ -1,7 +1,7 @@
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
 import { randomUUID } from "node:crypto";
-import { accessSync, constants as fsConstants, readFileSync, realpathSync, statSync } from "node:fs";
-import { delimiter, extname, isAbsolute, join as joinPath, resolve as resolvePath } from "node:path";
+import { accessSync, constants as fsConstants, realpathSync, statSync } from "node:fs";
+import { delimiter, isAbsolute, join as joinPath, resolve as resolvePath } from "node:path";
 import { WebSocketServer } from "ws";
 import type {
   AgentEvent,
@@ -9,15 +9,6 @@ import type {
   AnswerRequest,
   ApproveRequest,
   AttachmentResponse,
-  Chart,
-  ChartAssetResponse,
-  ChartFeedbackRequest,
-  ChartFeedbackResponse,
-  ChartHtmlResponse,
-  ChartLayoutWarningsRequest,
-  FinalizeChartResponse,
-  RegisterChartRequest,
-  RegisterChartResponse,
   CodexReasoningEffort,
   ConfigEntry,
   ConfigResponse,
@@ -35,7 +26,6 @@ import type {
   ModelsResponse,
   ModelSwitchRequest,
   ModelSwitchResponse,
-  PlanDocResponse,
   StartAgentRequest,
   StartAgentResponse,
   ServerRequestResponse,
@@ -54,20 +44,9 @@ import type {
 } from "@perch/shared";
 import type { AgentAdapter } from "./adapters/types.js";
 import type { AuditLog } from "./audit.js";
-import {
-  buildChartsHub,
-  chartAuthoringPath,
-  chartChromeAsset,
-  chartCssPath,
-  chartReviewHtml,
-  formatChartFeedback,
-  formatLayoutWarnings,
-  injectChartSdk,
-  type ChartRegistry
-} from "./charts.js";
 import type { ClientAuth, FleetMonitor } from "./fleetMonitor.js";
 import {
-  CHART_CAPABILITY_NOTE,
+  PERCH_SESSION_NOTE,
   hookEventName,
   isAllowedTranscriptPath,
   normalizeHookEvent,
@@ -83,8 +62,6 @@ import { collectDoctor, type DoctorDeps } from "./deps.js";
 import type { Project, ProjectRegistry } from "./projects.js";
 import { suggestDirectories } from "./fsSuggest.js";
 import { dispatchBrief } from "./brief.js";
-import { renderChartsGalleryHtml } from "./chartsGallery.js";
-import { renderPlanHtml, resolvePlanDocPath } from "./planRender.js";
 import { extractPrUrl, type PrPoller } from "./prPoller.js";
 import { AutoReviewService, freezeReviewTarget } from "./autoreview.js";
 import { DeliveryService, receiptMatchesCurrentTarget } from "./delivery.js";
@@ -190,8 +167,6 @@ export type HttpServerOptions = {
   // tests never rewrite real provider config.
   installHooks?: (agent: AgentKind) => void;
   taskCompletion?: TaskCompletionReconciler;
-  // Charts (artifact review): registry + watchers behind the /charts routes.
-  charts?: ChartRegistry;
   // State-machine measurements (G6), served at GET /doctor/state-metrics.
   metrics?: StateMetrics;
   // Environment-doctor injection (PATH source); absent in production.
@@ -484,9 +459,8 @@ function strictConfigPatch(body: Record<string, unknown>): {
 type RpcResult = { status: number; body: unknown };
 
 function taskListResponse(url: URL, tasks: TaskStore): TasksResponse {
-  const planId = url.searchParams.get("planId");
   const includeClosed = url.searchParams.get("includeClosed") === "1";
-  const listed = planId ? tasks.listByPlan(planId) : tasks.list();
+  const listed = tasks.list();
   if (includeClosed) {
     return { tasks: listed };
   }
@@ -1146,76 +1120,6 @@ async function dispatchWebSocketRpc(
     return rpcOk(202, { ok: true });
   }
 
-  if (method === "GET" && pathname === "/charts") {
-    return rpcOk(200, { charts: options.charts?.list() ?? [] });
-  }
-
-  // The unified hub listing over the relay (the mobile Charts sheet).
-  if (method === "GET" && pathname === "/charts/hub") {
-    return chartsHubResult(options);
-  }
-
-  // A committed plan doc rendered in chart styling, as JSON for relay clients
-  // (which cannot fetch raw HTML). The mobile hub loads html into a WKWebView.
-  if (method === "GET" && pathname === "/charts/plan") {
-    const result = renderPlanDoc(options, url.searchParams.get("path") ?? "");
-    return result.html === undefined
-      ? rpcError(result.status, result.error ?? "Unknown plan doc")
-      : rpcOk(200, { html: result.html } satisfies PlanDocResponse);
-  }
-
-  // Approve a chart -> finalized (the mobile hub's approve action).
-  const chartFinalizeMatch = pathname.match(/^\/charts\/([^/]+)\/finalize$/);
-  if (method === "POST" && chartFinalizeMatch) {
-    return finalizeChartResult(decodeURIComponent(chartFinalizeMatch[1] ?? ""), options, auditPeer);
-  }
-
-  // Registration over RPC carries no hook token (hook tokens live in the
-  // agent's PTY env and ride raw HTTP), so this is the bearer path only.
-  if (method === "POST" && pathname === "/charts") {
-    if (auth.kind !== "server") {
-      return rpcError(403, "Chart registration needs the session hook token or the server token");
-    }
-    return registerChartBearer(body as RegisterChartRequest, options, auditPeer);
-  }
-
-  // Relay clients cannot fetch raw HTML/bytes (every RPC response is JSON),
-  // so the chart document and its sibling assets are additionally exposed as
-  // JSON here. LAN clients keep using the raw /charts routes.
-  const chartHtmlMatch = pathname.match(/^\/charts\/([^/]+)\/html$/);
-  if (method === "GET" && chartHtmlMatch) {
-    return chartHtmlRpc(decodeURIComponent(chartHtmlMatch[1] ?? ""), options);
-  }
-
-  const chartAssetMatch = pathname.match(/^\/charts\/([^/]+)\/asset64$/);
-  if (method === "GET" && chartAssetMatch) {
-    return chartAssetRpc(
-      decodeURIComponent(chartAssetMatch[1] ?? ""),
-      url.searchParams.get("path") ?? "",
-      options
-    );
-  }
-
-  const chartFeedbackMatch = pathname.match(/^\/charts\/([^/]+)\/feedback$/);
-  if (method === "POST" && chartFeedbackMatch) {
-    return chartFeedbackRpc(
-      decodeURIComponent(chartFeedbackMatch[1] ?? ""),
-      body as ChartFeedbackRequest,
-      options,
-      auditPeer
-    );
-  }
-
-  const chartLayoutMatch = pathname.match(/^\/charts\/([^/]+)\/layout-warnings$/);
-  if (method === "POST" && chartLayoutMatch) {
-    return chartLayoutWarningsRpc(
-      decodeURIComponent(chartLayoutMatch[1] ?? ""),
-      body as ChartLayoutWarningsRequest,
-      options,
-      auditPeer
-    );
-  }
-
   return rpcError(404, "Not found");
 }
 
@@ -1299,44 +1203,7 @@ async function route(
     return;
   }
 
-  // Chart registration: the drawing agent registers with its own per-session
-  // hook token (the `chart` verb alongside the brief's task verbs); the server
-  // token may also register on a named session (the mate drawing charts).
-  // Fail-closed like the task verbs - registration mutates the registry.
-  if (request.method === "POST" && pathname === "/charts") {
-    await handleRegisterChart(request, response, options);
-    return;
-  }
-
-  // Perch-owned chart statics (the stylesheet and the review chrome): shipped
-  // in the public repo, they carry no user data, and they must load as
-  // subresources of token-authed pages - a <link> tag or the sandboxed chart
-  // iframe cannot attach the query token - so like /health they skip auth.
-  // Everything chart-SPECIFIC (the HTML, sibling assets, feedback) stays
-  // behind auth in routeCharts.
-  if (request.method === "GET" && /^\/charts(?:\/[^/]+)?\/chart\.css$/.test(pathname)) {
-    serveChartCss(response);
-    return;
-  }
-  const chromeAssetMatch = pathname.match(/^\/charts\/chrome\/([^/]+)$/);
-  if (request.method === "GET" && chromeAssetMatch) {
-    serveChartChromeAsset(response, decodeURIComponent(chromeAssetMatch[1] ?? ""));
-    return;
-  }
-  // The authoring guide is the same class of perch-owned static: the chart
-  // capability note tells agents to curl it first, from any repo, so like
-  // chart.css it must resolve without auth or a perch checkout.
-  if (request.method === "GET" && pathname === "/charts/authoring") {
-    serveChartAuthoring(response);
-    return;
-  }
-
   const auth = authenticate(request, options);
-  if (!auth && isLocalChartReviewRequest(request, pathname)) {
-    if (await routeCharts(request, response, options, pathname, { kind: "server" }, url, true)) {
-      return;
-    }
-  }
   if (!auth) {
     writeJson(response, 401, { error: "Unauthorized" });
     return;
@@ -2242,332 +2109,11 @@ async function route(
       return;
     }
 
-    if (await routeCharts(request, response, options, pathname, auth, url)) {
-      return;
-    }
-
     writeJson(response, 404, { error: "Not found" });
   } catch (error) {
     const message = error instanceof Error ? error.message : "Internal server error";
     writeJson(response, 500, { error: message });
   }
-}
-
-// The authed /charts surface: list, the perch-owned stylesheet, chart HTML
-// with the annotation SDK injected, directory-confined sibling assets, boss
-// feedback, and the SDK's layout-audit intake. Returns false when the path is
-// not a charts route so route() falls through to its 404.
-async function routeCharts(
-  request: IncomingMessage,
-  response: ServerResponse,
-  options: HttpServerOptions,
-  pathname: string,
-  auth: ClientAuth,
-  url: URL,
-  localReview = false
-): Promise<boolean> {
-  const charts = options.charts;
-  if (!charts || !(pathname === "/charts" || pathname.startsWith("/charts/"))) {
-    return false;
-  }
-  const auditPeer =
-    auth.kind === "device"
-      ? { deviceId: auth.deviceId, remoteAddress: request.socket.remoteAddress }
-      : { remoteAddress: request.socket.remoteAddress };
-
-  if (request.method === "GET" && pathname === "/charts") {
-    writeJson(response, 200, { charts: charts.list() });
-    return true;
-  }
-
-  // The unified hub listing (before the /charts/:id match, which "hub" would
-  // otherwise capture as an id): charts grouped by project + committed plans.
-  if (request.method === "GET" && pathname === "/charts/hub") {
-    const result = chartsHubResult(options);
-    writeJson(response, result.status, result.body);
-    return true;
-  }
-
-  // A committed plan doc rendered in chart styling (before /charts/:id, which
-  // "plan" would otherwise capture as an id). The hub taps into it to show plan
-  // content in the same look a chart gets.
-  if (request.method === "GET" && pathname === "/charts/plan") {
-    const result = renderPlanDoc(options, url.searchParams.get("path") ?? "");
-    if (result.html === undefined) {
-      writeJson(response, result.status, { error: result.error });
-      return true;
-    }
-    response.writeHead(result.status, { "content-type": "text/html; charset=utf-8" });
-    response.end(result.html);
-    return true;
-  }
-
-  // The desktop Charts gallery: a server-rendered browse page over the unified
-  // hub listing - every chart and plan grouped by project, each a link into its
-  // existing review/plan page.
-  // Before the /charts/:id match, which would otherwise capture "gallery" as an
-  // id. Chart review links deliberately stay tokenless: local GET review is
-  // easy, while the chart iframe must never receive or inherit a bearer token.
-  if (request.method === "GET" && pathname === "/charts/gallery") {
-    const hub = buildChartsHub(charts.list(), options.projects.list(), chartProjectResolver(options));
-    const token = url.searchParams.get("token") ?? "";
-    response.writeHead(200, { "content-type": "text/html; charset=utf-8" });
-    response.end(renderChartsGalleryHtml(hub, token));
-    return true;
-  }
-
-  // Approve a chart -> finalized. A boss action from the desktop gallery.
-  const finalizeMatch = pathname.match(/^\/charts\/([^/]+)\/finalize$/);
-  if (request.method === "POST" && finalizeMatch) {
-    const result = await finalizeChartResult(
-      decodeURIComponent(finalizeMatch[1] ?? ""),
-      options,
-      auditPeer
-    );
-    writeJson(response, result.status, result.body);
-    return true;
-  }
-
-  // Note: chart.css (as /charts/chart.css and chart-relative ./chart.css) and
-  // the review-chrome assets are served BEFORE auth in route() - subresources
-  // of a token-authed page cannot attach the query token. Local desktop review
-  // GETs can read the review surface without a bearer token; feedback and
-  // layout POSTs still need the scoped nonce minted by GET /review.
-
-  const htmlMatch = pathname.match(/^\/charts\/([^/]+)(?:\/index\.html)?$/);
-  if (request.method === "GET" && htmlMatch) {
-    const chart = charts.find(decodeURIComponent(htmlMatch[1] ?? ""));
-    if (!chart) {
-      writeJson(response, 404, { error: "Unknown chart" });
-      return true;
-    }
-    // Snapshot-first: the durable copy under ~/.perch/charts/<id>/ keeps the
-    // chart rendering after its worktree (the author's scratch copy) is gone.
-    let html: string;
-    try {
-      html = readFileSync(charts.htmlFileFor(chart), "utf8");
-    } catch {
-      writeJson(response, 404, { error: `Chart file is gone: ${chart.file}` });
-      return true;
-    }
-    response.writeHead(200, { "content-type": "text/html; charset=utf-8" });
-    response.end(injectChartSdk(html));
-    return true;
-  }
-
-  // The desktop review surface (T3): the chart in a sandboxed iframe with the
-  // annotation chrome around it. The review page may be opened bare on
-  // loopback, but mutating review POSTs require the scoped nonce minted here.
-  const reviewMatch = pathname.match(/^\/charts\/([^/]+)\/review$/);
-  if (request.method === "GET" && reviewMatch) {
-    const chart = charts.find(decodeURIComponent(reviewMatch[1] ?? ""));
-    if (!chart) {
-      writeJson(response, 404, { error: "Unknown chart" });
-      return true;
-    }
-    if (isLoopbackAddress(request.socket.remoteAddress) && url.searchParams.has("token")) {
-      response.writeHead(303, { location: pathname });
-      response.end();
-      return true;
-    }
-    const reviewNonce = charts.issueReviewNonce(chart.id);
-    if (!reviewNonce) {
-      writeJson(response, 404, { error: "Unknown chart" });
-      return true;
-    }
-    response.writeHead(200, {
-      "content-type": "text/html; charset=utf-8",
-      "referrer-policy": "no-referrer",
-      "set-cookie": chartReviewCookie(chart.id, reviewNonce)
-    });
-    response.end(chartReviewHtml(chart, { reviewNonce }));
-    return true;
-  }
-
-  const feedbackMatch = pathname.match(/^\/charts\/([^/]+)\/feedback$/);
-  if (request.method === "POST" && feedbackMatch) {
-    const chartId = decodeURIComponent(feedbackMatch[1] ?? "");
-    if (localReview && !validChartReviewPost(request, charts, chartId)) {
-      writeJson(response, 401, { error: "Chart review POST requires a valid review nonce" });
-      return true;
-    }
-    const body = await readJsonOrEmpty<ChartFeedbackRequest>(request);
-    const result = await chartFeedbackRpc(
-      chartId,
-      body as ChartFeedbackRequest,
-      options,
-      auditPeer
-    );
-    writeJson(response, result.status, result.body);
-    return true;
-  }
-
-  const layoutMatch = pathname.match(/^\/charts\/([^/]+)\/layout-warnings$/);
-  if (request.method === "POST" && layoutMatch) {
-    const chartId = decodeURIComponent(layoutMatch[1] ?? "");
-    if (localReview && !validChartReviewPost(request, charts, chartId)) {
-      writeJson(response, 401, { error: "Chart review POST requires a valid review nonce" });
-      return true;
-    }
-    const body = await readJsonOrEmpty<ChartLayoutWarningsRequest>(request);
-    const result = await chartLayoutWarningsRpc(
-      chartId,
-      body as ChartLayoutWarningsRequest,
-      options,
-      auditPeer
-    );
-    writeJson(response, result.status, result.body);
-    return true;
-  }
-
-  // Sibling assets referenced by the chart, confined to its directory
-  // (snapshot-first via assetFileFor, with traversal protection).
-  const assetMatch = pathname.match(/^\/charts\/([^/]+)\/(.+)$/);
-  if (request.method === "GET" && assetMatch) {
-    const chart = charts.find(decodeURIComponent(assetMatch[1] ?? ""));
-    if (!chart) {
-      writeJson(response, 404, { error: "Unknown chart" });
-      return true;
-    }
-    const assetPath = decodeURIComponent(assetMatch[2] ?? "");
-    const file = charts.assetFileFor(chart, assetPath);
-    if (!file) {
-      writeJson(response, 403, { error: "Forbidden" });
-      return true;
-    }
-    let bytes: Buffer;
-    try {
-      bytes = readFileSync(file);
-    } catch {
-      writeJson(response, 404, { error: "Not found" });
-      return true;
-    }
-    response.writeHead(200, { "content-type": assetContentType(file) });
-    response.end(bytes);
-    return true;
-  }
-
-  return false;
-}
-
-function chartReviewCookie(chartId: string, nonce: string): string {
-  return `${chartReviewCookieName(chartId)}=${nonce}; Max-Age=${Math.floor(
-    12 * 60 * 60
-  )}; Path=/charts/${encodeURIComponent(chartId)}; HttpOnly; SameSite=Strict`;
-}
-
-function validChartReviewPost(request: IncomingMessage, charts: ChartRegistry, chartId: string): boolean {
-  const nonce = String(request.headers["x-perch-chart-review"] ?? "").trim();
-  if (!nonce) {
-    return false;
-  }
-  const cookie = chartReviewCookieValue(request, chartId);
-  if (!cookie || !tokensEqual(cookie, nonce)) {
-    return false;
-  }
-  return charts.verifyReviewNonce(chartId, nonce);
-}
-
-function chartReviewCookieValue(request: IncomingMessage, chartId: string): string | undefined {
-  const name = `${chartReviewCookieName(chartId)}=`;
-  const header = String(request.headers.cookie ?? "");
-  for (const part of header.split(";")) {
-    const trimmed = part.trim();
-    if (trimmed.startsWith(name)) {
-      return trimmed.slice(name.length);
-    }
-  }
-  return undefined;
-}
-
-function chartReviewCookieName(chartId: string): string {
-  return `perch_chart_review_${chartId}`;
-}
-
-function serveChartCss(response: ServerResponse): void {
-  let css: string;
-  try {
-    css = readFileSync(chartCssPath(), "utf8");
-  } catch {
-    writeJson(response, 404, { error: "chart.css is not installed on this server yet" });
-    return;
-  }
-  response.writeHead(200, { "content-type": "text/css; charset=utf-8" });
-  response.end(css);
-}
-
-function serveChartAuthoring(response: ServerResponse): void {
-  let markdown: string;
-  try {
-    markdown = readFileSync(chartAuthoringPath(), "utf8");
-  } catch {
-    writeJson(response, 404, { error: "the chart authoring guide is not installed on this server yet" });
-    return;
-  }
-  response.writeHead(200, { "content-type": "text/markdown; charset=utf-8" });
-  response.end(markdown);
-}
-
-function isLocalChartReviewRequest(request: IncomingMessage, pathname: string): boolean {
-  if (!isLoopbackAddress(request.socket.remoteAddress)) {
-    return false;
-  }
-  if (request.method === "GET") {
-    if (/^\/charts\/[0-9a-f]+\/review$/.test(pathname) || /^\/charts\/[0-9a-f]+(?:\/index\.html)?$/.test(pathname)) {
-      return true;
-    }
-    const assetMatch = pathname.match(/^\/charts\/[0-9a-f]+\/([^/]+)/);
-    const reserved = new Set(["asset64", "feedback", "finalize", "html", "layout-warnings", "review"]);
-    return !!assetMatch && !reserved.has(assetMatch[1] ?? "");
-  }
-  if (request.method === "POST") {
-    return /^\/charts\/[0-9a-f]+\/(?:feedback|layout-warnings)$/.test(pathname);
-  }
-  return false;
-}
-
-function isLoopbackAddress(address: string | undefined): boolean {
-  return address === "127.0.0.1" || address === "::1" || address === "::ffff:127.0.0.1";
-}
-
-// The review-chrome statics (chartChromeAsset is a fixed two-file allowlist,
-// so the request name never touches the filesystem as a path).
-function serveChartChromeAsset(response: ServerResponse, name: string): void {
-  const asset = chartChromeAsset(name);
-  if (!asset) {
-    writeJson(response, 404, { error: "Not found" });
-    return;
-  }
-  let body: string;
-  try {
-    body = readFileSync(asset.path, "utf8");
-  } catch {
-    writeJson(response, 404, { error: "Not found" });
-    return;
-  }
-  response.writeHead(200, { "content-type": asset.contentType });
-  response.end(body);
-}
-
-const ASSET_CONTENT_TYPES: Record<string, string> = {
-  ".html": "text/html; charset=utf-8",
-  ".css": "text/css; charset=utf-8",
-  ".js": "application/javascript; charset=utf-8",
-  ".mjs": "application/javascript; charset=utf-8",
-  ".json": "application/json",
-  ".svg": "image/svg+xml",
-  ".png": "image/png",
-  ".jpg": "image/jpeg",
-  ".jpeg": "image/jpeg",
-  ".gif": "image/gif",
-  ".webp": "image/webp",
-  ".woff": "font/woff",
-  ".woff2": "font/woff2",
-  ".txt": "text/plain; charset=utf-8"
-};
-
-function assetContentType(file: string): string {
-  return ASSET_CONTENT_TYPES[extname(file).toLowerCase()] ?? "application/octet-stream";
 }
 
 // Deliver composer text so it actually SUBMITS. Claude: a raw PTY write
@@ -2619,53 +2165,6 @@ async function deliverInputAccepted(
   }
 
   return result;
-}
-
-// The revised plan markdown of an edit-a-finalized-plan dispatch is staged
-// centrally and committed by the worker; bound it so a bad request cannot
-// stage an unbounded file. Generous next to a plan doc's real size.
-const MAX_PLAN_EDIT_CONTENT_BYTES = 512 * 1024;
-
-// Validate a plan-edit request's target path and content. The path must be a
-// repo-relative flat `docs/plans/<name>.md` with no traversal (the worker
-// resolves it inside its own worktree; the server never writes to a repo).
-// Returns an error message, or undefined when valid.
-function planEditError(planEdit: { path?: unknown; content?: unknown }): string | undefined {
-  const path = planEdit.path;
-  if (typeof path !== "string" || path.trim().length === 0) {
-    return "planEdit.path required";
-  }
-  const parts = path.trim().split("/");
-  if (path.trim().startsWith("/") || /^[a-zA-Z]:/.test(path.trim())) {
-    return "planEdit.path must be repo-relative, not absolute";
-  }
-  if (parts.includes("..") || parts.includes(".") || parts.includes("")) {
-    return "planEdit.path must not contain empty, . or .. segments";
-  }
-  if (parts.length !== 3 || parts[0] !== "docs" || parts[1] !== "plans" || !/\.md$/i.test(path.trim())) {
-    return "planEdit.path must be docs/plans/<name>.md";
-  }
-  if (typeof planEdit.content !== "string" || planEdit.content.length === 0) {
-    return "planEdit.content required";
-  }
-  const bytes = Buffer.byteLength(planEdit.content, "utf8");
-  if (bytes > MAX_PLAN_EDIT_CONTENT_BYTES) {
-    return `planEdit.content too large: ${bytes} bytes (max ${MAX_PLAN_EDIT_CONTENT_BYTES})`;
-  }
-  return undefined;
-}
-
-// The planId a dispatched task is stamped with: an explicit planId wins;
-// otherwise a plan-edit defaults to the edited plan's path (so the edit's own
-// task is discoverable by `listByPlan`).
-function resolveTaskPlanId(body: CreateTaskRequest): string | undefined {
-  if (typeof body.planId === "string" && body.planId.trim().length > 0) {
-    return body.planId.trim();
-  }
-  if (body.planEdit && typeof body.planEdit.path === "string") {
-    return body.planEdit.path.trim();
-  }
-  return undefined;
 }
 
 function idempotencyKeyError(key: unknown): string | undefined {
@@ -2770,14 +2269,6 @@ async function handleCreateTask(
     if (!body.parent) body.parent = options.hooks.resolveAlias(hookSessionId);
   }
 
-  if (body.planEdit) {
-    const err = planEditError(body.planEdit);
-    if (err) {
-      writeJson(response, 400, { error: err });
-      return;
-    }
-  }
-
   const repeated = repeatedDispatchTask(body, options);
   if (repeated) {
     writeJson(response, 201, { task: await resumeRepeatedDispatch(body, repeated, options) });
@@ -2807,8 +2298,7 @@ function createTaskRecord(body: CreateTaskRequest, options: HttpServerOptions): 
     title: body.title,
     project: body.project,
     prompt: body.prompt?.trim() || body.title.trim(),
-    kind: body.kind,
-    planId: resolveTaskPlanId(body)
+    kind: body.kind
   });
 }
 
@@ -3059,13 +2549,8 @@ async function prepareDispatchLaunch(
     (configuredApplies ? configured.effort : undefined) ??
     (builtInApplies ? builtInDefaults.effort : undefined);
   const lease = options.worktrees.findByHolder(task.id) ?? await options.worktrees.acquire(body.project, task.id);
-  // Edit-a-finalized-plan-as-a-commit: stage the revised markdown centrally
-  // (never in the repo) and point the brief at it; the worker commits it.
-  const planBrief = body.planEdit
-    ? { edit: { relativePath: body.planEdit.path, stagedPath: options.tasks.stagePlanEdit(task.id, body.planEdit.content) } }
-    : {};
   const prompt = body.prompt?.trim() || task.title;
-  const kickoff = prompt + dispatchBrief(task, lease.path, planBrief, agent);
+  const kickoff = prompt + dispatchBrief(task, lease.path, agent);
   const request: StartAgentRequest = {
     command: agent,
     agent,
@@ -3136,11 +2621,6 @@ async function createTaskRpc(
   if (idempotencyError) return rpcError(400, idempotencyError);
   const kindError = taskKindCreationError(body.kind);
   if (kindError) return rpcError(400, kindError);
-  if (body.planEdit) {
-    const err = planEditError(body.planEdit);
-    if (err) return rpcError(400, err);
-  }
-
   const repeated = repeatedDispatchTask(body, options);
   if (repeated) {
     return rpcOk(201, { task: await resumeRepeatedDispatch(body, repeated, options) });
@@ -3906,8 +3386,8 @@ function allowsLegacyCodexHookReporting(metadata: Record<string, unknown> | unde
 
 // Lossless report bounds. Density is preserved byte-for-byte within these
 // explicit limits; oversize submissions are rejected loudly (413), never
-// silently truncated. Larger artifacts belong in repo files or charts,
-// referenced from the report by path or content hash.
+// silently truncated. Larger artifacts belong in repo files referenced from
+// the report by path or content hash.
 export const MAX_WORKER_REPORT_SUMMARY_BYTES = 4 * 1024;
 export const MAX_WORKER_REPORT_BODY_BYTES = 256 * 1024;
 export const MAX_WORKER_REPORT_EVIDENCE_BYTES = 256 * 1024;
@@ -4116,7 +3596,7 @@ async function handleWorkerReport(
   const reportBytes = Buffer.byteLength(body.report, "utf8");
   if (reportBytes > MAX_WORKER_REPORT_BODY_BYTES) {
     writeJson(response, 413, {
-      error: `report too large: ${reportBytes} bytes (max ${MAX_WORKER_REPORT_BODY_BYTES}); commit large artifacts to the branch (or a chart) and reference them by path or content hash - nothing is truncated server-side`
+      error: `report too large: ${reportBytes} bytes (max ${MAX_WORKER_REPORT_BODY_BYTES}); commit large artifacts to the branch and reference them by path or content hash - nothing is truncated server-side`
     });
     return;
   }
@@ -4413,73 +3893,6 @@ function boundedPolicyString(value: unknown, maxLength: number): string {
   return typeof value === "string" && value.length <= maxLength ? value.trim() : "";
 }
 
-// Chart registration (the `chart` verb): hook-token callers are pinned to
-// their own session, exactly like the task verbs; the server token registers
-// on a named session (the mate). Devices never register - fail-closed.
-async function handleRegisterChart(
-  request: IncomingMessage,
-  response: ServerResponse,
-  options: HttpServerOptions
-): Promise<void> {
-  if (!options.charts) {
-    writeJson(response, 501, { error: "Charts are not enabled on this server" });
-    return;
-  }
-  const body = await readJsonOrEmpty<RegisterChartRequest>(request);
-  const bearer = authenticate(request, options);
-  let result: RpcResult;
-  if (bearer) {
-    if (bearer.kind !== "server") {
-      writeJson(response, 403, { error: "Chart registration needs the session hook token or the server token" });
-      return;
-    }
-    result = await registerChartBearer(body as RegisterChartRequest, options, {
-      remoteAddress: request.socket.remoteAddress
-    });
-  } else {
-    const sessionId = String(request.headers["x-perch-session"] ?? "");
-    const token = String(request.headers["x-perch-token"] ?? "");
-    if (!sessionId || !token || !options.hooks.verify(sessionId, token)) {
-      writeJson(response, 401, { error: "Unauthorized" });
-      return;
-    }
-    result = await registerChartCore(body.file, options.hooks.resolveAlias(sessionId), options, {
-      remoteAddress: request.socket.remoteAddress
-    });
-  }
-  writeJson(response, result.status, result.body);
-}
-
-// Bearer registration must name a LIVE owning session: feedback routes into
-// that session's PTY, so binding a chart to a bogus id would make every
-// review dead-end on the dead-session error.
-async function registerChartBearer(
-  body: RegisterChartRequest,
-  options: HttpServerOptions,
-  auditMeta: Pick<Parameters<AuditLog["write"]>[0], "deviceId" | "remoteAddress">
-): Promise<RpcResult> {
-  if (typeof body.sessionId !== "string" || body.sessionId.trim().length === 0) {
-    return rpcError(400, "sessionId required when registering with the server token");
-  }
-  const canonical = canonicalSessionIdFor(options.adapter, body.sessionId);
-  const sessions = await options.adapter.listSessions();
-  if (!sessions.some((session) => session.id === canonical)) {
-    return rpcError(400, `Unknown session: ${body.sessionId}`);
-  }
-  // Optional project tag: resolve it to a tracked project's rootPath now, so a
-  // chart with no task still groups under its project. Unresolvable is a hard
-  // 400 (never silently dropped into "ungrouped").
-  let projectRoot: string | undefined;
-  if (typeof body.project === "string" && body.project.trim().length > 0) {
-    const resolved = resolveTrackedProject(options.projects, body.project.trim());
-    if (!resolved) {
-      return rpcError(400, `Unknown project: ${body.project}`);
-    }
-    projectRoot = resolved.rootPath;
-  }
-  return registerChartCore(body.file, canonical, options, auditMeta, projectRoot);
-}
-
 // Resolve a client-supplied project reference to a tracked project: an exact
 // rootPath match first (paths are resolved before comparison), else a unique
 // name match. An ambiguous name (two tracked projects share it) or no match
@@ -4512,328 +3925,6 @@ function resolveDispatchProjectRoot(
     return { rootPath: resolvePath(ref) };
   }
   return { error: `Unknown project: "${ref}" is not in the projects registry` };
-}
-
-async function registerChartCore(
-  file: unknown,
-  owningSessionId: string,
-  options: HttpServerOptions,
-  auditMeta: Pick<Parameters<AuditLog["write"]>[0], "deviceId" | "remoteAddress">,
-  projectRoot?: string
-): Promise<RpcResult> {
-  if (!options.charts) {
-    return rpcError(501, "Charts are not enabled on this server");
-  }
-  if (typeof file !== "string" || file.trim().length === 0) {
-    return rpcError(400, "file required");
-  }
-  // Task linkage: the owning session's open task, when it has one.
-  const task = options.tasks
-    .list()
-    .find((candidate) => candidate.sessionId === owningSessionId && candidate.state !== "closed");
-  const liveMateSessionId = options.ownerManager?.liveMateSessionId();
-  const parentSessionId = task?.parentSessionId === liveMateSessionId ? liveMateSessionId : undefined;
-  let chart: Chart;
-  try {
-    chart = options.charts.register(file, {
-      sessionId: owningSessionId,
-      ...(task ? { taskId: task.id, taskTitle: task.title } : {}),
-      ...(parentSessionId ? { parentSessionId } : {}),
-      ...(projectRoot ? { projectRoot } : {})
-    });
-  } catch (error) {
-    return rpcError(400, error instanceof Error ? error.message : String(error));
-  }
-  await audit(options.auditLog, {
-    action: "register_chart",
-    sessionId: owningSessionId,
-    chartId: chart.id,
-    ...(task ? { taskId: task.id } : {}),
-    ...auditMeta
-  });
-  const responseBody: RegisterChartResponse = { chart, url: `/charts/${chart.id}` };
-  return rpcOk(201, responseBody);
-}
-
-// Boss feedback on a chart -> one normalized block into the owning session's
-// composer through the queue-gated path (queues while a permission prompt is
-// open, exactly like any composer message - attention, never an approval
-// gate). When a drawing worker has ended, the registration's server-captured
-// parent is the only permitted fallback. Feedback is never silently queued for
-// a corpse or redirected from a client-supplied session id.
-// The unified hub listing: every registered chart grouped by its owning project
-// (resolved through task linkage) with that project's committed docs/plans,
-// plus charts that resolve
-// to no tracked project. One read source for the mobile hub and the desktop
-// /charts gallery.
-function chartsHubResult(options: HttpServerOptions): RpcResult {
-  const charts = options.charts;
-  if (!charts) {
-    return rpcError(501, "Charts are not enabled on this server");
-  }
-  const hub = buildChartsHub(charts.list(), options.projects.list(), chartProjectResolver(options));
-  return rpcOk(200, hub);
-}
-
-// Map a chart to its owning tracked project's rootPath for hub grouping. An
-// explicit `projectRoot` (the mate path) wins when it still names a tracked
-// project; otherwise fall back to task-linkage inference (a dispatched
-// worker's task carries its project). Untagged, task-less charts resolve to
-// undefined and land in "ungrouped".
-function chartProjectResolver(options: HttpServerOptions): (chart: Chart) => string | undefined {
-  return (chart) => {
-    if (chart.projectRoot && options.projects.find(chart.projectRoot)) {
-      return chart.projectRoot;
-    }
-    return chart.taskId ? options.tasks.find(chart.taskId)?.project : undefined;
-  };
-}
-
-// Render a tracked project's committed plan doc as a chart-styled HTML page.
-// Read-only and strictly confined to tracked projects' docs/plans - `requested`
-// may be the absolute path the hub lists (ChartPlanDoc.path) or a repo-relative
-// docs/plans/<name>.md; anything resolving outside is a 404, never a read. Both
-// front-ends (the mobile hub and the desktop gallery) tap into it to render a
-// plan's content in the same look a chart gets.
-function renderPlanDoc(options: HttpServerOptions, requested: string): { status: number; html?: string; error?: string } {
-  const wanted = requested.trim();
-  if (!wanted) {
-    return { status: 400, error: "path required" };
-  }
-  const roots = options.projects.list().map((project) => project.rootPath);
-  const file = resolvePlanDocPath(wanted, roots);
-  if (!file) {
-    return { status: 404, error: "Unknown plan doc" };
-  }
-  let markdown: string;
-  try {
-    markdown = readFileSync(file, "utf8");
-  } catch {
-    return { status: 404, error: `Plan doc is gone: ${file}` };
-  }
-  return { status: 200, html: renderPlanHtml(markdown, file) };
-}
-
-// Approve a chart into the finalized state. A boss action from either
-// front-end (button or command) - device/bearer auth, audit-logged like every
-// other mutating action. Idempotent in the registry.
-async function finalizeChartResult(
-  chartId: string,
-  options: HttpServerOptions,
-  auditMeta: Pick<Parameters<AuditLog["write"]>[0], "deviceId" | "remoteAddress">
-): Promise<RpcResult> {
-  const charts = options.charts;
-  if (!charts) {
-    return rpcError(501, "Charts are not enabled on this server");
-  }
-  const chart = charts.finalize(chartId);
-  if (!chart) {
-    return rpcError(404, `Unknown chart: ${chartId}`);
-  }
-  await audit(options.auditLog, {
-    action: "finalize_chart",
-    chartId: chart.id,
-    ...auditMeta
-  });
-  const responseBody: FinalizeChartResponse = { chart };
-  return rpcOk(200, responseBody);
-}
-
-// The chart document as JSON (SDK injected), for the relay RPC surface.
-function chartHtmlRpc(chartId: string, options: HttpServerOptions): RpcResult {
-  const charts = options.charts;
-  if (!charts) {
-    return rpcError(501, "Charts are not enabled on this server");
-  }
-  const chart = charts.find(chartId);
-  if (!chart) {
-    return rpcError(404, `Unknown chart: ${chartId}`);
-  }
-  // Snapshot-first, like the raw HTML route: the chart outlives its worktree.
-  let html: string;
-  try {
-    html = readFileSync(charts.htmlFileFor(chart), "utf8");
-  } catch {
-    return rpcError(404, `Chart file is gone: ${chart.file}`);
-  }
-  const responseBody: ChartHtmlResponse = { chart, html: injectChartSdk(html) };
-  return rpcOk(200, responseBody);
-}
-
-// A chart sibling asset (or chart.css) as base64 JSON, for the relay RPC
-// surface. Same directory confinement as the raw asset route.
-function chartAssetRpc(chartId: string, assetPath: string, options: HttpServerOptions): RpcResult {
-  const charts = options.charts;
-  if (!charts) {
-    return rpcError(501, "Charts are not enabled on this server");
-  }
-  const chart = charts.find(chartId);
-  if (!chart) {
-    return rpcError(404, `Unknown chart: ${chartId}`);
-  }
-  if (!assetPath) {
-    return rpcError(400, "path required");
-  }
-  const file = assetPath === "chart.css" ? chartCssPath() : charts.assetFileFor(chart, assetPath);
-  if (!file) {
-    return rpcError(403, "Forbidden");
-  }
-  let bytes: Buffer;
-  try {
-    bytes = readFileSync(file);
-  } catch {
-    return rpcError(404, "Not found");
-  }
-  const responseBody: ChartAssetResponse = {
-    base64: bytes.toString("base64"),
-    contentType: assetContentType(file)
-  };
-  return rpcOk(200, responseBody);
-}
-
-async function chartFeedbackRpc(
-  chartId: string,
-  body: ChartFeedbackRequest,
-  options: HttpServerOptions,
-  auditMeta: Pick<Parameters<AuditLog["write"]>[0], "deviceId" | "remoteAddress">
-): Promise<RpcResult> {
-  const charts = options.charts;
-  if (!charts) {
-    return rpcError(501, "Charts are not enabled on this server");
-  }
-  const chart = charts.find(chartId);
-  if (!chart) {
-    return rpcError(404, `Unknown chart: ${chartId}`);
-  }
-  const annotations = Array.isArray(body.annotations) ? body.annotations : [];
-  const message = typeof body.message === "string" ? body.message.trim() : "";
-  if (annotations.length === 0 && !message) {
-    return rpcError(400, "feedback needs annotations or a message");
-  }
-  const sessions = options.monitor.withLiveState(await options.adapter.listSessions());
-  const liveSession = (sessionId: string | undefined) =>
-    sessionId
-      ? sessions.find((session) => session.id === sessionId && session.status !== "done" && session.status !== "error")
-      : undefined;
-  const owner = liveSession(chart.sessionId);
-  const liveMateSessionId = options.ownerManager?.liveMateSessionId();
-  const parent = chart.parentSessionId === liveMateSessionId ? liveSession(liveMateSessionId) : undefined;
-  const recipient = owner ?? parent;
-  if (!recipient) {
-    return chartFeedbackUnavailable(chart);
-  }
-  const block = formatChartFeedback(chart, { message, annotations });
-  let queued: boolean;
-  let deliveredRecipient = recipient;
-  try {
-    ({ queued } = await deliverInput(options, recipient.id, block, "human"));
-  } catch (error) {
-    if (!isUnavailableSessionError(error)) {
-      throw error;
-    }
-    if (recipient.id !== chart.sessionId) {
-      return chartFeedbackUnavailable(chart);
-    }
-    const refreshedMateSessionId = options.ownerManager?.liveMateSessionId();
-    const refreshedSessions = options.monitor.withLiveState(await options.adapter.listSessions());
-    const refreshedParent =
-      chart.parentSessionId === refreshedMateSessionId
-        ? refreshedSessions.find(
-            (session) =>
-              session.id === refreshedMateSessionId && session.status !== "done" && session.status !== "error"
-          )
-        : undefined;
-    if (!refreshedParent) {
-      return chartFeedbackUnavailable(chart);
-    }
-    try {
-      ({ queued } = await deliverInput(options, refreshedParent.id, block, "human"));
-      deliveredRecipient = refreshedParent;
-    } catch (fallbackError) {
-      if (isUnavailableSessionError(fallbackError)) {
-        return chartFeedbackUnavailable(chart);
-      }
-      throw fallbackError;
-    }
-  }
-  await audit(options.auditLog, {
-    action: "chart_feedback",
-    sessionId: deliveredRecipient.id,
-    chartId: chart.id,
-    ...(chart.taskId ? { taskId: chart.taskId } : {}),
-    ...auditMeta,
-    textLength: block.length
-  });
-  const responseBody: ChartFeedbackResponse = { ok: true, queued };
-  return rpcOk(202, responseBody);
-}
-
-function isUnavailableSessionError(error: unknown): boolean {
-  if (!(error instanceof Error)) return false;
-  return (
-    error.message === "worker session has ended; follow-up input was not accepted" ||
-    error.message.startsWith("Unknown PTY session:") ||
-    /^Session .+ has ended$/.test(error.message) ||
-    error.message.startsWith("unknown codex app-server session:")
-  );
-}
-
-function chartFeedbackUnavailable(chart: Chart): RpcResult {
-  const parentDetail = chart.parentSessionId
-    ? ` and its registered parent (${chart.parentSessionId}) are unavailable`
-    : " and it has no registered parent";
-  return {
-    status: 409,
-    body: {
-      error: `The session that drew this chart is gone (${chart.sessionId})${parentDetail}. Start a fresh agent with the chart as context.`,
-      chartId: chart.id,
-      alternatives: ["new_agent"]
-    }
-  };
-}
-
-// Layout-audit findings from the injected SDK, delivered to the drawing agent
-// through the same composer path but prefixed as machine feedback. Unchanged
-// or empty reports are dropped (never spam the composer on every reload), and
-// a dead owning session degrades to delivered:false - unlike boss feedback,
-// there is no one to fix the layout, so nothing needs re-routing.
-async function chartLayoutWarningsRpc(
-  chartId: string,
-  body: ChartLayoutWarningsRequest,
-  options: HttpServerOptions,
-  auditMeta: Pick<Parameters<AuditLog["write"]>[0], "deviceId" | "remoteAddress">
-): Promise<RpcResult> {
-  const charts = options.charts;
-  if (!charts) {
-    return rpcError(501, "Charts are not enabled on this server");
-  }
-  const chart = charts.find(chartId);
-  if (!chart) {
-    return rpcError(404, `Unknown chart: ${chartId}`);
-  }
-  const raw = body.layout_warnings ?? body.layoutWarnings ?? [];
-  const { changed, warnings } = charts.recordLayoutWarnings(chart.id, raw);
-  if (!changed || warnings.length === 0) {
-    return rpcOk(200, { ok: true, delivered: false });
-  }
-  const sessions = options.monitor.withLiveState(await options.adapter.listSessions());
-  const owner = sessions.find((session) => session.id === chart.sessionId);
-  if (!owner || owner.status === "done" || owner.status === "error") {
-    return rpcOk(200, { ok: true, delivered: false, note: "owning session is gone" });
-  }
-  const block = formatLayoutWarnings(chart, warnings);
-  // Machine-origin provenance: the audit is not the boss typing.
-  options.timeline.recordSource(chart.sessionId, block, "agent");
-  const { queued } = await deliverInput(options, chart.sessionId, block, "agent");
-  await audit(options.auditLog, {
-    action: "chart_layout",
-    sessionId: chart.sessionId,
-    chartId: chart.id,
-    ...(chart.taskId ? { taskId: chart.taskId } : {}),
-    ...auditMeta,
-    textLength: block.length
-  });
-  return rpcOk(202, { ok: true, queued, delivered: true });
 }
 
 // Teardown: fm-teardown's landed-gate, then end session -> release worktree
@@ -5169,7 +4260,7 @@ async function handleHookReport(
     // workers keep the same note in their dispatch brief.
     if (eventName === "SessionStart") {
       writeJson(response, 200, {
-        hookSpecificOutput: { hookEventName: "SessionStart", additionalContext: CHART_CAPABILITY_NOTE }
+        hookSpecificOutput: { hookEventName: "SessionStart", additionalContext: PERCH_SESSION_NOTE }
       });
       return;
     }

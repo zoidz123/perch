@@ -12,7 +12,7 @@ export type PushNotification = {
   subtitle?: string;
   body: string;
   sessionId: string;
-  category: "approval" | "approval_choices" | "turn_done" | "error" | "mate_message" | "chart_ready";
+  category: "approval" | "approval_choices" | "turn_done" | "error" | "mate_message";
   // iOS notification grouping. Defaults to the session (one thread per solo
   // session, approvals threaded per session); the mate conversation pins a
   // stable "mate" thread across mate restarts.

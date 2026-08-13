@@ -164,8 +164,11 @@ test("POST /mate/start seeds the mate home and spawns the labeled mate; a live m
     const spec = readFileSync(join(mateHome, "AGENTS.md"), "utf8");
     assert.ok(spec.length > 0);
     assert.doesNotMatch(spec, /yolo/i);
-    assert.match(spec, /\*\*direct-PR\*\*/, "mate policy keeps direct-PR semantics");
-    assert.match(spec, /\*\*local-only\*\*/, "mate policy keeps local-only semantics");
+    assert.match(spec, /"kind": "ship"\|"scout"\|"operate"/, "mate policy lists every current task kind");
+    assert.match(spec, /Server-owned delivery verifies that receipt, pushes the reviewed head, and creates the PR/);
+    assert.match(spec, /complete report and structured evidence through the Mate mailbox/);
+    assert.match(spec, /Delivery mode fields are retired and receive a 409 response/);
+    assert.doesNotMatch(spec, /direct-PR|local-only|Drawing charts|\/charts\//);
     assert.ok(lstatSync(join(mateHome, "CLAUDE.md")).isSymbolicLink());
 
     // The mate home is infrastructure, never a registered project: the app

@@ -344,26 +344,3 @@ test("truncateAtWord keeps short text intact and clips long text on a space", ()
   assert.equal(clipped.length, 151); // no space to break on: hard cut + ellipsis
   assert.ok(clipped.endsWith("…"));
 });
-
-test("chart-ready pushes for a crew session too - boss-facing, never absorbed as crew noise", () => {
-  const { router, sent } = harness({
-    findSession: (id) => (id === "pty:crew" ? crewSession : undefined)
-  });
-  // The same crew session whose task events stay silent behind the mate...
-  router.taskEvent(task("t-1", { sessionId: "pty:crew", state: "done" }), { kind: "done" });
-  assert.equal(sent.length, 0);
-  // ...pushes immediately when it registers a chart for review.
-  router.chartReady("pty:crew", crewSession, "relay-reliability");
-  assert.equal(sent.length, 1);
-  assert.equal(sent[0]?.category, "chart_ready");
-  assert.equal(sent[0]?.title, "perch: a chart is ready for review");
-  assert.match(sent[0]?.body ?? "", /relay-reliability/);
-});
-
-test("chart-ready pushes for solo and mate sessions with the project in the title", () => {
-  const { router, sent } = harness();
-  router.chartReady("pty:solo", soloSession, "roadmap");
-  assert.equal(sent.length, 1);
-  assert.equal(sent[0]?.category, "chart_ready");
-  assert.match(sent[0]?.title ?? "", /chart is ready for review/);
-});

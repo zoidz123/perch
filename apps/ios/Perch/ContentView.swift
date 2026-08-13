@@ -112,13 +112,6 @@ struct ContentView: View {
             PairView()
                 .environmentObject(store)
         }
-        // A committed plan opened from the Plans hub is read-only because it
-        // has no owning agent session to route feedback to.
-        .fullScreenCover(item: $store.openPlan) { plan in
-            PlanReviewView(plan: plan)
-                .environmentObject(store)
-                .preferredColorScheme(.dark)
-        }
         .task {
                 pushCoordinator.store = store
                 if store.isPaired && !screenshotRun {
@@ -1024,35 +1017,16 @@ struct HomeComposer: View {
     var focused: FocusState<Bool>.Binding
     @State private var text = ""
     @State private var sending = false
-    @State private var showPlansHub = false
     @StateObject private var dictation = VoiceDictation()
 
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
-            // Controls row: the mate's model picker sits at the left, while
-            // committed implementation plans remain reachable from the home
-            // composer without exposing the retired chart surface.
             HStack(spacing: 10) {
                 if let mate = store.mateSession {
                     ModelChip(sessionId: mate.id, agent: mate.agent)
                         .padding(.leading, 8)
                 }
-
                 Spacer(minLength: 8)
-
-                Button {
-                    showPlansHub = true
-                } label: {
-                    HStack(spacing: 5) {
-                        Image(systemName: "doc.plaintext")
-                            .font(.system(size: 13, weight: .semibold))
-                        Text("Plans")
-                            .font(.system(size: 13, weight: .medium))
-                    }
-                    .foregroundStyle(Style.textSecondary)
-                }
-                .buttonStyle(.plain)
-                .padding(.trailing, 8)
             }
 
             HStack(spacing: 10) {
@@ -1116,11 +1090,6 @@ struct HomeComposer: View {
             .animation(.snappy(duration: 0.22, extraBounce: 0.02), value: dictation.isActive)
             .animation(.easeOut(duration: 0.16), value: focused.wrappedValue)
             .dictationLifecycle(dictation)
-        }
-        .sheet(isPresented: $showPlansHub) {
-            PlansHubView()
-                .environmentObject(store)
-                .preferredColorScheme(.dark)
         }
     }
 
@@ -1560,7 +1529,6 @@ struct SessionDetailView: View {
     @State private var selectionToken = UUID()
     @State private var pickedPhotos: [PhotosPickerItem] = []
     @State private var uploadingPhoto = false
-    @State private var showPlansHub = false
     @FocusState private var composerFocused: Bool
     @StateObject private var dictation = VoiceDictation()
 
@@ -1585,11 +1553,6 @@ struct SessionDetailView: View {
 
     private var contentPresentation: ConnectionContentPresentation {
         store.sessionContentPresentation(for: sessionId)
-    }
-
-    // The mate's own chat exposes the committed Plans hub from its composer.
-    private var isMate: Bool {
-        session?.labels?["role"] == "mate"
     }
 
     // Structured timeline recovery exists for claude (hooks + transcript
@@ -1850,28 +1813,12 @@ struct SessionDetailView: View {
             AttachmentBar(picked: $pickedPhotos, uploading: $uploadingPhoto)
 
             // Controls row: the model picker remains available for provider
-            // sessions. The mate also exposes the committed Plans hub here.
-            if (session?.agent == .claude || session?.agent == .codex) || isMate {
+            // sessions.
+            if session?.agent == .claude || session?.agent == .codex {
                 HStack(spacing: 10) {
                     if let agent = session?.agent, agent == .claude || agent == .codex {
                         ModelChip(sessionId: sessionId, agent: agent)
                             .padding(.leading, 8)
-                    }
-                    if isMate {
-                        Spacer(minLength: 8)
-                        Button {
-                            showPlansHub = true
-                        } label: {
-                            HStack(spacing: 5) {
-                                Image(systemName: "doc.plaintext")
-                                    .font(.system(size: 13, weight: .semibold))
-                                Text("Plans")
-                                    .font(.system(size: 13, weight: .medium))
-                            }
-                            .foregroundStyle(Style.textSecondary)
-                        }
-                        .buttonStyle(.plain)
-                        .padding(.trailing, 8)
                     }
                 }
             }
@@ -1924,11 +1871,6 @@ struct SessionDetailView: View {
             .animation(.snappy(duration: 0.22, extraBounce: 0.02), value: dictation.isActive)
             .animation(.easeOut(duration: 0.16), value: composerFocused)
             .dictationLifecycle(dictation)
-        }
-        .sheet(isPresented: $showPlansHub) {
-            PlansHubView()
-                .environmentObject(store)
-                .preferredColorScheme(.dark)
         }
     }
 

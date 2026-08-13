@@ -651,7 +651,7 @@ function codexMigrationHandoff(
     "Perch migrated this task to a fresh Codex thread to preserve root-only task authority.",
     "Continue from the current worktree and verify existing changes before editing.",
     prompt ? `Original task brief:\n${prompt}` : `Task: ${task.title}`
-  ].join("\n\n") + dispatchBrief(task, worktreePath, {}, "codex");
+  ].join("\n\n") + dispatchBrief(task, worktreePath, "codex");
 }
 
 function pendingMigrationHandoff(

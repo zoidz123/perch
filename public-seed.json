@@ -43,7 +43,6 @@
     "packages/relay/deploy/README.md"
   ],
   "runtimeMarkdown": [
-    "apps/server/assets/charts/AUTHORING.md",
     "apps/server/assets/mate/AGENTS.md",
     "apps/server/assets/autoreview/skill/AGENTS.md",
     "apps/server/assets/autoreview/skill/CLAUDE.md",

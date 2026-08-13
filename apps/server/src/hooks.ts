@@ -144,22 +144,10 @@ function installPerchHookShim(env: NodeJS.ProcessEnv): void {
   writeFileAtomic(path, content, 0o700);
 }
 
-// The capability note delivered to every perch session that needs it: Claude
-// receives it as SessionStart additionalContext through the hook above; codex
-// receives it the same way in solo sessions and keeps it in task-worker briefs.
-// Lives server-side so it versions with the server, and points at the served
-// authoring guide - external users have no perch repo checkout to read.
-export const CHART_CAPABILITY_NOTE = [
-  "You are running under perch: the boss watches and steers this session from a phone or another desktop.",
-  "When a deliverable is easier reviewed visually than as prose - a plan, a comparison, findings - you can draw a chart: one HTML file the boss reviews and annotates on phone or desktop.",
-  "FIRST fetch the authoring guide and follow it strictly (every chart renders in the one fixed perch look via chart.css and its documented classes - no <style> blocks, no style= attributes):",
-  '  curl -sf "${PERCH_HOOK_URL%/hooks}/charts/authoring"',
-  "Write the file to .charts/<slug>.html in your workspace (scratch, keep it out of commits), then register it once:",
-  '  curl -sf -X POST "${PERCH_HOOK_URL%/hooks}/charts" \\',
-  '    -H "x-perch-session: $PERCH_SESSION_ID" -H "x-perch-token: $PERCH_HOOK_TOKEN" \\',
-  "    -H \"content-type: application/json\" -d '{\"file\":\"<absolute path to the .html file>\"}'",
-  "Registration notifies the boss; edits to the file refresh an open review live; boss feedback arrives in this session as a [perch chart] block."
-].join("\n");
+// Delivered to every managed session at startup so the worker understands the
+// control relationship even when it has no task-specific brief.
+export const PERCH_SESSION_NOTE =
+  "You are running under perch: the boss watches and steers this session from a phone or another desktop.";
 
 // Hook events perch listens to. PreToolUse doubles as a cheap "running"
 // heartbeat during long turns. Keep this list to events Claude actually

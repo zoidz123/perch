@@ -114,8 +114,6 @@ try {
   command(functionalBin, ["config", "set", "--global", "dispatch.agent", "codex"]);
   const config = command(functionalBin, ["config", "get", "dispatch.agent", "--effective"]);
   assert.match(config, /codex/);
-  const authoring = fetchText(`${serverUrl}/charts/authoring`);
-  assert.match(authoring, /chart\.css/);
   command(functionalBin, ["pair"]);
   command(functionalBin, ["server", "stop"]);
   waitForStop();
@@ -157,9 +155,7 @@ function auditPack(pack) {
     "README.md",
     "bin/perch.mjs",
     "apps/server/dist/index.js",
-    "apps/server/dist/charts/vendor/LICENSE",
     "apps/server/assets/mate/AGENTS.md",
-    "apps/server/assets/charts/chart.css",
     "apps/server/assets/autoreview/manifest.json",
     "apps/server/assets/autoreview/LICENSE.upstream",
     "apps/server/assets/autoreview/perch-deletion-handling.patch",
@@ -180,7 +176,6 @@ function auditPack(pack) {
     /^README\.md$/,
     /^bin\/perch\.mjs$/,
     /^apps\/server\/dist\/.*\.js$/,
-    /^apps\/server\/dist\/charts\/vendor\/LICENSE$/,
     /^apps\/server\/assets\//,
     /^packages\/(shared|relay)\/dist\/.*\.js$/,
     /^THIRD_PARTY_NOTICES\.md$/
@@ -297,12 +292,4 @@ function waitForStop() {
     Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 100);
   }
   throw new Error(`server did not stop at ${serverUrl}`);
-}
-
-function fetchText(url) {
-  return execFileSync(process.execPath, ["-e", `fetch(${JSON.stringify(url)}).then(async r => { if (!r.ok) process.exit(1); process.stdout.write(await r.text()) })`], {
-    env: isolatedEnvironment,
-    encoding: "utf8",
-    timeout: 5000
-  });
 }

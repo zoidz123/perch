@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 
 import { execFileSync } from "node:child_process";
-import { cpSync, existsSync, lstatSync, mkdirSync, readdirSync, readlinkSync, rmSync } from "node:fs";
+import { existsSync, lstatSync, readdirSync, readlinkSync, rmSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -27,19 +27,10 @@ execFileSync(process.execPath, [npm, "run", "build", "--ignore-scripts"], {
   stdio: "inherit"
 });
 
-const vendorSource = join(root, "apps/server/src/charts/vendor");
-const vendorDestination = join(root, "apps/server/dist/charts/vendor");
-mkdirSync(vendorDestination, { recursive: true });
-cpSync(vendorSource, vendorDestination, { recursive: true });
-
 const required = [
   "bin/perch.mjs",
   "apps/server/dist/index.js",
-  "apps/server/dist/charts/vendor/LICENSE",
-  "apps/server/dist/charts/vendor/artifact-sdk.js",
   "apps/server/assets/mate/AGENTS.md",
-  "apps/server/assets/charts/chart.css",
-  "apps/server/assets/charts/AUTHORING.md",
   "apps/server/assets/autoreview/manifest.json",
   "apps/server/assets/autoreview/LICENSE.upstream",
   "apps/server/assets/autoreview/skill/CLAUDE.md",

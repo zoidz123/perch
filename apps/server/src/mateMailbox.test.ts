@@ -153,7 +153,6 @@ test("every boss lifecycle event creates a mailbox delivery; heartbeats and note
   const tasks = new TaskStore(env(root));
   const task = makeWorkedTask(tasks, "routing", "pty:worker");
 
-  tasks.recordEvent(task.id, { kind: "chart_ready", source: "system", message: "chart" });
   tasks.recordEvent(task.id, { kind: "pr_linked", source: "worker", message: "PR" });
   tasks.recordEvent(task.id, { kind: "stalled", source: "system", message: "watchdog" });
   tasks.recordEvent(task.id, { kind: "checks_green", source: "poller", message: "CI green" });
@@ -170,12 +169,11 @@ test("every boss lifecycle event creates a mailbox delivery; heartbeats and note
   tasks.recordEvent(task.id, { kind: "failed", source: "system", message: "post-merge failure" });
   tasks.recordEvent(task.id, { kind: "note", source: "worker", message: "bookkeeping" });
   const deliveries = tasks.stateDb.mateMailbox.list();
-  assert.equal(deliveries.length, 12);
+  assert.equal(deliveries.length, 11);
   const kinds = deliveries.map(
     (delivery) => tasks.stateDb.tasks.eventById(delivery.taskEventId)?.kind
   );
   assert.deepEqual(kinds, [
-    "chart_ready",
     "pr_linked",
     "stalled",
     "checks_green",

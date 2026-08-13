@@ -527,9 +527,6 @@ enum AgentEvent: Identifiable, Equatable {
     case assistantStream(sessionId: String, itemId: String, text: String, done: Bool, at: String)
     case approvalRequest(sessionId: String, id: String, summary: String, command: String?, at: String)
     case status(sessionId: String, status: AgentSessionStatus, at: String)
-    // Deprecated append-only wire event retained for compatibility with
-    // servers that still emit it. Mobile intentionally decodes then ignores it.
-    case chart(sessionId: String, chartId: String, name: String, reason: String, at: String)
 
     var id: String {
         switch self {
@@ -549,8 +546,6 @@ enum AgentEvent: Identifiable, Equatable {
             "\(sessionId)-approval-\(id)-\(at)"
         case let .status(sessionId, status, at):
             "\(sessionId)-status-\(status.rawValue)-\(at)"
-        case let .chart(sessionId, chartId, _, reason, at):
-            "\(sessionId)-chart-\(chartId)-\(reason)-\(at)"
         }
     }
 
@@ -563,8 +558,7 @@ enum AgentEvent: Identifiable, Equatable {
              let .timelineResync(sessionId, _, _),
              let .assistantStream(sessionId, _, _, _, _),
              let .approvalRequest(sessionId, _, _, _, _),
-             let .status(sessionId, _, _),
-             let .chart(sessionId, _, _, _, _):
+             let .status(sessionId, _, _):
             sessionId
         }
     }
@@ -601,9 +595,6 @@ extension AgentEvent: Decodable {
         case item
         case itemId
         case done
-        case chartId
-        case name
-        case reason
         case revision
     }
 
@@ -668,14 +659,6 @@ extension AgentEvent: Decodable {
             self = .status(
                 sessionId: try container.decode(String.self, forKey: .sessionId),
                 status: try container.decode(AgentSessionStatus.self, forKey: .status),
-                at: try container.decode(String.self, forKey: .at)
-            )
-        case "chart":
-            self = .chart(
-                sessionId: try container.decode(String.self, forKey: .sessionId),
-                chartId: try container.decode(String.self, forKey: .chartId),
-                name: try container.decode(String.self, forKey: .name),
-                reason: try container.decodeIfPresent(String.self, forKey: .reason) ?? "updated",
                 at: try container.decode(String.self, forKey: .at)
             )
         default:

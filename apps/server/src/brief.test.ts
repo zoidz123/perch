@@ -12,7 +12,7 @@ function task(overrides: Partial<Task> = {}): Task {
 }
 
 test("ship brief exposes server-owned AutoReview and delivery operations without direct delivery instructions", () => {
-  const brief = dispatchBrief(task(), "/tmp/wt", {}, "codex");
+  const brief = dispatchBrief(task(), "/tmp/wt", "codex");
   assert.match(brief, /perch\.autoreview_run/);
   assert.match(brief, /perch\.delivery_create_pr/);
   assert.match(brief, /Do not run git push, gh pr create, curl, or any independent delivery command/);
@@ -21,7 +21,7 @@ test("ship brief exposes server-owned AutoReview and delivery operations without
 });
 
 test("Claude ship brief has typed CLI parity and no worker-authored HTTP operation", () => {
-  const brief = dispatchBrief(task(), "/tmp/wt", {}, "claude");
+  const brief = dispatchBrief(task(), "/tmp/wt", "claude");
   assert.match(brief, /perch autoreview run --task ship-the-thing-a1b2/);
   assert.match(brief, /perch delivery create-pr --task ship-the-thing-a1b2/);
   assert.ok(!brief.includes("/autoreview"));
@@ -37,14 +37,8 @@ test("scout and operate briefs prohibit source delivery", () => {
   assert.match(operate, /Do not change repository files, run AutoReview, push, or create a code PR/);
 });
 
-test("a planId stamps the brief with the first-commit convention", () => {
-  const brief = dispatchBrief(task({ planId: "docs/plans/2026-08-07-hub.md" }), "/tmp/wt");
-  assert.match(brief, /builds from finalized plan `docs\/plans\/2026-08-07-hub\.md`/);
-  assert.match(brief, /Commit it first/);
-});
-
 test("Codex briefs preserve root-only native child guidance", () => {
-  const brief = dispatchBrief(task(), "/tmp/wt", {}, "codex");
+  const brief = dispatchBrief(task(), "/tmp/wt", "codex");
   assert.ok(brief.endsWith(CODEX_NATIVE_CHILD_GUIDANCE));
   assert.match(brief, /root thread's perch\.report_task_event tool/);
 });
@@ -60,7 +54,7 @@ test("no brief instructs a worker to run curl or draw a chart", () => {
   for (const kind of kinds) {
     for (const agent of agents) {
       const label = `${kind}/${agent ?? "default"}`;
-      const brief = dispatchBrief(task({ kind }), "/tmp/wt", {}, agent);
+      const brief = dispatchBrief(task({ kind }), "/tmp/wt", agent);
       assert.doesNotMatch(brief, CURL_INVOCATION, `${label} brief contains a curl invocation`);
       assert.doesNotMatch(brief, /chart/i, `${label} brief mentions charts`);
       assert.ok(!brief.includes("PERCH_HOOK_URL"), `${label} brief leaks the hook URL`);
