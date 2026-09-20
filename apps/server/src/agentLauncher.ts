@@ -34,6 +34,7 @@ import type { MateRecoveryCoordinator } from "./mateRecovery.js";
 import type { TimelineStore } from "./timeline.js";
 import type { WorktreeLease, WorktreePool } from "./worktrees.js";
 import type { CodexHistorySyncCoordinator } from "./codexHistorySync.js";
+import type { HerdrWorkerIntegration } from "./herdr.js";
 
 type LaunchAuditMeta = Pick<AuditRecord, "deviceId" | "remoteAddress">;
 
@@ -67,6 +68,9 @@ export type ManagedAgentLauncherOptions = {
   mateRecoveryCoordinator?: MateRecoveryCoordinator;
   promptDeliveries?: PromptDeliveryTracker;
   codexHistorySync?: CodexHistorySyncCoordinator;
+  // Optional Herdr presentation layer. It never replaces the task ledger or
+  // Codex app-server authority; unavailable Herdr is a no-op/fallback.
+  herdr?: HerdrWorkerIntegration;
 };
 
 export type StartManagedAgentInput = {
@@ -409,6 +413,23 @@ export async function startManagedAgent(
             }`
           );
         }
+      }
+    }
+
+    // Codex remains app-server-owned. Herdr receives a real, separate Perch
+    // worker console that reads status/output and forwards human input through
+    // this authoritative adapter. A console creation failure must never start
+    // a second Codex TUI or disrupt the task's existing runtime.
+    if (isCodexLaunch && options.herdr && input.taskId) {
+      try {
+        await options.herdr.ensureCodexConsole({
+          sessionId: session.id,
+          taskId: input.taskId,
+          workerName: task?.workerName,
+          cwd
+        });
+      } catch (error) {
+        console.warn(`herdr: Codex worker console unavailable for ${session.id}: ${error instanceof Error ? error.message : error}`);
       }
     }
 

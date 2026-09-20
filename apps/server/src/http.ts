@@ -131,6 +131,7 @@ import { ClaudeInteractionCoordinator, publicInteraction } from "./claudeInterac
 import type { PromptDeliveryTracker } from "./promptDeliveries.js";
 import { CodexHistorySyncCoordinator } from "./codexHistorySync.js";
 import type { MateMailboxNudger } from "./mateWake.js";
+import type { HerdrWorkerIntegration } from "./herdr.js";
 
 export { markTaskWorkingFromActivity } from "./agentLauncher.js";
 
@@ -197,6 +198,7 @@ export type HttpServerOptions = {
   // it should continue silently at the boundary. Optional for isolated HTTP
   // tests and older server compositions.
   mailboxNudger?: MateMailboxNudger;
+  herdr?: HerdrWorkerIntegration;
 };
 
 const CODEX_ON_PATH_TTL_MS = 30_000;
@@ -616,6 +618,14 @@ async function dispatchWebSocketRpc(
 
   if (method === "GET" && pathname === "/sessions") {
     return rpcOk(200, { sessions: options.monitor.withLiveState(await options.adapter.listSessions()) });
+  }
+
+  if (method === "GET" && pathname === "/integrations/herdr") {
+    return herdrStatusRpc(options);
+  }
+  if (method === "POST" && pathname === "/integrations/herdr") {
+    if (auth.kind !== "server") return rpcError(403, "Herdr setup requires the server token");
+    return updateHerdrRpc(body, options);
   }
 
   if (method === "GET" && pathname === "/claude-approvals") {
@@ -1355,6 +1365,22 @@ async function route(
       writeJson(response, 200, {
         sessions: options.monitor.withLiveState(await options.adapter.listSessions())
       });
+      return;
+    }
+
+    if (request.method === "GET" && pathname === "/integrations/herdr") {
+      const result = await herdrStatusRpc(options);
+      writeJson(response, result.status, result.body);
+      return;
+    }
+    if (request.method === "POST" && pathname === "/integrations/herdr") {
+      if (auth.kind !== "server") {
+        writeJson(response, 403, { error: "Herdr setup requires the server token" });
+        return;
+      }
+      const body = await readJson<Record<string, unknown>>(request);
+      const result = await updateHerdrRpc(body, options);
+      writeJson(response, result.status, result.body);
       return;
     }
 
@@ -4503,6 +4529,54 @@ function isNegativeDecision(decision: unknown): boolean {
 
 function auditValue(value: unknown): string | undefined {
   return typeof value === "string" ? value : typeof value === "number" ? String(value) : undefined;
+}
+
+async function herdrStatusRpc(options: HttpServerOptions): Promise<RpcResult> {
+  if (!options.herdr) return rpcError(501, "Herdr integration is not available in this Perch server");
+  const compatibility = await options.herdr.compatibility();
+  // This is intentionally configuration/diagnostics only. Pane identities,
+  // task paths, terminal output, provider ids, and tokens never leave the
+  // local durable integration record through this endpoint.
+  return rpcOk(200, {
+    configured: options.herdr.config(),
+    compatibility: {
+      available: compatibility.available,
+      compatible: compatibility.compatible,
+      ...(compatibility.version ? { version: compatibility.version } : {}),
+      ...(compatibility.protocol ? { protocol: compatibility.protocol } : {}),
+      ...(compatibility.reason ? { reason: compatibility.reason } : {})
+    },
+    providers: {
+      claude: { implemented: true },
+      codex: { implemented: true, presentation: "Perch worker console" },
+      cursor: { implemented: false }
+    }
+  });
+}
+
+async function updateHerdrRpc(body: Record<string, unknown>, options: HttpServerOptions): Promise<RpcResult> {
+  if (!options.settings) return rpcError(501, "Perch settings are unavailable");
+  const enabled = body.enabled;
+  if (enabled !== undefined && typeof enabled !== "boolean") return rpcError(400, "enabled must be a boolean");
+  const rawProviders = body.providers;
+  if (rawProviders !== undefined && !isRecord(rawProviders)) return rpcError(400, "providers must be an object");
+  const providers: Record<string, boolean> = {};
+  for (const provider of ["claude", "codex", "cursor"] as const) {
+    const value = rawProviders?.[provider];
+    if (value !== undefined && typeof value !== "boolean") {
+      return rpcError(400, `providers.${provider} must be a boolean`);
+    }
+    if (typeof value === "boolean") providers[provider] = value;
+  }
+  try {
+    const configured = options.settings.updateHerdr({
+      ...(typeof enabled === "boolean" ? { enabled } : {}),
+      providers
+    });
+    return rpcOk(200, { configured });
+  } catch (error) {
+    return rpcError(400, error instanceof Error ? error.message : String(error));
+  }
 }
 
 function rpcOk(status: number, body: unknown): RpcResult {

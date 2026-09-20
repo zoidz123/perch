@@ -88,7 +88,20 @@ async function main() {
     return;
   }
 
+  if (parsed.command === "herdr" && parsed.args[0] === "setup") {
+    // Setup is the only Perch command that may install a Herdr provider
+    // integration, and it is explicit at the terminal where the user can see
+    // Herdr's own mutation. All other commands only update Perch-local state.
+    await runHerdrSetup(parsed.args.slice(1), parsed.options);
+    return;
+  }
+
   await ensureServerRunning(parsed.options);
+
+  if (parsed.command === "herdr") {
+    await runHerdrCommand(parsed.args, parsed.options);
+    return;
+  }
 
   if (parsed.command === "ls") {
     await listSessions(parsed.options);
@@ -899,6 +912,183 @@ async function runConfigCommand(args, options) {
     const value = parsed.effective ? entry.effectiveValue : entry.storedValue;
     console.log(`${key.padEnd(34)} ${formatConfigValue(value).padEnd(18)} ${entry.source.padEnd(11)} ${entry.scope}`);
   }
+}
+
+// ---------------------------------------------------------------------------
+// Herdr integration: explicit setup, local configuration, and console client
+// ---------------------------------------------------------------------------
+
+function parseHerdrProviders(args) {
+  let value = "all";
+  for (let index = 0; index < args.length; index += 1) {
+    const arg = args[index];
+    if (arg === "--provider") {
+      value = requireValue(args, (index += 1), arg);
+    } else if (arg.startsWith("--provider=")) {
+      value = arg.slice("--provider=".length);
+    } else {
+      throw new Error(`unknown Herdr option: ${arg}`);
+    }
+  }
+  const requested = value === "all" ? ["claude", "codex"] : value.split(",").map((item) => item.trim()).filter(Boolean);
+  if (requested.length === 0 || requested.some((provider) => provider !== "claude" && provider !== "codex")) {
+    throw new Error("--provider must be claude, codex, claude,codex, or all (Cursor is not implemented)");
+  }
+  return [...new Set(requested)];
+}
+
+async function runHerdrSetup(args, options) {
+  const providers = parseHerdrProviders(args);
+  for (const provider of providers) {
+    await runInherited("herdr", ["integration", "install", provider]);
+  }
+  await ensureServerRunning(options);
+  await updateHerdrConfig(options, {
+    enabled: true,
+    providers: Object.fromEntries(providers.map((provider) => [provider, true]))
+  });
+  console.log(`Herdr enabled for ${providers.join(", ")}. Perch will create worker panes without focusing them.`);
+}
+
+async function runHerdrCommand(args, options) {
+  const [action = "status", ...rest] = args;
+  if (action === "status") {
+    if (rest.length > 0) throw new Error("Usage: perch herdr status");
+    const [response, providerStatus] = await Promise.all([
+      fetch(httpUrl(options, "/integrations/herdr"), { headers: jsonHeaders(options) }),
+      runCaptured("herdr", ["integration", "status"]).catch((error) => `Herdr provider integrations unavailable: ${error.message}`)
+    ]);
+    if (!response.ok) throw new Error(await responseError(response));
+    console.log(JSON.stringify(await response.json(), null, 2));
+    console.log(providerStatus.trim());
+    return;
+  }
+  if (action === "enable") {
+    const providers = parseHerdrProviders(rest);
+    await updateHerdrConfig(options, {
+      enabled: true,
+      providers: Object.fromEntries(providers.map((provider) => [provider, true]))
+    });
+    console.log(`Herdr enabled for ${providers.join(", ")}. This did not install or modify provider integrations; use \`perch herdr setup\` first if needed.`);
+    return;
+  }
+  if (action === "disable") {
+    if (rest.length > 0) throw new Error("Usage: perch herdr disable");
+    await updateHerdrConfig(options, { enabled: false });
+    console.log("Herdr disabled. Existing worker panes are left alone and no new panes will be created.");
+    return;
+  }
+  if (action === "console") {
+    await runHerdrConsole(rest, options);
+    return;
+  }
+  throw new Error("Usage: perch herdr <setup|status|enable|disable|console>");
+}
+
+async function updateHerdrConfig(options, body) {
+  const response = await fetch(httpUrl(options, "/integrations/herdr"), {
+    method: "POST",
+    headers: jsonHeaders(options),
+    body: JSON.stringify(body)
+  });
+  if (!response.ok) throw new Error(await responseError(response));
+  return response.json();
+}
+
+async function runHerdrConsole(args, options) {
+  let sessionRef;
+  for (let index = 0; index < args.length; index += 1) {
+    const arg = args[index];
+    if (arg === "--session") sessionRef = requireValue(args, (index += 1), arg);
+    else if (arg.startsWith("--session=")) sessionRef = arg.slice("--session=".length);
+    else throw new Error(`unknown Perch worker console option: ${arg}`);
+  }
+  if (!sessionRef) throw new Error("Usage: perch herdr console --session <perch-session-id>");
+  const session = await resolveSession(sessionRef, options);
+  if (session.agent !== "codex") {
+    throw new Error("Perch worker console is currently used only for app-server-owned Codex workers");
+  }
+  console.log(`Perch worker console - ${session.title}`);
+  console.log("This is not a Codex TUI. Enter a line to route it through Perch's authoritative Codex adapter. Ctrl-C closes the console, not the worker.");
+
+  let previous = "";
+  let previousState = "";
+  let closed = false;
+  const refresh = async () => {
+    if (closed) return;
+    const [logsResponse, sessionsResponse] = await Promise.all([
+      fetch(httpUrl(options, `/sessions/${encodeURIComponent(session.id)}/logs?lines=80`), {
+        headers: jsonHeaders(options)
+      }),
+      fetch(httpUrl(options, "/sessions"), { headers: jsonHeaders(options) })
+    ]);
+    if (!logsResponse.ok || !sessionsResponse.ok) return;
+    const [body, sessionsBody] = await Promise.all([logsResponse.json(), sessionsResponse.json()]);
+    const live = (sessionsBody.sessions ?? []).find((entry) => entry.id === session.id);
+    const state = live?.status ?? "unavailable";
+    if (state !== previousState) {
+      previousState = state;
+      process.stdout.write(`\n[Perch status: ${state}]\n`);
+    }
+    const text = (body.events ?? [])
+      .map((event) => event.text ?? event.raw ?? "")
+      .filter(Boolean)
+      .join("\n")
+      .trim();
+    if (text && text !== previous) {
+      previous = text;
+      process.stdout.write(`\n${text}\nperch> `);
+    }
+  };
+  await refresh();
+  const timer = setInterval(() => void refresh().catch(() => {}), 1500);
+  const { createInterface } = await import("node:readline");
+  const readline = createInterface({ input: process.stdin, output: process.stdout, prompt: "perch> " });
+  readline.on("line", (line) => {
+    void (async () => {
+      const text = line.trim();
+      if (!text) {
+        readline.prompt();
+        return;
+      }
+      const response = await fetch(httpUrl(options, `/sessions/${encodeURIComponent(session.id)}/submit`), {
+        method: "POST",
+        headers: jsonHeaders(options),
+        body: JSON.stringify({ text })
+      });
+      if (!response.ok) console.error(await responseError(response));
+      else console.log("submitted through Perch");
+      readline.prompt();
+    })().catch((error) => {
+      console.error(error instanceof Error ? error.message : String(error));
+      readline.prompt();
+    });
+  });
+  readline.once("close", () => {
+    closed = true;
+    clearInterval(timer);
+  });
+  readline.prompt();
+}
+
+async function runInherited(command, args) {
+  await new Promise((resolvePromise, reject) => {
+    const child = spawn(command, args, { stdio: "inherit" });
+    child.once("error", reject);
+    child.once("exit", (code) => (code === 0 ? resolvePromise() : reject(new Error(`${command} exited ${code ?? "unknown"}`))));
+  });
+}
+
+async function runCaptured(command, args) {
+  return await new Promise((resolvePromise, reject) => {
+    const child = spawn(command, args, { stdio: ["ignore", "pipe", "pipe"] });
+    let stdout = "";
+    let stderr = "";
+    child.stdout.on("data", (chunk) => { stdout += chunk; });
+    child.stderr.on("data", (chunk) => { stderr += chunk; });
+    child.once("error", reject);
+    child.once("exit", (code) => (code === 0 ? resolvePromise(stdout) : reject(new Error(stderr || `${command} exited ${code ?? "unknown"}`))));
+  });
 }
 
 function parseConfigArgs(args) {
@@ -2117,7 +2307,7 @@ function parseArgs(argv) {
     }
     // Subcommands with their own flag grammar keep those flags as positionals; the shared flags above
     // (--server, --token, ...) are already consumed.
-    if (arg.startsWith("-") && command !== "project" && command !== "config" && command !== "models" && command !== "tasks" && command !== "task" && command !== "worktrees" && command !== "doctor" && command !== "report" && command !== "mailbox" && command !== "autoreview" && command !== "delivery") {
+    if (arg.startsWith("-") && command !== "project" && command !== "config" && command !== "models" && command !== "tasks" && command !== "task" && command !== "worktrees" && command !== "doctor" && command !== "report" && command !== "mailbox" && command !== "autoreview" && command !== "delivery" && command !== "herdr") {
       throw new Error(`unknown option for ${command}: ${arg} (see \`perch --help\`)`);
     }
     args.push(arg);
@@ -2704,6 +2894,7 @@ function printHelp(command) {
   perch config set <mate|dispatch> <model> [--effort <level>] [--agent <agent>]
   perch config unset --global <key>
   perch config validate [--global] [--effective] [--json]
+  perch herdr <setup|status|enable|disable>
   perch worktrees
   perch worktrees release <id> [--force]
   perch doctor [--json] [--fix [--yes]]
@@ -2762,6 +2953,7 @@ function commandHelp(command) {
   if (command === "project") return "Usage:\n  perch project [list|ls]\n  perch project add <path>\n  perch project show <path>\n  perch project remove|rm <path>\n\nThe project registry is live server state only. It does not control delivery; choose ship, scout, or operate when creating a task.";
   if (command === "models") return "Usage: perch models [--json]\n\nLists selectable Mate and dispatch models, aliases, supported effort levels, and sources.";
   if (command === "config") return `Usage:\n  perch config show [--global] [--effective] [--json]\n  perch config get <key> [--global] [--effective] [--json]\n  perch config set <mate|dispatch> <model> [--effort <level>] [--agent <agent>]\n  perch config set --global <key> <value>\n  perch config unset --global <key>\n  perch config validate [--global] [--effective] [--json]\n\nGlobal defaults: dispatch.* for workers and mate.* for Mate.\nTask kind controls delivery: ship, scout, or operate.\nUse \`perch project list\` for the live project registry.`;
+  if (command === "herdr") return "Usage:\n  perch herdr setup [--provider claude|codex|claude,codex|all]\n  perch herdr status\n  perch herdr enable [--provider claude|codex|claude,codex|all]\n  perch herdr disable\n\nsetup is the one explicit command that installs Herdr's provider integrations, then enables Perch-local worker panes. Claude runs in its real Herdr pane. Codex gets a clearly labeled Perch worker console and never a second Codex TUI. Cursor is not implemented.";
   if (command === "worktrees") return "Usage:\n  perch worktrees\n  perch worktrees release <id> [--force]\n\nLists isolated task worktrees or releases an orphaned lease.";
   if (command === "doctor") return "Usage: perch doctor [--json] [--fix [--yes]]\n\nChecks the server environment for the external tools perch depends on, and reports what `--fix` would do.";
   if (command === "uninstall") return "Usage: perch uninstall [--dry-run] [--purge-data] [--force]\n\nRemoves Perch-managed agent configuration. It preserves ~/.perch state unless --purge-data is supplied.";

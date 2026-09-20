@@ -60,9 +60,28 @@ export type MateDefaultsUpdate = {
   effort?: string | null;
 };
 
+// Herdr is deliberately opt-in. The installed provider integrations are
+// global provider configuration, so Perch never installs them implicitly:
+// `perch herdr setup` is the one explicit command that may do so.
+//
+// Cursor is retained as a provider-neutral seam only. It is not enabled or
+// launched until Perch has a verified Cursor transport implementation.
+export type HerdrProvider = "claude" | "codex" | "cursor";
+
+export type HerdrSettings = {
+  enabled?: boolean;
+  providers?: Partial<Record<HerdrProvider, boolean>>;
+};
+
+export type HerdrSettingsUpdate = {
+  enabled?: boolean;
+  providers?: Partial<Record<HerdrProvider, boolean>>;
+};
+
 export type SettingsFile = {
   dispatchDefaults?: DispatchDefaults;
   mateDefaults?: MateDefaults;
+  herdr?: HerdrSettings;
 };
 
 const STORED_MODEL_REGISTRY = collectModels();
@@ -171,6 +190,40 @@ export class FleetSettings {
       ...(model ? { model } : {}),
       ...(effort ? { effort: effort as MateDefaults["effort"] } : {})
     });
+  }
+
+  herdr(): HerdrSettings {
+    const stored = this.load().herdr;
+    return {
+      enabled: stored?.enabled === true,
+      providers: {
+        claude: stored?.providers?.claude === true,
+        codex: stored?.providers?.codex === true,
+        // Cursor intentionally remains disabled until a transport exists.
+        cursor: false
+      }
+    };
+  }
+
+  updateHerdr(update: HerdrSettingsUpdate): HerdrSettings {
+    const current = this.load().herdr ?? {};
+    const providers = { ...(current.providers ?? {}) };
+    for (const provider of ["claude", "codex", "cursor"] as const) {
+      const value = update.providers?.[provider];
+      if (value !== undefined) {
+        if (provider === "cursor" && value) {
+          throw new Error("Cursor Herdr support is not implemented yet");
+        }
+        providers[provider] = value;
+      }
+    }
+    const next: HerdrSettings = {
+      ...current,
+      ...(update.enabled !== undefined ? { enabled: update.enabled } : {}),
+      providers
+    };
+    this.persist({ ...this.load(), herdr: next });
+    return this.herdr();
   }
 
   // Apply a partial update to the persisted mate defaults (null clears a key).
