@@ -182,7 +182,7 @@ const herdrClaude = new HerdrClaudeAdapter(herdrIntegration, {
     pushRouter.sessionExited(sessionId);
   }
 });
-const adapter = new RoutingAgentAdapter(ptyAdapter, codexOwned, herdrClaude);
+const adapter = new RoutingAgentAdapter(ptyAdapter, codexOwned, herdrClaude, herdrIntegration);
 tasks.claimLegacyActiveWorkerNames();
 runtimeManager.bootstrapLegacyTasks();
 runtimeManager.repairLegacySessionGoneArtifacts();

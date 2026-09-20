@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 import type { AgentSession, FleetEvent, RecentEventsResult } from "@perch/shared";
 import type { CodexAppServerAdapter } from "./codexAppServerAdapter.js";
+import type { HerdrWorkerIntegration } from "../herdr.js";
 import type { PtyAgentAdapter } from "./pty.js";
 import { RoutingAgentAdapter } from "./routingAdapter.js";
 import type { AgentAdapter } from "./types.js";
@@ -9,6 +10,7 @@ import type { AgentAdapter } from "./types.js";
 class EventAdapter implements AgentAdapter {
   readonly name = "event-adapter";
   private readonly handlers = new Set<(event: FleetEvent) => void>();
+  readonly stopped: string[] = [];
 
   async getTopology() {
     return { windows: [], generatedAt: "" };
@@ -26,6 +28,10 @@ class EventAdapter implements AgentAdapter {
   async sendEnter(): Promise<void> {}
   async interrupt(): Promise<void> {}
 
+  async stopSession(sessionId: string): Promise<void> {
+    this.stopped.push(sessionId);
+  }
+
   subscribeFleetEvents(handler: (event: FleetEvent) => void): () => void {
     this.handlers.add(handler);
     return () => this.handlers.delete(handler);
@@ -37,8 +43,8 @@ class EventAdapter implements AgentAdapter {
 }
 
 class OwnedEventAdapter extends EventAdapter {
-  has(): boolean {
-    return false;
+  has(sessionId: string): boolean {
+    return sessionId === "pty:codex";
   }
 }
 
@@ -64,4 +70,22 @@ test("routing fans PTY and owned-Codex topology into one coalesced invalidation"
   codex.emit({ kind: "topology", at: "t4", name: "codex.owned-session.removed" });
   await Promise.resolve();
   assert.equal(received.length, 2, "unsubscribing detaches both fleet-event sources");
+});
+
+test("task teardown closes the durable Herdr surface after its owning Codex worker stops", async () => {
+  const pty = new EventAdapter();
+  const codex = new OwnedEventAdapter();
+  const closed: string[] = [];
+  const herdr = { close: async (sessionId: string) => { closed.push(sessionId); } };
+  const routing = new RoutingAgentAdapter(
+    pty as unknown as PtyAgentAdapter,
+    codex as unknown as CodexAppServerAdapter,
+    undefined,
+    herdr as HerdrWorkerIntegration
+  );
+
+  await routing.stopSession("pty:codex");
+
+  assert.deepEqual(codex.stopped, ["pty:codex"]);
+  assert.deepEqual(closed, ["pty:codex"]);
 });

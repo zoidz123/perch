@@ -22,13 +22,16 @@ Enable does not install or mutate a provider integration.
 
 ## What Perch creates
 
-Each dispatched Claude worker is started in a real Herdr-owned pane with `--no-focus`.
+Each newly dispatched Claude worker gets a new, clearly labeled tab in the Mate's current Herdr workspace.
+Perch creates that tab with `--no-focus`, then starts the worker in its one root pane.
+It never splits the Mate's current tab, and it does not select the new tab.
 Perch still mints the worker session id, owns the task/worktree ledger, installs and correlates hooks, handles approvals and recovery, and applies the existing teardown gate.
 The pane's exact Herdr session, workspace, tab, pane, and terminal identities are stored durably.
 After a Perch restart, it reconnects only to the stored pane ids and never creates replacements during reconnect.
 A missing pane becomes stale state instead of a duplicate pane.
 
-Each dispatched Codex worker remains owned solely by Perch's `codex app-server` adapter.
+Each newly dispatched Codex worker gets the same one-tab, one-root-pane presentation.
+It remains owned solely by Perch's `codex app-server` adapter.
 Perch never starts a second Codex TUI or another app-server client.
 Instead it creates a real Herdr pane running `perch herdr console --session <id>`.
 The pane is explicitly reported as `Perch worker console` in Herdr.
@@ -36,8 +39,10 @@ It shows live state/output from Perch and routes typed lines through Perch's exi
 
 The task ledger remains the lifecycle authority for every worker.
 Herdr status is presentation only.
-On a landed or forced teardown, Perch closes only the stored pane id after its existing gate authorizes the cleanup.
-Missing or already-closed panes are harmless best-effort cleanup outcomes.
+On a landed or forced teardown, Perch closes the stored worker tab only when it still contains that one root pane.
+If someone added another pane to it, Perch closes only the stored worker pane instead.
+It never closes an unrelated tab or pane.
+Missing Codex console panes are marked stale presentation state and never change the task's working state or cause Perch to create a replacement on reconnect.
 
 ## Compatibility and privacy
 
