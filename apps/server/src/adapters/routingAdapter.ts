@@ -18,6 +18,7 @@ import type {
 import type { SubmitBarrier } from "../modelSwitch.js";
 import type { HerdrClaudeAdapter } from "../herdr.js";
 import type { CodexAppServerAdapter } from "./codexAppServerAdapter.js";
+import type { HerdrWorkerIntegration } from "../herdr.js";
 import type { PtyAgentAdapter } from "./pty.js";
 import type { AgentAdapter, TerminalSnapshot } from "./types.js";
 
@@ -33,7 +34,8 @@ export class RoutingAgentAdapter implements AgentAdapter {
   constructor(
     private readonly pty: PtyAgentAdapter,
     private readonly codexOwned: CodexAppServerAdapter,
-    private readonly herdrClaude?: HerdrClaudeAdapter
+    private readonly herdrClaude?: HerdrClaudeAdapter,
+    private readonly herdr?: HerdrWorkerIntegration
   ) {}
 
   private ownerOf(sessionId: string): AgentAdapter {
@@ -127,9 +129,13 @@ export class RoutingAgentAdapter implements AgentAdapter {
     await this.pty.resize?.(sessionId, cols, rows);
   }
 
-  stopSession(sessionId: string): Promise<void> {
+  async stopSession(sessionId: string): Promise<void> {
     const owner = this.ownerOf(sessionId);
-    return owner.stopSession ? owner.stopSession(sessionId) : Promise.resolve();
+    await (owner.stopSession ? owner.stopSession(sessionId) : Promise.resolve());
+    // Presentation cleanup belongs to task teardown, not a transient Codex
+    // console or app-server disconnect. The integration closes only its
+    // durable worker identity and leaves every unrelated Herdr tab untouched.
+    await this.herdr?.close(sessionId).catch(() => {});
   }
 
   runtimeProcess(sessionId: string): { processId: number; processStartedAt: string } | undefined {

@@ -38,23 +38,37 @@ export type HerdrPaneIdentity = Pick<
   "workspaceId" | "tabId" | "paneId" | "terminalId"
 >;
 
+export type HerdrTabIdentity = Pick<HerdrPaneIdentity, "workspaceId" | "tabId"> & {
+  paneCount?: number;
+};
+
+type WorkerPaneLaunch = {
+  sessionId: string;
+  taskId?: string;
+  workerName?: string;
+  provider: "claude" | "codex";
+  cwd: string;
+  command: string;
+  args: string[];
+  env: Record<string, string>;
+};
+
 export type HerdrTransport = {
   compatibility(): Promise<HerdrCompatibility>;
   installIntegration(provider: Exclude<HerdrProvider, "cursor">): Promise<void>;
-  startAgent(input: {
+  createWorkerTab(input: {
     name: string;
     cwd: string;
-    command: string;
-    args: string[];
     env: Record<string, string>;
-    workspaceId?: string;
-    tabId?: string;
   }): Promise<HerdrPaneIdentity>;
+  runPane(paneId: string, command: string): Promise<void>;
   pane(identity: string): Promise<HerdrPaneIdentity | undefined>;
+  tab(tabId: string): Promise<HerdrTabIdentity | undefined>;
   readPane(paneId: string, lines: number): Promise<string>;
   sendText(paneId: string, text: string): Promise<void>;
   sendKeys(paneId: string, ...keys: string[]): Promise<void>;
   closePane(paneId: string): Promise<void>;
+  closeTab(tabId: string): Promise<void>;
   reportConsoleAgent(paneId: string, state: "idle" | "working" | "blocked" | "unknown"): Promise<void>;
 };
 
@@ -109,30 +123,39 @@ export class CliHerdrTransport implements HerdrTransport {
     await this.run(["integration", "install", provider]);
   }
 
-  async startAgent(input: {
+  async createWorkerTab(input: {
     name: string;
     cwd: string;
-    command: string;
-    args: string[];
     env: Record<string, string>;
-    workspaceId?: string;
-    tabId?: string;
   }): Promise<HerdrPaneIdentity> {
-    const args = ["agent", "start", input.name, "--cwd", input.cwd, "--no-focus"];
-    if (input.workspaceId) args.push("--workspace", input.workspaceId);
-    if (input.tabId) args.push("--tab", input.tabId);
+    // `agent start --tab` splits an additional pane and can select that tab
+    // despite --no-focus. A tab's public create command gives us one root pane
+    // in Herdr's currently focused (Mate) workspace without selecting it.
+    const args = ["tab", "create", "--cwd", input.cwd, "--label", input.name, "--no-focus"];
     for (const [key, value] of Object.entries(input.env)) {
       // The hook capability is passed only to the terminal process. It is not
       // written to Herdr metadata or Perch presentation records.
       args.push("--env", `${key}=${value}`);
     }
-    args.push("--", input.command, ...input.args);
-    return paneIdentityFromResponse(await this.runJson(args));
+    return tabRootPaneIdentityFromResponse(await this.runJson(args));
+  }
+
+  async runPane(paneId: string, command: string): Promise<void> {
+    await this.run(["pane", "run", paneId, command]);
   }
 
   async pane(paneId: string): Promise<HerdrPaneIdentity | undefined> {
     try {
       return paneIdentityFromResponse(await this.runJson(["pane", "get", paneId]));
+    } catch (error) {
+      if (isMissingPaneError(error)) return undefined;
+      throw error;
+    }
+  }
+
+  async tab(tabId: string): Promise<HerdrTabIdentity | undefined> {
+    try {
+      return tabIdentityFromResponse(await this.runJson(["tab", "get", tabId]));
     } catch (error) {
       if (isMissingPaneError(error)) return undefined;
       throw error;
@@ -156,6 +179,14 @@ export class CliHerdrTransport implements HerdrTransport {
   async closePane(paneId: string): Promise<void> {
     try {
       await this.run(["pane", "close", paneId]);
+    } catch (error) {
+      if (!isMissingPaneError(error)) throw error;
+    }
+  }
+
+  async closeTab(tabId: string): Promise<void> {
+    try {
+      await this.run(["tab", "close", tabId]);
     } catch (error) {
       if (!isMissingPaneError(error)) throw error;
     }
@@ -268,12 +299,13 @@ export class HerdrWorkerIntegration {
     await this.assertCompatible();
     const command = request.command.trim();
     const args = [...(request.args ?? []), ...spawnModelArgs("claude", request.model, request.effort)];
-    const identity = await this.transport.startAgent({
-      // A task title can contain the user's brief. Herdr only needs a short
-      // operational label, so never promote title/prompt-shaped text into the
-      // external terminal name.
-      name: paneName(request.labels?.workerName ?? "Perch Claude worker"),
-      cwd: request.cwd ?? process.cwd(),
+    const cwd = request.cwd ?? process.cwd();
+    const identity = await this.createWorkerPane({
+      sessionId,
+      taskId: taskId ?? request.labels?.task,
+      workerName: request.labels?.workerName,
+      provider: "claude",
+      cwd,
       command,
       args,
       env: environment
@@ -308,8 +340,11 @@ export class HerdrWorkerIntegration {
       throw error;
     }
     const console = this.consoleCommand(input.sessionId);
-    const identity = await this.transport.startAgent({
-      name: paneName(`Perch worker console ${input.workerName ?? "worker"}`),
+    const identity = await this.createWorkerPane({
+      sessionId: input.sessionId,
+      taskId: input.taskId,
+      workerName: input.workerName,
+      provider: "codex",
       cwd: input.cwd,
       command: console.command,
       args: console.args,
@@ -386,13 +421,41 @@ export class HerdrWorkerIntegration {
   async close(sessionId: string): Promise<void> {
     const record = this.panes.find(sessionId);
     if (!record || record.state === "closed") return;
-    await this.transport.closePane(record.paneId);
+    const [pane, tab] = await Promise.all([
+      this.transport.pane(record.paneId),
+      this.transport.tab(record.tabId)
+    ]);
+    // Close the worker's tab only while it still contains exactly its stored
+    // root pane. If a person moved another pane into it, preserve that pane and
+    // close the stored worker pane instead. Either operation is identity-bound.
+    if (
+      pane
+      && pane.workspaceId === record.workspaceId
+      && pane.tabId === record.tabId
+      && tab?.workspaceId === record.workspaceId
+      && tab.paneCount === 1
+    ) {
+      await this.transport.closeTab(record.tabId);
+    } else if (pane) {
+      await this.transport.closePane(record.paneId);
+    }
     this.panes.markState(sessionId, "closed");
   }
 
   async syncConsole(session: HerdrWorkerPaneRecord, status: AgentSessionStatus): Promise<void> {
     if (session.presentationKind !== "console" || session.state !== "live") return;
-    await this.transport.reportConsoleAgent(session.paneId, herdrState(status));
+    try {
+      await this.transport.reportConsoleAgent(session.paneId, herdrState(status));
+    } catch (error) {
+      // A closed console is presentation loss only. The Codex app-server and
+      // durable task remain authoritative, and reconnect must never create a
+      // replacement tab that could duplicate a surviving console.
+      if (isMissingPaneError(error)) {
+        this.panes.markState(session.perchSessionId, "stale");
+        return;
+      }
+      throw error;
+    }
   }
 
   async syncCodexStatus(sessionId: string, status: AgentSessionStatus): Promise<void> {
@@ -414,6 +477,20 @@ export class HerdrWorkerIntegration {
       throw new Error(`No live Herdr pane for Perch session ${sessionId}`);
     }
     return record;
+  }
+
+  private async createWorkerPane(input: WorkerPaneLaunch): Promise<HerdrPaneIdentity> {
+    const label = workerTabLabel(input);
+    const identity = await this.transport.createWorkerTab({ name: label, cwd: input.cwd, env: input.env });
+    try {
+      await this.transport.runPane(identity.paneId, shellCommand(input.command, input.args));
+      return identity;
+    } catch (error) {
+      // The tab was just created for this worker and is not persisted until its
+      // root process starts. Closing this exact id cannot touch a Mate tab.
+      await this.transport.closeTab(identity.tabId).catch(() => {});
+      throw error;
+    }
   }
 }
 
@@ -621,12 +698,36 @@ function paneIdentityFromResponse(response: unknown): HerdrPaneIdentity {
   return { workspaceId, tabId, paneId, ...(terminalId ? { terminalId } : {}) };
 }
 
+function tabRootPaneIdentityFromResponse(response: unknown): HerdrPaneIdentity {
+  const root = response as { result?: Record<string, unknown> };
+  const result = root?.result ?? root;
+  const source = (result as { root_pane?: Record<string, unknown>; rootPane?: Record<string, unknown> }).root_pane
+    ?? (result as { rootPane?: Record<string, unknown> }).rootPane;
+  if (!source) throw new Error("Herdr tab creation did not include its root pane identity");
+  return paneIdentityFromResponse({ result: { pane: source } });
+}
+
+function tabIdentityFromResponse(response: unknown): HerdrTabIdentity {
+  const root = response as { result?: Record<string, unknown> };
+  const result = root?.result ?? root;
+  const source = (result as { tab?: Record<string, unknown> }).tab ?? result as Record<string, unknown>;
+  const workspaceId = stringValue(source.workspace_id ?? source.workspaceId);
+  const tabId = stringValue(source.tab_id ?? source.tabId);
+  if (!workspaceId || !tabId) throw new Error("Herdr response did not include a workspace and tab identity");
+  const paneCount = typeof source.pane_count === "number"
+    ? source.pane_count
+    : typeof source.paneCount === "number"
+      ? source.paneCount
+      : undefined;
+  return { workspaceId, tabId, ...(paneCount !== undefined ? { paneCount } : {}) };
+}
+
 function stringValue(value: unknown): string | undefined {
   return typeof value === "string" && value.length > 0 ? value : undefined;
 }
 
 function isMissingPaneError(error: unknown): boolean {
-  return /not found|unknown (pane|agent|terminal)|does not exist/i.test(errorMessage(error));
+  return /not found|unknown (pane|agent|terminal|tab)|does not exist/i.test(errorMessage(error));
 }
 
 function errorMessage(error: unknown): string {
@@ -640,10 +741,32 @@ function requireSessionId(request: StartAgentRequest): string {
   return request.sessionId;
 }
 
-function paneName(value: string): string {
-  // Herdr's terminal title is user-visible. Keep it useful but never allow a
-  // task prompt or an unbounded external label to enter a title/metadata path.
-  return value.replace(/[\r\n\x00-\x1f]/g, " ").trim().slice(0, 80) || "Perch worker";
+function workerTabLabel(input: Pick<WorkerPaneLaunch, "sessionId" | "taskId" | "workerName" | "provider">): string {
+  // Reserve enough visible space for both halves. A long worker display name
+  // must not erase task identity, which is the part that separates siblings.
+  const worker = labelComponent(input.workerName ?? (input.provider === "codex" ? "Codex worker" : "Claude worker"), 28);
+  const identity = labelComponent(
+    input.taskId ? `task ${input.taskId}` : `session ${shortSessionId(input.sessionId)}`,
+    48
+  );
+  return `${worker} - ${identity}`;
+}
+
+function shortSessionId(sessionId: string): string {
+  const value = sessionId.startsWith("pty:") ? sessionId.slice(4) : sessionId;
+  return value.slice(0, 12) || "worker";
+}
+
+function labelComponent(value: string, limit: number): string {
+  return value.replace(/[\r\n\x00-\x1f]/g, " ").trim().slice(0, limit) || "Perch worker";
+}
+
+function shellCommand(command: string, args: string[]): string {
+  return [command, ...args].map(shellQuote).join(" ");
+}
+
+function shellQuote(value: string): string {
+  return `'${value.replace(/'/g, `'"'"'`)}'`;
 }
 
 function herdrState(status: AgentSessionStatus): "idle" | "working" | "blocked" | "unknown" {
