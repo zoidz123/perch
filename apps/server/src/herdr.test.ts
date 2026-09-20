@@ -99,6 +99,7 @@ function claudeRequest(sessionId = "pty:claude-worker"): StartAgentRequest {
 }
 
 test("public Herdr CLI transport starts no-focus panes and treats structured missing-pane errors as absent", async () => {
+  assert.doesNotThrow(() => new CliHerdrTransport(), "the default public-CLI runner must initialize at server boot");
   const calls: string[][] = [];
   const transport = new CliHerdrTransport("herdr", async (_command, args) => {
     calls.push(args);

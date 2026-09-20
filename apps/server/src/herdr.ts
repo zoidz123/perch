@@ -70,7 +70,7 @@ export class HerdrUnavailableError extends Error {
 export class CliHerdrTransport implements HerdrTransport {
   constructor(
     private readonly binary = "herdr",
-    private readonly runCommand: (command: string, args: string[]) => Promise<string> = runCommand
+    private readonly executeCommand: (command: string, args: string[]) => Promise<string> = runCommand
   ) {}
 
   async compatibility(): Promise<HerdrCompatibility> {
@@ -188,7 +188,7 @@ export class CliHerdrTransport implements HerdrTransport {
   }
 
   private async run(args: string[]): Promise<string> {
-    const output = await this.runCommand(this.binary, args);
+    const output = await this.executeCommand(this.binary, args);
     throwForHerdrResponseError(output);
     return output;
   }
