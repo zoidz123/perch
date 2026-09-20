@@ -22,7 +22,7 @@ test("fresh startup creates the versioned WAL database with foreign keys enabled
 
   assert.equal(state.path, join(root, "state.sqlite"));
   assert.equal(existsSync(state.path), true);
-  assert.equal(state.schemaVersion(), 22);
+  assert.equal(state.schemaVersion(), 23);
   assert.equal(state.journalMode(), "wal");
   assert.equal(state.foreignKeysEnabled(), true);
 
@@ -49,7 +49,8 @@ test("fresh startup creates the versioned WAL database with foreign keys enabled
     { version: 19, name: "durable-pending-session-inputs" },
     { version: 20, name: "retryable-pending-session-inputs" },
     { version: 21, name: "mate-input-delivery-stages" },
-    { version: 22, name: "delete-confirmed-pending-session-inputs" }
+    { version: 22, name: "delete-confirmed-pending-session-inputs" },
+    { version: 23, name: "herdr-worker-pane-identity" }
   ]);
   assert.deepEqual(
     inspect
@@ -66,6 +67,7 @@ test("fresh startup creates the versioned WAL database with foreign keys enabled
       "codex_history_syncs",
       "delivery_pr_attempts",
       "durable_owners",
+      "herdr_worker_panes",
       "legacy_imports",
       "mate_mailbox_deliveries",
       "native_child_runs",
@@ -213,13 +215,13 @@ test("version 22 deletes accepted-linked and legacy confirmed pending rows", () 
   legacy.prepare("UPDATE prompt_deliveries SET state = 'accepted' WHERE id = ?").run(delivery.id);
   legacy.prepare("UPDATE pending_session_inputs SET state = 'confirmed' WHERE id = ?").run(legacyConfirmed.id);
   legacy.exec(`
-    DELETE FROM schema_migrations WHERE version = 22;
+    DELETE FROM schema_migrations WHERE version IN (22, 23);
     PRAGMA user_version = 21;
   `);
   legacy.close();
 
   const migrated = new StateDb(env(root));
-  assert.equal(migrated.schemaVersion(), 22);
+  assert.equal(migrated.schemaVersion(), 23);
   assert.equal(migrated.pendingSessionInputs.find(pending.id), undefined);
   assert.equal(migrated.pendingSessionInputs.find(legacyConfirmed.id), undefined);
   migrated.close();
@@ -262,14 +264,14 @@ test("version 20 adopts the wedged head's unknown delivery for retry", () => {
     DROP TABLE pending_session_inputs_current;
     CREATE INDEX pending_session_inputs_session_idx
       ON pending_session_inputs(perch_session_id, created_at);
-    DELETE FROM schema_migrations WHERE version IN (20, 21, 22);
+    DELETE FROM schema_migrations WHERE version IN (20, 21, 22, 23);
     PRAGMA user_version = 19;
   `);
   legacy.close();
 
   const migrated = new StateDb(env(root));
   const adopted = migrated.pendingSessionInputs.find(pending.id);
-  assert.equal(migrated.schemaVersion(), 22);
+  assert.equal(migrated.schemaVersion(), 23);
   assert.equal(adopted?.deliveryId, delivery.id);
   assert.equal(adopted?.attemptCount, 1);
   assert.ok(adopted?.nextAttemptAt);
@@ -331,13 +333,13 @@ test("version 13 migrates an earlier prompt delivery schema without losing rows"
     DROP TABLE delivery_pr_attempts;
     DROP TABLE autoreview_attempts;
     DROP TABLE pending_session_inputs;
-    DELETE FROM schema_migrations WHERE version IN (13, 14, 15, 16, 17, 18, 19, 20, 21, 22);
+    DELETE FROM schema_migrations WHERE version IN (13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23);
     PRAGMA user_version = 12;
   `);
   legacy.close();
 
   const migrated = new StateDb(env(root));
-  assert.equal(migrated.schemaVersion(), 22);
+  assert.equal(migrated.schemaVersion(), 23);
   assert.deepEqual(migrated.promptDeliveries.find("legacy-delivery"), {
     id: "legacy-delivery",
     perchSessionId: "pty:legacy",

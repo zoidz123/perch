@@ -2,6 +2,7 @@ import { createHash } from "node:crypto";
 import { statSync } from "node:fs";
 import { request as httpRequest } from "node:http";
 import { basename } from "node:path";
+import { fileURLToPath } from "node:url";
 import { PtyAgentAdapter } from "./adapters/pty.js";
 import { CodexAppServerAdapter } from "./adapters/codexAppServerAdapter.js";
 import { CodexDaemonManager } from "./adapters/codexDaemon.js";
@@ -52,6 +53,7 @@ import { OutboxWorker } from "./outboxWorker.js";
 import { RuntimeManager } from "./runtimeManager.js";
 import { OwnerManager } from "./ownerManager.js";
 import { PromptDeliveryTracker, promptDeliverySurface } from "./promptDeliveries.js";
+import { HerdrClaudeAdapter, HerdrWorkerIntegration } from "./herdr.js";
 
 const config = readConfig();
 const hooks = new HookRegistry(process.env);
@@ -121,7 +123,6 @@ const ptyAdapter = new PtyAgentAdapter(undefined, {
   },
   onLog: (message) => console.log(message)
 });
-const adapter = new RoutingAgentAdapter(ptyAdapter, codexOwned);
 const auditLog = new AuditLog(config.auditLogPath);
 const devices = new DeviceRegistry();
 // Derive (or load) the long-term box keypair on boot; its public half is
@@ -134,6 +135,54 @@ const worktrees = new WorktreePool();
 const tasks = new TaskStore();
 const runtimeManager = new RuntimeManager(tasks);
 const ownerManager = new OwnerManager(tasks);
+const perchBin = fileURLToPath(new URL("../../../bin/perch.mjs", import.meta.url));
+const herdrIntegration = new HerdrWorkerIntegration(
+  tasks.stateDb.herdrWorkerPanes,
+  () => settings.herdr(),
+  undefined,
+  (sessionId) => ({
+    command: process.execPath,
+    // This process is a Perch console client, not `codex`. It consumes only
+    // the local Perch API and therefore cannot become a second app-server
+    // client or take over the authoritative Codex thread.
+    args: [perchBin, "herdr", "console", "--session", sessionId, "--server", `http://127.0.0.1:${config.port}`],
+    env: {
+      ...(process.env.PERCH_HOME ? { PERCH_HOME: process.env.PERCH_HOME } : {}),
+      PERCH_SERVER_URL: `http://127.0.0.1:${config.port}`
+    }
+  })
+);
+const herdrClaude = new HerdrClaudeAdapter(herdrIntegration, {
+  sessionEnv: (sessionId, request) => ({
+    PERCH_SESSION_ID: sessionId,
+    PERCH_HOOK_URL: `http://127.0.0.1:${config.port}/hooks`,
+    PERCH_HOOK_TOKEN: hooks.ensure(sessionId).token,
+    ...taskCapabilityEnvironment(tasks, request)
+  }),
+  taskIdForSession: (sessionId) => tasks.stateDb.runtimes.findBySession(sessionId)?.taskId,
+  onSessionExit: (sessionId, exitContext) => {
+    hooks.unregister(sessionId);
+    timeline.detach(sessionId);
+    removeAttachments(sessionId);
+    ownerManager.recordSessionExit(sessionId, exitContext.status);
+    void cleanupSessionExitWorktree(sessionId, exitContext, {
+      tasks,
+      worktrees,
+      adapter,
+      auditLog,
+      metrics,
+      runtimeManager
+    }).catch((error) => {
+      console.warn(
+        `worktree: Herdr session-exit cleanup failed for ${sessionId}: ${
+          error instanceof Error ? error.message : error
+        }`
+      );
+    });
+    pushRouter.sessionExited(sessionId);
+  }
+});
+const adapter = new RoutingAgentAdapter(ptyAdapter, codexOwned, herdrClaude);
 tasks.claimLegacyActiveWorkerNames();
 runtimeManager.bootstrapLegacyTasks();
 runtimeManager.repairLegacySessionGoneArtifacts();
@@ -759,8 +808,27 @@ const server = createControlServer({
   taskScheduler,
   runtimeManager,
   ownerManager,
-  mailboxNudger
+  mailboxNudger,
+  herdr: herdrIntegration
 });
+
+// Herdr keeps terminal panes alive across a Perch server restart. Re-adopt
+// only the exact persisted pane ids and never create panes during recovery,
+// which makes restart reconnect idempotent and prevents duplicates.
+const reconcileHerdrPanes = async (): Promise<void> => {
+  const result = await herdrIntegration.reconnect();
+  await herdrClaude.reconnect(result.connected);
+  for (const session of await codexOwned.listSessions()) {
+    await herdrIntegration.syncCodexStatus(session.id, session.status).catch(() => {});
+  }
+};
+adapter.subscribeFleetEvents?.((event) => {
+  if (event.sessionId && event.agent === "codex" && event.status) {
+    void herdrIntegration.syncCodexStatus(event.sessionId, event.status).catch(() => {});
+  }
+});
+const herdrReconcileTimer = setInterval(() => void reconcileHerdrPanes().catch(() => {}), 15_000);
+herdrReconcileTimer.unref?.();
 
 // Off-LAN reach: a relay is on by default (config.relayUrl resolves to the
 // hosted default unless PERCH_RELAY_URL overrides or opts out). We dial it
@@ -818,6 +886,9 @@ server.listen(config.port, "0.0.0.0", () => {
   codexDaemons.sweepOrphans(keepSockets);
   taskScheduler.start();
   outboxWorker.start();
+  void reconcileHerdrPanes().catch((error) => {
+    console.warn(`herdr: reconnect failed: ${error instanceof Error ? error.message : error}`);
+  });
   console.log(`Perch server listening on http://0.0.0.0:${config.port}`);
 });
 
@@ -866,6 +937,7 @@ async function shutdown(): Promise<void> {
     reconciler.stop();
     mailboxNudger?.stop();
     taskWatchdog?.stop();
+    clearInterval(herdrReconcileTimer);
     pushRouter.stop();
     relayClient?.stop();
     monitor.stop();

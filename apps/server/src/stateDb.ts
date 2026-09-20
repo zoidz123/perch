@@ -14,7 +14,7 @@ import type {
 import Database from "better-sqlite3";
 import type { TaskDeliverable, TaskVerificationFacts } from "./taskPresentation.js";
 
-const LATEST_SCHEMA_VERSION = 22;
+const LATEST_SCHEMA_VERSION = 23;
 const LEGACY_TASK_IMPORT = "tasks-json-v1";
 
 const MIGRATIONS = [
@@ -784,7 +784,30 @@ const MIGRATIONS = [
       WHERE state = 'confirmed'
          OR delivery_id IN (
            SELECT id FROM prompt_deliveries WHERE state = 'accepted'
-         );
+      );
+    `
+  },
+  {
+    version: 23,
+    name: "herdr-worker-pane-identity",
+    sql: `
+      CREATE TABLE IF NOT EXISTS herdr_worker_panes (
+        perch_session_id TEXT PRIMARY KEY,
+        task_id TEXT REFERENCES tasks(id) ON DELETE RESTRICT,
+        provider TEXT NOT NULL CHECK (provider IN ('claude', 'codex', 'cursor')),
+        presentation_kind TEXT NOT NULL CHECK (presentation_kind IN ('provider', 'console')),
+        herdr_session_id TEXT NOT NULL,
+        workspace_id TEXT NOT NULL,
+        tab_id TEXT NOT NULL,
+        pane_id TEXT NOT NULL UNIQUE,
+        terminal_id TEXT,
+        state TEXT NOT NULL CHECK (state IN ('live', 'stale', 'closed')),
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        closed_at TEXT
+      ) STRICT;
+      CREATE INDEX IF NOT EXISTS herdr_worker_panes_task_idx ON herdr_worker_panes(task_id, state);
+      CREATE INDEX IF NOT EXISTS herdr_worker_panes_live_idx ON herdr_worker_panes(state, updated_at);
     `
   }
 ] as const;
@@ -865,6 +888,27 @@ export type MateMailboxAckResult =
   | { outcome: "stale_generation"; delivery: MateMailboxDeliveryRecord };
 
 export type RuntimeState = "starting" | "live" | "recoverable" | "recovering" | "ended";
+
+// Durable public-API identity for one real Herdr pane. This is deliberately
+// narrow: no cwd, prompts, tails, provider thread ids, credentials, or attach
+// commands are copied into the integration record.
+export type HerdrWorkerPaneState = "live" | "stale" | "closed";
+export type HerdrPresentationKind = "provider" | "console";
+export type HerdrWorkerPaneRecord = {
+  perchSessionId: string;
+  taskId?: string;
+  provider: "claude" | "codex" | "cursor";
+  presentationKind: HerdrPresentationKind;
+  herdrSessionId: string;
+  workspaceId: string;
+  tabId: string;
+  paneId: string;
+  terminalId?: string;
+  state: HerdrWorkerPaneState;
+  createdAt: string;
+  updatedAt: string;
+  closedAt?: string;
+};
 
 export type RuntimeRecord = {
   id: string;
@@ -1297,6 +1341,21 @@ type TaskEventRow = {
   message: string | null;
   data_json: string | null;
 };
+type HerdrWorkerPaneRow = {
+  perch_session_id: string;
+  task_id: string | null;
+  provider: "claude" | "codex" | "cursor";
+  presentation_kind: HerdrPresentationKind;
+  herdr_session_id: string;
+  workspace_id: string;
+  tab_id: string;
+  pane_id: string;
+  terminal_id: string | null;
+  state: HerdrWorkerPaneState;
+  created_at: string;
+  updated_at: string;
+  closed_at: string | null;
+};
 
 export class StateDb {
   readonly path: string;
@@ -1316,6 +1375,7 @@ export class StateDb {
   readonly pendingSessionInputs: PendingSessionInputRepository;
   readonly codexHistorySyncs: CodexHistorySyncRepository;
   readonly nativeChildRuns: NativeChildRunRepository;
+  readonly herdrWorkerPanes: HerdrWorkerPaneRepository;
   readonly workerReports: WorkerReportRepository;
   readonly mateMailbox: MateMailboxRepository;
   readonly autoreview: AutoReviewRepository;
@@ -1351,6 +1411,7 @@ export class StateDb {
     this.pendingSessionInputs = new PendingSessionInputRepository(this.db);
     this.codexHistorySyncs = new CodexHistorySyncRepository(this.db);
     this.nativeChildRuns = new NativeChildRunRepository(this.db);
+    this.herdrWorkerPanes = new HerdrWorkerPaneRepository(this.db);
     this.importLegacyTasks(join(home, "tasks"));
   }
 
@@ -2338,6 +2399,101 @@ function mateMailboxFromRow(row: MateMailboxRow): MateMailboxDeliveryRecord {
     createdAt: row.created_at,
     updatedAt: row.updated_at
   };
+}
+
+function herdrWorkerPaneFromRow(row: HerdrWorkerPaneRow): HerdrWorkerPaneRecord {
+  return {
+    perchSessionId: row.perch_session_id,
+    ...(row.task_id ? { taskId: row.task_id } : {}),
+    provider: row.provider,
+    presentationKind: row.presentation_kind,
+    herdrSessionId: row.herdr_session_id,
+    workspaceId: row.workspace_id,
+    tabId: row.tab_id,
+    paneId: row.pane_id,
+    ...(row.terminal_id ? { terminalId: row.terminal_id } : {}),
+    state: row.state,
+    createdAt: row.created_at,
+    updatedAt: row.updated_at,
+    ...(row.closed_at ? { closedAt: row.closed_at } : {})
+  };
+}
+
+export class HerdrWorkerPaneRepository {
+  constructor(private readonly db: Database.Database) {}
+
+  find(perchSessionId: string): HerdrWorkerPaneRecord | undefined {
+    const row = this.db
+      .prepare("SELECT * FROM herdr_worker_panes WHERE perch_session_id = ?")
+      .get(perchSessionId) as HerdrWorkerPaneRow | undefined;
+    return row ? herdrWorkerPaneFromRow(row) : undefined;
+  }
+
+  live(): HerdrWorkerPaneRecord[] {
+    return (this.db
+      .prepare("SELECT * FROM herdr_worker_panes WHERE state = 'live' ORDER BY created_at")
+      .all() as HerdrWorkerPaneRow[]).map(herdrWorkerPaneFromRow);
+  }
+
+  upsert(
+    input: Omit<HerdrWorkerPaneRecord, "createdAt" | "updatedAt" | "closedAt" | "state"> & {
+      state?: HerdrWorkerPaneState;
+    }
+  ): HerdrWorkerPaneRecord {
+    const now = new Date().toISOString();
+    const existing = this.find(input.perchSessionId);
+    const record: HerdrWorkerPaneRecord = {
+      ...input,
+      state: input.state ?? "live",
+      createdAt: existing?.createdAt ?? now,
+      updatedAt: now
+    };
+    this.db
+      .prepare(
+        `INSERT INTO herdr_worker_panes(
+          perch_session_id, task_id, provider, presentation_kind, herdr_session_id,
+          workspace_id, tab_id, pane_id, terminal_id, state, created_at, updated_at, closed_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(perch_session_id) DO UPDATE SET
+          task_id = excluded.task_id,
+          provider = excluded.provider,
+          presentation_kind = excluded.presentation_kind,
+          herdr_session_id = excluded.herdr_session_id,
+          workspace_id = excluded.workspace_id,
+          tab_id = excluded.tab_id,
+          pane_id = excluded.pane_id,
+          terminal_id = excluded.terminal_id,
+          state = excluded.state,
+          updated_at = excluded.updated_at,
+          closed_at = excluded.closed_at`
+      )
+      .run(
+        record.perchSessionId,
+        record.taskId ?? null,
+        record.provider,
+        record.presentationKind,
+        record.herdrSessionId,
+        record.workspaceId,
+        record.tabId,
+        record.paneId,
+        record.terminalId ?? null,
+        record.state,
+        record.createdAt,
+        record.updatedAt,
+        record.closedAt ?? null
+      );
+    return record;
+  }
+
+  markState(perchSessionId: string, state: HerdrWorkerPaneState): HerdrWorkerPaneRecord | undefined {
+    const current = this.find(perchSessionId);
+    if (!current || current.state === state) return current;
+    const now = new Date().toISOString();
+    this.db
+      .prepare("UPDATE herdr_worker_panes SET state = ?, updated_at = ?, closed_at = ? WHERE perch_session_id = ?")
+      .run(state, now, state === "closed" ? now : null, perchSessionId);
+    return { ...current, state, updatedAt: now, ...(state === "closed" ? { closedAt: now } : {}) };
+  }
 }
 
 export class RuntimeRepository {

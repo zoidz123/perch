@@ -16,6 +16,7 @@ import type {
   TopologyResponse
 } from "@perch/shared";
 import type { SubmitBarrier } from "../modelSwitch.js";
+import type { HerdrClaudeAdapter } from "../herdr.js";
 import type { CodexAppServerAdapter } from "./codexAppServerAdapter.js";
 import type { PtyAgentAdapter } from "./pty.js";
 import type { AgentAdapter, TerminalSnapshot } from "./types.js";
@@ -31,23 +32,31 @@ export class RoutingAgentAdapter implements AgentAdapter {
 
   constructor(
     private readonly pty: PtyAgentAdapter,
-    private readonly codexOwned: CodexAppServerAdapter
+    private readonly codexOwned: CodexAppServerAdapter,
+    private readonly herdrClaude?: HerdrClaudeAdapter
   ) {}
 
   private ownerOf(sessionId: string): AgentAdapter {
-    return this.codexOwned.has(sessionId) ? this.codexOwned : this.pty;
+    if (this.codexOwned.has(sessionId)) return this.codexOwned;
+    if (this.herdrClaude?.has(sessionId)) return this.herdrClaude;
+    return this.pty;
   }
 
-  getTopology(): Promise<TopologyResponse> {
-    return this.pty.getTopology();
+  async getTopology(): Promise<TopologyResponse> {
+    const [pty, herdr] = await Promise.all([
+      this.pty.getTopology(),
+      this.herdrClaude?.getTopology() ?? Promise.resolve({ windows: [], generatedAt: new Date().toISOString() })
+    ]);
+    return { windows: [...pty.windows, ...herdr.windows], generatedAt: new Date().toISOString() };
   }
 
   async listSessions(): Promise<AgentSession[]> {
-    const [ptySessions, ownedSessions] = await Promise.all([
+    const [ptySessions, ownedSessions, herdrSessions] = await Promise.all([
       this.pty.listSessions(),
-      this.codexOwned.listSessions()
+      this.codexOwned.listSessions(),
+      this.herdrClaude?.listSessions() ?? Promise.resolve([])
     ]);
-    return [...ptySessions, ...ownedSessions];
+    return [...ptySessions, ...ownedSessions, ...herdrSessions];
   }
 
   readRecentEvents(sessionId: string, lines: number): Promise<RecentEventsResult> {
@@ -55,7 +64,7 @@ export class RoutingAgentAdapter implements AgentAdapter {
   }
 
   canonicalSessionId(sessionId: string): string {
-    if (this.codexOwned.has(sessionId)) return sessionId;
+    if (this.codexOwned.has(sessionId) || this.herdrClaude?.has(sessionId)) return sessionId;
     const pty: AgentAdapter = this.pty;
     return pty.canonicalSessionId?.(sessionId) ?? sessionId;
   }
@@ -73,7 +82,7 @@ export class RoutingAgentAdapter implements AgentAdapter {
   }
 
   promptAnswerInFlight(sessionId: string): boolean {
-    if (this.codexOwned.has(sessionId)) return false;
+    if (this.codexOwned.has(sessionId) || this.herdrClaude?.has(sessionId)) return false;
     return this.pty.promptAnswerInFlight?.(sessionId) ?? false;
   }
 
@@ -92,22 +101,29 @@ export class RoutingAgentAdapter implements AgentAdapter {
   // Launch routing: Codex is app-server-owned, everything else is a PTY. The
   // managed launcher calls codexOwned.startOwned directly when it needs to
   // carry resume context; this path serves plain AgentAdapter consumers.
-  startAgent(request: StartAgentRequest): Promise<AgentSession> {
+  async startAgent(request: StartAgentRequest): Promise<AgentSession> {
     if (isCodexLaunchRequest(request)) return this.codexOwned.startAgent(request);
+    if (request.agent === "claude" && this.herdrClaude?.enabled()) {
+      try {
+        return await this.herdrClaude.startAgent(request);
+      } catch (error) {
+        if ((error as { name?: string }).name !== "HerdrUnavailableError") throw error;
+      }
+    }
     if (!this.pty.startAgent) throw new Error("PTY agents are not supported by this server");
     return this.pty.startAgent(request);
   }
 
   snapshot(sessionId: string): Promise<TerminalSnapshot> {
-    if (this.codexOwned.has(sessionId)) {
-      throw new Error("app-server-owned codex sessions have no terminal snapshot");
+    if (this.codexOwned.has(sessionId) || this.herdrClaude?.has(sessionId)) {
+      throw new Error("this session has no Perch-owned terminal snapshot");
     }
     if (!this.pty.snapshot) throw new Error("snapshot is not supported by this server");
     return this.pty.snapshot(sessionId);
   }
 
   async resize(sessionId: string, cols: number, rows: number): Promise<void> {
-    if (this.codexOwned.has(sessionId)) return;
+    if (this.codexOwned.has(sessionId) || this.herdrClaude?.has(sessionId)) return;
     await this.pty.resize?.(sessionId, cols, rows);
   }
 
@@ -117,7 +133,7 @@ export class RoutingAgentAdapter implements AgentAdapter {
   }
 
   runtimeProcess(sessionId: string): { processId: number; processStartedAt: string } | undefined {
-    if (this.codexOwned.has(sessionId)) return undefined;
+    if (this.codexOwned.has(sessionId) || this.herdrClaude?.has(sessionId)) return undefined;
     return this.pty.runtimeProcess?.(sessionId);
   }
 
@@ -138,10 +154,12 @@ export class RoutingAgentAdapter implements AgentAdapter {
     };
     const unsubscribePty = this.pty.subscribeFleetEvents?.(forward);
     const unsubscribeCodex = this.codexOwned.subscribeFleetEvents?.(forward);
+    const unsubscribeHerdr = this.herdrClaude?.subscribeFleetEvents?.(forward);
     return () => {
       closed = true;
       unsubscribePty?.();
       unsubscribeCodex?.();
+      unsubscribeHerdr?.();
     };
   }
 
